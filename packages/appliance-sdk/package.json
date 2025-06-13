@@ -7,6 +7,11 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
+    "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "zod": "^3.25.64",
+    "zod-to-ts": "^1.2.0"
   }
 }
