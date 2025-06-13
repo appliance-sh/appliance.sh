@@ -1,0 +1,12 @@
+{
+  "name": "appliance.sh",
+  "version": "0.0.0-semantically-versioned",
+  "description": "Shell for installing, running, and developing applications on the Appliance platform",
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
