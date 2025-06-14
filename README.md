@@ -7,7 +7,7 @@ Appliance is a platform to install and run applications on the cloud.
 1. Install the Appliance Command Line Interface (CLI)
 
 ```shell
-npm install --global @cli/cli
+npm install --global @appliance.sh/cli
 ```
 
 2. Check that Appliance is correctly installed

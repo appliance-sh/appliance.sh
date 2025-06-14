@@ -13,7 +13,6 @@
   },
   "license": "MIT",
   "author": "Eliot Lim",
-  "main": "index.js",
   "scripts": {
     "build": "npm run --workspace=packages/sdk build && npm run --workspace=packages/cli build",
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
