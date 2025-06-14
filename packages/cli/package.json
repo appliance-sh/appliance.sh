@@ -7,7 +7,7 @@
   "type": "commonjs",
   "main": "index.js",
   "bin": {
-    "appliance": "dist/index.js"
+    "appliance": "dist/appliance.js"
   },
   "scripts": {
     "build": "tsc",
@@ -16,7 +16,10 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@types/node": "^24.0.1",
+    "chalk": "^5.4.1",
     "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1"
   }
 }
