@@ -15,10 +15,12 @@
   "author": "Eliot Lim",
   "main": "index.js",
   "scripts": {
-    "build": "npm run --workspace=packages/appliance-sdk build",
+    "build": "npm run --workspace=packages/appliance-sdk build && npm run --workspace=packages/appliance.sh build",
+    "install": "npm run --workspace=packages/appliance.sh install",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "workspaces": [
-    "packages/appliance-sdk"
+    "packages/appliance-sdk",
+    "packages/appliance.sh"
   ]
 }

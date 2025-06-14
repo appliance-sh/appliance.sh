@@ -6,8 +6,13 @@
   "author": "Eliot Lim",
   "type": "commonjs",
   "main": "index.js",
+  "exports": {
+    "require": "./dist/cjs/index.js",
+    "import": "./dist/esm/index.js",
+    "types": "./dist/types"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution node --module es2022 --outDir dist/esm",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
