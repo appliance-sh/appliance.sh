@@ -1,5 +1,5 @@
 {
-  "name": "@appliance.sh/appliance-sdk",
+  "name": "@appliance.sh/sdk",
   "version": "0.0.0-semantically-versioned",
   "description": "SDK for installing, running, and developing applications for the Appliance platform",
   "license": "MIT",
@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution node --module es2022 --outDir dist/esm",
+    "clean": "rm -rf ./dist/",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {

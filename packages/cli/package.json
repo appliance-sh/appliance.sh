@@ -1,5 +1,5 @@
 {
-  "name": "appliance.sh",
+  "name": "@appliance.sh/cli",
   "version": "0.0.0-semantically-versioned",
   "description": "Shell for installing, running, and developing applications on the Appliance platform",
   "license": "MIT",
@@ -11,10 +11,12 @@
   },
   "scripts": {
     "build": "tsc",
-    "install": "npm link",
+    "clean": "rm -rf ./dist/",
+    "setup": "npm link && npm install --global .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@types/node": "^24.0.1",
     "commander": "^14.0.0"
   }
 }
