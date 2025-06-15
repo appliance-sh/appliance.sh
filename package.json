@@ -14,11 +14,16 @@
   "license": "MIT",
   "author": "Eliot Lim",
   "lint-staged": {
-    "**/*": "prettier --write --ignore-unknown"
+    "**/*": [
+      "npx eslint",
+      "prettier --write --ignore-unknown"
+    ]
   },
   "scripts": {
     "build": "npm run --workspace=packages/sdk build && npm run --workspace=packages/cli build",
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
+    "lint-check": "npx eslint . && prettier --check .",
+    "lint-fix": "npx eslint --fix . && prettier --fix .",
     "setup": "npm run --workspace=packages/cli setup",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky"

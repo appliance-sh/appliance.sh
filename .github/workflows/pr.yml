@@ -33,3 +33,5 @@ jobs:
         run: npm audit signatures
       - name: Build
         run: npm build
+      - name: Check linting and code style
+        run: npm run lint-check
