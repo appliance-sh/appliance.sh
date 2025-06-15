@@ -13,19 +13,31 @@
   },
   "license": "MIT",
   "author": "Eliot Lim",
+  "lint-staged": {
+    "**/*": "prettier --write --ignore-unknown"
+  },
   "scripts": {
     "build": "npm run --workspace=packages/sdk build && npm run --workspace=packages/cli build",
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
     "setup": "npm run --workspace=packages/cli setup",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "husky"
   },
   "workspaces": [
     "packages/sdk",
     "packages/cli"
   ],
   "devDependencies": {
+    "@eslint/js": "^9.29.0",
     "@semantic-release/exec": "^7.1.0",
     "@semantic-release/github": "^11.0.3",
-    "semantic-release": "^24.2.5"
+    "eslint": "^9.29.0",
+    "eslint-plugin-react": "^7.37.5",
+    "globals": "^16.2.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.1.2",
+    "prettier": "3.5.3",
+    "semantic-release": "^24.2.5",
+    "typescript-eslint": "^8.34.0"
   }
 }
