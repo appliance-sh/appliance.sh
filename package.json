@@ -22,8 +22,8 @@
   "scripts": {
     "build": "npm run --workspace=packages/sdk build && npm run --workspace=packages/cli build",
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
-    "lint-check": "npx eslint . && prettier --check .",
-    "lint-fix": "npx eslint --fix . && prettier --fix .",
+    "lint-check": "npx eslint . && prettier . --check",
+    "lint-fix": "npx eslint --fix . && prettier . --fix --write",
     "setup": "npm run --workspace=packages/cli setup",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky"
