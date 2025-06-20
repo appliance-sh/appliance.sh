@@ -12,10 +12,11 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf ./dist/",
-    "setup": "npm link && npm install --global .",
+    "dev:setup": "npm link \"@appliance.sh/sdk\" && npm install --global .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@appliance.sh/sdk": "*",
     "chalk": "^5.4.1",
     "commander": "^14.0.0"
   },

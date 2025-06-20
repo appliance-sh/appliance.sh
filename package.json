@@ -24,7 +24,7 @@
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
     "lint-check": "npx eslint . && prettier . --check",
     "lint-fix": "npx eslint --fix . && prettier . --fix --write",
-    "setup": "npm run --workspace=packages/cli setup",
+    "dev:setup": "npm run --workspace=packages/sdk dev:setup && npm run --workspace=packages/cli dev:setup",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky"
   },

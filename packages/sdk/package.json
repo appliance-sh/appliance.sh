@@ -11,9 +11,12 @@
     "import": "./dist/esm/index.js",
     "types": "./dist/types"
   },
+  "types": "./dist/types",
   "scripts": {
-    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution node --module es2022 --outDir dist/esm",
+    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution node --module es2022 --outDir dist/esm && npm run postbuild && npm link",
     "clean": "rm -rf ./dist/",
+    "dev:setup": "npm link",
+    "postbuild": "sed -i '' \"s/0.0.0-semantically-released/$(git describe --tags --abbrev=0)/g\" dist/cjs/version.js && sed -i '' \"s/0.0.0-semantically-released/$(git describe --tags --abbrev=0)/g\" dist/esm/version.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
