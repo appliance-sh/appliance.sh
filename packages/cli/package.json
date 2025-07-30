@@ -13,7 +13,8 @@
     "build": "tsc",
     "clean": "rm -rf ./dist/",
     "dev:setup": "npm link \"@appliance.sh/sdk\" && npm install --global .",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "release": "semantic-release"
   },
   "dependencies": {
     "@appliance.sh/sdk": "*",
