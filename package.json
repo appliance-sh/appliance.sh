@@ -1,5 +1,5 @@
 {
-  "name": "appliance",
+  "name": "appliance.sh",
   "private": true,
   "version": "0.0.0-semantically-versioned",
   "description": "Appliance is a platform to install and run applications on the cloud",
