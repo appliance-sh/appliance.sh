@@ -16,6 +16,8 @@ jobs:
       issues: write # to be able to comment on released issues
       pull-requests: write # to be able to comment on released pull requests
       id-token: write # to enable use of OIDC for npm provenance
+    outputs:
+      publish_required: ${{ steps.semantic_release.outputs.publish_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -36,4 +38,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm run release
+        run: |
+          git config --global user.email "eliot.lim@gmail.com"
+          git config --global user.name "Eliot Lim"
+          npm run release
