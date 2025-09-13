@@ -17,8 +17,7 @@
     "clean": "rm -rf ./dist/",
     "dev:setup": "npm link",
     "postbuild": "npx ts-node scripts/postbuild.ts",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "release": "semantic-release"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "zod": "^3.25.64",
