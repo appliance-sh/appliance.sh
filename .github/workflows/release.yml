@@ -16,8 +16,6 @@ jobs:
       issues: write # to be able to comment on released issues
       pull-requests: write # to be able to comment on released pull requests
       id-token: write # to enable use of OIDC for npm provenance
-    outputs:
-      publish_required: ${{ steps.semantic_release.outputs.publish_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -34,8 +32,8 @@ jobs:
       - name: Check linting and code style
         run: npm run lint:check
       - name: Release
-        id: semantic_release
+        id: nx_release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx semantic-release
+        run: npm run release
