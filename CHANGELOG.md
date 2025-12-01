@@ -1,3 +1,13 @@
+## 1.4.0 (2025-12-01)
+
+### 🚀 Features
+
+- **api-aws:** add ecr test ([#5](https://github.com/appliance-sh/appliance/pull/5))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.3.0 (2025-12-01)
 
 ### 🚀 Features

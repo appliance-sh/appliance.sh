@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/sdk",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "SDK for installing, running, and developing applications for the Appliance platform",
   "license": "MIT",
   "author": "Eliot Lim",
