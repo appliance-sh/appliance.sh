@@ -1,5 +1,5 @@
 {
-  "name": "appliance",
+  "name": "appliance.sh",
   "private": true,
   "version": "0.0.0-semantically-versioned",
   "description": "Appliance is a platform to install and run applications on the cloud",
@@ -31,13 +31,12 @@
   },
   "workspaces": [
     "packages/sdk",
-    "packages/cli"
+    "packages/cli",
+    "packages/api-aws"
   ],
   "devDependencies": {
     "@eslint/js": "^9.29.0",
     "@nx/js": "^21.5.2",
-    "@semantic-release/exec": "^7.1.0",
-    "@semantic-release/github": "^11.0.3",
     "@swc-node/register": "^1.11.1",
     "@swc/core": "^1.13.5",
     "eslint": "^9.29.0",

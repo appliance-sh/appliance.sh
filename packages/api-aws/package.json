@@ -1,0 +1,29 @@
+{
+  "name": "@appliance.sh/api-aws",
+  "version": "1.2.0",
+  "description": "SDK for installing, running, and developing applications for the Appliance platform",
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "type": "commonjs",
+  "main": "index.js",
+  "exports": {
+    "require": "./dist/cjs/index.js",
+    "import": "./dist/esm/index.js",
+    "types": "./dist/types"
+  },
+  "types": "./dist/types",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf ./dist/",
+    "dev:setup": "npm link \"@appliance.sh/sdk\" && npm install --global .",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@appliance.sh/sdk": "1.2.0",
+    "aws-cdk": "^2.1033.0",
+    "aws-cdk-lib": "^2.230.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1"
+  }
+}
