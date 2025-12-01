@@ -1,3 +1,13 @@
+## 1.3.0 (2025-12-01)
+
+### 🚀 Features
+
+- **sdk:** add appliance manifest types ([#4](https://github.com/appliance-sh/appliance/pull/4))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.2.0 (2025-09-13)
 
 ### 🚀 Features
