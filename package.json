@@ -20,10 +20,11 @@
     ]
   },
   "scripts": {
-    "build": "npm run --workspace=packages/sdk build && npm run --workspace=packages/cli build",
+    "build": "npm run --workspaces build",
     "clean": "rm -rf ./node_modules && npm run --workspaces clean",
     "lint:check": "npx eslint . && prettier . --check",
     "lint:fix": "npx eslint --fix . && prettier . --fix --write",
+    "dev": "npm run --workspace=packages/api-server start:dev",
     "dev:setup": "npm run --workspace=packages/sdk dev:setup && npm run --workspace=packages/cli dev:setup",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky",
@@ -32,6 +33,7 @@
   "workspaces": [
     "packages/sdk",
     "packages/cli",
+    "packages/api-server",
     "packages/install-aws"
   ],
   "devDependencies": {
