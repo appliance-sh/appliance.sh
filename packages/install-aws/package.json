@@ -1,0 +1,21 @@
+{
+  "name": "@appliance.sh/install-aws",
+  "version": "1.4.0",
+  "description": "Install the Appliance platform on AWS",
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "scripts": {
+    "build": "cdk synth src/index.ts",
+    "clean": "rm -rf ./dist/",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@appliance.sh/sdk": "1.4.0",
+    "aws-cdk": "^2.1033.0",
+    "aws-cdk-lib": "^2.230.0",
+    "constructs": "^10.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1"
+  }
+}
