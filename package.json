@@ -32,7 +32,7 @@
   "workspaces": [
     "packages/sdk",
     "packages/cli",
-    "packages/api-aws"
+    "packages/install-aws"
   ],
   "devDependencies": {
     "@eslint/js": "^9.29.0",
