@@ -5,7 +5,7 @@
   "license": "MIT",
   "author": "Eliot Lim",
   "scripts": {
-    "build": "cdk synth > dist/appliance-install-aws.yml",
+    "build": "mkdir -p ./dist && cdk synth > dist/appliance-install-aws.yml",
     "clean": "rm -rf ./dist/",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
