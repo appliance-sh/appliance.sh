@@ -5,7 +5,8 @@
     /* Packages */
     "paths": {
       "@appliance.sh/cli": ["./packages/cli"],
-      "@appliance.sh/sdk": ["./packages/sdk"]
+      "@appliance.sh/sdk": ["./packages/sdk"],
+      "@appliance.sh/api-server": ["./packages/api-server"]
     },
 
     /* Projects */
