@@ -30,10 +30,6 @@
             "createRelease": "github"
           }
         }
-      },
-      "others": {
-        "projects": ["api-server", "install-aws"],
-        "projectsRelationship": "fixed"
       }
     }
   }
