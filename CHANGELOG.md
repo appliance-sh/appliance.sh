@@ -1,3 +1,29 @@
+## 1.5.0 (2025-12-15)
+
+### 🚀 Features
+
+- add cdk experimental stacks ([#8](https://github.com/appliance-sh/appliance.sh/pull/8))
+- **api-server:** init nest project ([#7](https://github.com/appliance-sh/appliance.sh/pull/7))
+
+### 🩹 Fixes
+
+- nx workspaces and packages ([#9](https://github.com/appliance-sh/appliance.sh/pull/9))
+- nx release ci ([#10](https://github.com/appliance-sh/appliance.sh/pull/10))
+- nx release ci again ([#11](https://github.com/appliance-sh/appliance.sh/pull/11))
+- release npm ([#12](https://github.com/appliance-sh/appliance.sh/pull/12))
+- release node setup ([#13](https://github.com/appliance-sh/appliance.sh/pull/13))
+- npm package public ([#14](https://github.com/appliance-sh/appliance.sh/pull/14))
+- npm package public again ([#15](https://github.com/appliance-sh/appliance.sh/pull/15))
+- nx release groups ([#16](https://github.com/appliance-sh/appliance.sh/pull/16))
+- nx release projects ([#17](https://github.com/appliance-sh/appliance.sh/pull/17))
+- package repository url ([#18](https://github.com/appliance-sh/appliance.sh/pull/18))
+- package repository url again ([#19](https://github.com/appliance-sh/appliance.sh/pull/19))
+- nx workspace changelog ([#20](https://github.com/appliance-sh/appliance.sh/pull/20))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.4.0 (2025-12-01)
 
 ### 🚀 Features
