@@ -24,12 +24,12 @@
     "groups": {
       "packages": {
         "projects": ["sdk", "cli", "install-aws", "api-server"],
-        "projectsRelationship": "fixed",
-        "changelog": {
-          "workspaceChangelog": {
-            "createRelease": "github"
-          }
-        }
+        "projectsRelationship": "fixed"
+      }
+    },
+    "changelog": {
+      "workspaceChangelog": {
+        "createRelease": "github"
       }
     }
   }
