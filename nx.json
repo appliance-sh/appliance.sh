@@ -21,9 +21,15 @@
     "version": {
       "conventionalCommits": true
     },
-    "changelog": {
-      "workspaceChangelog": {
-        "createRelease": "github"
+    "groups": {
+      "packages": {
+        "projects": ["sdk", "cli", "install-aws", "api-server"],
+        "projectsRelationship": "fixed",
+        "changelog": {
+          "workspaceChangelog": {
+            "createRelease": "github"
+          }
+        }
       }
     }
   }
