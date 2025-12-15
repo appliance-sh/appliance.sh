@@ -2,13 +2,13 @@
   "name": "appliance.sh",
   "version": "0.0.0-semantically-versioned",
   "description": "Appliance is a platform to install and run applications on the cloud",
-  "homepage": "https://github.com/appliance-sh/appliance#readme",
+  "homepage": "https://github.com/appliance-sh/appliance.sh#readme",
   "bugs": {
-    "url": "https://github.com/appliance-sh/appliance/issues"
+    "url": "https://github.com/appliance-sh/appliance.sh/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/appliance-sh/appliance.git"
+    "url": "git+https://github.com/appliance-sh/appliance.sh.git"
   },
   "license": "MIT",
   "author": "Eliot Lim",
