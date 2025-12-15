@@ -28,7 +28,8 @@
     "dev:setup": "npm run --workspace=packages/sdk dev:setup && npm run --workspace=packages/cli dev:setup",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky",
-    "release": "nx release"
+    "release": "nx release",
+    "release:ci": "nx release --yes"
   },
   "workspaces": [
     "packages/sdk",
