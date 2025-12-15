@@ -2,6 +2,7 @@
   "name": "@appliance.sh/cli",
   "version": "1.4.0",
   "description": "Shell for installing, running, and developing applications on the Appliance platform",
+  "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "author": "Eliot Lim",
   "type": "commonjs",

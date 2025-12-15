@@ -2,6 +2,7 @@
   "name": "@appliance.sh/sdk",
   "version": "1.4.0",
   "description": "SDK for installing, running, and developing applications for the Appliance platform",
+  "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "author": "Eliot Lim",
   "type": "commonjs",
