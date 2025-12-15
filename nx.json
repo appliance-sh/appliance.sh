@@ -23,7 +23,7 @@
     },
     "groups": {
       "packages": {
-        "projects": ["sdk", "cli"],
+        "projects": ["sdk", "cli", "install-aws", "api-server"],
         "projectsRelationship": "fixed",
         "changelog": {
           "workspaceChangelog": {
