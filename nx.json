@@ -23,13 +23,17 @@
     },
     "groups": {
       "packages": {
-        "projects": ["sdk", "cli", "install-aws", "api-server"],
+        "projects": ["sdk", "cli"],
         "projectsRelationship": "fixed",
         "changelog": {
           "workspaceChangelog": {
             "createRelease": "github"
           }
         }
+      },
+      "others": {
+        "projects": ["api-server", "install-aws"],
+        "projectsRelationship": "fixed"
       }
     }
   }
