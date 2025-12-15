@@ -2,6 +2,7 @@
   "name": "@appliance.sh/install-aws",
   "version": "1.4.0",
   "description": "Install the Appliance platform on AWS",
+  "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "author": "Eliot Lim",
   "scripts": {
