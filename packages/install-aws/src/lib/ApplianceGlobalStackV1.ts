@@ -1,6 +1,10 @@
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 
+export interface ApplianceGlobalStackV1Props extends cdk.StackProps {
+  domain: string;
+}
+
 export class ApplianceGlobalStackV1 extends cdk.Stack {
   public hostedZone;
   public apiLambda;
@@ -8,7 +12,7 @@ export class ApplianceGlobalStackV1 extends cdk.Stack {
   public globalCertificate;
   public cfDistribution;
 
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: ApplianceGlobalStackV1Props) {
     super(scope, id, props);
 
     const stages = {
@@ -18,7 +22,7 @@ export class ApplianceGlobalStackV1 extends cdk.Stack {
       stage4: true,
     };
 
-    const domainName = 'appliance.sh';
+    const domainName = props.domain;
 
     if (stages.stage1) {
       this.hostedZone = new cdk.aws_route53.PublicHostedZone(this, `${id}-zone`, {
@@ -63,9 +67,9 @@ export class ApplianceGlobalStackV1 extends cdk.Stack {
     if (stages.stage4 && this.hostedZone && this.cfDistribution) {
       new cdk.aws_route53.CnameRecord(this, `${id}-cname`, {
         zone: this.hostedZone,
-        recordName: `api.${domainName}`,
+        recordName: `*.${domainName}`,
         domainName: this.cfDistribution.distributionDomainName,
-        ttl: cdk.Duration.minutes(5),
+        ttl: cdk.Duration.seconds(30),
       });
     }
   }

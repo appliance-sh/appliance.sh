@@ -3,6 +3,8 @@ import { Construct } from 'constructs';
 
 interface ApplianceApiStackV1Props extends cdk.StackProps {
   hostedZone: cdk.aws_route53.PublicHostedZone;
+  cfDistribution: cdk.aws_cloudfront.Distribution;
+  domain: string;
 }
 
 export class ApplianceApiStackV1 extends cdk.Stack {
@@ -19,7 +21,7 @@ export class ApplianceApiStackV1 extends cdk.Stack {
       stage3: true,
     };
 
-    const domainName = 'appliance.sh';
+    const domainName = props.domain;
 
     if (stages.stage2) {
       const apiLambdaEcr = new cdk.aws_ecr.Repository(this, `${id}`, {
