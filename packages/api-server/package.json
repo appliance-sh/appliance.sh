@@ -3,7 +3,7 @@
   "version": "1.5.0",
   "description": "",
   "author": "Eliot Lim",
-  "private": true,
+  "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "scripts": {
     "build": "nest build",
@@ -23,6 +23,9 @@
     "@nestjs/common": "^11.0.1",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
+    "@aws-sdk/client-cloudformation": "^3.679.0",
+    "aws-cdk-lib": "^2.230.0",
+    "constructs": "^10.4.3",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },

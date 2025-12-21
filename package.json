@@ -25,6 +25,7 @@
     "lint:fix": "npx eslint --fix . && prettier . --fix --write",
     "dev": "npm run --workspace=packages/api-server start:dev",
     "dev:setup": "npm run --workspace=packages/sdk dev:setup && npm run --workspace=packages/cli dev:setup",
+    "deploy": "npm run --workspace=packages/install-aws deploy",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky",
     "release": "nx release",
