@@ -1,3 +1,13 @@
+## 1.6.0 (2025-12-21)
+
+### 🚀 Features
+
+- add cloudfront and nestjs proof of concept ([#21](https://github.com/appliance-sh/appliance.sh/pull/21))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.5.0 (2025-12-15)
 
 ### 🚀 Features
