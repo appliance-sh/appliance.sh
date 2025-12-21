@@ -59,11 +59,11 @@ export class ApplianceStackAwsCdkService {
             StackName: stackName,
             TemplateBody: templateBody,
             Capabilities: ['CAPABILITY_NAMED_IAM', 'CAPABILITY_AUTO_EXPAND'],
-          }),
+          })
         );
         await waitUntilStackCreateComplete(
           { client: cf, maxWaitTime: 30 * 60, minDelay: 5, maxDelay: 20 },
-          { StackName: stackName },
+          { StackName: stackName }
         );
         return { action: 'deploy', ok: true, idempotentNoop: false, message: 'Stack created', stackName };
       }
@@ -74,15 +74,19 @@ export class ApplianceStackAwsCdkService {
             StackName: stackName,
             TemplateBody: templateBody,
             Capabilities: ['CAPABILITY_NAMED_IAM', 'CAPABILITY_AUTO_EXPAND'],
-          }),
+          })
         );
         await waitUntilStackUpdateComplete(
           { client: cf, maxWaitTime: 30 * 60, minDelay: 5, maxDelay: 20 },
-          { StackName: stackName },
+          { StackName: stackName }
         );
         return { action: 'deploy', ok: true, idempotentNoop: false, message: 'Stack updated', stackName };
-      } catch (e: any) {
-        if (typeof e?.message === 'string' && e.message.includes('No updates are to be performed')) {
+      } catch (e) {
+        if (
+          e instanceof Error &&
+          typeof e?.message === 'string' &&
+          e.message.includes('No updates are to be performed')
+        ) {
           return { action: 'deploy', ok: true, idempotentNoop: true, message: 'No changes (idempotent)', stackName };
         }
         throw e;
@@ -106,7 +110,7 @@ export class ApplianceStackAwsCdkService {
     await cf.send(new DeleteStackCommand({ StackName: stackName }));
     await waitUntilStackDeleteComplete(
       { client: cf, maxWaitTime: 30 * 60, minDelay: 5, maxDelay: 20 },
-      { StackName: stackName },
+      { StackName: stackName }
     );
     return { action: 'destroy', ok: true, idempotentNoop: false, message: 'Stack deleted', stackName };
   }
@@ -115,8 +119,9 @@ export class ApplianceStackAwsCdkService {
     try {
       const res = await cf.send(new DescribeStacksCommand({ StackName: stackName }));
       return !!res.Stacks && res.Stacks.length > 0;
-    } catch (e: any) {
-      const code = e?.name || e?.Code || e?.code;
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      const code = e?.name;
       const message = e?.message || '';
       if (code === 'ValidationError' && message.includes('does not exist')) return false;
       if (message.includes('does not exist')) return false;
