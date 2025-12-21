@@ -1,3 +1,13 @@
+## 1.7.0 (2025-12-21)
+
+### 🚀 Features
+
+- switch to pulumi ([#22](https://github.com/appliance-sh/appliance.sh/pull/22))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.6.0 (2025-12-21)
 
 ### 🚀 Features
