@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { ApplianceStackModule } from './cdk/appliance-stack.module';
+import { PulumiModule } from './pulumi/pulumi.module';
 
 @Module({
-  imports: [ApplianceStackModule],
+  imports: [PulumiModule],
   controllers: [AppController],
   providers: [AppService],
 })
