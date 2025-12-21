@@ -16,7 +16,7 @@ export class ApplianceStack extends cdk.Stack {
       runtime: cdk.aws_lambda.Runtime.NODEJS_24_X,
       handler: 'index.handler',
       code: cdk.aws_lambda.Code.fromInline('exports.handler = async () => "Hello World!";'),
-    })
+    });
 
     const fnUrl = lambdaUrl.addFunctionUrl({
       authType: cdk.aws_lambda.FunctionUrlAuthType.AWS_IAM,

@@ -47,4 +47,4 @@ new ApplianceApiGlobalStackV1(app, `${stackId}-api-global`, {
   cfDistribution: globalStack.cfDistribution,
   crossRegionReferences: true,
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
-})
+});

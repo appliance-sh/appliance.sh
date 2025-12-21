@@ -16,7 +16,7 @@ export class ApplianceApiGlobalStackV1 extends cdk.Stack {
     super(scope, id, props);
 
     if (props.hostedZone && props.functionUrl) {
-      const domainName = `api.${props.hostedZone.zoneName}`
+      const domainName = `api.${props.hostedZone.zoneName}`;
 
       // check if this is the cfDistribution is actually already created using the aws sdk api
       // not using the cdk resource because it's not available in the construct library yet
