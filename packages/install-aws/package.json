@@ -7,7 +7,8 @@
   "author": "Eliot Lim",
   "scripts": {
     "build": "mkdir -p ./dist && cdk synth > dist/appliance-install-aws.yml",
-    "deploy": "cdk deploy --all --hotswap-fallback true --mode=direct",
+    "deploy": "cdk deploy --all",
+    "deploy:direct": "cdk deploy --all -- direct",
     "clean": "rm -rf ./dist/",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

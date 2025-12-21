@@ -9,7 +9,7 @@ interface ApplianceApiGlobalStackV1Props extends cdk.StackProps {
 }
 
 export class ApplianceApiGlobalStackV1 extends cdk.Stack {
-  // public cfDistribution;
+  public cfDistribution;
   public cfCname;
 
   constructor(scope: Construct, id: string, props: ApplianceApiGlobalStackV1Props) {
@@ -30,29 +30,28 @@ export class ApplianceApiGlobalStackV1 extends cdk.Stack {
       //   );
       //   return existingDistribution;
       // });
-      // const isFirstRun = false;
+      const isFirstRun = false;
+
+      this.cfDistribution = new cdk.aws_cloudfront.Distribution(this, `${id}-distribution`, {
+        // domainNames is undefined on the first run, and only defined after the cname record is created on the next run
+        domainNames: isFirstRun ? undefined : [domainName],
+        certificate: props.globalCertificate,
+        defaultBehavior: {
+          origin: cdk.aws_cloudfront_origins.FunctionUrlOrigin.withOriginAccessControl(props.functionUrl),
+        },
+      });
+
+      // const apiConnectionGroup = new cdk.aws_cloudfront.CfnConnectionGroup(this, `${id}-connection-pool`, {
+      //   name: `${id}-connection-pool`,
+      // })
       //
-      // this.cfDistribution = new cdk.aws_cloudfront.Distribution(this, `${id}-distribution`, {
-      //   // domainNames is undefined on the first run, and only defined after the cname record is created on the next run
-      //   domainNames: isFirstRun ? undefined : [domainName],
-      //   certificate: props.globalCertificate,
-      //   defaultBehavior: {
-      //     origin: cdk.aws_cloudfront_origins.FunctionUrlOrigin.withOriginAccessControl(props.functionUrl),
-      //   },
-      // });
-
-      const apiConnectionGroup = new cdk.aws_cloudfront.CfnConnectionGroup(this, `${id}-connection-pool`, {
-        name: `${id}-connection-pool`,
-      })
-
-
-      const apiTenant = new cdk.aws_cloudfront.CfnDistributionTenant(this, `${id}-distribution-tenant`, {
-        distributionId: props.cfDistribution.distributionId,
-        name: `${id}-tenant`,
-
-        domains: [domainName],
-        enabled: false,
-      })
+      // const apiTenant = new cdk.aws_cloudfront.CfnDistributionTenant(this, `${id}-distribution-tenant`, {
+      //   distributionId: props.cfDistribution.distributionId,
+      //   name: `${id}-tenant`,
+      //
+      //   domains: [domainName],
+      //   enabled: false,
+      // })
 
       this.cfCname = new cdk.aws_route53.CnameRecord(this, `${id}-cname`, {
         zone: props.hostedZone,

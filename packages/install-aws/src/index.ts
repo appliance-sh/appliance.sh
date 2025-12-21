@@ -8,16 +8,21 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { ApplianceApiStackV1 } from './lib/ApplianceApiStackV1';
 import { ApplianceGlobalStackV1 } from './lib/ApplianceGlobalStackV1';
+import { ApplianceBase } from './lib/ApplianceBase';
 
 const app = new cdk.App();
 
-const name = 'stack';
-const domain = 'appliance.sh';
-const stackId = `appliance-api-${name}`;
+const stackId = `appliance-api-${`stack`}`;
+
+const base = new ApplianceBase(app, 'appliance-base', {
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
+});
+
+const domainName = base.domainName;
 
 const globalStack = new ApplianceGlobalStackV1(app, `${stackId}-global`, {
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: 'us-east-1' },
-  domain: domain,
+  domain: domainName.valueAsString,
   crossRegionReferences: true,
 });
 
@@ -30,7 +35,7 @@ const localApiStack = new ApplianceApiStackV1(app, stackId, {
   crossRegionReferences: true,
   hostedZone: globalStack.hostedZone,
   cfDistribution: globalStack.cfDistribution,
-  domain: domain,
+  domain: domainName.valueAsString,
 });
 
 if (!localApiStack.apiLambdaUrl) throw new Error('Local API stack not deployed');
