@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
+import { ApplianceStack } from './ApplianceStack';
 
 export type PulumiAction = 'deploy' | 'destroy';
 
@@ -28,12 +29,32 @@ export class PulumiService {
 
   private inlineProgram() {
     return async () => {
+      const name = 'appliance';
+      const regionalProvider = new aws.Provider(`${name}-regional`, {
+        region: 'ap-southeast-1',
+      });
+      const globalProvider = new aws.Provider(`${name}-global`, {
+        region: 'us-east-1',
+      });
+
+      const applianceStack = new ApplianceStack(
+        `${name}-stack`,
+        {
+          tags: { project: name },
+        },
+        {
+          globalProvider,
+          provider: regionalProvider,
+        }
+      );
+
       const bucket = new aws.s3.Bucket('dummy-bucket', {
         forceDestroy: true,
         versioning: { enabled: true },
         tags: { app: 'appliance-api' },
       });
       return {
+        applianceStack,
         bucketName: bucket.bucket,
       };
     };
