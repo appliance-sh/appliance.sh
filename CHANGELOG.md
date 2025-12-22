@@ -1,3 +1,13 @@
+## 1.8.0 (2025-12-22)
+
+### 🚀 Features
+
+- working functionurl poc ([#23](https://github.com/appliance-sh/appliance.sh/pull/23))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.7.0 (2025-12-21)
 
 ### 🚀 Features
