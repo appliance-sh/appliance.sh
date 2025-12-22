@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { portInput } from '../common';
 
 export const applianceBaseInput = z.object({
   manifest: z.literal('v1'),
@@ -9,6 +10,15 @@ export const applianceBaseInput = z.object({
 
 export const applianceTypeContainerInput = applianceBaseInput.extend({
   type: z.literal('container'),
+  port: portInput,
+});
+
+export const applianceTypeInput = applianceBaseInput.extend({
+  type: z.literal('framework'),
+  framework: z.string().optional().default('auto'),
+  port: portInput.optional(),
+  includes: z.array(z.string()).optional(),
+  excludes: z.array(z.string()).optional(),
 });
 
 export const applianceTypeOtherInput = applianceBaseInput.extend({

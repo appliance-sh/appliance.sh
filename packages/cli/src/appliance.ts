@@ -2,13 +2,13 @@
 
 import { Command } from 'commander';
 
-import { VERSION } from '@appliance.sh/sdk';
+import * as sdk from '@appliance.sh/sdk';
 
 const program = new Command();
 
 program
   .name('appliance')
-  .version(VERSION)
+  .version(sdk.VERSION)
   .command('build', 'builds the appliance in the current working directory')
   .command('configure', 'configures the appliance in the current working directory')
   .command('install [appliance-names...]', 'install one or more appliances')

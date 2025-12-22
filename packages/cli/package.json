@@ -5,7 +5,7 @@
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "author": "Eliot Lim",
-  "type": "commonjs",
+  "type": "module",
   "main": "index.js",
   "bin": {
     "appliance": "dist/appliance.js"
@@ -18,10 +18,14 @@
   },
   "dependencies": {
     "@appliance.sh/sdk": "1.8.0",
+    "@inquirer/prompts": "^7.10.1",
     "chalk": "^5.4.1",
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "json-diff": "^1.0.6",
+    "random-word-slugs": "^0.1.7"
   },
   "devDependencies": {
+    "@types/json-diff": "^1.0.3",
     "@types/node": "^24.0.1"
   }
 }

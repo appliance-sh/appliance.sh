@@ -1,6 +1,9 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "target": "es2019",
     "outDir": "./dist",
     "declaration": true,
     "declarationDir": "./dist/types"
