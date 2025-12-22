@@ -10,11 +10,11 @@
   "exports": {
     "require": "./dist/cjs/index.js",
     "import": "./dist/esm/index.js",
-    "types": "./dist/types"
+    "types": "./dist/types/index.d.ts"
   },
   "types": "./dist/types",
   "scripts": {
-    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution node --module es2022 --outDir dist/esm && npm run postbuild && npm link",
+    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution nodenext --module NodeNext --outDir dist/esm && npm run postbuild && npm link",
     "clean": "rm -rf ./dist/",
     "dev:setup": "npm link",
     "postbuild": "npx ts-node scripts/postbuild.ts",
