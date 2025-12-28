@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import path from 'path';
 import * as fs from 'node:fs';
-import { applianceInput, ApplianceInput, Result } from '@appliance.sh/sdk';
+import { Appliance, applianceInput, ApplianceInput, Result } from '@appliance.sh/sdk';
 
 export function extractApplianceFile(cmd: Command): Result<ApplianceInput> {
   let filePath;
@@ -25,9 +25,23 @@ export function extractApplianceFile(cmd: Command): Result<ApplianceInput> {
 
   try {
     const fileBuf = fs.readFileSync(filePath);
-    const result = applianceInput.safeParse(fileBuf.toString());
+    const result = applianceInput.safeParse(JSON.parse(fileBuf.toString()));
 
     return result;
+  } catch (err) {
+    return {
+      success: false,
+      error: err as Error,
+    };
+  }
+}
+
+export function saveApplianceFile(filePath: string, appliance: Appliance) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(appliance, null, 2));
+    return {
+      success: true,
+    };
   } catch (err) {
     return {
       success: false,

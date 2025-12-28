@@ -1,20 +1,35 @@
 import { z } from 'zod';
 import { portInput } from '../common';
 
+export enum ApplianceType {
+  container = 'container',
+  framework = 'framework',
+  other = 'other',
+}
+
+export enum ApplianceFramework {
+  Auto = 'auto',
+  Python = 'python',
+  Node = 'node',
+  Other = 'other',
+}
+
+export const applianceTypeSchema = z.enum(ApplianceType);
+
 export const applianceBaseInput = z.object({
   manifest: z.literal('v1'),
   name: z.string(),
-  version: z.string(),
-  scripts: z.record(z.string(), z.string()),
+  version: z.string().optional(),
+  scripts: z.record(z.string(), z.string()).optional(),
 });
 
 export const applianceTypeContainerInput = applianceBaseInput.extend({
-  type: z.literal('container'),
+  type: z.literal(applianceTypeSchema.enum.container),
   port: portInput,
 });
 
-export const applianceTypeInput = applianceBaseInput.extend({
-  type: z.literal('framework'),
+export const applianceTypeFrameworkInput = applianceBaseInput.extend({
+  type: z.literal(applianceTypeSchema.enum.framework),
   framework: z.string().optional().default('auto'),
   port: portInput.optional(),
   includes: z.array(z.string()).optional(),
@@ -22,10 +37,14 @@ export const applianceTypeInput = applianceBaseInput.extend({
 });
 
 export const applianceTypeOtherInput = applianceBaseInput.extend({
-  type: z.literal('other'),
+  type: z.literal(applianceTypeSchema.enum.other),
 });
 
-export const applianceInput = z.discriminatedUnion('type', [applianceTypeContainerInput, applianceTypeOtherInput]);
+export const applianceInput = z.discriminatedUnion('type', [
+  applianceTypeContainerInput,
+  applianceTypeFrameworkInput,
+  applianceTypeOtherInput,
+]);
 
 export type ApplianceInput = z.infer<typeof applianceInput>;
 export type Appliance = z.output<typeof applianceInput>;
