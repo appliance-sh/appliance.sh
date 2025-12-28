@@ -1,9 +1,15 @@
 import { Command } from 'commander';
-import { extractApplianceFile } from './utils/common.js';
-import { promptForApplianceName } from './wizards/appliance.js';
+import { extractApplianceFile, saveApplianceFile } from './utils/common.js';
+import {
+  promptForApplianceFramework,
+  promptForApplianceName,
+  promptForAppliancePort,
+  promptForApplianceType,
+} from './wizards/appliance.js';
 import * as diff from 'json-diff';
 
 import * as prompt from '@inquirer/prompts';
+import { ApplianceInput, ApplianceType } from '@appliance.sh/sdk';
 
 const program = new Command();
 
@@ -13,37 +19,69 @@ program
 
 const cmd = program.parse(process.argv);
 
-const applianceFile = extractApplianceFile(cmd);
+const applianceFileResult = extractApplianceFile(cmd);
 
 // If a file or directory was specified, but the file was not found, exit with an error.
 if (
   ((cmd.getOptionValue('file') && cmd.getOptionValue('file') !== 'appliance.json') ||
     cmd.getOptionValue('directory')) &&
-  !applianceFile.success
+  !applianceFileResult.success
 ) {
   console.log('The specified file was not found.');
   process.exit(1);
 }
 
+if (!applianceFileResult.success) {
+  console.log(`An error occurred while reading the specified file.`);
+  console.log(applianceFileResult.error);
+}
+
 let updatedApplianceFile = {
-  ...applianceFile.data,
-};
+  manifest: 'v1',
+  ...applianceFileResult.data,
+} as ApplianceInput;
 
 try {
-  const name = await promptForApplianceName(applianceFile.data);
+  const name = await promptForApplianceName(updatedApplianceFile);
 
   updatedApplianceFile = {
-    name,
     ...updatedApplianceFile,
+    name,
   };
 
-  console.log(diff.colorize(diff.diff(applianceFile, updatedApplianceFile)));
+  const type = await promptForApplianceType(updatedApplianceFile);
+
+  if (type === ApplianceType.framework) {
+    const framework = await promptForApplianceFramework(updatedApplianceFile);
+    updatedApplianceFile = {
+      ...updatedApplianceFile,
+      type,
+      framework,
+    };
+  } else if (type === ApplianceType.container) {
+    const port = await promptForAppliancePort(updatedApplianceFile);
+
+    updatedApplianceFile = {
+      ...updatedApplianceFile,
+      type,
+      port,
+    };
+  } else {
+    updatedApplianceFile = {
+      ...updatedApplianceFile,
+      type,
+    };
+  }
+
+  console.log(diff.colorize(diff.diff(applianceFileResult.data, updatedApplianceFile)));
 
   const saveChanges = await prompt.confirm({ message: 'Save changes?', default: true });
   if (!saveChanges) {
     console.log('Changes cancelled.');
     process.exit(0);
   }
+
+  saveApplianceFile(cmd.getOptionValue('file') || 'appliance.json', updatedApplianceFile);
 } catch (error) {
   console.error(error);
 }
