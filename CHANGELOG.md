@@ -1,3 +1,13 @@
+## 1.10.0 (2025-12-28)
+
+### 🚀 Features
+
+- **cli:** appliance configure 2 ([#25](https://github.com/appliance-sh/appliance.sh/pull/25))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.9.0 (2025-12-22)
 
 ### 🚀 Features
