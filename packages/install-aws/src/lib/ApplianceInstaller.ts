@@ -5,6 +5,7 @@ export class ApplianceInstaller extends cdk.Stack {
   public readonly name: cdk.CfnParameter;
   public readonly domainName: cdk.CfnParameter;
   public readonly state: cdk.aws_s3.Bucket;
+  public readonly stateBucketArn: cdk.CfnOutput;
 
   constructor(scope: Construct, id: string, props: cdk.StackProps = {}) {
     super(scope, id, props);
@@ -25,6 +26,11 @@ export class ApplianceInstaller extends cdk.Stack {
       encryption: cdk.aws_s3.BucketEncryption.S3_MANAGED,
       bucketKeyEnabled: true,
       blockPublicAccess: cdk.aws_s3.BlockPublicAccess.BLOCK_ALL,
+    });
+
+    this.stateBucketArn = new cdk.CfnOutput(this, `state-bucket-arn`, {
+      key: 'stateBucketArn',
+      value: this.state.bucketArn,
     });
   }
 }
