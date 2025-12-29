@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/sdk",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "SDK for installing, running, and developing applications for the Appliance platform",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",

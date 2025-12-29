@@ -1,3 +1,13 @@
+## 1.11.0 (2025-12-29)
+
+### 🚀 Features
+
+- **infra:** appliance base poc 1 ([#26](https://github.com/appliance-sh/appliance.sh/pull/26))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.10.0 (2025-12-28)
 
 ### 🚀 Features
