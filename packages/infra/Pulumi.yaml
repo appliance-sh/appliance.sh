@@ -1,0 +1,7 @@
+name: appliance-infra
+description: Infrastructure for the Appliance platform
+runtime:
+  name: nodejs
+  options:
+    packagemanager: npm
+config:

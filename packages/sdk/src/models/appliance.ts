@@ -16,19 +16,19 @@ export enum ApplianceFramework {
 
 export const applianceTypeSchema = z.enum(ApplianceType);
 
-export const applianceBaseInput = z.object({
+export const applianceTypeBase = z.object({
   manifest: z.literal('v1'),
   name: z.string(),
   version: z.string().optional(),
   scripts: z.record(z.string(), z.string()).optional(),
 });
 
-export const applianceTypeContainerInput = applianceBaseInput.extend({
+export const applianceTypeContainerInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.container),
   port: portInput,
 });
 
-export const applianceTypeFrameworkInput = applianceBaseInput.extend({
+export const applianceTypeFrameworkInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.framework),
   framework: z.string().optional().default('auto'),
   port: portInput.optional(),
@@ -36,7 +36,7 @@ export const applianceTypeFrameworkInput = applianceBaseInput.extend({
   excludes: z.array(z.string()).optional(),
 });
 
-export const applianceTypeOtherInput = applianceBaseInput.extend({
+export const applianceTypeOtherInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.other),
 });
 

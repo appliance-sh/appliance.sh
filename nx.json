@@ -23,7 +23,7 @@
     },
     "groups": {
       "packages": {
-        "projects": ["sdk", "cli", "install-aws", "api-server"],
+        "projects": ["sdk", "cli", "install-aws", "api-server", "infra"],
         "projectsRelationship": "fixed"
       }
     },
