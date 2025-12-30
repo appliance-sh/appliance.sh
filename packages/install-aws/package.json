@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/install-aws",
-  "version": "1.11.0",
+  "version": "1.11.1",
   "description": "Install the Appliance platform on AWS",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@appliance.sh/sdk": "1.11.0",
+    "@appliance.sh/sdk": "1.11.1",
     "@aws-sdk/client-cloudfront": "^3.955.0",
     "aws-cdk": "^2.1033.0",
     "aws-cdk-lib": "^2.230.0",

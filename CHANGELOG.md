@@ -1,3 +1,13 @@
+## 1.11.1 (2025-12-30)
+
+### 🩹 Fixes
+
+- **ci:** update infra repository url ([#27](https://github.com/appliance-sh/appliance.sh/pull/27))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.11.0 (2025-12-29)
 
 ### 🚀 Features
