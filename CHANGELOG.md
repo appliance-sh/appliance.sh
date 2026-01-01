@@ -1,3 +1,13 @@
+## 1.12.0 (2026-01-01)
+
+### 🚀 Features
+
+- **infra:** working cloudfront poc ([#28](https://github.com/appliance-sh/appliance.sh/pull/28))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.11.1 (2025-12-30)
 
 ### 🩹 Fixes
