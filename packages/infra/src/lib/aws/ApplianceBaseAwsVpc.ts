@@ -7,6 +7,8 @@ export type ApplianceBaseAwsVpcArgs = {
 
 export interface ApplianceBaseAwsVpcOpts extends pulumi.ComponentResourceOptions {
   globalProvider?: pulumi.ProviderResource;
+  nativeProvider?: pulumi.ProviderResource;
+  nativeGlobalProvider?: pulumi.ProviderResource;
 }
 
 export class ApplianceBaseAwsVpc extends pulumi.ComponentResource {
