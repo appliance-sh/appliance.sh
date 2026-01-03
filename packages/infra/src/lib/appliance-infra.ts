@@ -36,7 +36,7 @@ export async function applianceInfra() {
     const applianceBase = new baseController(
       `${base}`,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      { config: baseConfig.data as any },
+      { config: baseConfig.data },
       {
         globalProvider: baseGlobalProvider,
         provider: baseRegionalProvider,

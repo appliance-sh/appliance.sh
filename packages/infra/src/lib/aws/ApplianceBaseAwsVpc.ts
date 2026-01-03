@@ -1,8 +1,8 @@
 import * as pulumi from '@pulumi/pulumi';
-import { ApplianceBaseAwsVpcInput } from '@appliance.sh/sdk';
+import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
 
 export type ApplianceBaseAwsVpcArgs = {
-  config: ApplianceBaseAwsVpcInput;
+  config: ApplianceBaseConfigInput;
 };
 
 export interface ApplianceBaseAwsVpcOpts extends pulumi.ComponentResourceOptions {
@@ -14,5 +14,9 @@ export interface ApplianceBaseAwsVpcOpts extends pulumi.ComponentResourceOptions
 export class ApplianceBaseAwsVpc extends pulumi.ComponentResource {
   constructor(name: string, args: ApplianceBaseAwsVpcArgs, opts?: ApplianceBaseAwsVpcOpts) {
     super('appliance-infra:appliance-base-aws-vpc', name, args, opts);
+
+    if (args.config.type !== ApplianceBaseType.ApplianceAwsVpc) {
+      throw new Error('Invalid config');
+    }
   }
 }

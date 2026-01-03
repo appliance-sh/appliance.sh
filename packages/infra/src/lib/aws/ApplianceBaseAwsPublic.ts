@@ -2,10 +2,10 @@ import * as pulumi from '@pulumi/pulumi';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 
-import { ApplianceBaseAwsPublicInput } from '@appliance.sh/sdk';
+import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
 
 export type ApplianceBaseAwsPublicArgs = {
-  config: ApplianceBaseAwsPublicInput;
+  config: ApplianceBaseConfigInput;
 };
 
 export interface ApplianceBaseAwsPublicOpts extends pulumi.ComponentResourceOptions {
@@ -21,8 +21,14 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
   public readonly certificateArn?: pulumi.Output<string>;
   public readonly cloudfrontDistribution?: aws.cloudfront.Distribution;
 
+  public readonly config;
+
   constructor(name: string, args: ApplianceBaseAwsPublicArgs, opts?: ApplianceBaseAwsPublicOpts) {
     super('appliance-infra:appliance-base-aws-public', name, args, opts);
+
+    if (args.config.type !== ApplianceBaseType.ApplianceAwsPublic) {
+      throw new Error('Invalid config');
+    }
 
     if (args.config.dns.createZone) {
       this.zone = new aws.route53.Zone(
@@ -90,6 +96,33 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         { parent: this, provider: opts?.globalProvider }
       ).arn;
     }
+
+    const state = new aws.s3.Bucket(
+      `${name}-state`,
+      {
+        acl: 'private',
+        forceDestroy: true,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.s3.BucketVersioning(
+      `${name}-state-versioning`,
+      {
+        bucket: state.bucket,
+        versioningConfiguration: { status: 'Enabled' },
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.s3.BucketServerSideEncryptionConfiguration(
+      `${name}-state-sse`,
+      {
+        bucket: state.bucket,
+        rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: 'AES256' } }],
+      },
+      { parent: this, provider: opts?.provider }
+    );
 
     const lambdaOrigin = new aws.lambda.CallbackFunction(
       `${name}-origin`,
@@ -224,5 +257,24 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       },
       { parent: this, provider: opts?.globalProvider }
     );
+
+    this.config = {
+      name: name,
+      region: args.config.region,
+      stateBackendUrl: pulumi.interpolate`s3://${state.bucket}`,
+      domainName: args.config.dns.domainName,
+    };
+
+    new aws.ssm.Parameter(
+      `${name}-base-config`,
+      {
+        name: `/appliance/base/${name}/config`,
+        type: 'SecureString',
+        value: pulumi.jsonStringify(this.config),
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    this.registerOutputs(this.config);
   }
 }

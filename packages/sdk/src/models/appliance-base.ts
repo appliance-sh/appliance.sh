@@ -43,8 +43,11 @@ export const applianceBaseConfigInput = z.discriminatedUnion('type', [applianceA
 
 export type ApplianceBaseConfigInput = z.infer<typeof applianceBaseConfigInput>;
 
-export const applianceBaseConfig = applianceBaseInput.extend({
-  apiUrl: z.url(),
+export const applianceBaseConfig = z.object({
+  name: z.string(),
+  type: z.enum(ApplianceBaseType),
+  region: z.string(),
+  stateBackendUrl: z.string(),
 });
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
