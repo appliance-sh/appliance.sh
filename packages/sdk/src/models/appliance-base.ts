@@ -37,7 +37,7 @@ export const applianceAwsVpcInput = applianceBaseAwsInput.extend({
   ]),
 });
 
-export type ApplianceBaseAwsVpcInput = z.infer<typeof applianceAwsPublicInput>;
+export type ApplianceBaseAwsVpcInput = z.infer<typeof applianceAwsVpcInput>;
 
 export const applianceBaseConfigInput = z.discriminatedUnion('type', [applianceAwsPublicInput, applianceAwsVpcInput]);
 
