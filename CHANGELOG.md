@@ -1,3 +1,13 @@
+## 1.13.0 (2026-01-03)
+
+### 🚀 Features
+
+- **infra:** state and params ([#30](https://github.com/appliance-sh/appliance.sh/pull/30))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.12.1 (2026-01-03)
 
 ### 🩹 Fixes
