@@ -1,3 +1,13 @@
+## 1.12.1 (2026-01-03)
+
+### 🩹 Fixes
+
+- **infra:** update ApplianceBaseAwsVpcInput type ([#29](https://github.com/appliance-sh/appliance.sh/pull/29))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.12.0 (2026-01-01)
 
 ### 🚀 Features
