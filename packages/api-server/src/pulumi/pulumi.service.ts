@@ -17,18 +17,18 @@ export interface PulumiResult {
 @Injectable()
 export class PulumiService {
   private readonly logger = new Logger(PulumiService.name);
-  private readonly region = process.env.AWS_REGION || 'us-east-1';
   private readonly projectName = 'appliance-api-managed-proj';
 
   private readonly baseConfig = process.env.APPLIANCE_BASE_CONFIG
     ? applianceBaseConfig.parse(JSON.parse(process.env.APPLIANCE_BASE_CONFIG))
     : undefined;
+  private readonly region = this.baseConfig?.aws.region || 'us-east-1';
 
   private inlineProgram() {
     return async () => {
       const name = 'appliance';
       const regionalProvider = new aws.Provider(`${name}-regional`, {
-        region: this.baseConfig?.region ?? 'ap-southeast-1',
+        region: this.baseConfig?.aws.region ?? 'ap-southeast-1',
       });
       const globalProvider = new aws.Provider(`${name}-global`, {
         region: 'us-east-1',
@@ -38,6 +38,7 @@ export class PulumiService {
         `${name}-stack`,
         {
           tags: { project: name },
+          cloudfrontDistributionId: this.baseConfig?.aws.cloudfrontDistributionId,
         },
         {
           globalProvider,
@@ -67,7 +68,7 @@ export class PulumiService {
       { projectName: this.projectName, stackName, program },
       { envVars }
     );
-    await stack.setConfig('aws:region', { value: this.region });
+    await stack.setConfig('aws:region', { value: this.baseConfig.aws.region });
     return stack;
   }
 

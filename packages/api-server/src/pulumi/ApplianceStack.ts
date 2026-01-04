@@ -3,6 +3,7 @@ import * as aws from '@pulumi/aws';
 
 export interface ApplianceStackArgs {
   tags?: Record<string, string>;
+  cloudfrontDistributionId?: pulumi.Input<string>;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -58,18 +59,31 @@ export class ApplianceStack extends pulumi.ComponentResource {
       `${name}-url`,
       {
         functionName: this.lambda.name,
-        authorizationType: 'NONE',
+        authorizationType: args.cloudfrontDistributionId ? 'AWS_IAM' : 'NONE',
       },
       defaultOpts
     );
 
-    new aws.lambda.Permission(`${name}-url-invoke-url-permission`, {
-      function: this.lambda.name,
-      action: 'lambda:InvokeFunctionUrl',
-      principal: '*',
-      functionUrlAuthType: 'NONE',
-      statementId: 'FunctionURLAllowPublicAccess',
-    });
+    if (args.cloudfrontDistributionId) {
+      new aws.lambda.Permission(`${name}-url-invoke-url-permission`, {
+        function: this.lambda.name,
+        action: 'lambda:InvokeFunctionUrl',
+        principal: 'cloudfront.amazonaws.com',
+        functionUrlAuthType: 'AWS_IAM',
+        sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
+          aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
+        }:distribution/${args.cloudfrontDistributionId}`,
+        statementId: 'FunctionURLAllowCloudFrontAccess',
+      });
+    } else {
+      new aws.lambda.Permission(`${name}-url-invoke-url-permission`, {
+        function: this.lambda.name,
+        action: 'lambda:InvokeFunctionUrl',
+        principal: '*',
+        functionUrlAuthType: 'NONE',
+        statementId: 'FunctionURLAllowPublicAccess',
+      });
+    }
 
     new aws.lambda.Permission(`${name}-url-invoke-lambda-permission`, {
       function: this.lambda.name,

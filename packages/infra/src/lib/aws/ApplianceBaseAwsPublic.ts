@@ -260,9 +260,13 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
 
     this.config = {
       name: name,
-      region: args.config.region,
       stateBackendUrl: pulumi.interpolate`s3://${state.bucket}`,
       domainName: args.config.dns.domainName,
+      type: ApplianceBaseType.ApplianceAwsPublic,
+      aws: {
+        region: args.config.region,
+        cloudfrontDistributionId: this.cloudfrontDistribution.id,
+      },
     };
 
     new aws.ssm.Parameter(

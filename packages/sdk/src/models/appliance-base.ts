@@ -46,8 +46,11 @@ export type ApplianceBaseConfigInput = z.infer<typeof applianceBaseConfigInput>;
 export const applianceBaseConfig = z.object({
   name: z.string(),
   type: z.enum(ApplianceBaseType),
-  region: z.string(),
   stateBackendUrl: z.string(),
+  aws: z.object({
+    region: z.string(),
+    cloudfrontDistributionId: z.string().optional(),
+  }),
 });
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
