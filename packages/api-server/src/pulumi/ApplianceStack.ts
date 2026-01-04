@@ -1,14 +1,18 @@
 import * as pulumi from '@pulumi/pulumi';
 import * as aws from '@pulumi/aws';
+import * as awsNative from '@pulumi/aws-native';
+import { ApplianceBaseConfig } from '@appliance.sh/sdk';
 
 export interface ApplianceStackArgs {
   tags?: Record<string, string>;
-  cloudfrontDistributionId?: pulumi.Input<string>;
+  config: ApplianceBaseConfig;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
   globalProvider: aws.Provider;
   provider: aws.Provider;
+  nativeProvider: awsNative.Provider;
+  nativeGlobalProvider: awsNative.Provider;
 }
 
 export class ApplianceStack extends pulumi.ComponentResource {
@@ -16,11 +20,14 @@ export class ApplianceStack extends pulumi.ComponentResource {
   lambdaRolePolicy: aws.iam.Policy;
   lambda: aws.lambda.Function;
   lambdaUrl: aws.lambda.FunctionUrl;
+  distributionTenant?: awsNative.cloudfront.DistributionTenant;
+  dnsRecord: pulumi.Output<string>;
 
   constructor(name: string, args: ApplianceStackArgs, opts: ApplianceStackOpts) {
     super('appliance:aws:ApplianceStack', name, args, opts);
 
     const defaultOpts = { parent: this, provider: opts.provider };
+    const defaultNativeOpts = { parent: this, provider: opts.nativeProvider };
     const defaultTags = { stack: name, managed: 'appliance', ...args.tags };
 
     this.lambdaRole = new aws.iam.Role(`${name}-role`, {
@@ -59,12 +66,14 @@ export class ApplianceStack extends pulumi.ComponentResource {
       `${name}-url`,
       {
         functionName: this.lambda.name,
-        authorizationType: args.cloudfrontDistributionId ? 'AWS_IAM' : 'NONE',
+        authorizationType: args.config.aws.cloudfrontDistributionId ? 'AWS_IAM' : 'NONE',
       },
       defaultOpts
     );
 
-    if (args.cloudfrontDistributionId) {
+    this.dnsRecord = pulumi.interpolate`${name}.${args.config.domainName ?? ''}`;
+
+    if (args.config.aws.cloudfrontDistributionId) {
       new aws.lambda.Permission(`${name}-url-invoke-url-permission`, {
         function: this.lambda.name,
         action: 'lambda:InvokeFunctionUrl',
@@ -72,7 +81,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
         functionUrlAuthType: 'AWS_IAM',
         sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
           aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
-        }:distribution/${args.cloudfrontDistributionId}`,
+        }:distribution/${args.config.aws.cloudfrontDistributionId}`,
         statementId: 'FunctionURLAllowCloudFrontAccess',
       });
     } else {
@@ -85,12 +94,45 @@ export class ApplianceStack extends pulumi.ComponentResource {
       });
     }
 
-    new aws.lambda.Permission(`${name}-url-invoke-lambda-permission`, {
-      function: this.lambda.name,
-      action: 'lambda:InvokeFunction',
-      principal: '*',
-      statementId: 'FunctionURLAllowInvokeAction',
-    });
+    if (args.config.aws.cloudfrontDistributionId && args.config.aws.cloudfrontDistributionDomainName) {
+      new awsNative.lambda.Permission(
+        `${name}-url-invoke-lambda-native-permission`,
+        {
+          action: 'lambda:InvokeFunction',
+          principal: 'cloudfront.amazonaws.com',
+          sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
+            aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
+          }:distribution/${args.config.aws.cloudfrontDistributionId}`,
+          functionName: this.lambda.name,
+          invokedViaFunctionUrl: true,
+        },
+        defaultNativeOpts
+      );
+
+      new aws.route53.Record(
+        `${name}-cname-record`,
+        {
+          zoneId: args.config.aws.zoneId,
+          name: pulumi.interpolate`${name}.${args.config.domainName ?? ''}`,
+          type: 'CNAME',
+          ttl: 60,
+          records: [args.config.aws.cloudfrontDistributionDomainName],
+        },
+        { parent: this, provider: opts.globalProvider }
+      );
+
+      new aws.route53.Record(
+        `${name}-txt-record`,
+        {
+          zoneId: args.config.aws.zoneId,
+          name: pulumi.interpolate`origin.${name}.${args.config.domainName ?? ''}`,
+          type: 'TXT',
+          ttl: 60,
+          records: [this.lambdaUrl.functionUrl],
+        },
+        { parent: this, provider: opts.globalProvider }
+      );
+    }
 
     this.registerOutputs({
       lambda: this.lambda,

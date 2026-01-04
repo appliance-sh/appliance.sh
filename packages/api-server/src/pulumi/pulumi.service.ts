@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
+import * as awsNative from '@pulumi/aws-native';
 import { ApplianceStack } from './ApplianceStack';
 import { applianceBaseConfig } from '@appliance.sh/sdk';
 
@@ -27,10 +28,22 @@ export class PulumiService {
   private inlineProgram() {
     return async () => {
       const name = 'appliance';
+
+      if (!this.baseConfig) {
+        throw new Error('Missing base config');
+      }
+
       const regionalProvider = new aws.Provider(`${name}-regional`, {
-        region: this.baseConfig?.aws.region ?? 'ap-southeast-1',
+        region: (this.baseConfig?.aws.region as aws.Region) ?? 'ap-southeast-1',
       });
       const globalProvider = new aws.Provider(`${name}-global`, {
+        region: 'us-east-1',
+      });
+      const nativeRegionalProvider = new awsNative.Provider(`${name}-native-regional`, {
+        region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
+      });
+
+      const nativeGlobalProvider = new awsNative.Provider(`${name}-native-global`, {
         region: 'us-east-1',
       });
 
@@ -38,11 +51,13 @@ export class PulumiService {
         `${name}-stack`,
         {
           tags: { project: name },
-          cloudfrontDistributionId: this.baseConfig?.aws.cloudfrontDistributionId,
+          config: this.baseConfig,
         },
         {
           globalProvider,
           provider: regionalProvider,
+          nativeProvider: nativeRegionalProvider,
+          nativeGlobalProvider: nativeGlobalProvider,
         }
       );
 

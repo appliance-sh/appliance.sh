@@ -47,9 +47,12 @@ export const applianceBaseConfig = z.object({
   name: z.string(),
   type: z.enum(ApplianceBaseType),
   stateBackendUrl: z.string(),
+  domainName: z.string().optional(),
   aws: z.object({
     region: z.string(),
+    zoneId: z.string(),
     cloudfrontDistributionId: z.string().optional(),
+    cloudfrontDistributionDomainName: z.string().optional(),
   }),
 });
 

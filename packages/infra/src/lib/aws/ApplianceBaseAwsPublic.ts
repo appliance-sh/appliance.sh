@@ -265,7 +265,9 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       type: ApplianceBaseType.ApplianceAwsPublic,
       aws: {
         region: args.config.region,
+        zoneId: this.zoneId,
         cloudfrontDistributionId: this.cloudfrontDistribution.id,
+        cloudfrontDistributionDomainName: this.cloudfrontDistribution.domainName,
       },
     };
 
