@@ -1,6 +1,5 @@
 import * as pulumi from '@pulumi/pulumi';
 import * as aws from '@pulumi/aws';
-import * as awsNative from '@pulumi/aws-native';
 
 import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
 
@@ -170,6 +169,108 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       { parent: this, provider: opts?.globalProvider }
     );
 
+    const edgeRouterRole = new aws.iam.Role(
+      `${name}-edge-router-role`,
+      {
+        assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+          Service: ['lambda.amazonaws.com', 'edgelambda.amazonaws.com'],
+        }),
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
+    new aws.iam.RolePolicyAttachment(
+      `${name}-edge-router-role-logging`,
+      {
+        role: edgeRouterRole.name,
+        policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
+    const edgeFunction = new aws.lambda.CallbackFunction(
+      `${name.replaceAll('.', '-')}-edge-router`,
+      {
+        role: edgeRouterRole,
+        runtime: 'nodejs22.x',
+        timeout: 5,
+        publish: true,
+        loggingConfig: {
+          logGroup: `/appliance/base/${name}/edge-router-logs`,
+          logFormat: 'Text',
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        callback: async (event: any) => {
+          const request = event.Records[0].cf.request;
+          const headers = request.headers;
+          const host = headers.host[0].value;
+
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const dns = require('dns').promises;
+
+          let originUrl: URL;
+          try {
+            const txtRecords = await dns.resolveTxt(`origin.${host}`);
+            const functionUrl = txtRecords[0][0];
+            originUrl = new URL(functionUrl);
+          } catch (e) {
+            console.error(`Failed to resolve TXT record for origin.${host}`, e);
+            originUrl = new URL(lambdaOriginFunctionUrl.functionUrl.get());
+          }
+
+          request.origin = {
+            custom: {
+              domainName: originUrl.hostname,
+              port: 443,
+              protocol: 'https',
+              path: request.path,
+              sslProtocols: ['TLSv1', 'TLSv1.1', 'TLSv1.2'],
+              readTimeout: 30,
+              keepaliveTimeout: 5,
+              customHeaders: {},
+            },
+          };
+          request.headers['host'] = [{ key: 'host', value: originUrl.hostname }];
+          request.headers['X-Forwarded-Host'] = [{ key: 'X-Forwarded-Host', value: host }];
+
+          return request;
+        },
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
+    new aws.lambda.Permission(
+      `${name}-edge-router-invoke-url-permission`,
+      {
+        function: edgeFunction.name,
+        action: 'lambda:InvokeFunction',
+        principal: 'edgelambda.amazonaws.com',
+        statementId: 'AllowExecutionFromCloudFront',
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
+    const distributionLogs = new aws.cloudwatch.LogGroup(
+      `${name}-distribution-logs`,
+      {
+        name: pulumi.interpolate`/appliance/base/${name}/distribution-logs`,
+        retentionInDays: 7,
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
+    const distributionDeliveryDestination = new aws.cloudwatch.LogDeliveryDestination(
+      `${name.replace('.', '-')}-distribution-delivery-destination`,
+      {
+        outputFormat: 'json',
+        deliveryDestinationType: 'CWL',
+        deliveryDestinationConfiguration: {
+          destinationResourceArn: distributionLogs.arn,
+        },
+      },
+      { parent: this, provider: opts?.globalProvider }
+    );
+
     this.cloudfrontDistribution = new aws.cloudfront.Distribution(
       `${name}-distribution`,
       {
@@ -185,17 +286,24 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
             .apply((res) => res.id ?? ''),
           originRequestPolicyId: aws.cloudfront
             .getOriginRequestPolicyOutput(
-              { name: 'Managed-AllViewerExceptHostHeader' },
+              { name: 'Managed-AllViewer' },
               {
                 parent: this,
                 provider: opts?.globalProvider,
               }
             )
             .apply((res) => res.id ?? ''),
-          allowedMethods: ['HEAD', 'GET'],
-          cachedMethods: ['HEAD', 'GET'],
+          allowedMethods: ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'],
+          cachedMethods: ['GET', 'HEAD'],
           targetOriginId: 'LambdaOrigin',
           viewerProtocolPolicy: 'redirect-to-https',
+          lambdaFunctionAssociations: [
+            {
+              eventType: 'origin-request',
+              lambdaArn: edgeFunction.qualifiedArn,
+              includeBody: true,
+            },
+          ],
         },
         origins: [
           {
@@ -222,28 +330,24 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       { parent: this, provider: opts?.globalProvider }
     );
 
-    new aws.lambda.Permission(
-      `${name.replaceAll('.', '-')}-origin-invoke-function-url-permission`,
+    const distributionDeliverySource = new aws.cloudwatch.LogDeliverySource(
+      `${name.replace('.', '-')}-distribution-delivery-source`,
       {
-        action: 'lambda:InvokeFunctionUrl',
-        principal: 'cloudfront.amazonaws.com',
-        function: lambdaOrigin.name,
-        functionUrlAuthType: 'AWS_IAM',
-        sourceArn: this.cloudfrontDistribution.arn,
+        region: 'us-east-1',
+        logType: 'ACCESS_LOGS',
+        resourceArn: this.cloudfrontDistribution.arn,
       },
-      { parent: this, provider: opts?.provider }
+      { parent: this, provider: opts?.globalProvider }
     );
 
-    new awsNative.lambda.Permission(
-      `${name.replaceAll('.', '-')}-origin-invoke-function-permission`,
+    new aws.cloudwatch.LogDelivery(
+      `${name.replace('.', '-')}-distribution-logging`,
       {
-        action: 'lambda:InvokeFunction',
-        principal: 'cloudfront.amazonaws.com',
-        sourceArn: this.cloudfrontDistribution.arn,
-        functionName: lambdaOrigin.name,
-        invokedViaFunctionUrl: true,
+        region: 'us-east-1',
+        deliverySourceName: distributionDeliverySource.name,
+        deliveryDestinationArn: distributionDeliveryDestination.arn,
       },
-      { parent: this, provider: opts?.nativeProvider }
+      { parent: this, provider: opts?.globalProvider }
     );
 
     new aws.route53.Record(

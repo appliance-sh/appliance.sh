@@ -20,7 +20,6 @@ export class ApplianceStack extends pulumi.ComponentResource {
   lambdaRolePolicy: aws.iam.Policy;
   lambda: aws.lambda.Function;
   lambdaUrl: aws.lambda.FunctionUrl;
-  distributionTenant?: awsNative.cloudfront.DistributionTenant;
   dnsRecord: pulumi.Output<string>;
 
   constructor(name: string, args: ApplianceStackArgs, opts: ApplianceStackOpts) {
