@@ -83,6 +83,29 @@ export class ApplianceStack extends pulumi.ComponentResource {
         }:distribution/${args.config.aws.cloudfrontDistributionId}`,
         statementId: 'FunctionURLAllowCloudFrontAccess',
       });
+
+      // Grant the edge router role permission to invoke the Lambda Function URL
+      // The edge router role is the execution role of the Lambda@Edge function that signs requests
+      if (args.config.aws.edgeRouterRoleArn) {
+        new aws.lambda.Permission(`${name}-invoke-url-edge-router-permission`, {
+          function: this.lambda.name,
+          action: 'lambda:InvokeFunctionUrl',
+          principal: args.config.aws.edgeRouterRoleArn,
+          functionUrlAuthType: 'AWS_IAM',
+          statementId: 'FunctionURLAllowEdgeRouterRoleAccess',
+        });
+
+        new awsNative.lambda.Permission(
+          `${name}-invoke-edge-router-permission`,
+          {
+            action: 'lambda:InvokeFunction',
+            principal: args.config.aws.edgeRouterRoleArn,
+            functionName: this.lambda.name,
+            invokedViaFunctionUrl: true,
+          },
+          defaultNativeOpts
+        );
+      }
     } else {
       new aws.lambda.Permission(`${name}-url-invoke-url-permission`, {
         function: this.lambda.name,

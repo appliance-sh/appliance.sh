@@ -53,6 +53,7 @@ export const applianceBaseConfig = z.object({
     zoneId: z.string(),
     cloudfrontDistributionId: z.string().optional(),
     cloudfrontDistributionDomainName: z.string().optional(),
+    edgeRouterRoleArn: z.string().optional(),
   }),
 });
 

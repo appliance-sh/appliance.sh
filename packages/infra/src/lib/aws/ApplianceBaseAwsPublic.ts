@@ -207,15 +207,100 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
 
           // eslint-disable-next-line @typescript-eslint/no-require-imports
           const dns = require('dns').promises;
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const crypto = require('crypto');
 
           let originUrl: URL;
+          let signatureRequired = false;
           try {
             const txtRecords = await dns.resolveTxt(`origin.${host}`);
             const functionUrl = txtRecords[0][0];
             originUrl = new URL(functionUrl);
+            signatureRequired = true;
           } catch (e) {
             console.error(`Failed to resolve TXT record for origin.${host}`, e);
             originUrl = new URL(lambdaOriginFunctionUrl.functionUrl.get());
+          }
+
+          if (signatureRequired) {
+            // Extract the region from the Lambda Function URL hostname
+            // Format: <function-id>.lambda-url.<region>.on.aws
+            const hostnameParts = originUrl.hostname.split('.');
+            const regionIndex = hostnameParts.indexOf('lambda-url');
+            const targetRegion =
+              regionIndex >= 0 && hostnameParts[regionIndex + 1] ? hostnameParts[regionIndex + 1] : 'us-east-1';
+
+            // Helper functions for SigV4 signing
+            const sha256 = (data: string | Buffer) => crypto.createHash('sha256').update(data).digest();
+            const hmacSha256 = (key: Buffer | string, data: string) =>
+              crypto.createHmac('sha256', key).update(data).digest();
+            const toHex = (buffer: Buffer) => buffer.toString('hex');
+
+            const getSignatureKey = (secretKey: string, dateStamp: string, regionName: string, serviceName: string) => {
+              const kDate = hmacSha256(`AWS4${secretKey}`, dateStamp);
+              const kRegion = hmacSha256(kDate, regionName);
+              const kService = hmacSha256(kRegion, serviceName);
+              const kSigning = hmacSha256(kService, 'aws4_request');
+              return kSigning;
+            };
+
+            // Sign the request using SigV4
+            // Get credentials from environment (Lambda@Edge has access to execution role credentials)
+            const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+            const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+            const sessionToken = process.env.AWS_SESSION_TOKEN;
+
+            if (accessKeyId && secretAccessKey) {
+              const method = request.method;
+              const service = 'lambda';
+              const canonicalUri = request.uri || '/';
+              const canonicalQuerystring = request.querystring || '';
+
+              const now = new Date();
+              const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+              const dateStamp = amzDate.substring(0, 8);
+
+              // Create canonical headers
+              const payloadHash = toHex(
+                sha256(request.body?.data ? Buffer.from(request.body.data, request.body.encoding || 'base64') : '')
+              );
+
+              const canonicalHeaders =
+                `host:${originUrl.hostname}\n` +
+                `x-amz-content-sha256:${payloadHash}\n` +
+                `x-amz-date:${amzDate}\n` +
+                (sessionToken ? `x-amz-security-token:${sessionToken}\n` : '');
+
+              const signedHeaders = sessionToken
+                ? 'host;x-amz-content-sha256;x-amz-date;x-amz-security-token'
+                : 'host;x-amz-content-sha256;x-amz-date';
+
+              const canonicalRequest = [
+                method,
+                canonicalUri,
+                canonicalQuerystring,
+                canonicalHeaders,
+                signedHeaders,
+                payloadHash,
+              ].join('\n');
+
+              const algorithm = 'AWS4-HMAC-SHA256';
+              const credentialScope = `${dateStamp}/${targetRegion}/${service}/aws4_request`;
+              const stringToSign = [algorithm, amzDate, credentialScope, toHex(sha256(canonicalRequest))].join('\n');
+
+              const signingKey = getSignatureKey(secretAccessKey, dateStamp, targetRegion, service);
+              const signature = toHex(hmacSha256(signingKey, stringToSign));
+
+              const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+              // Add SigV4 headers to the request
+              request.headers['authorization'] = [{ key: 'Authorization', value: authorizationHeader }];
+              request.headers['x-amz-date'] = [{ key: 'X-Amz-Date', value: amzDate }];
+              request.headers['x-amz-content-sha256'] = [{ key: 'X-Amz-Content-Sha256', value: payloadHash }];
+              if (sessionToken) {
+                request.headers['x-amz-security-token'] = [{ key: 'X-Amz-Security-Token', value: sessionToken }];
+              }
+            }
           }
 
           request.origin = {
@@ -372,6 +457,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         zoneId: this.zoneId,
         cloudfrontDistributionId: this.cloudfrontDistribution.id,
         cloudfrontDistributionDomainName: this.cloudfrontDistribution.domainName,
+        edgeRouterRoleArn: edgeRouterRole.arn,
       },
     };
 
