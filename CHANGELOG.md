@@ -1,3 +1,13 @@
+## 1.14.0 (2026-01-14)
+
+### 🚀 Features
+
+- **api-server:** create cloudfront distribution and invocation mechanism ([#31](https://github.com/appliance-sh/appliance.sh/pull/31))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.13.0 (2026-01-03)
 
 ### 🚀 Features
