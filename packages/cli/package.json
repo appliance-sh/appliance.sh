@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/cli",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "Shell for installing, running, and developing applications on the Appliance platform",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
@@ -17,7 +17,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@appliance.sh/sdk": "1.15.0",
+    "@appliance.sh/sdk": "1.16.0",
     "@inquirer/prompts": "^7.10.1",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",

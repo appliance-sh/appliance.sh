@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/infra",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "Deploy the Appliance Infrastructure",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
@@ -21,7 +21,7 @@
     "deploy": "pulumi up"
   },
   "dependencies": {
-    "@appliance.sh/sdk": "1.15.0",
+    "@appliance.sh/sdk": "1.16.0",
     "@pulumi/aws": "^7.16.0",
     "@pulumi/aws-native": "^1.48.0",
     "@pulumi/awsx": "^3.1.0",

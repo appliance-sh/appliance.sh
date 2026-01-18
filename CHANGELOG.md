@@ -1,3 +1,13 @@
+## 1.16.0 (2026-01-18)
+
+### 🚀 Features
+
+- **api-server:** hoist ApplianceStack to infra ([#33](https://github.com/appliance-sh/appliance.sh/pull/33))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.15.0 (2026-01-18)
 
 ### 🚀 Features
