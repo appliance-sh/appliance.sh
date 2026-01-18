@@ -18,7 +18,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "deploy:entrypoint": "ts-node src/index.ts",
-    "deploy": "pulumi up"
+    "deploy": "pulumi up",
+    "dev:setup": "npm link"
   },
   "dependencies": {
     "@appliance.sh/sdk": "1.16.0",
