@@ -1,4 +1,3 @@
-import { Injectable, Logger } from '@nestjs/common';
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
@@ -15,9 +14,7 @@ export interface PulumiResult {
   stackName: string;
 }
 
-@Injectable()
-export class PulumiService {
-  private readonly logger = new Logger(PulumiService.name);
+class PulumiService {
   private readonly projectName = 'appliance-api-managed-proj';
 
   private readonly baseConfig = process.env.APPLIANCE_BASE_CONFIG
@@ -108,7 +105,7 @@ export class PulumiService {
 
   async deploy(stackName = 'appliance-api-managed'): Promise<PulumiResult> {
     const stack = await this.getOrCreateStack(stackName);
-    const result = await stack.up({ onOutput: (m) => this.logger.log(m) });
+    const result = await stack.up({ onOutput: (m) => console.log(m) });
     const changes = result.summary.resourceChanges || {};
     const totalChanges = Object.entries(changes)
       .filter(([k]) => k !== 'same')
@@ -126,7 +123,7 @@ export class PulumiService {
   async destroy(stackName = 'appliance-api-managed'): Promise<PulumiResult> {
     try {
       const stack = await this.selectExistingStack(stackName);
-      await stack.destroy({ onOutput: (m) => this.logger.log(m) });
+      await stack.destroy({ onOutput: (m) => console.log(m) });
       return { action: 'destroy', ok: true, idempotentNoop: false, message: 'Stack resources deleted', stackName };
     } catch (e) {
       if (!(e instanceof Error)) throw e;
@@ -144,3 +141,6 @@ export class PulumiService {
     }
   }
 }
+
+// Export a singleton instance
+export const pulumiService = new PulumiService();
