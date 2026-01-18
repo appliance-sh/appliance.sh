@@ -1,7 +1,7 @@
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
-import { ApplianceStack } from './ApplianceStack';
+import { ApplianceStack } from '@appliance.sh/infra';
 import { applianceBaseConfig } from '@appliance.sh/sdk';
 
 export type PulumiAction = 'deploy' | 'destroy';

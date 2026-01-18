@@ -34,8 +34,8 @@
   "workspaces": [
     "packages/sdk",
     "packages/cli",
-    "packages/api-server",
     "packages/infra",
+    "packages/api-server",
     "packages/install-aws"
   ],
   "devDependencies": {
