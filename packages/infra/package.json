@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/infra",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "description": "Deploy the Appliance Infrastructure",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",

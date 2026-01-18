@@ -1,3 +1,13 @@
+## 1.15.0 (2026-01-18)
+
+### 🚀 Features
+
+- **api-server:** switch to express ([#32](https://github.com/appliance-sh/appliance.sh/pull/32))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.14.0 (2026-01-14)
 
 ### 🚀 Features
