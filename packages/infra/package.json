@@ -5,17 +5,29 @@
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",
   "author": "Eliot Lim",
-  "main": "src/index.ts",
+  "main": "dist/lib/index.js",
+  "types": "dist/lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib/index.d.ts",
+      "import": "./dist/lib/index.js",
+      "require": "./dist/lib/index.js"
+    }
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "echo \"No build required\"",
+    "build": "tsc",
     "deploy:entrypoint": "ts-node src/index.ts",
     "deploy": "pulumi up"
   },
   "dependencies": {
-    "@pulumi/aws": "^7.15.0",
-    "@pulumi/aws-native": "^1.46.0",
+    "@appliance.sh/sdk": "1.15.0",
+    "@pulumi/aws": "^7.16.0",
+    "@pulumi/aws-native": "^1.48.0",
     "@pulumi/awsx": "^3.1.0",
-    "@pulumi/pulumi": "^3.213.0"
+    "@pulumi/pulumi": "^3.216.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
   }
 }
