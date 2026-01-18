@@ -1,3 +1,13 @@
+## 1.16.1 (2026-01-18)
+
+### 🩹 Fixes
+
+- **ci:** add npm dev setup script to infra ([#34](https://github.com/appliance-sh/appliance.sh/pull/34))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.16.0 (2026-01-18)
 
 ### 🚀 Features

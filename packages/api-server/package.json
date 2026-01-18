@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/api-server",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "",
   "author": "Eliot Lim",
   "repository": "https://github.com/appliance-sh/appliance.sh",
@@ -19,8 +19,8 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
-    "@appliance.sh/infra": "1.16.0",
-    "@appliance.sh/sdk": "1.16.0",
+    "@appliance.sh/infra": "1.16.1",
+    "@appliance.sh/sdk": "1.16.1",
     "@pulumi/aws": "^7.16.0",
     "@pulumi/aws-native": "^1.48.0",
     "@pulumi/pulumi": "^3.216.0",
