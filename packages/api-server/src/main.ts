@@ -1,8 +1,26 @@
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
+import express from 'express';
+import { indexRoutes } from './routes';
+import { infraRoutes } from './routes/infra';
+
+export function createApp() {
+  const app = express();
+
+  app.use(express.json());
+
+  // Set up routes
+  app.use('/', indexRoutes);
+  app.use('/infra', infraRoutes);
+
+  return app;
+}
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  await app.listen(process.env.PORT ?? 3000);
+  const app = createApp();
+  const port = process.env.PORT ?? 3000;
+
+  app.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
+  });
 }
+
 bootstrap();
