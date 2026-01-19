@@ -1,3 +1,13 @@
+## 1.17.0 (2026-01-19)
+
+### 🚀 Features
+
+- **infra:** absorb pulumi dependencies ([#35](https://github.com/appliance-sh/appliance.sh/pull/35))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.16.1 (2026-01-18)
 
 ### 🩹 Fixes
