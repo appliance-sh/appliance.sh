@@ -3,6 +3,9 @@ export * from './aws/ApplianceStack';
 export * from './aws/ApplianceBaseAwsPublic';
 export * from './aws/ApplianceBaseAwsVpc';
 
+// Deployment Service
+export * from './ApplianceDeploymentService';
+
 // Controller
 export * from './controller';
 
