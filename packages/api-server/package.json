@@ -21,9 +21,6 @@
   "dependencies": {
     "@appliance.sh/infra": "1.16.1",
     "@appliance.sh/sdk": "1.16.1",
-    "@pulumi/aws": "^7.16.0",
-    "@pulumi/aws-native": "^1.48.0",
-    "@pulumi/pulumi": "^3.216.0",
     "express": "^5.2.1"
   },
   "devDependencies": {
