@@ -12,6 +12,7 @@ program
   .command('build', 'builds the appliance in the current working directory')
   .command('configure', 'configures the appliance in the current working directory')
   .command('install [appliance-names...]', 'install one or more appliances')
+  .command('login', 'authenticate with the appliance API')
   .command('remove [appliance-names...]', 'remove one or more appliances');
 
 program.parse(process.argv);
