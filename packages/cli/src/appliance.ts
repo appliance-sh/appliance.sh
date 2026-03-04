@@ -11,8 +11,10 @@ program
   .version(sdk.VERSION)
   .command('build', 'builds the appliance in the current working directory')
   .command('configure', 'configures the appliance in the current working directory')
+  .command('init', 'initialise the CLI with the appliance server')
   .command('install [appliance-names...]', 'install one or more appliances')
   .command('login', 'authenticate with the appliance API')
-  .command('remove [appliance-names...]', 'remove one or more appliances');
+  .command('remove [appliance-names...]', 'remove one or more appliances')
+  .command('test', 'run connection and signing diagnostics');
 
 program.parse(process.argv);
