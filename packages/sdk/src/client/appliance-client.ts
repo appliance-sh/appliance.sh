@@ -17,10 +17,10 @@ export class ApplianceClient {
     this.credentials = config.credentials;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<Result<T>> {
+  private async request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<Result<T>> {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      const timeoutId = setTimeout(() => controller.abort(), timeout ?? this.timeout);
 
       const url = `${this.baseUrl}${path}`;
       const bodyStr = body ? JSON.stringify(body) : undefined;
@@ -183,17 +183,27 @@ export class ApplianceClient {
 
   // Deployment methods
   async deploy(environmentId: string): Promise<Result<Deployment>> {
-    return this.request<Deployment>('POST', '/api/v1/deployments', {
-      environmentId,
-      action: 'deploy',
-    });
+    return this.request<Deployment>(
+      'POST',
+      '/api/v1/deployments',
+      {
+        environmentId,
+        action: 'deploy',
+      },
+      600000
+    );
   }
 
   async destroy(environmentId: string): Promise<Result<Deployment>> {
-    return this.request<Deployment>('POST', '/api/v1/deployments', {
-      environmentId,
-      action: 'destroy',
-    });
+    return this.request<Deployment>(
+      'POST',
+      '/api/v1/deployments',
+      {
+        environmentId,
+        action: 'destroy',
+      },
+      600000
+    );
   }
 
   async getDeployment(id: string): Promise<Result<Deployment>> {

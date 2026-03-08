@@ -1,19 +1,21 @@
 import { Environment, EnvironmentInput, EnvironmentStatus } from '@appliance.sh/sdk';
+import type { ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getStorageService } from './storage.service';
 import { randomUUID } from 'crypto';
 
 const COLLECTION = 'environments';
 
 export class EnvironmentService {
-  async create(input: EnvironmentInput): Promise<Environment> {
+  async create(input: EnvironmentInput, projectName: string, baseConfig: ApplianceBaseConfig): Promise<Environment> {
     const storage = getStorageService();
     const now = new Date().toISOString();
     const id = randomUUID();
     const environment: Environment = {
       ...input,
       id,
+      baseConfig,
       status: EnvironmentStatus.Pending,
-      stackName: `${input.projectId}-${id}`,
+      stackName: `${projectName}-${input.name}`,
       createdAt: now,
       updatedAt: now,
     };

@@ -13,13 +13,13 @@ export enum EnvironmentStatus {
 export const environmentInput = z.object({
   name: z.string(),
   projectId: z.string(),
-  baseConfig: applianceBaseConfig,
 });
 
 export type EnvironmentInput = z.infer<typeof environmentInput>;
 
 export const environment = environmentInput.extend({
   id: z.string(),
+  baseConfig: applianceBaseConfig,
   status: z.nativeEnum(EnvironmentStatus),
   stackName: z.string(),
   lastDeployedAt: z.string().optional(),
