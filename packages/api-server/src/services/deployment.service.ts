@@ -9,6 +9,7 @@ import {
 import { createApplianceDeploymentService } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
+import { projectService } from './project.service';
 
 const COLLECTION = 'deployments';
 
@@ -41,6 +42,21 @@ export class DeploymentService {
       input.action === DeploymentAction.Deploy ? EnvironmentStatus.Deploying : EnvironmentStatus.Destroying;
     await environmentService.updateStatus(environment.id, envStatus);
 
+    // Look up the project for tagging
+    const project = await projectService.get(environment.projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${environment.projectId}`);
+    }
+
+    const metadata = {
+      projectId: project.id,
+      projectName: project.name,
+      environmentId: environment.id,
+      environmentName: environment.name,
+      deploymentId: deployment.id,
+      stackName: environment.stackName,
+    };
+
     // Execute the deployment
     try {
       const deploymentService = createApplianceDeploymentService({
@@ -49,7 +65,7 @@ export class DeploymentService {
 
       let result;
       if (input.action === DeploymentAction.Deploy) {
-        result = await deploymentService.deploy(environment.stackName);
+        result = await deploymentService.deploy(environment.stackName, metadata);
       } else {
         result = await deploymentService.destroy(environment.stackName);
       }

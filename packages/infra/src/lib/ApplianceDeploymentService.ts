@@ -1,7 +1,7 @@
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
-import { ApplianceStack, toResourceId } from './aws/ApplianceStack';
+import { ApplianceStack, ApplianceStackMetadata, toResourceId } from './aws/ApplianceStack';
 import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
 
 export type PulumiAction = 'deploy' | 'destroy';
@@ -32,7 +32,7 @@ export class ApplianceDeploymentService {
     this.region = this.baseConfig?.aws.region || 'us-east-1';
   }
 
-  private inlineProgram(stackName: string) {
+  private inlineProgram(stackName: string, metadata?: ApplianceStackMetadata) {
     return async () => {
       if (!this.baseConfig) {
         throw new Error('Missing base config');
@@ -56,7 +56,7 @@ export class ApplianceDeploymentService {
       const applianceStack = new ApplianceStack(
         stackName,
         {
-          tags: { project: stackName },
+          metadata,
           config: this.baseConfig,
         },
         {
@@ -73,8 +73,8 @@ export class ApplianceDeploymentService {
     };
   }
 
-  private async getOrCreateStack(stackName: string): Promise<auto.Stack> {
-    const program = this.inlineProgram(stackName);
+  private async getOrCreateStack(stackName: string, metadata?: ApplianceStackMetadata): Promise<auto.Stack> {
+    const program = this.inlineProgram(stackName, metadata);
     const envVars: Record<string, string> = {
       AWS_REGION: this.region,
     };
@@ -112,8 +112,8 @@ export class ApplianceDeploymentService {
     return auto.Stack.createOrSelect(stackName, ws);
   }
 
-  async deploy(stackName = 'appliance-api-managed'): Promise<PulumiResult> {
-    const stack = await this.getOrCreateStack(stackName);
+  async deploy(stackName: string, metadata?: ApplianceStackMetadata): Promise<PulumiResult> {
+    const stack = await this.getOrCreateStack(stackName, metadata);
     const result = await stack.up({ onOutput: (m) => console.log(m) });
     const changes = result.summary.resourceChanges || {};
     const totalChanges = Object.entries(changes)
@@ -129,7 +129,7 @@ export class ApplianceDeploymentService {
     };
   }
 
-  async destroy(stackName = 'appliance-api-managed'): Promise<PulumiResult> {
+  async destroy(stackName: string): Promise<PulumiResult> {
     try {
       const stack = await this.selectExistingStack(stackName);
       await stack.destroy({ onOutput: (m) => console.log(m) });

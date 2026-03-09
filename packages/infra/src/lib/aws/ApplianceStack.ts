@@ -35,8 +35,17 @@ export function toDnsLabel(name: string): string {
   return truncateWithHash(name, MAX_DNS_LABEL_LENGTH);
 }
 
+export interface ApplianceStackMetadata {
+  projectId: string;
+  projectName: string;
+  environmentId: string;
+  environmentName: string;
+  deploymentId: string;
+  stackName: string;
+}
+
 export interface ApplianceStackArgs {
-  tags?: Record<string, string>;
+  metadata?: ApplianceStackMetadata;
   config: ApplianceBaseConfig;
 }
 
@@ -64,7 +73,17 @@ export class ApplianceStack extends pulumi.ComponentResource {
 
     const defaultOpts = { parent: this, provider: opts.provider };
     const defaultNativeOpts = { parent: this, provider: opts.nativeProvider };
-    const defaultTags = { stack: name, managed: 'appliance', ...args.tags };
+    const defaultTags: Record<string, string> = {
+      'appliance:managed': 'true',
+      'appliance:stack-name': name,
+    };
+    if (args.metadata) {
+      defaultTags['appliance:project-id'] = args.metadata.projectId;
+      defaultTags['appliance:project-name'] = args.metadata.projectName;
+      defaultTags['appliance:environment-id'] = args.metadata.environmentId;
+      defaultTags['appliance:environment-name'] = args.metadata.environmentName;
+      defaultTags['appliance:deployment-id'] = args.metadata.deploymentId;
+    }
 
     this.lambdaRole = new aws.iam.Role(`${rid}-role`, {
       path: `/appliance/${name}/`,
