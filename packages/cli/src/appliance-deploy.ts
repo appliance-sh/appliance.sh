@@ -25,20 +25,26 @@ async function findOrCreateProject(client: ReturnType<typeof createApplianceClie
 async function findOrCreateEnvironment(
   client: ReturnType<typeof createApplianceClient>,
   projectId: string,
+  projectName: string,
   name: string
 ): Promise<Environment> {
+  const expectedStackName = `${projectName}-${name}`;
   const listResult = await client.listEnvironments(projectId);
   if (!listResult.success) throw new Error(`Failed to list environments: ${listResult.error.message}`);
 
   const existing = listResult.data.find((e) => e.name === name);
   if (existing) {
-    console.log(chalk.dim(`Using existing environment: ${existing.id}`));
-    return existing;
+    if (existing.stackName === expectedStackName) {
+      console.log(chalk.dim(`Using existing environment: ${existing.id}`));
+      return existing;
+    }
+    console.log(chalk.yellow(`Replacing environment with stale stack name: ${existing.stackName}`));
+    await client.deleteEnvironment(projectId, existing.id);
   }
 
   const createResult = await client.createEnvironment({ name, projectId });
   if (!createResult.success) throw new Error(`Failed to create environment: ${createResult.error.message}`);
-  console.log(chalk.green(`Created environment: ${createResult.data.id}`));
+  console.log(chalk.green(`Created environment: ${createResult.data.id} (stack: ${createResult.data.stackName})`));
   return createResult.data;
 }
 
@@ -86,7 +92,7 @@ program
 
     try {
       const project = await findOrCreateProject(client, projectName);
-      const environment = await findOrCreateEnvironment(client, project.id, environmentName);
+      const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
       const result = await client.deploy(environment.id);

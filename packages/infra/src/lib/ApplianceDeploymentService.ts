@@ -1,7 +1,7 @@
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
-import { ApplianceStack } from './aws/ApplianceStack';
+import { ApplianceStack, toResourceId } from './aws/ApplianceStack';
 import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
 
 export type PulumiAction = 'deploy' | 'destroy';
@@ -38,17 +38,18 @@ export class ApplianceDeploymentService {
         throw new Error('Missing base config');
       }
 
-      const regionalProvider = new aws.Provider(`${stackName}-regional`, {
+      const rid = toResourceId(stackName);
+      const regionalProvider = new aws.Provider(`${rid}-regional`, {
         region: (this.baseConfig?.aws.region as aws.Region) ?? 'ap-southeast-1',
       });
-      const globalProvider = new aws.Provider(`${stackName}-global`, {
+      const globalProvider = new aws.Provider(`${rid}-global`, {
         region: 'us-east-1',
       });
-      const nativeRegionalProvider = new awsNative.Provider(`${stackName}-native-regional`, {
+      const nativeRegionalProvider = new awsNative.Provider(`${rid}-native-regional`, {
         region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
       });
 
-      const nativeGlobalProvider = new awsNative.Provider(`${stackName}-native-global`, {
+      const nativeGlobalProvider = new awsNative.Provider(`${rid}-native-global`, {
         region: 'us-east-1',
       });
 
