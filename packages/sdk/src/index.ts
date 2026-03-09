@@ -5,3 +5,4 @@ export type * from './result';
 export * from './object-store';
 export * from './client';
 export * from './signing';
+export * from './identifiers';

@@ -1,6 +1,5 @@
-import { Project, ProjectInput, ProjectStatus } from '@appliance.sh/sdk';
+import { Project, ProjectInput, ProjectStatus, generateId } from '@appliance.sh/sdk';
 import { getStorageService } from './storage.service';
-import { randomUUID } from 'crypto';
 
 const COLLECTION = 'projects';
 
@@ -10,7 +9,7 @@ export class ProjectService {
     const now = new Date().toISOString();
     const project: Project = {
       ...input,
-      id: randomUUID(),
+      id: generateId('proj'),
       status: ProjectStatus.Active,
       createdAt: now,
       updatedAt: now,

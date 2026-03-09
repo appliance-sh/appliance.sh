@@ -1,6 +1,6 @@
-import { randomUUID, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
 import { getStorageService } from './storage.service';
-import { ApiKeyCreateResponse } from '@appliance.sh/sdk';
+import { ApiKeyCreateResponse, generateId } from '@appliance.sh/sdk';
 
 const COLLECTION = 'api-keys';
 
@@ -17,7 +17,7 @@ interface StoredApiKey {
 export class ApiKeyService {
   async create(name: string): Promise<ApiKeyCreateResponse> {
     const storage = getStorageService();
-    const id = `ak_${randomUUID()}`;
+    const id = generateId('ak');
     const secret = `sk_${randomBytes(32).toString('hex')}`;
     const now = new Date().toISOString();
 

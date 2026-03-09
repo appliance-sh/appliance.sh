@@ -1,8 +1,14 @@
-import { Deployment, DeploymentInput, DeploymentStatus, DeploymentAction, EnvironmentStatus } from '@appliance.sh/sdk';
+import {
+  Deployment,
+  DeploymentInput,
+  DeploymentStatus,
+  DeploymentAction,
+  EnvironmentStatus,
+  generateId,
+} from '@appliance.sh/sdk';
 import { createApplianceDeploymentService } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
-import { randomUUID } from 'crypto';
 
 const COLLECTION = 'deployments';
 
@@ -18,7 +24,7 @@ export class DeploymentService {
     const now = new Date().toISOString();
     const deployment: Deployment = {
       ...input,
-      id: randomUUID(),
+      id: generateId('dep'),
       projectId: environment.projectId,
       status: DeploymentStatus.Pending,
       startedAt: now,
