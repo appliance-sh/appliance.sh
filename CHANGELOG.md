@@ -1,3 +1,14 @@
+## 1.19.0 (2026-03-09)
+
+### 🚀 Features
+
+- **api-server:** remove test infra endpoints ([60bf461](https://github.com/appliance-sh/appliance.sh/commit/60bf461))
+- **sdk:** prefixed uuidv7 identifiers ([9236019](https://github.com/appliance-sh/appliance.sh/commit/9236019))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.18.0 (2026-03-09)
 
 ### 🚀 Features
