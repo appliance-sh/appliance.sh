@@ -10,3 +10,12 @@ describe('Index Route', () => {
     expect(response.text).toBe('Hello World!');
   });
 });
+
+describe('Authenticated routes', () => {
+  it('should return 401 for /api/v1/projects without auth', async () => {
+    const app = createApp();
+    const response = await request(app).get('/api/v1/projects');
+    expect(response.status).toBe(401);
+    expect(response.body.error).toBe('Missing signature headers');
+  });
+});

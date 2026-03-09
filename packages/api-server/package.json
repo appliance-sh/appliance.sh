@@ -21,6 +21,7 @@
   "dependencies": {
     "@appliance.sh/infra": "1.17.0",
     "@appliance.sh/sdk": "1.17.0",
+    "@aws-sdk/client-s3": "^3.750.0",
     "express": "^5.2.1"
   },
   "devDependencies": {

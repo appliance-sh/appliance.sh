@@ -20,6 +20,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
   public readonly certificateArn?: pulumi.Output<string>;
   public readonly cloudfrontDistribution?: aws.cloudfront.Distribution;
 
+  public readonly dataBucket: aws.s3.Bucket;
   public readonly config;
 
   constructor(name: string, args: ApplianceBaseAwsPublicArgs, opts?: ApplianceBaseAwsPublicOpts) {
@@ -118,6 +119,33 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       `${name}-state-sse`,
       {
         bucket: state.bucket,
+        rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: 'AES256' } }],
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    this.dataBucket = new aws.s3.Bucket(
+      `${name}-data`,
+      {
+        acl: 'private',
+        forceDestroy: true,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.s3.BucketVersioning(
+      `${name}-data-versioning`,
+      {
+        bucket: this.dataBucket.bucket,
+        versioningConfiguration: { status: 'Enabled' },
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.s3.BucketServerSideEncryptionConfiguration(
+      `${name}-data-sse`,
+      {
+        bucket: this.dataBucket.bucket,
         rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: 'AES256' } }],
       },
       { parent: this, provider: opts?.provider }
@@ -458,6 +486,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         cloudfrontDistributionId: this.cloudfrontDistribution.id,
         cloudfrontDistributionDomainName: this.cloudfrontDistribution.domainName,
         edgeRouterRoleArn: edgeRouterRole.arn,
+        dataBucketName: this.dataBucket.bucket,
       },
     };
 

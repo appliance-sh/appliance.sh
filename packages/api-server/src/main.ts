@@ -1,15 +1,32 @@
 import express from 'express';
 import { indexRoutes } from './routes';
 import { infraRoutes } from './routes/infra';
+import { projectRoutes } from './routes/projects';
+import { environmentRoutes } from './routes/environments';
+import { deploymentRoutes } from './routes/deployments';
+import { bootstrapRoutes } from './routes/bootstrap';
+import { signatureAuth } from './middleware/auth';
 
 export function createApp() {
   const app = express();
 
-  app.use(express.json());
+  app.use(
+    express.json({
+      verify: (req, _res, buf) => {
+        (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+      },
+    })
+  );
 
-  // Set up routes
+  // Unauthenticated routes
   app.use('/', indexRoutes);
-  app.use('/infra', infraRoutes);
+  app.use('/bootstrap', bootstrapRoutes);
+
+  // Authenticated routes
+  app.use('/api/v1/projects', signatureAuth, projectRoutes);
+  app.use('/api/v1/projects/:projectId/environments', signatureAuth, environmentRoutes);
+  app.use('/api/v1/deployments', signatureAuth, deploymentRoutes);
+  app.use('/api/v1/infra', signatureAuth, infraRoutes);
 
   return app;
 }

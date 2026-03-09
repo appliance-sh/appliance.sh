@@ -1,0 +1,6 @@
+{
+  "manifest": "v1",
+  "name": "muscular-cartoon",
+  "type": "container",
+  "port": 3000
+}

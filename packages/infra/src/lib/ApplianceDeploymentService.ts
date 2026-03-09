@@ -1,7 +1,7 @@
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
-import { ApplianceStack } from './aws/ApplianceStack';
+import { ApplianceStack, toResourceId } from './aws/ApplianceStack';
 import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
 
 export type PulumiAction = 'deploy' | 'destroy';
@@ -32,32 +32,31 @@ export class ApplianceDeploymentService {
     this.region = this.baseConfig?.aws.region || 'us-east-1';
   }
 
-  private inlineProgram() {
+  private inlineProgram(stackName: string) {
     return async () => {
-      const name = 'appliance';
-
       if (!this.baseConfig) {
         throw new Error('Missing base config');
       }
 
-      const regionalProvider = new aws.Provider(`${name}-regional`, {
+      const rid = toResourceId(stackName);
+      const regionalProvider = new aws.Provider(`${rid}-regional`, {
         region: (this.baseConfig?.aws.region as aws.Region) ?? 'ap-southeast-1',
       });
-      const globalProvider = new aws.Provider(`${name}-global`, {
+      const globalProvider = new aws.Provider(`${rid}-global`, {
         region: 'us-east-1',
       });
-      const nativeRegionalProvider = new awsNative.Provider(`${name}-native-regional`, {
+      const nativeRegionalProvider = new awsNative.Provider(`${rid}-native-regional`, {
         region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
       });
 
-      const nativeGlobalProvider = new awsNative.Provider(`${name}-native-global`, {
+      const nativeGlobalProvider = new awsNative.Provider(`${rid}-native-global`, {
         region: 'us-east-1',
       });
 
       const applianceStack = new ApplianceStack(
-        `${name}-stack`,
+        stackName,
         {
-          tags: { project: name },
+          tags: { project: stackName },
           config: this.baseConfig,
         },
         {
@@ -75,7 +74,7 @@ export class ApplianceDeploymentService {
   }
 
   private async getOrCreateStack(stackName: string): Promise<auto.Stack> {
-    const program = this.inlineProgram();
+    const program = this.inlineProgram(stackName);
     const envVars: Record<string, string> = {
       AWS_REGION: this.region,
     };
