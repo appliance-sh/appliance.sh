@@ -1,6 +1,12 @@
 import { Router } from 'express';
+import { timingSafeEqual } from 'crypto';
 import { apiKeyInput } from '@appliance.sh/sdk';
 import { apiKeyService } from '../../services/api-key.service';
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
 
 export const bootstrapRoutes = Router();
 
@@ -13,7 +19,7 @@ bootstrapRoutes.post('/create-key', async (req, res) => {
     }
 
     const providedToken = req.headers['x-bootstrap-token'] as string | undefined;
-    if (!providedToken || providedToken !== bootstrapToken) {
+    if (!providedToken || !constantTimeEqual(providedToken, bootstrapToken)) {
       res.status(403).json({ error: 'Invalid bootstrap token' });
       return;
     }

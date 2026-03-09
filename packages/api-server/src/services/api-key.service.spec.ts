@@ -52,7 +52,7 @@ describe('ApiKeyService', () => {
     expect(stored).not.toBeNull();
     expect(stored!.id).toBe(created.id);
     expect(stored!.name).toBe('test-key');
-    expect(stored!.rawSecret).toBe(created.secret);
+    expect(stored!.secret).toBe(created.secret);
   });
 
   it('should return null for non-existent key', async () => {

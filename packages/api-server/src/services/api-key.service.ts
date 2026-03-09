@@ -1,14 +1,15 @@
-import { randomUUID, randomBytes, createHash } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import { getStorageService } from './storage.service';
 import { ApiKeyCreateResponse } from '@appliance.sh/sdk';
 
 const COLLECTION = 'api-keys';
 
+// The shared secret must be stored to verify HMAC signatures (RFC 9421).
+// Unlike password hashing, HMAC requires the original key on both sides.
 interface StoredApiKey {
   id: string;
   name: string;
-  rawSecret: string;
-  secretHash: string;
+  secret: string;
   createdAt: string;
   lastUsedAt?: string;
 }
@@ -18,14 +19,12 @@ export class ApiKeyService {
     const storage = getStorageService();
     const id = `ak_${randomUUID()}`;
     const secret = `sk_${randomBytes(32).toString('hex')}`;
-    const secretHash = createHash('sha256').update(secret).digest('hex');
     const now = new Date().toISOString();
 
     const stored: StoredApiKey = {
       id,
       name,
-      rawSecret: secret,
-      secretHash,
+      secret,
       createdAt: now,
     };
 

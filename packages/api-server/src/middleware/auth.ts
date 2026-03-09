@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { timingSafeEqual } from 'crypto';
 import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
 import { apiKeyService } from '../services/api-key.service';
 
@@ -27,8 +28,11 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     }
 
     const expected = computeContentDigest(req.rawBody.toString());
-    if (contentDigest !== expected) {
-      res.status(401).json({ error: 'Content-Digest mismatch' });
+    if (
+      contentDigest.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(contentDigest), Buffer.from(expected))
+    ) {
+      res.status(401).json({ error: 'Unauthorized' });
       return;
     }
   }
@@ -44,12 +48,12 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     async (keyId: string) => {
       const key = await apiKeyService.getByKeyId(keyId);
       if (!key) return null;
-      return { secret: key.rawSecret };
+      return { secret: key.secret };
     }
   );
 
   if (!result.verified) {
-    res.status(401).json({ error: 'Invalid signature', message: result.error });
+    res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 

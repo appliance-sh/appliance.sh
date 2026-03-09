@@ -8,7 +8,7 @@ const TEST_KEY_ID = 'ak_test-key-id';
 const TEST_SECRET = 'sk_test-secret-value';
 const TEST_HOST = 'test.local';
 
-const mockKeyStore = new Map<string, { id: string; rawSecret: string; name: string }>();
+const mockKeyStore = new Map<string, { id: string; secret: string; name: string }>();
 
 vi.mock('../services/api-key.service', () => ({
   apiKeyService: {
@@ -40,7 +40,7 @@ describe('signatureAuth middleware', () => {
     mockKeyStore.clear();
     mockKeyStore.set(TEST_KEY_ID, {
       id: TEST_KEY_ID,
-      rawSecret: TEST_SECRET,
+      secret: TEST_SECRET,
       name: 'test',
     });
   });
