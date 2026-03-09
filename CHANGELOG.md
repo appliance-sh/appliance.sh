@@ -1,3 +1,13 @@
+## 1.18.0 (2026-03-09)
+
+### 🚀 Features
+
+- project environment deployment ([#36](https://github.com/appliance-sh/appliance.sh/pull/36))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.17.0 (2026-01-19)
 
 ### 🚀 Features
