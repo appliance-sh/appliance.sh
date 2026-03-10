@@ -1,0 +1,7 @@
+{
+  "manifest": "v1",
+  "name": "demo-node-container",
+  "type": "container",
+  "port": 3000,
+  "platform": "linux/amd64"
+}

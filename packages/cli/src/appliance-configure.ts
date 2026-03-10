@@ -54,10 +54,12 @@ try {
 
   if (type === ApplianceType.framework) {
     const framework = await promptForApplianceFramework(updatedApplianceFile);
+    const platform = await promptForAppliancePlatform(updatedApplianceFile);
     updatedApplianceFile = {
       ...updatedApplianceFile,
       type,
       framework,
+      platform,
     };
   } else if (type === ApplianceType.container) {
     const port = await promptForAppliancePort(updatedApplianceFile);

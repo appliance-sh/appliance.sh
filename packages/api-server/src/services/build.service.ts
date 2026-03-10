@@ -1,7 +1,7 @@
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { applianceBaseConfig, applianceInput } from '@appliance.sh/sdk';
-import type { ApplianceContainer } from '@appliance.sh/sdk';
+import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execSync } from 'child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -10,6 +10,11 @@ import * as os from 'node:os';
 export interface ResolvedBuild {
   imageUri?: string;
   codeS3Key?: string;
+  runtime?: string;
+  handler?: string;
+  layers?: string[];
+  architectures?: string[];
+  environment?: Record<string, string>;
 }
 
 function getBaseConfig() {
@@ -17,6 +22,23 @@ function getBaseConfig() {
   if (!raw) throw new Error('APPLIANCE_BASE_CONFIG not set');
   return applianceBaseConfig.parse(JSON.parse(raw));
 }
+
+const LAMBDA_ADAPTER_LAYER: Record<string, string> = {
+  'linux/amd64': 'arn:aws:lambda:${region}:753240598075:layer:LambdaAdapterLayerX86:26',
+  'linux/arm64': 'arn:aws:lambda:${region}:753240598075:layer:LambdaAdapterLayerArm64:26',
+};
+
+const FRAMEWORK_RUNTIMES: Record<string, string> = {
+  node: 'nodejs22.x',
+  python: 'python3.13',
+  auto: 'nodejs22.x',
+  other: 'nodejs22.x',
+};
+
+const FRAMEWORK_ARCHITECTURES: Record<string, string> = {
+  'linux/amd64': 'x86_64',
+  'linux/arm64': 'arm64',
+};
 
 export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
@@ -55,13 +77,92 @@ export class BuildService {
 
       if (manifest.type === 'container') {
         return this.resolveContainer(tmpDir, manifest, tag, config);
+      } else if (manifest.type === 'framework') {
+        return this.resolveFramework(tmpDir, manifest, tag, config);
       } else {
-        // For framework/other, the zip is already in S3 — just reference it
         return { codeS3Key: s3Key };
       }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  }
+
+  private async resolveFramework(
+    tmpDir: string,
+    manifest: ApplianceFrameworkApp,
+    tag: string,
+    config: ReturnType<typeof getBaseConfig>
+  ): Promise<ResolvedBuild> {
+    if (!config.aws.dataBucketName) throw new Error('Data bucket not configured');
+
+    const port = manifest.port ?? 8080;
+    const framework = manifest.framework ?? 'auto';
+    const detectedFramework = framework === 'auto' ? this.detectFramework(tmpDir) : framework;
+    const runtime = FRAMEWORK_RUNTIMES[detectedFramework] ?? FRAMEWORK_RUNTIMES['node'];
+
+    // Generate a run.sh that starts the web server
+    const startCommand = manifest.scripts?.start ?? this.defaultStartCommand(detectedFramework, tmpDir);
+    const runSh = ['#!/bin/bash', `export PORT=${port}`, `exec ${startCommand}`].join('\n');
+    fs.writeFileSync(path.join(tmpDir, 'run.sh'), runSh, { mode: 0o755 });
+
+    // Repackage as a new zip (excluding the original zip and manifest-only artifacts)
+    const repackagedKey = `builds/${tag}.zip`;
+    const repackagedZip = path.join(tmpDir, 'repackaged.zip');
+    execSync(`cd "${tmpDir}" && zip -r "${repackagedZip}" . -x "appliance.zip" -x "repackaged.zip"`, { stdio: 'pipe' });
+
+    // Upload the repackaged zip
+    const s3 = new S3Client({ region: config.aws.region });
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: config.aws.dataBucketName,
+        Key: repackagedKey,
+        Body: fs.readFileSync(repackagedZip),
+        ContentType: 'application/zip',
+      })
+    );
+
+    // Resolve the Lambda Web Adapter layer ARN and architecture for this region
+    const platform = manifest.platform;
+    const layerArn = LAMBDA_ADAPTER_LAYER[platform]?.replace('${region}', config.aws.region);
+    if (!layerArn) throw new Error(`No Lambda Web Adapter layer for platform: ${platform}`);
+    const architecture = FRAMEWORK_ARCHITECTURES[platform];
+    if (!architecture) throw new Error(`No Lambda architecture for platform: ${platform}`);
+
+    // The Web Adapter layer uses AWS_LAMBDA_EXEC_WRAPPER to intercept the
+    // Lambda runtime bootstrap. It starts run.sh (the web server) and proxies
+    // Lambda invocations to it as HTTP requests. The handler value is not
+    // called directly but must point to a valid file to pass validation.
+    return {
+      codeS3Key: repackagedKey,
+      runtime,
+      handler: 'run.sh',
+      layers: [layerArn],
+      architectures: [architecture],
+      environment: {
+        AWS_LAMBDA_EXEC_WRAPPER: '/opt/bootstrap',
+        AWS_LWA_PORT: String(port),
+      },
+    };
+  }
+
+  private detectFramework(tmpDir: string): string {
+    if (fs.existsSync(path.join(tmpDir, 'package.json'))) return 'node';
+    if (fs.existsSync(path.join(tmpDir, 'requirements.txt'))) return 'python';
+    if (fs.existsSync(path.join(tmpDir, 'Pipfile'))) return 'python';
+    if (fs.existsSync(path.join(tmpDir, 'pyproject.toml'))) return 'python';
+    return 'node';
+  }
+
+  private defaultStartCommand(framework: string, tmpDir: string): string {
+    if (framework === 'python') {
+      return 'python app.py';
+    }
+    // Node default
+    if (fs.existsSync(path.join(tmpDir, 'package.json'))) {
+      const pkg = JSON.parse(fs.readFileSync(path.join(tmpDir, 'package.json'), 'utf-8'));
+      if (pkg.scripts?.start) return 'npm start';
+    }
+    return 'node index.js';
   }
 
   private async resolveContainer(

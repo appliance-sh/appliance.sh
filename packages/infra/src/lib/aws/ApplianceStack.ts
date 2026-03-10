@@ -49,6 +49,11 @@ export interface ApplianceStackArgs {
   config: ApplianceBaseConfig;
   imageUri?: string;
   codeS3Key?: string;
+  runtime?: string;
+  handler?: string;
+  layers?: string[];
+  architectures?: string[];
+  environment?: Record<string, string>;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -163,13 +168,16 @@ export class ApplianceStack extends pulumi.ComponentResource {
         `${rid}-handler`,
         {
           packageType: 'Zip',
-          runtime: 'nodejs22.x',
-          handler: 'index.handler',
+          runtime: args.runtime ?? 'nodejs22.x',
+          handler: args.handler ?? 'index.handler',
           s3Bucket: args.config.aws.dataBucketName,
           s3Key: args.codeS3Key,
           role: this.lambdaRole.arn,
           timeout: 30,
           memorySize: 512,
+          layers: args.layers,
+          architectures: args.architectures,
+          environment: args.environment ? { variables: args.environment } : undefined,
           tags: defaultTags,
         },
         defaultOpts

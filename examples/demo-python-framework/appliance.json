@@ -1,0 +1,7 @@
+{
+  "manifest": "v1",
+  "name": "demo-python-framework",
+  "type": "framework",
+  "framework": "python",
+  "port": 8080
+}

@@ -14,6 +14,16 @@ export interface PulumiResult {
   stackName: string;
 }
 
+export interface ResolvedBuildParams {
+  imageUri?: string;
+  codeS3Key?: string;
+  runtime?: string;
+  handler?: string;
+  layers?: string[];
+  architectures?: string[];
+  environment?: Record<string, string>;
+}
+
 export interface ApplianceDeploymentServiceOptions {
   baseConfig?: ApplianceBaseConfig;
 }
@@ -32,11 +42,7 @@ export class ApplianceDeploymentService {
     this.region = this.baseConfig?.aws.region || 'us-east-1';
   }
 
-  private inlineProgram(
-    stackName: string,
-    metadata?: ApplianceStackMetadata,
-    build?: { imageUri?: string; codeS3Key?: string }
-  ) {
+  private inlineProgram(stackName: string, metadata?: ApplianceStackMetadata, build?: ResolvedBuildParams) {
     return async () => {
       if (!this.baseConfig) {
         throw new Error('Missing base config');
@@ -64,6 +70,11 @@ export class ApplianceDeploymentService {
           config: this.baseConfig,
           imageUri: build?.imageUri,
           codeS3Key: build?.codeS3Key,
+          runtime: build?.runtime,
+          handler: build?.handler,
+          layers: build?.layers,
+          architectures: build?.architectures,
+          environment: build?.environment,
         },
         {
           globalProvider,
@@ -82,7 +93,7 @@ export class ApplianceDeploymentService {
   private async getOrCreateStack(
     stackName: string,
     metadata?: ApplianceStackMetadata,
-    build?: { imageUri?: string; codeS3Key?: string }
+    build?: ResolvedBuildParams
   ): Promise<auto.Stack> {
     const program = this.inlineProgram(stackName, metadata, build);
     const envVars: Record<string, string> = {
@@ -125,7 +136,7 @@ export class ApplianceDeploymentService {
   async deploy(
     stackName: string,
     metadata?: ApplianceStackMetadata,
-    build?: { imageUri?: string; codeS3Key?: string }
+    build?: ResolvedBuildParams
   ): Promise<PulumiResult> {
     const stack = await this.getOrCreateStack(stackName, metadata, build);
     const result = await stack.up({ onOutput: (m) => console.log(m) });

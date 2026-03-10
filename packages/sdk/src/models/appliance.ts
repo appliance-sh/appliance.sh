@@ -39,6 +39,7 @@ export const applianceTypeContainerInput = applianceTypeBase.extend({
 export const applianceTypeFrameworkInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.framework),
   framework: z.string().optional().default('auto'),
+  platform: z.nativeEnum(AppliancePlatform).optional().default(AppliancePlatform.LinuxAmd64),
   port: portInput.optional(),
   includes: z.array(z.string()).optional(),
   excludes: z.array(z.string()).optional(),

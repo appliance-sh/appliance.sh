@@ -58,7 +58,9 @@ program
     if (appliance.type === ApplianceType.container) {
       await packageContainer(archive, appliance.name, appliance.platform, appliance.scripts?.build);
     } else if (appliance.type === ApplianceType.framework) {
-      packageBundle(archive, appliance.includes, appliance.excludes);
+      const framework = appliance.framework === 'auto' ? detectFramework() : appliance.framework;
+      installDependencies(framework);
+      packageBundle(archive, framework, appliance.includes, appliance.excludes);
     } else {
       // "other" type — include everything except common ignores
       packageBundle(archive);
@@ -105,10 +107,31 @@ async function packageContainer(archive: archiver.Archiver, name: string, platfo
   }
 }
 
-const DEFAULT_EXCLUDES = ['node_modules/**', '.git/**', '.env', '.env.*', 'appliance.zip', '*.tar'];
+function installDependencies(framework: string) {
+  if (framework === 'python' && fs.existsSync('requirements.txt')) {
+    console.log(chalk.dim('Installing Python dependencies...'));
+    try {
+      execSync('pip install -r requirements.txt -t . -q', { stdio: 'inherit' });
+    } catch {
+      console.error(chalk.red('Failed to install Python dependencies.'));
+      process.exit(1);
+    }
+  }
+}
 
-function packageBundle(archive: archiver.Archiver, includes?: string[], excludes?: string[]) {
-  const ignorePatterns = [...DEFAULT_EXCLUDES, ...(excludes ?? [])];
+function detectFramework(): string {
+  if (fs.existsSync('package.json')) return 'node';
+  if (fs.existsSync('requirements.txt')) return 'python';
+  if (fs.existsSync('Pipfile')) return 'python';
+  if (fs.existsSync('pyproject.toml')) return 'python';
+  return 'node';
+}
+
+const ALWAYS_EXCLUDES = ['.git/**', '.env', '.env.*', 'appliance.zip', '*.tar'];
+
+function packageBundle(archive: archiver.Archiver, framework?: string, includes?: string[], excludes?: string[]) {
+  const defaultExcludes = framework === 'node' ? [] : ['node_modules/**'];
+  const ignorePatterns = [...ALWAYS_EXCLUDES, ...defaultExcludes, ...(excludes ?? [])];
 
   if (includes && includes.length > 0) {
     for (const pattern of includes) {

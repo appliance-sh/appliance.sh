@@ -1,6 +1,0 @@
-{
-  "manifest": "v1",
-  "name": "appliance-demo",
-  "type": "container",
-  "port": 3000
-}

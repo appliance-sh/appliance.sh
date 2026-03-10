@@ -1,0 +1,7 @@
+{
+  "manifest": "v1",
+  "name": "demo-node-framework",
+  "type": "framework",
+  "framework": "node",
+  "port": 3000
+}
