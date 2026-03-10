@@ -55,6 +55,7 @@ export const applianceBaseConfig = z.object({
     cloudfrontDistributionDomainName: z.string().optional(),
     edgeRouterRoleArn: z.string().optional(),
     dataBucketName: z.string().optional(),
+    ecrRepositoryUrl: z.string().optional(),
   }),
 });
 

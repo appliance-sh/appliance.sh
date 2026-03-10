@@ -19,6 +19,8 @@
   "dependencies": {
     "@appliance.sh/sdk": "1.19.1",
     "@inquirer/prompts": "^7.10.1",
+    "@types/archiver": "^7.0.0",
+    "archiver": "^7.0.1",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
     "json-diff": "^1.0.6",

@@ -38,9 +38,9 @@ describe('ApiKeyService', () => {
     service = new ApiKeyService();
   });
 
-  it('should create a key with ak_ prefixed id and sk_ prefixed secret', async () => {
+  it('should create a key with apikey_ prefixed id and sk_ prefixed secret', async () => {
     const result = await service.create('test-key');
-    expect(result.id).toMatch(/^ak_/);
+    expect(result.id).toMatch(/^apikey_/);
     expect(result.secret).toMatch(/^sk_/);
     expect(result.name).toBe('test-key');
     expect(result.createdAt).toBeDefined();

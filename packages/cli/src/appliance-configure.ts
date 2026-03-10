@@ -3,6 +3,7 @@ import { extractApplianceFile, saveApplianceFile } from './utils/common.js';
 import {
   promptForApplianceFramework,
   promptForApplianceName,
+  promptForAppliancePlatform,
   promptForAppliancePort,
   promptForApplianceType,
 } from './wizards/appliance.js';
@@ -60,11 +61,13 @@ try {
     };
   } else if (type === ApplianceType.container) {
     const port = await promptForAppliancePort(updatedApplianceFile);
+    const platform = await promptForAppliancePlatform(updatedApplianceFile);
 
     updatedApplianceFile = {
       ...updatedApplianceFile,
       type,
       port,
+      platform,
     };
   } else {
     updatedApplianceFile = {

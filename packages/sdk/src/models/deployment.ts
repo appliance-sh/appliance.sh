@@ -15,6 +15,7 @@ export enum DeploymentStatus {
 export const deploymentInput = z.object({
   environmentId: z.string(),
   action: z.nativeEnum(DeploymentAction),
+  buildId: z.string().optional(),
 });
 
 export type DeploymentInput = z.infer<typeof deploymentInput>;

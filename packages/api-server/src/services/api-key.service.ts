@@ -17,7 +17,7 @@ interface StoredApiKey {
 export class ApiKeyService {
   async create(name: string): Promise<ApiKeyCreateResponse> {
     const storage = getStorageService();
-    const id = generateId('ak');
+    const id = generateId('apikey');
     const secret = `sk_${randomBytes(32).toString('hex')}`;
     const now = new Date().toISOString();
 

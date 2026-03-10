@@ -9,7 +9,7 @@ export class ProjectService {
     const now = new Date().toISOString();
     const project: Project = {
       ...input,
-      id: generateId('proj'),
+      id: generateId('project'),
       status: ProjectStatus.Active,
       createdAt: now,
       updatedAt: now,

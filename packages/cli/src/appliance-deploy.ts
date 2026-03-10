@@ -1,4 +1,6 @@
 import { Command } from 'commander';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import type { Project, Environment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
@@ -78,7 +80,17 @@ program
   .description('deploy a named project/environment')
   .argument('<project>', 'project name')
   .argument('<environment>', 'environment name')
+  .option('-a, --build <path>', 'appliance.zip build to deploy', 'appliance.zip')
   .action(async (projectName: string, environmentName: string) => {
+    const opts = program.opts();
+    const buildPath = path.resolve(opts.build as string);
+
+    if (!fs.existsSync(buildPath)) {
+      console.error(chalk.red(`Build not found: ${buildPath}`));
+      console.error(chalk.dim('Run `appliance build` first to create appliance.zip'));
+      process.exit(1);
+    }
+
     const credentials = loadCredentials();
     if (!credentials) {
       console.error(chalk.red('Credentials not found. Run `appliance init` first.'));
@@ -94,8 +106,22 @@ program
       const project = await findOrCreateProject(client, projectName);
       const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
+      // Upload the build
+      const buildData = fs.readFileSync(buildPath);
+      const sizeMb = (buildData.length / 1024 / 1024).toFixed(1);
+      console.log(chalk.dim(`Uploading build (${sizeMb} MB)...`));
+
+      const uploadResult = await client.uploadBuild(buildData);
+      if (!uploadResult.success) {
+        console.error(chalk.red(`Upload failed: ${uploadResult.error.message}`));
+        process.exit(1);
+      }
+
+      console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
+
+      // Deploy with the build
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
-      const result = await client.deploy(environment.id);
+      const result = await client.deploy(environment.id, uploadResult.data.buildId);
       if (!result.success) {
         console.error(chalk.red(`Deploy failed: ${result.error.message}`));
         process.exit(1);
