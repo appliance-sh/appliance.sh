@@ -25,7 +25,7 @@ buildRoutes.post('/', raw({ type: 'application/octet-stream', limit: '500mb' }),
       return;
     }
 
-    const buildId = generateId('bld');
+    const buildId = generateId('build');
     const s3Key = `builds/${buildId}.zip`;
 
     const s3 = new S3Client({ region: config.aws.region });

@@ -7,7 +7,7 @@ export class EnvironmentService {
   async create(input: EnvironmentInput, projectName: string): Promise<Environment> {
     const storage = getStorageService();
     const now = new Date().toISOString();
-    const id = generateId('env');
+    const id = generateId('environment');
     const environment: Environment = {
       ...input,
       id,

@@ -26,7 +26,7 @@ export class DeploymentService {
     const now = new Date().toISOString();
     const deployment: Deployment = {
       ...input,
-      id: generateId('dep'),
+      id: generateId('deployment'),
       projectId: environment.projectId,
       status: DeploymentStatus.Pending,
       startedAt: now,
