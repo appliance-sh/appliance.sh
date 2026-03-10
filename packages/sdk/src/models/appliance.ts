@@ -7,6 +7,11 @@ export enum ApplianceType {
   other = 'other',
 }
 
+export enum AppliancePlatform {
+  LinuxAmd64 = 'linux/amd64',
+  LinuxArm64 = 'linux/arm64',
+}
+
 export enum ApplianceFramework {
   Auto = 'auto',
   Python = 'python',
@@ -18,7 +23,9 @@ export const applianceTypeSchema = z.enum(ApplianceType);
 
 export const applianceTypeBase = z.object({
   manifest: z.literal('v1'),
-  name: z.string(),
+  name: z
+    .string()
+    .regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/, 'Name must be lowercase alphanumeric with hyphens, DNS-safe'),
   version: z.string().optional(),
   scripts: z.record(z.string(), z.string()).optional(),
 });
@@ -26,7 +33,7 @@ export const applianceTypeBase = z.object({
 export const applianceTypeContainerInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.container),
   port: portInput,
-  platform: z.string().optional().default('linux/amd64'),
+  platform: z.nativeEnum(AppliancePlatform).optional().default(AppliancePlatform.LinuxAmd64),
 });
 
 export const applianceTypeFrameworkInput = applianceTypeBase.extend({

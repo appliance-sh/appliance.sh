@@ -37,6 +37,15 @@ export class BuildService {
     fs.writeFileSync(zipPath, body);
 
     try {
+      // List zip contents and validate paths before extracting
+      const entries = execSync(`zipinfo -1 "${zipPath}"`, { encoding: 'utf-8' }).trim().split('\n');
+      for (const entryPath of entries) {
+        const resolved = path.resolve(tmpDir, entryPath);
+        if (!resolved.startsWith(tmpDir + path.sep) && resolved !== tmpDir) {
+          throw new Error(`Zip contains path traversal: ${entryPath}`);
+        }
+      }
+
       execSync(`unzip -o -q "${zipPath}" -d "${tmpDir}"`, { stdio: 'pipe' });
 
       // Read the manifest
@@ -67,8 +76,12 @@ export class BuildService {
     const imageTarPath = path.join(tmpDir, 'image.tar');
     if (!fs.existsSync(imageTarPath)) throw new Error('Build missing image.tar');
 
-    // Load the user's original image into Docker
-    execSync(`docker load -i "${imageTarPath}"`, { stdio: 'pipe' });
+    // Load the user's original image into Docker and capture the loaded image reference
+    const loadOutput = execSync(`docker load -i "${imageTarPath}"`, { encoding: 'utf-8' });
+    // Output is like "Loaded image: name:tag" or "Loaded image ID: sha256:abc..."
+    const loadedMatch = loadOutput.match(/Loaded image(?: ID)?:\s*(.+)/);
+    if (!loadedMatch) throw new Error(`Failed to parse docker load output: ${loadOutput}`);
+    const loadedImage = loadedMatch[1].trim();
 
     // Wrap the image with the Lambda Web Adapter so the same plain HTTP
     // container works on both Lambda and ECS/Fargate without any changes.
@@ -78,7 +91,7 @@ export class BuildService {
       wrapperDockerfile,
       [
         `FROM --platform=${manifest.platform} public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 AS adapter`,
-        `FROM ${manifest.name}`,
+        `FROM ${loadedImage}`,
         `COPY --from=adapter /lambda-adapter /opt/extensions/lambda-adapter`,
         `ENV AWS_LWA_PORT=${manifest.port}`,
       ].join('\n')

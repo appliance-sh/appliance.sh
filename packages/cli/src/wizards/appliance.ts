@@ -1,5 +1,5 @@
 import * as prompts from '@inquirer/prompts';
-import { ApplianceFramework, ApplianceInput, ApplianceType } from '@appliance.sh/sdk';
+import { ApplianceFramework, ApplianceInput, AppliancePlatform, ApplianceType } from '@appliance.sh/sdk';
 import * as slug from 'random-word-slugs';
 
 export const promptForApplianceName = (config?: Partial<ApplianceInput>) => {
@@ -33,13 +33,13 @@ export const promptForApplianceFramework = (config: Partial<ApplianceInput>) => 
 
 export const promptForAppliancePlatform = (config: Partial<ApplianceInput>) => {
   const current = config.type === ApplianceType.container ? (config as Record<string, unknown>).platform : undefined;
-  const platform = prompts.select<string>({
+  const platform = prompts.select<AppliancePlatform>({
     message: 'Choose a platform:',
     choices: [
-      { value: 'linux/amd64', name: 'linux/amd64 (x86_64)' },
-      { value: 'linux/arm64', name: 'linux/arm64 (ARM / Graviton)' },
+      { value: AppliancePlatform.LinuxAmd64, name: 'linux/amd64 (x86_64)' },
+      { value: AppliancePlatform.LinuxArm64, name: 'linux/arm64 (ARM / Graviton)' },
     ],
-    default: (current as string) ?? 'linux/amd64',
+    default: (current as AppliancePlatform) ?? AppliancePlatform.LinuxAmd64,
   });
 
   return platform;
