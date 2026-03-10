@@ -1,3 +1,13 @@
+## 1.20.0 (2026-03-10)
+
+### 🚀 Features
+
+- **api-server:** deploy poc ([#37](https://github.com/appliance-sh/appliance.sh/pull/37))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.19.1 (2026-03-10)
 
 ### 🩹 Fixes
