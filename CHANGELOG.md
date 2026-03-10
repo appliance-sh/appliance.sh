@@ -1,3 +1,13 @@
+## 1.19.1 (2026-03-10)
+
+### 🩹 Fixes
+
+- **sdk:** remove baseConfig from environment ([1d9edfc](https://github.com/appliance-sh/appliance.sh/commit/1d9edfc))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.19.0 (2026-03-09)
 
 ### 🚀 Features
