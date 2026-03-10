@@ -93,7 +93,11 @@ export class ApplianceStack extends pulumi.ComponentResource {
       tags: defaultTags,
     });
 
-    const policyStatements = [{ Effect: 'Allow' as const, Action: 'logs:CreateLogGroup', Resource: '*' }];
+    const policyStatements = [
+      { Effect: 'Allow' as const, Action: 'logs:CreateLogGroup', Resource: '*' },
+      { Effect: 'Allow' as const, Action: 'logs:CreateLogStream', Resource: '*' },
+      { Effect: 'Allow' as const, Action: 'logs:PutLogEvents', Resource: '*' },
+    ];
 
     if (args.imageUri) {
       policyStatements.push(
