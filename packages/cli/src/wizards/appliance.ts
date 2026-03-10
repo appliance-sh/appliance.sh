@@ -31,6 +31,20 @@ export const promptForApplianceFramework = (config: Partial<ApplianceInput>) => 
   return framework;
 };
 
+export const promptForAppliancePlatform = (config: Partial<ApplianceInput>) => {
+  const current = config.type === ApplianceType.container ? (config as Record<string, unknown>).platform : undefined;
+  const platform = prompts.select<string>({
+    message: 'Choose a platform:',
+    choices: [
+      { value: 'linux/amd64', name: 'linux/amd64 (x86_64)' },
+      { value: 'linux/arm64', name: 'linux/arm64 (ARM / Graviton)' },
+    ],
+    default: (current as string) ?? 'linux/amd64',
+  });
+
+  return platform;
+};
+
 export const promptForAppliancePort = (config: Partial<ApplianceInput>) => {
   const port = prompts.number<true>({
     message: 'What port should the app listen on?',

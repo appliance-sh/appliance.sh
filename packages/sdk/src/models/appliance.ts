@@ -26,6 +26,7 @@ export const applianceTypeBase = z.object({
 export const applianceTypeContainerInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.container),
   port: portInput,
+  platform: z.string().optional().default('linux/amd64'),
 });
 
 export const applianceTypeFrameworkInput = applianceTypeBase.extend({

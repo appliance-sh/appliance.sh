@@ -56,7 +56,7 @@ program
     archive.file(path.resolve(manifestPath), { name: 'appliance.json' });
 
     if (appliance.type === ApplianceType.container) {
-      await packageContainer(archive, appliance.name, appliance.scripts?.build);
+      await packageContainer(archive, appliance.name, appliance.platform, appliance.scripts?.build);
     } else if (appliance.type === ApplianceType.framework) {
       packageBundle(archive, appliance.includes, appliance.excludes);
     } else {
@@ -72,15 +72,15 @@ program
     console.log(chalk.green(`Built: ${outputPath} (${sizeMb} MB)`));
   });
 
-async function packageContainer(archive: archiver.Archiver, name: string, buildScript?: string) {
+async function packageContainer(archive: archiver.Archiver, name: string, platform: string, buildScript?: string) {
   // Build the image if no build script was already run (default docker build)
   const imageTag = name;
   if (!buildScript) {
     console.log(
-      chalk.dim(`Building container: docker build --platform linux/amd64 --provenance=false -t ${imageTag} .`)
+      chalk.dim(`Building container: docker build --platform ${platform} --provenance=false -t ${imageTag} .`)
     );
     try {
-      execSync(`docker build --platform linux/amd64 --provenance=false -t ${imageTag} .`, { stdio: 'inherit' });
+      execSync(`docker build --platform ${platform} --provenance=false -t ${imageTag} .`, { stdio: 'inherit' });
     } catch {
       console.error(chalk.red('Docker build failed.'));
       process.exit(1);
