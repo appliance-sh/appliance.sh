@@ -182,13 +182,14 @@ export class ApplianceClient {
   }
 
   // Deployment methods
-  async deploy(environmentId: string): Promise<Result<Deployment>> {
+  async deploy(environmentId: string, buildId?: string): Promise<Result<Deployment>> {
     return this.request<Deployment>(
       'POST',
       '/api/v1/deployments',
       {
         environmentId,
         action: 'deploy',
+        ...(buildId ? { buildId } : {}),
       },
       600000
     );
@@ -208,6 +209,48 @@ export class ApplianceClient {
 
   async getDeployment(id: string): Promise<Result<Deployment>> {
     return this.request<Deployment>('GET', `/api/v1/deployments/${id}`);
+  }
+
+  // Build methods
+  async uploadBuild(data: Buffer | Uint8Array): Promise<Result<{ buildId: string }>> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 300000);
+
+      const url = `${this.baseUrl}/api/v1/builds`;
+      const headers: Record<string, string> = {
+        'content-type': 'application/octet-stream',
+      };
+
+      if (this.credentials) {
+        const sigHeaders = await signRequest(this.credentials, {
+          method: 'POST',
+          url,
+          headers,
+          body: Buffer.from(data).toString('base64'),
+        });
+        Object.assign(headers, sigHeaders);
+      }
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: data,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        return { success: false, error: new Error(`HTTP ${response.status}: ${errorBody}`) };
+      }
+
+      const result = await response.json();
+      return { success: true, data: result as { buildId: string } };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error : new Error(String(error)) };
+    }
   }
 }
 

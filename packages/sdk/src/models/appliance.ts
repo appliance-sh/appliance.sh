@@ -48,3 +48,6 @@ export const applianceInput = z.discriminatedUnion('type', [
 
 export type ApplianceInput = z.infer<typeof applianceInput>;
 export type Appliance = z.output<typeof applianceInput>;
+export type ApplianceContainer = z.output<typeof applianceTypeContainerInput>;
+export type ApplianceFrameworkApp = z.output<typeof applianceTypeFrameworkInput>;
+export type ApplianceOther = z.output<typeof applianceTypeOtherInput>;

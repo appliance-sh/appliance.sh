@@ -21,6 +21,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
   public readonly cloudfrontDistribution?: aws.cloudfront.Distribution;
 
   public readonly dataBucket: aws.s3.Bucket;
+  public readonly ecrRepository: aws.ecr.Repository;
   public readonly config;
 
   constructor(name: string, args: ApplianceBaseAwsPublicArgs, opts?: ApplianceBaseAwsPublicOpts) {
@@ -147,6 +148,35 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       {
         bucket: this.dataBucket.bucket,
         rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: 'AES256' } }],
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    this.ecrRepository = new aws.ecr.Repository(
+      `${name}-ecr`,
+      {
+        name: name.replaceAll('.', '-'),
+        imageScanningConfiguration: { scanOnPush: true },
+        imageTagMutability: 'MUTABLE',
+        forceDelete: true,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.ecr.LifecyclePolicy(
+      `${name}-ecr-lifecycle`,
+      {
+        repository: this.ecrRepository.name,
+        policy: JSON.stringify({
+          rules: [
+            {
+              rulePriority: 1,
+              description: 'Keep last 50 images',
+              selection: { tagStatus: 'any', countType: 'imageCountMoreThan', countNumber: 50 },
+              action: { type: 'expire' },
+            },
+          ],
+        }),
       },
       { parent: this, provider: opts?.provider }
     );
@@ -487,6 +517,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         cloudfrontDistributionDomainName: this.cloudfrontDistribution.domainName,
         edgeRouterRoleArn: edgeRouterRole.arn,
         dataBucketName: this.dataBucket.bucket,
+        ecrRepositoryUrl: this.ecrRepository.repositoryUrl,
       },
     };
 

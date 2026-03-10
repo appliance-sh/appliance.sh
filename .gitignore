@@ -147,3 +147,7 @@ dist
 .github/instructions/nx.instructions.md
 
 resources/*
+
+# Appliance builds
+**/appliance.zip
+**/*.appliance.zip

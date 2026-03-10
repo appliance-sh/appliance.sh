@@ -32,7 +32,11 @@ export class ApplianceDeploymentService {
     this.region = this.baseConfig?.aws.region || 'us-east-1';
   }
 
-  private inlineProgram(stackName: string, metadata?: ApplianceStackMetadata) {
+  private inlineProgram(
+    stackName: string,
+    metadata?: ApplianceStackMetadata,
+    build?: { imageUri?: string; codeS3Key?: string }
+  ) {
     return async () => {
       if (!this.baseConfig) {
         throw new Error('Missing base config');
@@ -58,6 +62,8 @@ export class ApplianceDeploymentService {
         {
           metadata,
           config: this.baseConfig,
+          imageUri: build?.imageUri,
+          codeS3Key: build?.codeS3Key,
         },
         {
           globalProvider,
@@ -73,8 +79,12 @@ export class ApplianceDeploymentService {
     };
   }
 
-  private async getOrCreateStack(stackName: string, metadata?: ApplianceStackMetadata): Promise<auto.Stack> {
-    const program = this.inlineProgram(stackName, metadata);
+  private async getOrCreateStack(
+    stackName: string,
+    metadata?: ApplianceStackMetadata,
+    build?: { imageUri?: string; codeS3Key?: string }
+  ): Promise<auto.Stack> {
+    const program = this.inlineProgram(stackName, metadata, build);
     const envVars: Record<string, string> = {
       AWS_REGION: this.region,
     };
@@ -112,8 +122,12 @@ export class ApplianceDeploymentService {
     return auto.Stack.createOrSelect(stackName, ws);
   }
 
-  async deploy(stackName: string, metadata?: ApplianceStackMetadata): Promise<PulumiResult> {
-    const stack = await this.getOrCreateStack(stackName, metadata);
+  async deploy(
+    stackName: string,
+    metadata?: ApplianceStackMetadata,
+    build?: { imageUri?: string; codeS3Key?: string }
+  ): Promise<PulumiResult> {
+    const stack = await this.getOrCreateStack(stackName, metadata, build);
     const result = await stack.up({ onOutput: (m) => console.log(m) });
     const changes = result.summary.resourceChanges || {};
     const totalChanges = Object.entries(changes)

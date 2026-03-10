@@ -10,6 +10,7 @@ import { createApplianceDeploymentService } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
 import { projectService } from './project.service';
+import { buildService } from './build.service';
 
 const COLLECTION = 'deployments';
 
@@ -59,13 +60,18 @@ export class DeploymentService {
 
     // Execute the deployment
     try {
-      const deploymentService = createApplianceDeploymentService();
+      const infraService = createApplianceDeploymentService();
 
       let result;
       if (input.action === DeploymentAction.Deploy) {
-        result = await deploymentService.deploy(environment.stackName, metadata);
+        // Resolve the build into cloud-specific params if present
+        const build = input.buildId
+          ? await buildService.resolve(input.buildId, `${environment.stackName}-${deployment.id}`)
+          : undefined;
+
+        result = await infraService.deploy(environment.stackName, metadata, build);
       } else {
-        result = await deploymentService.destroy(environment.stackName);
+        result = await infraService.destroy(environment.stackName);
       }
 
       deployment.status = DeploymentStatus.Succeeded;

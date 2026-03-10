@@ -47,6 +47,8 @@ export interface ApplianceStackMetadata {
 export interface ApplianceStackArgs {
   metadata?: ApplianceStackMetadata;
   config: ApplianceBaseConfig;
+  imageUri?: string;
+  codeS3Key?: string;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -91,11 +93,46 @@ export class ApplianceStack extends pulumi.ComponentResource {
       tags: defaultTags,
     });
 
+    const policyStatements = [{ Effect: 'Allow' as const, Action: 'logs:CreateLogGroup', Resource: '*' }];
+
+    if (args.imageUri) {
+      policyStatements.push(
+        {
+          Effect: 'Allow' as const,
+          Action: 'ecr:GetDownloadUrlForLayer',
+          Resource: '*',
+        },
+        {
+          Effect: 'Allow' as const,
+          Action: 'ecr:BatchGetImage',
+          Resource: '*',
+        },
+        {
+          Effect: 'Allow' as const,
+          Action: 'ecr:BatchCheckLayerAvailability',
+          Resource: '*',
+        },
+        {
+          Effect: 'Allow' as const,
+          Action: 'ecr:GetAuthorizationToken',
+          Resource: '*',
+        }
+      );
+    }
+
+    if (args.codeS3Key && args.config.aws.dataBucketName) {
+      policyStatements.push({
+        Effect: 'Allow' as const,
+        Action: 's3:GetObject',
+        Resource: `arn:aws:s3:::${args.config.aws.dataBucketName}/${args.codeS3Key}`,
+      });
+    }
+
     this.lambdaRolePolicy = new aws.iam.Policy(`${rid}-policy`, {
       path: `/appliance/${name}/`,
       policy: {
         Version: '2012-10-17',
-        Statement: [{ Effect: 'Allow', Action: 'logs:CreateLogGroup', Resource: '*' }],
+        Statement: policyStatements,
       },
     });
 
@@ -104,17 +141,48 @@ export class ApplianceStack extends pulumi.ComponentResource {
       policyArn: this.lambdaRolePolicy.arn,
     });
 
-    this.lambda = new aws.lambda.CallbackFunction(
-      `${rid}-handler`,
-      {
-        runtime: 'nodejs22.x',
-        callback: async () => {
-          return { statusCode: 200, body: JSON.stringify({ message: 'Hello world!' }) };
+    if (args.imageUri) {
+      this.lambda = new aws.lambda.Function(
+        `${rid}-handler`,
+        {
+          packageType: 'Image',
+          imageUri: args.imageUri,
+          role: this.lambdaRole.arn,
+          timeout: 30,
+          memorySize: 512,
+          tags: defaultTags,
         },
-        tags: defaultTags,
-      },
-      defaultOpts
-    );
+        defaultOpts
+      );
+    } else if (args.codeS3Key && args.config.aws.dataBucketName) {
+      this.lambda = new aws.lambda.Function(
+        `${rid}-handler`,
+        {
+          packageType: 'Zip',
+          runtime: 'nodejs22.x',
+          handler: 'index.handler',
+          s3Bucket: args.config.aws.dataBucketName,
+          s3Key: args.codeS3Key,
+          role: this.lambdaRole.arn,
+          timeout: 30,
+          memorySize: 512,
+          tags: defaultTags,
+        },
+        defaultOpts
+      );
+    } else {
+      this.lambda = new aws.lambda.CallbackFunction(
+        `${rid}-handler`,
+        {
+          runtime: 'nodejs22.x',
+          callback: async () => {
+            return { statusCode: 200, body: JSON.stringify({ message: 'Hello world!' }) };
+          },
+          tags: defaultTags,
+        },
+        defaultOpts
+      );
+    }
 
     // lambda url
     this.lambdaUrl = new aws.lambda.FunctionUrl(
