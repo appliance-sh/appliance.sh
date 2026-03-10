@@ -76,9 +76,11 @@ async function packageContainer(archive: archiver.Archiver, name: string, buildS
   // Build the image if no build script was already run (default docker build)
   const imageTag = name;
   if (!buildScript) {
-    console.log(chalk.dim(`Building container: docker build --provenance=false -t ${imageTag} .`));
+    console.log(
+      chalk.dim(`Building container: docker build --platform linux/amd64 --provenance=false -t ${imageTag} .`)
+    );
     try {
-      execSync(`docker build --provenance=false -t ${imageTag} .`, { stdio: 'inherit' });
+      execSync(`docker build --platform linux/amd64 --provenance=false -t ${imageTag} .`, { stdio: 'inherit' });
     } catch {
       console.error(chalk.red('Docker build failed.'));
       process.exit(1);

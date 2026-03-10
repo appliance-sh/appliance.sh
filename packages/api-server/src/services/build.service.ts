@@ -77,14 +77,16 @@ export class BuildService {
     fs.writeFileSync(
       wrapperDockerfile,
       [
+        `FROM --platform=linux/amd64 public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 AS adapter`,
         `FROM ${manifest.name}`,
-        `COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter`,
+        `COPY --from=adapter /lambda-adapter /opt/extensions/lambda-adapter`,
         `ENV AWS_LWA_PORT=${manifest.port}`,
       ].join('\n')
     );
-    execSync(`docker build --provenance=false -f "${wrapperDockerfile}" -t "${lambdaImageName}" "${tmpDir}"`, {
-      stdio: 'pipe',
-    });
+    execSync(
+      `docker build --platform linux/amd64 --provenance=false -f "${wrapperDockerfile}" -t "${lambdaImageName}" "${tmpDir}"`,
+      { stdio: 'pipe' }
+    );
 
     // Auth with ECR
     const ecr = new ECRClient({ region: config.aws.region });
