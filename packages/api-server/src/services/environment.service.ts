@@ -1,18 +1,16 @@
 import { Environment, EnvironmentInput, EnvironmentStatus, generateId } from '@appliance.sh/sdk';
-import type { ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getStorageService } from './storage.service';
 
 const COLLECTION = 'environments';
 
 export class EnvironmentService {
-  async create(input: EnvironmentInput, projectName: string, baseConfig: ApplianceBaseConfig): Promise<Environment> {
+  async create(input: EnvironmentInput, projectName: string): Promise<Environment> {
     const storage = getStorageService();
     const now = new Date().toISOString();
     const id = generateId('env');
     const environment: Environment = {
       ...input,
       id,
-      baseConfig,
       status: EnvironmentStatus.Pending,
       stackName: `${projectName}-${input.name}`,
       createdAt: now,

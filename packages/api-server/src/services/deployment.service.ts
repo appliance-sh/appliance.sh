@@ -59,9 +59,7 @@ export class DeploymentService {
 
     // Execute the deployment
     try {
-      const deploymentService = createApplianceDeploymentService({
-        baseConfig: environment.baseConfig,
-      });
+      const deploymentService = createApplianceDeploymentService();
 
       let result;
       if (input.action === DeploymentAction.Deploy) {

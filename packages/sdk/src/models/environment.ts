@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { applianceBaseConfig } from './appliance-base';
 
 export enum EnvironmentStatus {
   Pending = 'pending',
@@ -19,7 +18,6 @@ export type EnvironmentInput = z.infer<typeof environmentInput>;
 
 export const environment = environmentInput.extend({
   id: z.string(),
-  baseConfig: applianceBaseConfig,
   status: z.nativeEnum(EnvironmentStatus),
   stackName: z.string(),
   lastDeployedAt: z.string().optional(),
