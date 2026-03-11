@@ -17,6 +17,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
+    "build:watch": "tsc --watch --preserveWatchOutput",
     "clean": "rm -rf ./dist/",
     "deploy:entrypoint": "ts-node src/index.ts",
     "deploy": "npm run clean && pulumi up && npm run build",

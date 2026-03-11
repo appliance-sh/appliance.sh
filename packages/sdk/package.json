@@ -15,6 +15,7 @@
   "types": "./dist/types",
   "scripts": {
     "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution nodenext --module NodeNext --outDir dist/esm && npm run postbuild && npm link",
+    "build:watch": "tsc --module commonjs --outDir dist/cjs --watch --preserveWatchOutput",
     "clean": "rm -rf ./dist/",
     "dev:setup": "npm link",
     "postbuild": "npx ts-node scripts/postbuild.ts",
