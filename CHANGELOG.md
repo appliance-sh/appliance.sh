@@ -1,3 +1,13 @@
+## 1.21.0 (2026-03-11)
+
+### 🚀 Features
+
+- framework support for python and platform ([b349b1a](https://github.com/appliance-sh/appliance.sh/commit/b349b1a))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.20.0 (2026-03-10)
 
 ### 🚀 Features
