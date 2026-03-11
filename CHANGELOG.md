@@ -1,3 +1,13 @@
+## 1.22.0 (2026-03-11)
+
+### 🚀 Features
+
+- improve build process ([e380d2d](https://github.com/appliance-sh/appliance.sh/commit/e380d2d))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.21.0 (2026-03-11)
 
 ### 🚀 Features
