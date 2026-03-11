@@ -1,3 +1,13 @@
+## 1.22.1 (2026-03-11)
+
+### 🩹 Fixes
+
+- use execFileSync and other improvements ([de20aa7](https://github.com/appliance-sh/appliance.sh/commit/de20aa7))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.22.0 (2026-03-11)
 
 ### 🚀 Features
