@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { dnsName } from '../common';
 
 export enum ProjectStatus {
   Active = 'active',
@@ -6,7 +7,7 @@ export enum ProjectStatus {
 }
 
 export const projectInput = z.object({
-  name: z.string(),
+  name: dnsName,
   description: z.string().optional(),
 });
 

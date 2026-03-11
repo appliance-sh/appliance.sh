@@ -2,7 +2,7 @@ import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { applianceBaseConfig, applianceInput } from '@appliance.sh/sdk';
 import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -60,7 +60,8 @@ export class BuildService {
 
     try {
       // List zip contents and validate paths before extracting
-      const entries = execSync(`zipinfo -1 "${zipPath}"`, { encoding: 'utf-8' }).trim().split('\n');
+      // Validate zip contents before extracting
+      const entries = execFileSync('zipinfo', ['-1', zipPath], { encoding: 'utf-8' }).trim().split('\n');
       for (const entryPath of entries) {
         const resolved = path.resolve(tmpDir, entryPath);
         if (!resolved.startsWith(tmpDir + path.sep) && resolved !== tmpDir) {
@@ -68,7 +69,15 @@ export class BuildService {
         }
       }
 
-      execSync(`unzip -o -q "${zipPath}" -d "${tmpDir}"`, { stdio: 'pipe' });
+      execFileSync('unzip', ['-o', '-q', zipPath, '-d', tmpDir], { stdio: 'pipe' });
+
+      // Reject symlinks after extraction
+      for (const entryPath of entries) {
+        const fullPath = path.join(tmpDir, entryPath);
+        if (fs.existsSync(fullPath) && fs.lstatSync(fullPath).isSymbolicLink()) {
+          throw new Error(`Zip contains symlink: ${entryPath}`);
+        }
+      }
 
       // Read the manifest
       const manifestPath = path.join(tmpDir, 'appliance.json');
@@ -123,10 +132,11 @@ export class BuildService {
   /**
    * Container builds are fully pre-processed by the CLI (Lambda Web Adapter
    * already injected). The server just loads the image and pushes it to ECR.
+   * All subprocess calls use execFileSync (array args) to prevent shell injection.
    */
   private async resolveContainer(
     tmpDir: string,
-    manifest: ApplianceContainer,
+    _manifest: ApplianceContainer,
     tag: string,
     config: ReturnType<typeof getBaseConfig>
   ): Promise<ResolvedBuild> {
@@ -134,10 +144,13 @@ export class BuildService {
     if (!ecrRepositoryUrl) throw new Error('ECR repository not configured');
 
     const imageTarPath = path.join(tmpDir, 'image.tar');
-    if (!fs.existsSync(imageTarPath)) throw new Error('Build missing image.tar');
+    if (!fs.existsSync(imageTarPath)) {
+      const extracted = fs.readdirSync(tmpDir);
+      throw new Error(`Build missing image.tar. Extracted contents: ${extracted.join(', ')}`);
+    }
 
     // Load the pre-built Lambda-ready image
-    const loadOutput = execSync(`docker load -i "${imageTarPath}"`, { encoding: 'utf-8' });
+    const loadOutput = execFileSync('docker', ['load', '-i', imageTarPath], { encoding: 'utf-8' });
     const loadedMatch = loadOutput.match(/Loaded image(?: ID)?:\s*(.+)/);
     if (!loadedMatch) throw new Error(`Failed to parse docker load output: ${loadOutput}`);
     const loadedImage = loadedMatch[1].trim();
@@ -152,20 +165,20 @@ export class BuildService {
 
     const decoded = Buffer.from(authData.authorizationToken, 'base64').toString();
     const [username, password] = decoded.split(':');
-    execSync(`docker login --username ${username} --password-stdin ${authData.proxyEndpoint}`, {
+    execFileSync('docker', ['login', '--username', username, '--password-stdin', authData.proxyEndpoint], {
       input: password,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     // Tag and push
     const remoteTag = `${ecrRepositoryUrl}:${tag}`;
-    execSync(`docker tag "${loadedImage}" "${remoteTag}"`, { stdio: 'pipe' });
-    execSync(`docker push "${remoteTag}"`, { stdio: 'pipe' });
+    execFileSync('docker', ['tag', loadedImage, remoteTag], { stdio: 'pipe' });
+    execFileSync('docker', ['push', remoteTag], { stdio: 'pipe' });
 
     // Get digest
     let imageUri: string;
     try {
-      imageUri = execSync(`docker inspect --format='{{index .RepoDigests 0}}' "${remoteTag}"`, {
+      imageUri = execFileSync('docker', ['inspect', '--format={{index .RepoDigests 0}}', remoteTag], {
         encoding: 'utf-8',
       }).trim();
     } catch {

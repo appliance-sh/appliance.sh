@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { dnsName } from '../common';
 
 export enum EnvironmentStatus {
   Pending = 'pending',
@@ -10,7 +11,7 @@ export enum EnvironmentStatus {
 }
 
 export const environmentInput = z.object({
-  name: z.string(),
+  name: dnsName,
   projectId: z.string(),
 });
 

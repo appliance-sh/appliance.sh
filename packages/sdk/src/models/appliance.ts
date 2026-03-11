@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { portInput } from '../common';
+import { dnsName, portInput } from '../common';
 
 export enum ApplianceType {
   container = 'container',
@@ -23,9 +23,7 @@ export const applianceTypeSchema = z.enum(ApplianceType);
 
 export const applianceTypeBase = z.object({
   manifest: z.literal('v1'),
-  name: z
-    .string()
-    .regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/, 'Name must be lowercase alphanumeric with hyphens, DNS-safe'),
+  name: dnsName,
   version: z.string().optional(),
   scripts: z.record(z.string(), z.string()).optional(),
 });
