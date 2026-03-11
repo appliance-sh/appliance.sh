@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { applianceBaseConfig, applianceInput } from '@appliance.sh/sdk';
 import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
@@ -78,7 +78,7 @@ export class BuildService {
       if (manifest.type === 'container') {
         return this.resolveContainer(tmpDir, manifest, tag, config);
       } else if (manifest.type === 'framework') {
-        return this.resolveFramework(tmpDir, manifest, tag, config);
+        return this.resolveFramework(manifest, s3Key, config);
       } else {
         return { codeS3Key: s3Key };
       }
@@ -87,53 +87,28 @@ export class BuildService {
     }
   }
 
-  private async resolveFramework(
-    tmpDir: string,
+  /**
+   * Framework builds are fully pre-processed by the CLI (dependencies installed,
+   * run.sh generated). The server just resolves Lambda-specific params from the
+   * manifest metadata and points at the original uploaded zip.
+   */
+  private resolveFramework(
     manifest: ApplianceFrameworkApp,
-    tag: string,
+    s3Key: string,
     config: ReturnType<typeof getBaseConfig>
-  ): Promise<ResolvedBuild> {
-    if (!config.aws.dataBucketName) throw new Error('Data bucket not configured');
-
+  ): ResolvedBuild {
     const port = manifest.port ?? 8080;
     const framework = manifest.framework ?? 'auto';
-    const detectedFramework = framework === 'auto' ? this.detectFramework(tmpDir) : framework;
-    const runtime = FRAMEWORK_RUNTIMES[detectedFramework] ?? FRAMEWORK_RUNTIMES['node'];
+    const runtime = FRAMEWORK_RUNTIMES[framework] ?? FRAMEWORK_RUNTIMES['node'];
 
-    // Generate a run.sh that starts the web server
-    const startCommand = manifest.scripts?.start ?? this.defaultStartCommand(detectedFramework, tmpDir);
-    const runSh = ['#!/bin/bash', `export PORT=${port}`, `exec ${startCommand}`].join('\n');
-    fs.writeFileSync(path.join(tmpDir, 'run.sh'), runSh, { mode: 0o755 });
-
-    // Repackage as a new zip (excluding the original zip and manifest-only artifacts)
-    const repackagedKey = `builds/${tag}.zip`;
-    const repackagedZip = path.join(tmpDir, 'repackaged.zip');
-    execSync(`cd "${tmpDir}" && zip -r "${repackagedZip}" . -x "appliance.zip" -x "repackaged.zip"`, { stdio: 'pipe' });
-
-    // Upload the repackaged zip
-    const s3 = new S3Client({ region: config.aws.region });
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: config.aws.dataBucketName,
-        Key: repackagedKey,
-        Body: fs.readFileSync(repackagedZip),
-        ContentType: 'application/zip',
-      })
-    );
-
-    // Resolve the Lambda Web Adapter layer ARN and architecture for this region
     const platform = manifest.platform;
     const layerArn = LAMBDA_ADAPTER_LAYER[platform]?.replace('${region}', config.aws.region);
     if (!layerArn) throw new Error(`No Lambda Web Adapter layer for platform: ${platform}`);
     const architecture = FRAMEWORK_ARCHITECTURES[platform];
     if (!architecture) throw new Error(`No Lambda architecture for platform: ${platform}`);
 
-    // The Web Adapter layer uses AWS_LAMBDA_EXEC_WRAPPER to intercept the
-    // Lambda runtime bootstrap. It starts run.sh (the web server) and proxies
-    // Lambda invocations to it as HTTP requests. The handler value is not
-    // called directly but must point to a valid file to pass validation.
     return {
-      codeS3Key: repackagedKey,
+      codeS3Key: s3Key,
       runtime,
       handler: 'run.sh',
       layers: [layerArn],
@@ -145,26 +120,10 @@ export class BuildService {
     };
   }
 
-  private detectFramework(tmpDir: string): string {
-    if (fs.existsSync(path.join(tmpDir, 'package.json'))) return 'node';
-    if (fs.existsSync(path.join(tmpDir, 'requirements.txt'))) return 'python';
-    if (fs.existsSync(path.join(tmpDir, 'Pipfile'))) return 'python';
-    if (fs.existsSync(path.join(tmpDir, 'pyproject.toml'))) return 'python';
-    return 'node';
-  }
-
-  private defaultStartCommand(framework: string, tmpDir: string): string {
-    if (framework === 'python') {
-      return 'python app.py';
-    }
-    // Node default
-    if (fs.existsSync(path.join(tmpDir, 'package.json'))) {
-      const pkg = JSON.parse(fs.readFileSync(path.join(tmpDir, 'package.json'), 'utf-8'));
-      if (pkg.scripts?.start) return 'npm start';
-    }
-    return 'node index.js';
-  }
-
+  /**
+   * Container builds are fully pre-processed by the CLI (Lambda Web Adapter
+   * already injected). The server just loads the image and pushes it to ECR.
+   */
   private async resolveContainer(
     tmpDir: string,
     manifest: ApplianceContainer,
@@ -177,30 +136,11 @@ export class BuildService {
     const imageTarPath = path.join(tmpDir, 'image.tar');
     if (!fs.existsSync(imageTarPath)) throw new Error('Build missing image.tar');
 
-    // Load the user's original image into Docker and capture the loaded image reference
+    // Load the pre-built Lambda-ready image
     const loadOutput = execSync(`docker load -i "${imageTarPath}"`, { encoding: 'utf-8' });
-    // Output is like "Loaded image: name:tag" or "Loaded image ID: sha256:abc..."
     const loadedMatch = loadOutput.match(/Loaded image(?: ID)?:\s*(.+)/);
     if (!loadedMatch) throw new Error(`Failed to parse docker load output: ${loadOutput}`);
     const loadedImage = loadedMatch[1].trim();
-
-    // Wrap the image with the Lambda Web Adapter so the same plain HTTP
-    // container works on both Lambda and ECS/Fargate without any changes.
-    const lambdaImageName = `${manifest.name}-lambda`;
-    const wrapperDockerfile = path.join(tmpDir, 'Dockerfile.lambda');
-    fs.writeFileSync(
-      wrapperDockerfile,
-      [
-        `FROM --platform=${manifest.platform} public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 AS adapter`,
-        `FROM ${loadedImage}`,
-        `COPY --from=adapter /lambda-adapter /opt/extensions/lambda-adapter`,
-        `ENV AWS_LWA_PORT=${manifest.port}`,
-      ].join('\n')
-    );
-    execSync(
-      `docker build --platform ${manifest.platform} --provenance=false -f "${wrapperDockerfile}" -t "${lambdaImageName}" "${tmpDir}"`,
-      { stdio: 'pipe' }
-    );
 
     // Auth with ECR
     const ecr = new ECRClient({ region: config.aws.region });
@@ -217,15 +157,15 @@ export class BuildService {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Tag and push the Lambda-wrapped image
+    // Tag and push
     const remoteTag = `${ecrRepositoryUrl}:${tag}`;
-    execSync(`docker tag ${lambdaImageName} ${remoteTag}`, { stdio: 'pipe' });
-    execSync(`docker push ${remoteTag}`, { stdio: 'pipe' });
+    execSync(`docker tag "${loadedImage}" "${remoteTag}"`, { stdio: 'pipe' });
+    execSync(`docker push "${remoteTag}"`, { stdio: 'pipe' });
 
     // Get digest
     let imageUri: string;
     try {
-      imageUri = execSync(`docker inspect --format='{{index .RepoDigests 0}}' ${remoteTag}`, {
+      imageUri = execSync(`docker inspect --format='{{index .RepoDigests 0}}' "${remoteTag}"`, {
         encoding: 'utf-8',
       }).trim();
     } catch {
