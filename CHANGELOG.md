@@ -1,3 +1,13 @@
+## 1.23.0 (2026-03-15)
+
+### 🚀 Features
+
+- **cli:** improved documentation and app commands ([e44ac41](https://github.com/appliance-sh/appliance.sh/commit/e44ac41))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.22.1 (2026-03-11)
 
 ### 🩹 Fixes
