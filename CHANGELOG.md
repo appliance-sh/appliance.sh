@@ -1,3 +1,18 @@
+## 1.26.0 (2026-03-16)
+
+### 🚀 Features
+
+- **api-server:** support presigned url builds ([27009d4](https://github.com/appliance-sh/appliance.sh/commit/27009d4))
+- **cli:** support memory and timeout ([523f749](https://github.com/appliance-sh/appliance.sh/commit/523f749))
+
+### 🩹 Fixes
+
+- **api-server:** trust proxy behaviour ([6127e55](https://github.com/appliance-sh/appliance.sh/commit/6127e55))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.25.0 (2026-03-16)
 
 ### 🚀 Features
