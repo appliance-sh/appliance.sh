@@ -1,3 +1,14 @@
+## 1.25.0 (2026-03-16)
+
+### 🚀 Features
+
+- **api-server:** improve logging ([048c5e5](https://github.com/appliance-sh/appliance.sh/commit/048c5e5))
+- **cli:** support for APPLIANCE_API_URL env var override ([24aa53e](https://github.com/appliance-sh/appliance.sh/commit/24aa53e))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.24.0 (2026-03-16)
 
 ### 🚀 Features
