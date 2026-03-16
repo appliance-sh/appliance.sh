@@ -1,3 +1,13 @@
+## 1.24.0 (2026-03-16)
+
+### 🚀 Features
+
+- **cli:** environment variables and deployment ([1d85cfb](https://github.com/appliance-sh/appliance.sh/commit/1d85cfb))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.23.0 (2026-03-15)
 
 ### 🚀 Features
