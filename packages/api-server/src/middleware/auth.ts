@@ -41,7 +41,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     }
   }
 
-  const url = `${req.protocol}://${req.hostname}${req.originalUrl}`;
+  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
 
   const result = await verifySignedRequest(
     {

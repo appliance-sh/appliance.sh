@@ -12,7 +12,9 @@ import { requestLogger, logger } from './logger';
 export function createApp() {
   const app = express();
 
-  app.set('trust proxy', true);
+  if (process.env.APPLIANCE_TRUST_PROXY) {
+    app.set('trust proxy', true);
+  }
 
   app.use(requestLogger);
 
