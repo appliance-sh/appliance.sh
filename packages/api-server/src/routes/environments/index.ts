@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { environmentInput } from '@appliance.sh/sdk';
 import { environmentService } from '../../services/environment.service';
 import { projectService } from '../../services/project.service';
+import { logger } from '../../logger';
 
 interface EnvironmentParams {
   projectId: string;
@@ -23,9 +24,18 @@ environmentRoutes.post('/', async (req, res) => {
       projectId: params.projectId,
     });
     const environment = await environmentService.create(input, project.name);
+    logger.info('environment created', {
+      requestId: req.requestId,
+      projectId: params.projectId,
+      environmentId: environment.id,
+      environmentName: environment.name,
+    });
     res.status(201).json(environment);
   } catch (error) {
-    console.error('Create environment error:', error);
+    logger.error('create environment failed', error, {
+      requestId: req.requestId,
+      projectId: (req.params as EnvironmentParams).projectId,
+    });
     res.status(400).json({ error: 'Failed to create environment', message: String(error) });
   }
 });
@@ -36,7 +46,10 @@ environmentRoutes.get('/', async (req, res) => {
     const environments = await environmentService.listByProject(params.projectId);
     res.json(environments);
   } catch (error) {
-    console.error('List environments error:', error);
+    logger.error('list environments failed', error, {
+      requestId: req.requestId,
+      projectId: (req.params as EnvironmentParams).projectId,
+    });
     res.status(500).json({ error: 'Failed to list environments', message: String(error) });
   }
 });
@@ -55,7 +68,11 @@ environmentRoutes.get('/:id', async (req, res) => {
     }
     res.json(environment);
   } catch (error) {
-    console.error('Get environment error:', error);
+    logger.error('get environment failed', error, {
+      requestId: req.requestId,
+      projectId: (req.params as EnvironmentParams).projectId,
+      environmentId: (req.params as EnvironmentParams).id,
+    });
     res.status(500).json({ error: 'Failed to get environment', message: String(error) });
   }
 });
@@ -69,9 +86,18 @@ environmentRoutes.delete('/:id', async (req, res) => {
       return;
     }
     await environmentService.delete(params.id!);
+    logger.info('environment deleted', {
+      requestId: req.requestId,
+      projectId: params.projectId,
+      environmentId: params.id,
+    });
     res.status(204).send();
   } catch (error) {
-    console.error('Delete environment error:', error);
+    logger.error('delete environment failed', error, {
+      requestId: req.requestId,
+      projectId: (req.params as EnvironmentParams).projectId,
+      environmentId: (req.params as EnvironmentParams).id,
+    });
     res.status(500).json({ error: 'Failed to delete environment', message: String(error) });
   }
 });

@@ -7,9 +7,14 @@ import { deploymentRoutes } from './routes/deployments';
 import { buildRoutes } from './routes/builds';
 import { bootstrapRoutes } from './routes/bootstrap';
 import { signatureAuth } from './middleware/auth';
+import { requestLogger, logger } from './logger';
 
 export function createApp() {
   const app = express();
+
+  app.set('trust proxy', true);
+
+  app.use(requestLogger);
 
   app.use(
     express.json({
@@ -37,7 +42,7 @@ async function bootstrap() {
   const port = process.env.PORT ?? 3000;
 
   app.listen(port, () => {
-    console.log(`Server is running on http://localhost:${port}`);
+    logger.info('server started', { port: Number(port) });
   });
 }
 

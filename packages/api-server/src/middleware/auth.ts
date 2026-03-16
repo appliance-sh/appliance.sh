@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
 import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
 import { apiKeyService } from '../services/api-key.service';
+import { logger } from '../logger';
 
 declare module 'express-serve-static-core' {
   interface Request {
@@ -15,6 +16,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   const signatureInput = req.headers['signature-input'];
 
   if (!signature || !signatureInput) {
+    logger.warn('auth failed: missing signature headers', { requestId: req.requestId, path: req.originalUrl });
     res.status(401).json({ error: 'Missing signature headers' });
     return;
   }
@@ -23,6 +25,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   if (req.rawBody && req.rawBody.length > 0) {
     const contentDigest = req.headers['content-digest'] as string | undefined;
     if (!contentDigest) {
+      logger.warn('auth failed: missing content-digest', { requestId: req.requestId, path: req.originalUrl });
       res.status(401).json({ error: 'Missing Content-Digest header' });
       return;
     }
@@ -32,12 +35,13 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       contentDigest.length !== expected.length ||
       !timingSafeEqual(Buffer.from(contentDigest), Buffer.from(expected))
     ) {
+      logger.warn('auth failed: content-digest mismatch', { requestId: req.requestId, path: req.originalUrl });
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
   }
 
-  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const url = `${req.protocol}://${req.hostname}${req.originalUrl}`;
 
   const result = await verifySignedRequest(
     {
@@ -53,6 +57,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   );
 
   if (!result.verified) {
+    logger.warn('auth failed: invalid signature', { requestId: req.requestId, path: req.originalUrl });
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }

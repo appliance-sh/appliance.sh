@@ -1,6 +1,7 @@
 import { Router, raw } from 'express';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { applianceBaseConfig, generateId } from '@appliance.sh/sdk';
+import { logger } from '../../logger';
 
 export const buildRoutes = Router();
 
@@ -38,9 +39,10 @@ buildRoutes.post('/', raw({ type: 'application/octet-stream', limit: '500mb' }),
       })
     );
 
+    logger.info('build uploaded', { requestId: req.requestId, buildId, sizeBytes: body.length });
     res.status(201).json({ buildId, size: body.length });
   } catch (error) {
-    console.error('Build upload error:', error);
+    logger.error('build upload failed', error, { requestId: req.requestId });
     res.status(500).json({ error: 'Failed to upload build' });
   }
 });
