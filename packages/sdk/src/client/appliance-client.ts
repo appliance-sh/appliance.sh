@@ -219,27 +219,21 @@ export class ApplianceClient {
   // Build methods
   async uploadBuild(data: Buffer | Uint8Array): Promise<Result<{ buildId: string }>> {
     try {
+      // Step 1: Request a presigned upload URL
+      const createResult = await this.request<{ buildId: string; uploadUrl: string }>('POST', '/api/v1/builds');
+      if (!createResult.success) {
+        return createResult;
+      }
+
+      const { buildId, uploadUrl } = createResult.data;
+
+      // Step 2: Upload directly to the presigned URL
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 300000);
 
-      const url = `${this.baseUrl}/api/v1/builds`;
-      const headers: Record<string, string> = {
-        'content-type': 'application/octet-stream',
-      };
-
-      if (this.credentials) {
-        const sigHeaders = await signRequest(this.credentials, {
-          method: 'POST',
-          url,
-          headers,
-          body: Buffer.from(data).toString('base64'),
-        });
-        Object.assign(headers, sigHeaders);
-      }
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
+      const response = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/zip' },
         body: data,
         signal: controller.signal,
       });
@@ -248,11 +242,10 @@ export class ApplianceClient {
 
       if (!response.ok) {
         const errorBody = await response.text();
-        return { success: false, error: new Error(`HTTP ${response.status}: ${errorBody}`) };
+        return { success: false, error: new Error(`Upload failed: HTTP ${response.status}: ${errorBody}`) };
       }
 
-      const result = await response.json();
-      return { success: true, data: result as { buildId: string } };
+      return { success: true, data: { buildId } };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error : new Error(String(error)) };
     }
