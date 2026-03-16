@@ -8,6 +8,25 @@ import chalk from 'chalk';
 
 const POLL_INTERVAL_MS = 3000;
 
+function parseEnvFile(filePath: string): Record<string, string> {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const env: Record<string, string> = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+    // Strip surrounding quotes
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
 async function findOrCreateProject(client: ReturnType<typeof createApplianceClient>, name: string): Promise<Project> {
   const listResult = await client.listProjects();
   if (!listResult.success) throw new Error(`Failed to list projects: ${listResult.error.message}`);
@@ -81,6 +100,7 @@ program
   .argument('<project>', 'project name')
   .argument('<environment>', 'environment name')
   .option('-a, --build <path>', 'appliance.zip build to deploy', 'appliance.zip')
+  .option('-e, --env-file <path>', 'env file with runtime environment variables')
   .action(async (projectName: string, environmentName: string) => {
     const opts = program.opts();
     const buildPath = path.resolve(opts.build as string);
@@ -119,9 +139,22 @@ program
 
       console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
 
+      // Load environment variables: explicit --env-file, or auto-detect .env.<environment>
+      let envVars: Record<string, string> | undefined;
+      const envFilePath = path.resolve(opts.envFile ?? `.env.${environmentName}`);
+      if (fs.existsSync(envFilePath)) {
+        envVars = parseEnvFile(envFilePath);
+        console.log(
+          chalk.dim(`Loaded ${Object.keys(envVars).length} environment variables from ${path.basename(envFilePath)}`)
+        );
+      } else if (opts.envFile) {
+        console.error(chalk.red(`Env file not found: ${envFilePath}`));
+        process.exit(1);
+      }
+
       // Deploy with the build
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
-      const result = await client.deploy(environment.id, uploadResult.data.buildId);
+      const result = await client.deploy(environment.id, uploadResult.data.buildId, envVars);
       if (!result.success) {
         console.error(chalk.red(`Deploy failed: ${result.error.message}`));
         process.exit(1);

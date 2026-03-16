@@ -159,6 +159,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
           role: this.lambdaRole.arn,
           timeout: 30,
           memorySize: 512,
+          environment: args.environment ? { variables: args.environment } : undefined,
           tags: defaultTags,
         },
         defaultOpts

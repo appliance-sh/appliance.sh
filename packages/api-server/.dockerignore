@@ -1,0 +1,10 @@
+node_modules
+dist
+scripts
+*.spec.ts
+*.test.ts
+vitest*.config.*
+.eslintrc*
+eslint.config.*
+appliance.zip
+*.tar

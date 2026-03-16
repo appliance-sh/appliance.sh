@@ -136,7 +136,7 @@ export class BuildService {
    */
   private async resolveContainer(
     tmpDir: string,
-    _manifest: ApplianceContainer,
+    manifest: ApplianceContainer,
     tag: string,
     config: ReturnType<typeof getBaseConfig>
   ): Promise<ResolvedBuild> {

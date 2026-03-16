@@ -16,11 +16,15 @@ export const deploymentInput = z.object({
   environmentId: z.string(),
   action: z.nativeEnum(DeploymentAction),
   buildId: z.string().optional(),
+  environment: z.record(z.string(), z.string()).optional(),
 });
 
 export type DeploymentInput = z.infer<typeof deploymentInput>;
 
-export const deployment = deploymentInput.extend({
+export const deployment = z.object({
+  environmentId: z.string(),
+  action: z.nativeEnum(DeploymentAction),
+  buildId: z.string().optional(),
   id: z.string(),
   projectId: z.string(),
   status: z.nativeEnum(DeploymentStatus),

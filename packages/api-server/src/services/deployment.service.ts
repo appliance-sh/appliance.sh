@@ -24,8 +24,10 @@ export class DeploymentService {
     }
 
     const now = new Date().toISOString();
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { environment: _env, ...inputWithoutEnv } = input;
     const deployment: Deployment = {
-      ...input,
+      ...inputWithoutEnv,
       id: generateId('deployment'),
       projectId: environment.projectId,
       status: DeploymentStatus.Pending,
@@ -68,6 +70,14 @@ export class DeploymentService {
         const build = input.buildId
           ? await buildService.resolve(input.buildId, `${environment.stackName}-${deployment.id}`)
           : undefined;
+
+        // Merge deploy-time environment vars (from CLI --env-file) with build-resolved ones
+        if (input.environment) {
+          if (!build) {
+            throw new Error('Environment variables require a build');
+          }
+          build.environment = { ...input.environment, ...build.environment };
+        }
 
         result = await infraService.deploy(environment.stackName, metadata, build);
       } else {

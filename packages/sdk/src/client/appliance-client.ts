@@ -182,7 +182,11 @@ export class ApplianceClient {
   }
 
   // Deployment methods
-  async deploy(environmentId: string, buildId?: string): Promise<Result<Deployment>> {
+  async deploy(
+    environmentId: string,
+    buildId?: string,
+    environment?: Record<string, string>
+  ): Promise<Result<Deployment>> {
     return this.request<Deployment>(
       'POST',
       '/api/v1/deployments',
@@ -190,6 +194,7 @@ export class ApplianceClient {
         environmentId,
         action: 'deploy',
         ...(buildId ? { buildId } : {}),
+        ...(environment ? { environment } : {}),
       },
       600000
     );

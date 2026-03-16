@@ -1,0 +1,9 @@
+{
+  "manifest": "v1",
+  "name": "appliance-api-server",
+  "type": "container",
+  "port": 3000,
+  "scripts": {
+    "build": "bash scripts/docker-prep.sh"
+  }
+}
