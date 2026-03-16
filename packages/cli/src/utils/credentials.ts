@@ -24,7 +24,11 @@ export function loadCredentials(): Credentials | null {
       return null;
     }
     const data = fs.readFileSync(CREDENTIALS_FILE, 'utf-8');
-    return JSON.parse(data) as Credentials;
+    const credentials = JSON.parse(data) as Credentials;
+    if (process.env.APPLIANCE_API_URL) {
+      credentials.apiUrl = process.env.APPLIANCE_API_URL;
+    }
+    return credentials;
   } catch {
     return null;
   }
