@@ -15,6 +15,8 @@ export interface ResolvedBuild {
   layers?: string[];
   architectures?: string[];
   environment?: Record<string, string>;
+  memory?: number;
+  timeout?: number;
 }
 
 function getBaseConfig() {
@@ -126,6 +128,8 @@ export class BuildService {
         AWS_LAMBDA_EXEC_WRAPPER: '/opt/bootstrap',
         AWS_LWA_PORT: String(port),
       },
+      memory: manifest.memory,
+      timeout: manifest.timeout,
     };
   }
 
@@ -185,7 +189,7 @@ export class BuildService {
       imageUri = remoteTag;
     }
 
-    return { imageUri };
+    return { imageUri, memory: manifest.memory, timeout: manifest.timeout };
   }
 }
 

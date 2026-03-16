@@ -22,6 +22,8 @@ export interface ResolvedBuildParams {
   layers?: string[];
   architectures?: string[];
   environment?: Record<string, string>;
+  memory?: number;
+  timeout?: number;
 }
 
 export interface ApplianceDeploymentServiceOptions {
@@ -75,6 +77,8 @@ export class ApplianceDeploymentService {
           layers: build?.layers,
           architectures: build?.architectures,
           environment: build?.environment,
+          memory: build?.memory,
+          timeout: build?.timeout,
         },
         {
           globalProvider,

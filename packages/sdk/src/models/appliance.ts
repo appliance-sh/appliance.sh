@@ -26,6 +26,8 @@ export const applianceTypeBase = z.object({
   name: dnsName,
   version: z.string().optional(),
   scripts: z.record(z.string(), z.string()).optional(),
+  memory: z.number().int().min(128).max(10240).optional(),
+  timeout: z.number().int().min(1).max(900).optional(),
 });
 
 export const applianceTypeContainerInput = applianceTypeBase.extend({

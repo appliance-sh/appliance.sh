@@ -54,6 +54,8 @@ export interface ApplianceStackArgs {
   layers?: string[];
   architectures?: string[];
   environment?: Record<string, string>;
+  memory?: number;
+  timeout?: number;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -157,8 +159,8 @@ export class ApplianceStack extends pulumi.ComponentResource {
           packageType: 'Image',
           imageUri: args.imageUri,
           role: this.lambdaRole.arn,
-          timeout: 30,
-          memorySize: 512,
+          timeout: args.timeout ?? 30,
+          memorySize: args.memory ?? 512,
           environment: args.environment ? { variables: args.environment } : undefined,
           tags: defaultTags,
         },
@@ -174,8 +176,8 @@ export class ApplianceStack extends pulumi.ComponentResource {
           s3Bucket: args.config.aws.dataBucketName,
           s3Key: args.codeS3Key,
           role: this.lambdaRole.arn,
-          timeout: 30,
-          memorySize: 512,
+          timeout: args.timeout ?? 30,
+          memorySize: args.memory ?? 512,
           layers: args.layers,
           architectures: args.architectures,
           environment: args.environment ? { variables: args.environment } : undefined,
