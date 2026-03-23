@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/install-aws",
-  "version": "1.26.0",
+  "version": "1.26.1",
   "description": "Install the Appliance platform on AWS",
   "repository": "https://github.com/appliance-sh/appliance.sh",
   "license": "MIT",

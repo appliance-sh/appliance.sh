@@ -1,3 +1,14 @@
+## 1.26.1 (2026-03-23)
+
+### 🩹 Fixes
+
+- **sdk:** types for node ([58fd037](https://github.com/appliance-sh/appliance.sh/commit/58fd037))
+- **sdk:** build fixes ([b5e8902](https://github.com/appliance-sh/appliance.sh/commit/b5e8902))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.26.0 (2026-03-16)
 
 ### 🚀 Features
