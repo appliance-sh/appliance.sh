@@ -18,28 +18,22 @@
       "prettier --write --ignore-unknown"
     ]
   },
+  "packageManager": "pnpm@10.28.2",
   "scripts": {
-    "build": "npm run --workspaces build",
-    "clean": "rm -rf ./node_modules && npm run --workspaces clean",
-    "lint:check": "npx eslint . && prettier . --check",
-    "lint:fix": "npx eslint --fix . && prettier . --fix --write",
-    "dev": "npm run build && concurrently -k -n sdk,infra,server -c blue,magenta,green \"npm run --workspace=@appliance.sh/sdk build:watch\" \"npm run --workspace=@appliance.sh/infra build:watch\" \"npm run --workspace=@appliance.sh/api-server start:dev\"",
-    "dev:setup": "npm run --workspace=packages/sdk dev:setup && npm run --workspace=packages/cli dev:setup && npm run --workspace=packages/infra dev:setup",
-    "deploy": "npm run --workspace=packages/infra deploy",
+    "build": "pnpm -r run build",
+    "clean": "rm -rf ./node_modules && pnpm -r run clean",
+    "lint:check": "pnpm exec eslint . && prettier . --check",
+    "lint:fix": "pnpm exec eslint --fix . && prettier . --fix --write",
+    "dev": "pnpm run build && concurrently -k -n sdk,infra,server -c blue,magenta,green \"pnpm --filter @appliance.sh/sdk run build:watch\" \"pnpm --filter @appliance.sh/infra run build:watch\" \"pnpm --filter @appliance.sh/api-server run start:dev\"",
+    "dev:setup": "pnpm --filter @appliance.sh/sdk run dev:setup && pnpm --filter @appliance.sh/cli run dev:setup && pnpm --filter @appliance.sh/infra run dev:setup",
+    "deploy": "pnpm --filter @appliance.sh/infra run deploy",
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepare": "husky",
     "release": "nx release",
     "release:ci": "nx release --yes"
   },
-  "workspaces": [
-    "packages/sdk",
-    "packages/cli",
-    "packages/infra",
-    "packages/api-server",
-    "packages/install-aws"
-  ],
   "devDependencies": {
-    "@appliance.sh/sdk": "*",
+    "@appliance.sh/sdk": "workspace:*",
     "@eslint/js": "^9.29.0",
     "@nx/js": "^21.5.2",
     "@swc-node/register": "^1.11.1",

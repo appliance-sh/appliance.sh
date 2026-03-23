@@ -4,7 +4,7 @@ Technical reference for Appliance internals, API, and infrastructure.
 
 ## Packages
 
-Appliance is a TypeScript monorepo (npm workspaces + Nx) with 5 packages:
+Appliance is a TypeScript monorepo (pnpm workspaces + Nx) with 5 packages:
 
 | Package                       | Description                                               |
 | ----------------------------- | --------------------------------------------------------- |
@@ -193,10 +193,10 @@ The `install-aws` package provides an AWS CDK construct (`ApplianceInstaller`) t
 ### Setup
 
 ```bash
-npm install
-npm run dev:setup    # Link SDK across packages
-npm run dev          # API server in watch mode + SDK/infra rebuilds
-npm run build        # Build all packages
+pnpm install
+pnpm run dev:setup    # Workspace linking is automatic with pnpm
+pnpm run dev          # API server in watch mode + SDK/infra rebuilds
+pnpm run build        # Build all packages
 ```
 
 ### Testing
@@ -204,16 +204,16 @@ npm run build        # Build all packages
 Tests use Vitest (`packages/api-server/src/**/*.spec.ts`):
 
 ```bash
-npm run --workspace=packages/api-server test
-npm run --workspace=packages/api-server test:watch
-npm run --workspace=packages/api-server test:cov
+pnpm --filter @appliance.sh/api-server run test
+pnpm --filter @appliance.sh/api-server run test:watch
+pnpm --filter @appliance.sh/api-server run test:cov
 ```
 
 ### Linting
 
 ```bash
-npm run lint:check    # Check for issues
-npm run lint:fix      # Auto-fix issues
+pnpm run lint:check    # Check for issues
+pnpm run lint:fix      # Auto-fix issues
 ```
 
 Prettier: single quotes, trailing commas (es5), 2-space indent, 120 char line width. Pre-commit hook runs ESLint + Prettier via lint-staged.
@@ -223,6 +223,6 @@ Prettier: single quotes, trailing commas (es5), 2-space indent, 120 char line wi
 Uses Nx with conventional commits:
 
 ```bash
-npm run release       # Interactive
-npm run release:ci    # Non-interactive (CI)
+pnpm run release       # Interactive
+pnpm run release:ci    # Non-interactive (CI)
 ```

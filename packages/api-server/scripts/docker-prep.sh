@@ -7,13 +7,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 pushd "$REPO_ROOT" > /dev/null
 
 echo "Building SDK..."
-npm run --workspace=packages/sdk build
+pnpm --filter @appliance.sh/sdk run build
 
 echo "Building infra..."
-npm run --workspace=packages/infra build
+pnpm --filter @appliance.sh/infra run build
 
 echo "Building api-server..."
-npm run --workspace=packages/api-server build
+pnpm --filter @appliance.sh/api-server run build
 
 popd > /dev/null
 
@@ -31,7 +31,8 @@ cp -r "$REPO_ROOT/packages/infra/dist" "$STAGE_DIR/infra/dist"
 
 # Copy root package files for workspace install
 cp "$REPO_ROOT/package.json" "$STAGE_DIR/root-package.json"
-cp "$REPO_ROOT/package-lock.json" "$STAGE_DIR/root-package-lock.json"
+cp "$REPO_ROOT/pnpm-lock.yaml" "$STAGE_DIR/pnpm-lock.yaml"
+cp "$REPO_ROOT/pnpm-workspace.yaml" "$STAGE_DIR/pnpm-workspace.yaml"
 cp "$REPO_ROOT/tsconfig.json" "$STAGE_DIR/root-tsconfig.json"
 
 echo "Docker deps staged in .docker-deps/"
