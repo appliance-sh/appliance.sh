@@ -6,6 +6,9 @@ packages:
   - packages/install-aws
 
 onlyBuiltDependencies:
+  - '@pulumi/aws-native'
+  - '@pulumi/docker'
+  - '@pulumi/docker-build'
   - '@swc/core'
   - esbuild
   - nx
