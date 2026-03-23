@@ -10,7 +10,7 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ha, hb);
 }
 
-export const bootstrapRoutes = Router();
+export const bootstrapRoutes: Router = Router();
 
 bootstrapRoutes.post('/create-key', async (req, res) => {
   try {

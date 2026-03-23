@@ -3,7 +3,7 @@ import { deploymentInput } from '@appliance.sh/sdk';
 import { deploymentService } from '../../services/deployment.service';
 import { logger } from '../../logger';
 
-export const deploymentRoutes = Router();
+export const deploymentRoutes: Router = Router();
 
 deploymentRoutes.post('/', async (req, res) => {
   try {

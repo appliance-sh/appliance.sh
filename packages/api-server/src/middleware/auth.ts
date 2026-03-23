@@ -4,13 +4,6 @@ import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
 import { apiKeyService } from '../services/api-key.service';
 import { logger } from '../logger';
 
-declare module 'express-serve-static-core' {
-  interface Request {
-    apiKeyId?: string;
-    rawBody?: Buffer;
-  }
-}
-
 export async function signatureAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const signature = req.headers['signature'];
   const signatureInput = req.headers['signature-input'];

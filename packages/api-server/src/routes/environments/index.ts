@@ -9,7 +9,7 @@ interface EnvironmentParams {
   id?: string;
 }
 
-export const environmentRoutes = Router({ mergeParams: true });
+export const environmentRoutes: Router = Router({ mergeParams: true });
 
 environmentRoutes.post('/', async (req, res) => {
   try {

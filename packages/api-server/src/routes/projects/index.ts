@@ -3,7 +3,7 @@ import { projectInput } from '@appliance.sh/sdk';
 import { projectService } from '../../services/project.service';
 import { logger } from '../../logger';
 
-export const projectRoutes = Router();
+export const projectRoutes: Router = Router();
 
 projectRoutes.post('/', async (req, res) => {
   try {

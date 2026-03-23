@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { type Express } from 'express';
 import { indexRoutes } from './routes';
 
 import { projectRoutes } from './routes/projects';
@@ -9,7 +9,7 @@ import { bootstrapRoutes } from './routes/bootstrap';
 import { signatureAuth } from './middleware/auth';
 import { requestLogger, logger } from './logger';
 
-export function createApp() {
+export function createApp(): Express {
   const app = express();
 
   if (process.env.APPLIANCE_TRUST_PROXY) {
