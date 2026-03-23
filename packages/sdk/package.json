@@ -14,11 +14,11 @@
   },
   "types": "./dist/types",
   "scripts": {
-    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution nodenext --module NodeNext --outDir dist/esm && npm run postbuild && npm link",
+    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution nodenext --module NodeNext --outDir dist/esm && pnpm run postbuild",
     "build:watch": "tsc --module commonjs --outDir dist/cjs --watch --preserveWatchOutput",
     "clean": "rm -rf ./dist/",
-    "dev:setup": "npm link",
-    "postbuild": "npx ts-node scripts/postbuild.ts",
+    "dev:setup": "echo 'pnpm workspaces handle linking automatically'",
+    "postbuild": "pnpm exec ts-node scripts/postbuild.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {

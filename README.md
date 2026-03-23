@@ -7,7 +7,7 @@ A platform for installing and running applications on the cloud. Define your app
 ### 1. Install the CLI
 
 ```bash
-npm install --global appliance.sh
+pnpm add --global appliance.sh
 appliance --version
 ```
 

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { buildUploadService } from '../../services/build-upload.service';
 import { logger } from '../../logger';
 
-export const buildRoutes = Router();
+export const buildRoutes: Router = Router();
 
 buildRoutes.post('/', async (req, res) => {
   try {

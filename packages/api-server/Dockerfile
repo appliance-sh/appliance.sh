@@ -2,9 +2,12 @@ FROM node:22-slim AS build
 
 WORKDIR /app
 
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
 # Copy root workspace config (staged by docker-prep.sh)
 COPY .docker-deps/root-package.json package.json
-COPY .docker-deps/root-package-lock.json package-lock.json
+COPY .docker-deps/pnpm-lock.yaml pnpm-lock.yaml
+COPY .docker-deps/pnpm-workspace.yaml pnpm-workspace.yaml
 
 # Copy workspace package.json files for install
 COPY .docker-deps/sdk/package.json packages/sdk/
@@ -12,7 +15,7 @@ COPY .docker-deps/infra/package.json packages/infra/
 COPY package.json packages/api-server/
 
 # Install api-server dependencies via workspace
-RUN npm ci --ignore-scripts --workspace=packages/sdk --workspace=packages/infra --workspace=packages/api-server
+RUN pnpm install --frozen-lockfile --filter @appliance.sh/sdk --filter @appliance.sh/infra --filter @appliance.sh/api-server
 
 # Copy pre-built SDK and infra
 COPY .docker-deps/sdk/dist/ packages/sdk/dist/
@@ -22,20 +25,23 @@ COPY .docker-deps/infra/dist/ packages/infra/dist/
 COPY .docker-deps/root-tsconfig.json tsconfig.json
 COPY tsconfig.json packages/api-server/
 COPY src/ packages/api-server/src/
-RUN npm run --workspace=packages/api-server build
+RUN pnpm --filter @appliance.sh/api-server run build
 
 # --- Production stage ---
 FROM node:22-slim
 
 WORKDIR /app
 
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
 COPY .docker-deps/root-package.json package.json
-COPY .docker-deps/root-package-lock.json package-lock.json
+COPY .docker-deps/pnpm-lock.yaml pnpm-lock.yaml
+COPY .docker-deps/pnpm-workspace.yaml pnpm-workspace.yaml
 COPY .docker-deps/sdk/package.json packages/sdk/
 COPY .docker-deps/infra/package.json packages/infra/
 COPY package.json packages/api-server/
 
-RUN npm ci --ignore-scripts --omit=dev --workspace=packages/sdk --workspace=packages/infra --workspace=packages/api-server
+RUN pnpm install --frozen-lockfile --prod --filter @appliance.sh/sdk --filter @appliance.sh/infra --filter @appliance.sh/api-server
 
 # Copy built output
 COPY --from=build /app/packages/sdk/dist/ packages/sdk/dist/

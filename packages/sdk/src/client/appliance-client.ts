@@ -234,7 +234,7 @@ export class ApplianceClient {
       const response = await fetch(uploadUrl, {
         method: 'PUT',
         headers: { 'content-type': 'application/zip' },
-        body: data,
+        body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
         signal: controller.signal,
       });
 

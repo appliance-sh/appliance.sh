@@ -49,12 +49,6 @@ export const logger = {
   },
 };
 
-declare module 'express-serve-static-core' {
-  interface Request {
-    requestId?: string;
-  }
-}
-
 export function requestLogger(req: Request, res: Response, next: NextFunction): void {
   const requestId = (req.headers['x-request-id'] as string) || randomUUID();
   const start = Date.now();

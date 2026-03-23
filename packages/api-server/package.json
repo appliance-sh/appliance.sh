@@ -19,8 +19,8 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
-    "@appliance.sh/infra": "1.26.0",
-    "@appliance.sh/sdk": "1.26.0",
+    "@appliance.sh/infra": "workspace:*",
+    "@appliance.sh/sdk": "workspace:*",
     "@aws-sdk/client-ecr": "^3.1005.0",
     "@aws-sdk/client-s3": "^3.750.0",
     "@aws-sdk/s3-request-presigner": "^3.1009.0",
@@ -30,6 +30,7 @@
     "@eslint/eslintrc": "^3.2.0",
     "@eslint/js": "^9.18.0",
     "@types/express": "^5.0.0",
+    "@types/express-serve-static-core": "^5.1.1",
     "@types/node": "^22.10.7",
     "@types/supertest": "^6.0.2",
     "eslint": "^9.18.0",

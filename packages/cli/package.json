@@ -13,11 +13,11 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf ./dist/",
-    "dev:setup": "npm link \"@appliance.sh/sdk\" && npm install --global .",
+    "dev:setup": "pnpm link --global",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@appliance.sh/sdk": "1.26.0",
+    "@appliance.sh/sdk": "workspace:*",
     "@inquirer/prompts": "^7.10.1",
     "@types/archiver": "^7.0.0",
     "archiver": "^7.0.1",

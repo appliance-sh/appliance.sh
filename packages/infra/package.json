@@ -20,11 +20,11 @@
     "build:watch": "tsc --watch --preserveWatchOutput",
     "clean": "rm -rf ./dist/",
     "deploy:entrypoint": "ts-node src/index.ts",
-    "deploy": "npm run clean && pulumi up && npm run build",
-    "dev:setup": "npm link"
+    "deploy": "pnpm run clean && pulumi up && pnpm run build",
+    "dev:setup": "echo 'pnpm workspaces handle linking automatically'"
   },
   "dependencies": {
-    "@appliance.sh/sdk": "1.26.0",
+    "@appliance.sh/sdk": "workspace:*",
     "@pulumi/aws": "^7.16.0",
     "@pulumi/aws-native": "^1.48.0",
     "@pulumi/awsx": "^3.1.0",

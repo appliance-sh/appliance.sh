@@ -1,0 +1,12 @@
+packages:
+  - packages/sdk
+  - packages/cli
+  - packages/infra
+  - packages/api-server
+  - packages/install-aws
+
+onlyBuiltDependencies:
+  - '@swc/core'
+  - esbuild
+  - nx
+  - protobufjs
