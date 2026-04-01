@@ -28,9 +28,13 @@
     "dev:setup": "pnpm --filter @appliance.sh/sdk run dev:setup && pnpm --filter @appliance.sh/cli run dev:setup && pnpm --filter @appliance.sh/infra run dev:setup",
     "deploy": "pnpm --filter @appliance.sh/infra run deploy",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "prepare": "husky",
+    "prepare": "husky || true",
     "release": "nx release",
     "release:ci": "nx release --yes"
+  },
+  "private": true,
+  "nx": {
+    "includedScripts": []
   },
   "devDependencies": {
     "@appliance.sh/sdk": "workspace:*",

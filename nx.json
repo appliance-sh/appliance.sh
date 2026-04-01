@@ -20,15 +20,23 @@
     "version": {
       "conventionalCommits": true
     },
-    "groups": {
-      "packages": {
-        "projects": ["sdk", "cli", "install-aws", "api-server", "infra"],
-        "projectsRelationship": "fixed"
-      }
-    },
+    "projects": ["@appliance.sh/*", "appliance.sh"],
+    "projectsRelationship": "fixed",
+    "releaseTagPattern": "v{version}",
     "changelog": {
       "workspaceChangelog": {
         "createRelease": "github"
+      }
+    },
+    "conventionalCommits": {
+      "types": {
+        "feat": { "semverBump": "minor", "changelog": { "title": "Features" } },
+        "fix": { "semverBump": "patch", "changelog": { "title": "Bug Fixes" } },
+        "perf": { "semverBump": "patch", "changelog": { "title": "Performance" } },
+        "chore": { "semverBump": "patch", "changelog": { "title": "Chores" } },
+        "ci": { "semverBump": "patch", "changelog": { "title": "CI" } },
+        "docs": { "semverBump": "none", "changelog": { "title": "Documentation" } },
+        "refactor": { "semverBump": "patch", "changelog": { "title": "Refactoring" } }
       }
     }
   }
