@@ -4,6 +4,13 @@ WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@10 --activate
 
+# Disable husky git hooks (not needed in Docker)
+ENV HUSKY=0
+
+# Add the pulumi binary to the PATH
+RUN curl -fsSL https://get.pulumi.com | sh
+ENV PATH=$PATH:/root/.pulumi/bin
+
 # Copy root workspace config (staged by docker-prep.sh)
 COPY .docker-deps/root-package.json package.json
 COPY .docker-deps/pnpm-lock.yaml pnpm-lock.yaml
@@ -33,6 +40,13 @@ FROM node:22-slim
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@10 --activate
+
+# Disable husky git hooks (not needed in Docker)
+ENV HUSKY=0
+
+# Install the Pulumi binary and add it to the PATH
+RUN curl -fsSL https://get.pulumi.com | sh
+ENV PATH=$PATH:/root/.pulumi/bin
 
 COPY .docker-deps/root-package.json package.json
 COPY .docker-deps/pnpm-lock.yaml pnpm-lock.yaml
