@@ -1,3 +1,15 @@
+## 1.26.2 (2026-04-01)
+
+### Bug Fixes
+
+- **api-server:** build and container config ([1e6c161](https://github.com/appliance-sh/appliance.sh/commit/1e6c161))
+- **ci:** build and nx targets ([6d525b3](https://github.com/appliance-sh/appliance.sh/commit/6d525b3))
+- **ci:** better change detection ([be67e04](https://github.com/appliance-sh/appliance.sh/commit/be67e04))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.26.1 (2026-03-23)
 
 ### 🩹 Fixes
