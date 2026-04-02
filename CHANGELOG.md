@@ -1,3 +1,17 @@
+## 1.26.3 (2026-04-02)
+
+### Bug Fixes
+
+- **ci:** setup npm trusted publisher ([abb9a11](https://github.com/appliance-sh/appliance.sh/commit/abb9a11))
+
+### Chores
+
+- remove extraneous appliance manifest ([4d95c6a](https://github.com/appliance-sh/appliance.sh/commit/4d95c6a))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.26.2 (2026-04-01)
 
 ### Bug Fixes
