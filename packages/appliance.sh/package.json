@@ -1,0 +1,18 @@
+{
+  "name": "appliance.sh",
+  "version": "1.26.2",
+  "description": "Install and run applications on the cloud. Alias for @appliance.sh/cli.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/appliance-sh/appliance.sh.git",
+    "directory": "packages/appliance.sh"
+  },
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "bin": {
+    "appliance": "bin/appliance.js"
+  },
+  "dependencies": {
+    "@appliance.sh/cli": "workspace:*"
+  }
+}

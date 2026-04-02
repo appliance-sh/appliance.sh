@@ -1,9 +1,14 @@
 {
   "name": "@appliance.sh/api-server",
   "version": "1.26.2",
+  "private": true,
   "description": "",
   "author": "Eliot Lim",
-  "repository": "https://github.com/appliance-sh/appliance.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/appliance-sh/appliance.sh.git",
+    "directory": "packages/api-server"
+  },
   "license": "MIT",
   "scripts": {
     "build": "tsc",

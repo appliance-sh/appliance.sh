@@ -20,7 +20,7 @@
     "version": {
       "conventionalCommits": true
     },
-    "projects": ["@appliance.sh/*", "appliance.sh"],
+    "projects": ["@appliance.sh/*", "appliance.sh", "appliance-workspace"],
     "projectsRelationship": "fixed",
     "releaseTagPattern": "v{version}",
     "changelog": {

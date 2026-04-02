@@ -34,6 +34,7 @@
   },
   "private": true,
   "nx": {
+    "name": "appliance-workspace",
     "includedScripts": []
   },
   "devDependencies": {

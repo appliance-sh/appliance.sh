@@ -2,7 +2,11 @@
   "name": "@appliance.sh/cli",
   "version": "1.26.2",
   "description": "Shell for installing, running, and developing applications on the Appliance platform",
-  "repository": "https://github.com/appliance-sh/appliance.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/appliance-sh/appliance.sh.git",
+    "directory": "packages/cli"
+  },
   "license": "MIT",
   "author": "Eliot Lim",
   "type": "module",

@@ -4,6 +4,7 @@ packages:
   - packages/infra
   - packages/api-server
   - packages/install-aws
+  - packages/appliance.sh
 
 onlyBuiltDependencies:
   - '@pulumi/aws-native'

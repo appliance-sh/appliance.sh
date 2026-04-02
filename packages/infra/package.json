@@ -1,8 +1,13 @@
 {
   "name": "@appliance.sh/infra",
   "version": "1.26.2",
+  "private": true,
   "description": "Deploy the Appliance Infrastructure",
-  "repository": "https://github.com/appliance-sh/appliance.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/appliance-sh/appliance.sh.git",
+    "directory": "packages/infra"
+  },
   "license": "MIT",
   "author": "Eliot Lim",
   "main": "src/index.ts",
