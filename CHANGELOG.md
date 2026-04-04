@@ -1,3 +1,13 @@
+## 1.27.0 (2026-04-04)
+
+### Features
+
+- **api-server:** switch to crane ([c8d098b](https://github.com/appliance-sh/appliance.sh/commit/c8d098b))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.26.3 (2026-04-02)
 
 ### Bug Fixes
