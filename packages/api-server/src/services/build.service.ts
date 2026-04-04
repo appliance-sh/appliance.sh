@@ -2,7 +2,7 @@ import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { applianceBaseConfig, applianceInput } from '@appliance.sh/sdk';
 import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
-import { execFileSync } from 'child_process';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -87,7 +87,7 @@ export class BuildService {
       const manifest = applianceInput.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf-8')));
 
       if (manifest.type === 'container') {
-        return this.resolveContainer(tmpDir, manifest, tag, config);
+        return await this.resolveContainer(tmpDir, manifest, tag, config);
       } else if (manifest.type === 'framework') {
         return this.resolveFramework(manifest, s3Key, config);
       } else {
@@ -135,7 +135,8 @@ export class BuildService {
 
   /**
    * Container builds are fully pre-processed by the CLI (Lambda Web Adapter
-   * already injected). The server just loads the image and pushes it to ECR.
+   * already injected). The server pushes the image tar directly to ECR using
+   * crane (no Docker daemon required).
    * All subprocess calls use execFileSync (array args) to prevent shell injection.
    */
   private async resolveContainer(
@@ -153,13 +154,7 @@ export class BuildService {
       throw new Error(`Build missing image.tar. Extracted contents: ${extracted.join(', ')}`);
     }
 
-    // Load the pre-built Lambda-ready image
-    const loadOutput = execFileSync('docker', ['load', '-i', imageTarPath], { encoding: 'utf-8' });
-    const loadedMatch = loadOutput.match(/Loaded image(?: ID)?:\s*(.+)/);
-    if (!loadedMatch) throw new Error(`Failed to parse docker load output: ${loadOutput}`);
-    const loadedImage = loadedMatch[1].trim();
-
-    // Auth with ECR
+    // Auth with ECR via crane
     const ecr = new ECRClient({ region: config.aws.region });
     const authResult = await ecr.send(new GetAuthorizationTokenCommand({}));
     const authData = authResult.authorizationData?.[0];
@@ -169,22 +164,21 @@ export class BuildService {
 
     const decoded = Buffer.from(authData.authorizationToken, 'base64').toString();
     const [username, password] = decoded.split(':');
-    execFileSync('docker', ['login', '--username', username, '--password-stdin', authData.proxyEndpoint], {
+    const registryHost = authData.proxyEndpoint.replace(/^https?:\/\//, '');
+    execFileSync('crane', ['auth', 'login', registryHost, '-u', username, '--password-stdin'], {
       input: password,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Tag and push
+    // Push image tar directly to ECR (no daemon, no load/tag step)
     const remoteTag = `${ecrRepositoryUrl}:${tag}`;
-    execFileSync('docker', ['tag', loadedImage, remoteTag], { stdio: 'pipe' });
-    execFileSync('docker', ['push', remoteTag], { stdio: 'pipe' });
+    execFileSync('crane', ['push', imageTarPath, remoteTag], { stdio: 'pipe' });
 
-    // Get digest
+    // Get digest for immutable image reference
     let imageUri: string;
     try {
-      imageUri = execFileSync('docker', ['inspect', '--format={{index .RepoDigests 0}}', remoteTag], {
-        encoding: 'utf-8',
-      }).trim();
+      const digest = execFileSync('crane', ['digest', remoteTag], { encoding: 'utf-8' }).trim();
+      imageUri = `${ecrRepositoryUrl}@${digest}`;
     } catch {
       imageUri = remoteTag;
     }

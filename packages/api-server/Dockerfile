@@ -7,8 +7,10 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Add the pulumi binary to the PATH
-RUN curl -fsSL https://get.pulumi.com | sh
+# Install curl (not included in node:22-slim) and Pulumi (needed by postinstall)
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://get.pulumi.com | sh
 ENV PATH=$PATH:/root/.pulumi/bin
 
 # Copy root workspace config (staged by docker-prep.sh)
@@ -44,8 +46,12 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Install the Pulumi binary and add it to the PATH
-RUN curl -fsSL https://get.pulumi.com | sh
+# Install curl (not included in node:22-slim), then Pulumi and crane
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://get.pulumi.com | sh \
+    && curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+       | tar -xzf - -C /usr/local/bin crane
 ENV PATH=$PATH:/root/.pulumi/bin
 
 COPY .docker-deps/root-package.json package.json
