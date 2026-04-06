@@ -34,7 +34,14 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     }
   }
 
-  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const rawHost = req.app.get('trust proxy') ? req.get('x-forwarded-host') || req.get('host') : req.get('host');
+  const host = /^[a-zA-Z0-9._-]+(:\d+)?$/.test(rawHost ?? '') ? rawHost : undefined;
+  if (!host) {
+    logger.warn('auth failed: invalid host header', { requestId: req.requestId, path: req.originalUrl });
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const url = `${req.protocol}://${host}${req.originalUrl}`;
 
   const result = await verifySignedRequest(
     {
