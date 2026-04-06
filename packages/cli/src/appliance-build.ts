@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -35,7 +35,7 @@ program
     if (appliance.scripts?.build) {
       console.log(chalk.dim(`Running build: ${appliance.scripts.build}`));
       try {
-        execSync(appliance.scripts.build, { stdio: 'inherit' });
+        execFileSync('/bin/sh', ['-c', appliance.scripts.build], { stdio: 'inherit' });
       } catch {
         console.error(chalk.red('Build script failed.'));
         process.exit(1);
@@ -81,7 +81,9 @@ async function packageContainer(archive: archiver.Archiver, appliance: Appliance
   if (!appliance.scripts?.build) {
     console.log(chalk.dim(`Building container: docker build --platform ${platform} --provenance=false -t ${name} .`));
     try {
-      execSync(`docker build --platform ${platform} --provenance=false -t ${name} .`, { stdio: 'inherit' });
+      execFileSync('docker', ['build', '--platform', platform, '--provenance=false', '-t', name, '.'], {
+        stdio: 'inherit',
+      });
     } catch {
       console.error(chalk.red('Docker build failed.'));
       process.exit(1);
@@ -104,9 +106,12 @@ async function packageContainer(archive: archiver.Archiver, appliance: Appliance
         `ENV AWS_LWA_PORT=${port}`,
       ].join('\n')
     );
-    execSync(
-      `docker build --platform ${platform} --provenance=false -f "${wrapperDockerfile}" -t "${lambdaImageName}" "${tmpDir}"`,
-      { stdio: 'inherit' }
+    execFileSync(
+      'docker',
+      ['build', '--platform', platform, '--provenance=false', '-f', wrapperDockerfile, '-t', lambdaImageName, tmpDir],
+      {
+        stdio: 'inherit',
+      }
     );
   } catch {
     console.error(chalk.red('Failed to inject Lambda Web Adapter.'));
@@ -119,7 +124,7 @@ async function packageContainer(archive: archiver.Archiver, appliance: Appliance
   console.log(chalk.dim(`Exporting image: ${lambdaImageName}`));
   const imageTar = `${name}-image.tar`;
   try {
-    execSync(`docker save -o ${imageTar} ${lambdaImageName}`, { stdio: 'inherit' });
+    execFileSync('docker', ['save', '-o', imageTar, lambdaImageName], { stdio: 'inherit' });
     archive.file(path.resolve(imageTar), { name: 'image.tar' });
   } finally {
     archive.on('end', () => {
@@ -173,8 +178,8 @@ function installDependencies(framework: string) {
   if (framework === 'python' && fs.existsSync('requirements.txt')) {
     console.log(chalk.dim('Creating virtual environment and installing dependencies...'));
     try {
-      execSync(`python -m venv ${PYTHON_VENV_DIR}`, { stdio: 'inherit' });
-      execSync(`${PYTHON_VENV_DIR}/bin/pip install -r requirements.txt -q`, { stdio: 'inherit' });
+      execFileSync('python', ['-m', 'venv', PYTHON_VENV_DIR], { stdio: 'inherit' });
+      execFileSync(`${PYTHON_VENV_DIR}/bin/pip`, ['install', '-r', 'requirements.txt', '-q'], { stdio: 'inherit' });
     } catch {
       console.error(chalk.red('Failed to install Python dependencies.'));
       process.exit(1);
