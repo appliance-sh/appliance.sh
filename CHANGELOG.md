@@ -1,3 +1,14 @@
+## 1.27.1 (2026-04-06)
+
+### Bug Fixes
+
+- **api-server:** host derivation ([a9feb68](https://github.com/appliance-sh/appliance.sh/commit/a9feb68))
+- **cli:** use execFileSync ([9099c92](https://github.com/appliance-sh/appliance.sh/commit/9099c92))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.27.0 (2026-04-04)
 
 ### Features
