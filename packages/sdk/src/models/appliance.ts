@@ -28,6 +28,10 @@ export const applianceTypeBase = z.object({
   scripts: z.record(z.string(), z.string()).optional(),
   memory: z.number().int().min(128).max(10240).optional(),
   timeout: z.number().int().min(1).max(900).optional(),
+  // Ephemeral scratch storage in MB. Cloud-agnostic at the manifest level;
+  // the backend maps it to the target's equivalent (AWS: Lambda
+  // ephemeralStorage, i.e. /tmp size).
+  storage: z.number().int().min(512).max(10240).optional(),
 });
 
 export const applianceTypeContainerInput = applianceTypeBase.extend({

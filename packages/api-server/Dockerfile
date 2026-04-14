@@ -7,11 +7,15 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Install curl (not included in node:22-slim) and Pulumi (needed by postinstall)
+# Install curl (not included in node:22-slim) and Pulumi (needed by postinstall).
+# Pulumi installs into $HOME/.pulumi/bin (here, /root/.pulumi/bin). On Lambda
+# the container runs as a non-root user that cannot traverse /root (mode 0700),
+# so we copy the binaries into /usr/local/bin where they are world-executable.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://get.pulumi.com | sh
-ENV PATH=$PATH:/root/.pulumi/bin
+    && curl -fsSL https://get.pulumi.com | sh \
+    && cp /root/.pulumi/bin/* /usr/local/bin/ \
+    && rm -rf /root/.pulumi
 
 # Copy root workspace config (staged by docker-prep.sh)
 COPY .docker-deps/root-package.json package.json
@@ -46,13 +50,25 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Install curl (not included in node:22-slim), then Pulumi and crane
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+# Install curl and unzip (not included in node:22-slim), then Pulumi and crane.
+# unzip provides both `unzip` and `zipinfo`, which build.service.ts uses to
+# validate and extract uploaded appliance builds.
+#
+# Pulumi installs to /root/.pulumi/bin by default. On Lambda the container runs
+# as a non-root user that cannot traverse /root (mode 0700), so we relocate the
+# binaries to /usr/local/bin where they are world-executable.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://get.pulumi.com | sh \
+    && cp /root/.pulumi/bin/* /usr/local/bin/ \
+    && rm -rf /root/.pulumi \
     && curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
        | tar -xzf - -C /usr/local/bin crane
-ENV PATH=$PATH:/root/.pulumi/bin
+
+# Crane writes its auth config to $DOCKER_CONFIG (or $HOME/.docker by default).
+# On Lambda $HOME points at a read-only sandbox dir, so we direct crane at /tmp
+# which is the only writable filesystem in the Lambda execution environment.
+ENV DOCKER_CONFIG=/tmp/.docker
 
 COPY .docker-deps/root-package.json package.json
 COPY .docker-deps/pnpm-lock.yaml pnpm-lock.yaml
@@ -62,6 +78,20 @@ COPY .docker-deps/infra/package.json packages/infra/
 COPY package.json packages/api-server/
 
 RUN pnpm install --frozen-lockfile --prod --filter @appliance.sh/sdk --filter @appliance.sh/infra --filter @appliance.sh/api-server
+
+# Precache the Pulumi resource plugins that ApplianceDeploymentService uses.
+# Versions are read from the installed node_modules so they track whatever
+# pnpm resolved from the lockfile — no hardcoded list to drift. The plugin
+# binaries land in /opt/pulumi-cache/plugins and are symlinked into the
+# runtime PULUMI_HOME by ApplianceDeploymentService.ensurePluginCache at
+# first use, avoiding a 150+ MB cold-start download.
+RUN set -eux; \
+    AWS_VERSION=$(node -p "require('./packages/infra/node_modules/@pulumi/aws/package.json').version"); \
+    AWS_NATIVE_VERSION=$(node -p "require('./packages/infra/node_modules/@pulumi/aws-native/package.json').version"); \
+    AWSX_VERSION=$(node -p "require('./packages/infra/node_modules/@pulumi/awsx/package.json').version"); \
+    PULUMI_HOME=/opt/pulumi-cache pulumi plugin install resource aws "v$AWS_VERSION"; \
+    PULUMI_HOME=/opt/pulumi-cache pulumi plugin install resource aws-native "v$AWS_NATIVE_VERSION"; \
+    PULUMI_HOME=/opt/pulumi-cache pulumi plugin install resource awsx "v$AWSX_VERSION"
 
 # Copy built output
 COPY --from=build /app/packages/sdk/dist/ packages/sdk/dist/

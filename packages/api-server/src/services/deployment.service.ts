@@ -5,22 +5,35 @@ import {
   DeploymentAction,
   EnvironmentStatus,
   generateId,
+  signRequest,
+  type SigningCredentials,
 } from '@appliance.sh/sdk';
-import { createApplianceDeploymentService } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
 import { projectService } from './project.service';
-import { buildService } from './build.service';
+import { executeDeployment, type WorkerEvent } from './deployment-executor.service';
+import { logger } from '../logger';
 
 const COLLECTION = 'deployments';
 
+// Client-side timeout for dispatching to the worker. We only need enough
+// time for the request to reach the worker and start processing — we do
+// NOT wait for the deployment to finish. The worker continues running
+// even if we abort the connection.
+const DISPATCH_TIMEOUT_MS = 5000;
+
 export class DeploymentService {
-  async execute(input: DeploymentInput): Promise<Deployment> {
+  async execute(input: DeploymentInput, caller: SigningCredentials): Promise<Deployment> {
     const storage = getStorageService();
 
     const environment = await environmentService.get(input.environmentId);
     if (!environment) {
       throw new Error(`Environment not found: ${input.environmentId}`);
+    }
+
+    const project = await projectService.get(environment.projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${environment.projectId}`);
     }
 
     const now = new Date().toISOString();
@@ -36,74 +49,94 @@ export class DeploymentService {
 
     await storage.set(COLLECTION, deployment.id, deployment);
 
-    // Update deployment to in_progress
-    deployment.status = DeploymentStatus.InProgress;
-    await storage.set(COLLECTION, deployment.id, deployment);
-
-    // Update environment status
     const envStatus =
       input.action === DeploymentAction.Deploy ? EnvironmentStatus.Deploying : EnvironmentStatus.Destroying;
     await environmentService.updateStatus(environment.id, envStatus);
 
-    // Look up the project for tagging
-    const project = await projectService.get(environment.projectId);
-    if (!project) {
-      throw new Error(`Project not found: ${environment.projectId}`);
-    }
-
-    const metadata = {
-      projectId: project.id,
-      projectName: project.name,
-      environmentId: environment.id,
-      environmentName: environment.name,
+    const workerEvent: WorkerEvent = {
       deploymentId: deployment.id,
-      stackName: environment.stackName,
+      input,
+      metadata: {
+        projectId: project.id,
+        projectName: project.name,
+        environmentId: environment.id,
+        environmentName: environment.name,
+        deploymentId: deployment.id,
+        stackName: environment.stackName,
+      },
     };
 
-    // Execute the deployment
     try {
-      const infraService = createApplianceDeploymentService();
-
-      let result;
-      if (input.action === DeploymentAction.Deploy) {
-        // Resolve the build into cloud-specific params if present
-        const build = input.buildId
-          ? await buildService.resolve(input.buildId, `${environment.stackName}-${deployment.id}`)
-          : undefined;
-
-        // Merge deploy-time environment vars (from CLI --env-file) with build-resolved ones
-        if (input.environment) {
-          if (!build) {
-            throw new Error('Environment variables require a build');
-          }
-          build.environment = { ...input.environment, ...build.environment };
-        }
-
-        result = await infraService.deploy(environment.stackName, metadata, build);
-      } else {
-        result = await infraService.destroy(environment.stackName);
-      }
-
-      deployment.status = DeploymentStatus.Succeeded;
-      deployment.completedAt = new Date().toISOString();
-      deployment.message = result.message;
-      deployment.idempotentNoop = result.idempotentNoop;
-      await storage.set(COLLECTION, deployment.id, deployment);
-
-      // Update environment status
-      const finalEnvStatus =
-        input.action === DeploymentAction.Deploy ? EnvironmentStatus.Deployed : EnvironmentStatus.Destroyed;
-      await environmentService.updateStatus(environment.id, finalEnvStatus);
+      await this.dispatch(workerEvent, caller);
     } catch (error) {
+      logger.error('failed to dispatch worker', error, { deploymentId: deployment.id });
       deployment.status = DeploymentStatus.Failed;
       deployment.completedAt = new Date().toISOString();
-      deployment.message = error instanceof Error ? error.message : String(error);
+      deployment.message = `Failed to dispatch worker: ${error instanceof Error ? error.message : String(error)}`;
       await storage.set(COLLECTION, deployment.id, deployment);
-
       await environmentService.updateStatus(environment.id, EnvironmentStatus.Failed);
     }
 
     return deployment;
+  }
+
+  /**
+   * Dispatches a job to a worker. If WORKER_URL is set, the job is sent
+   * via HTTP to a separate worker container. Otherwise it runs inline
+   * (useful for local dev and single-container deployments).
+   *
+   * The dispatch is re-signed with the ORIGINAL caller's API key. This
+   * means the worker's /api/internal routes authenticate against the same
+   * shared api-key store as the data plane — no separate worker secret
+   * to leak, and the worker can attribute the job back to the real
+   * caller for audit purposes.
+   */
+  private async dispatch(event: WorkerEvent, caller: SigningCredentials): Promise<void> {
+    const workerUrl = process.env.WORKER_URL;
+    if (!workerUrl) {
+      // Inline execution — run in background, don't await.
+      executeDeployment(event).catch((err) => {
+        logger.error('inline deployment execution failed', err, { deploymentId: event.deploymentId });
+      });
+      return;
+    }
+
+    const url = `${workerUrl.replace(/\/$/, '')}/api/internal/jobs/deployment`;
+    const body = JSON.stringify(event);
+    const baseHeaders: Record<string, string> = { 'content-type': 'application/json' };
+
+    const sigHeaders = await signRequest(caller, { method: 'POST', url, headers: baseHeaders, body });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), DISPATCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { ...baseHeaders, ...sigHeaders },
+        body,
+        signal: controller.signal,
+      });
+
+      // If we got a response within the timeout window, surface any errors.
+      if (!response.ok) {
+        const responseBody = await response.text();
+        throw new Error(`Worker returned ${response.status}: ${responseBody}`);
+      }
+    } catch (error) {
+      // AbortError is expected — we only wait long enough for the request
+      // to reach the worker. The worker continues running even if we
+      // abort the client side of the connection.
+      if (error instanceof Error && error.name === 'AbortError') {
+        logger.info('worker dispatch aborted (expected, worker continues)', {
+          deploymentId: event.deploymentId,
+        });
+        return;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async get(id: string): Promise<Deployment | null> {

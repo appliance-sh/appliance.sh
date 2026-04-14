@@ -17,6 +17,7 @@ export interface ResolvedBuild {
   environment?: Record<string, string>;
   memory?: number;
   timeout?: number;
+  storage?: number;
 }
 
 function getBaseConfig() {
@@ -130,6 +131,7 @@ export class BuildService {
       },
       memory: manifest.memory,
       timeout: manifest.timeout,
+      storage: manifest.storage,
     };
   }
 
@@ -183,7 +185,7 @@ export class BuildService {
       imageUri = remoteTag;
     }
 
-    return { imageUri, memory: manifest.memory, timeout: manifest.timeout };
+    return { imageUri, memory: manifest.memory, timeout: manifest.timeout, storage: manifest.storage };
   }
 }
 

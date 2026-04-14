@@ -4,6 +4,13 @@ import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
 import { apiKeyService } from '../services/api-key.service';
 import { logger } from '../logger';
 
+/**
+ * Verify HTTP Message Signatures (RFC 9421) against the shared api-key
+ * store. Used for both data-plane `/api/v1/*` routes and the internal
+ * server→worker `/api/internal/*` routes — the server re-signs each worker
+ * dispatch with the original caller's key, so both sides share the same
+ * key lookup.
+ */
 export async function signatureAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const signature = req.headers['signature'];
   const signatureInput = req.headers['signature-input'];
@@ -14,7 +21,6 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     return;
   }
 
-  // Verify Content-Digest for requests with body
   if (req.rawBody && req.rawBody.length > 0) {
     const contentDigest = req.headers['content-digest'] as string | undefined;
     if (!contentDigest) {
@@ -57,14 +63,17 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   );
 
   if (!result.verified) {
-    logger.warn('auth failed: invalid signature', { requestId: req.requestId, path: req.originalUrl });
+    logger.warn('auth failed: invalid signature', {
+      requestId: req.requestId,
+      path: req.originalUrl,
+      error: result.error,
+    });
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   req.apiKeyId = result.keyId;
 
-  // Fire-and-forget lastUsed update
   if (result.keyId) {
     apiKeyService.updateLastUsed(result.keyId).catch(() => {});
   }

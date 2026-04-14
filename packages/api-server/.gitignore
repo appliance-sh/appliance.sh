@@ -59,9 +59,10 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 .pulumi-state/
 
 # Environment variables
-!.env.example
 .env
 .env.*
+!.env.example
+!.env.*.example
 
 # Docker build staging
 .docker-deps/

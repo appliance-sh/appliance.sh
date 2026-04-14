@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { deploymentInput } from '@appliance.sh/sdk';
 import { deploymentService } from '../../services/deployment.service';
+import { apiKeyService } from '../../services/api-key.service';
 import { logger } from '../../logger';
 
 export const deploymentRoutes: Router = Router();
@@ -14,8 +15,26 @@ deploymentRoutes.post('/', async (req, res) => {
       action: input.action,
       buildId: input.buildId,
     });
-    const deployment = await deploymentService.execute(input);
-    logger.info('deployment completed', {
+
+    // The worker dispatch re-signs the internal request with the same
+    // API key the caller used here, so the worker verifies against the
+    // shared api-key store instead of a separate shared secret. Fetch
+    // the full key now while the request context is still in scope.
+    if (!req.apiKeyId) {
+      res.status(401).json({ error: 'Unauthenticated' });
+      return;
+    }
+    const callerKey = await apiKeyService.getByKeyId(req.apiKeyId);
+    if (!callerKey) {
+      res.status(401).json({ error: 'Api key not found' });
+      return;
+    }
+
+    const deployment = await deploymentService.execute(input, {
+      keyId: callerKey.id,
+      secret: callerKey.secret,
+    });
+    logger.info('deployment dispatched', {
       requestId: req.requestId,
       deploymentId: deployment.id,
       status: deployment.status,
