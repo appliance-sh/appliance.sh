@@ -18,5 +18,6 @@ export default defineConfig([
   pluginReact.configs.flat.recommended,
   globalIgnores([
     'packages/*/dist/**/*', // ignore all contents in and under the `dist/` directories
+    '.nx/cache/**/*', // ignore all files cached by the Nx build system
   ]),
 ]);
