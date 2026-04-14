@@ -78,6 +78,16 @@ export class ApplianceStack extends pulumi.ComponentResource {
   constructor(name: string, args: ApplianceStackArgs, opts: ApplianceStackOpts) {
     super('appliance:aws:ApplianceStack', name, args, opts);
 
+    // CloudFront is the only supported ingress — the Lambda Function URL is
+    // always created with AWS_IAM auth and is intended to be invoked either
+    // by the CloudFront distribution (via OAC) or by the edge router role.
+    // Refuse to build a stack that would expose the function URL publicly.
+    if (!args.config.aws.cloudfrontDistributionId) {
+      throw new Error(
+        'ApplianceStack requires a cloudfrontDistributionId in base config — publicly accessible Lambda Function URLs are not supported.'
+      );
+    }
+
     // Short ID for AWS resource names (subject to 64-char limits)
     const rid = toResourceId(name);
     // DNS-safe label (max 63 chars per label)
@@ -206,12 +216,14 @@ export class ApplianceStack extends pulumi.ComponentResource {
       );
     }
 
-    // lambda url
+    // lambda url — always AWS_IAM. The only supported callers are the
+    // CloudFront distribution (via OAC) and the edge-router Lambda@Edge
+    // role, both of which are granted invoke permission below.
     this.lambdaUrl = new aws.lambda.FunctionUrl(
       `${rid}-url`,
       {
         functionName: this.lambda.name,
-        authorizationType: args.config.aws.cloudfrontDistributionId ? 'AWS_IAM' : 'NONE',
+        authorizationType: 'AWS_IAM',
       },
       defaultOpts
     );
@@ -219,59 +231,45 @@ export class ApplianceStack extends pulumi.ComponentResource {
     // DNS uses the full stack name, not the truncated resource ID
     this.dnsRecord = pulumi.interpolate`${dnsLabel}.${args.config.domainName ?? ''}`;
 
-    if (args.config.aws.cloudfrontDistributionId) {
+    new aws.lambda.Permission(
+      `${rid}-cf-invoke-url`,
+      {
+        function: this.lambda.name,
+        action: 'lambda:InvokeFunctionUrl',
+        principal: 'cloudfront.amazonaws.com',
+        functionUrlAuthType: 'AWS_IAM',
+        sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
+          aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
+        }:distribution/${args.config.aws.cloudfrontDistributionId}`,
+        statementId: 'FunctionURLAllowCloudFrontAccess',
+      },
+      defaultOpts
+    );
+
+    // Grant the edge router role permission to invoke the Lambda Function URL
+    // The edge router role is the execution role of the Lambda@Edge function that signs requests
+    if (args.config.aws.edgeRouterRoleArn) {
       new aws.lambda.Permission(
-        `${rid}-cf-invoke-url`,
+        `${rid}-edge-invoke-url`,
         {
           function: this.lambda.name,
           action: 'lambda:InvokeFunctionUrl',
-          principal: 'cloudfront.amazonaws.com',
+          principal: args.config.aws.edgeRouterRoleArn,
           functionUrlAuthType: 'AWS_IAM',
-          sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
-            aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
-          }:distribution/${args.config.aws.cloudfrontDistributionId}`,
-          statementId: 'FunctionURLAllowCloudFrontAccess',
+          statementId: 'FunctionURLAllowEdgeRouterRoleAccess',
         },
         defaultOpts
       );
 
-      // Grant the edge router role permission to invoke the Lambda Function URL
-      // The edge router role is the execution role of the Lambda@Edge function that signs requests
-      if (args.config.aws.edgeRouterRoleArn) {
-        new aws.lambda.Permission(
-          `${rid}-edge-invoke-url`,
-          {
-            function: this.lambda.name,
-            action: 'lambda:InvokeFunctionUrl',
-            principal: args.config.aws.edgeRouterRoleArn,
-            functionUrlAuthType: 'AWS_IAM',
-            statementId: 'FunctionURLAllowEdgeRouterRoleAccess',
-          },
-          defaultOpts
-        );
-
-        new awsNative.lambda.Permission(
-          `${rid}-edge-invoke`,
-          {
-            action: 'lambda:InvokeFunction',
-            principal: args.config.aws.edgeRouterRoleArn,
-            functionName: this.lambda.name,
-            invokedViaFunctionUrl: true,
-          },
-          defaultNativeOpts
-        );
-      }
-    } else {
-      new aws.lambda.Permission(
-        `${rid}-public-invoke-url`,
+      new awsNative.lambda.Permission(
+        `${rid}-edge-invoke`,
         {
-          function: this.lambda.name,
-          action: 'lambda:InvokeFunctionUrl',
-          principal: '*',
-          functionUrlAuthType: 'NONE',
-          statementId: 'FunctionURLAllowPublicAccess',
+          action: 'lambda:InvokeFunction',
+          principal: args.config.aws.edgeRouterRoleArn,
+          functionName: this.lambda.name,
+          invokedViaFunctionUrl: true,
         },
-        defaultOpts
+        defaultNativeOpts
       );
     }
 

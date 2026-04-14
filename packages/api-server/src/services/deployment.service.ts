@@ -22,6 +22,13 @@ const COLLECTION = 'deployments';
 // even if we abort the connection.
 const DISPATCH_TIMEOUT_MS = 5000;
 
+export class EnvironmentBusyError extends Error {
+  constructor(environmentId: string, status: EnvironmentStatus) {
+    super(`Environment ${environmentId} is ${status}`);
+    this.name = 'EnvironmentBusyError';
+  }
+}
+
 export class DeploymentService {
   async execute(input: DeploymentInput, caller: SigningCredentials): Promise<Deployment> {
     const storage = getStorageService();
@@ -29,6 +36,16 @@ export class DeploymentService {
     const environment = await environmentService.get(input.environmentId);
     if (!environment) {
       throw new Error(`Environment not found: ${input.environmentId}`);
+    }
+
+    // Refuse to start a new deployment while a transition is in flight
+    // for this environment — overlapping Pulumi runs on the same stack
+    // would race on state. Only `Deploying` and `Destroying` are rejected:
+    // `Pending` is the initial state (must allow the first deploy), and
+    // terminal states (`Deployed`, `Destroyed`, `Failed`) are all safe to
+    // start a new deployment from.
+    if (environment.status === EnvironmentStatus.Deploying || environment.status === EnvironmentStatus.Destroying) {
+      throw new EnvironmentBusyError(environment.id, environment.status);
     }
 
     const project = await projectService.get(environment.projectId);

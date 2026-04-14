@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { deploymentInput } from '@appliance.sh/sdk';
-import { deploymentService } from '../../services/deployment.service';
+import { deploymentService, EnvironmentBusyError } from '../../services/deployment.service';
 import { apiKeyService } from '../../services/api-key.service';
 import { logger } from '../../logger';
 
@@ -41,8 +41,16 @@ deploymentRoutes.post('/', async (req, res) => {
     });
     res.status(201).json(deployment);
   } catch (error) {
+    if (error instanceof EnvironmentBusyError) {
+      logger.warn('deployment rejected: environment busy', {
+        requestId: req.requestId,
+        error: error.message,
+      });
+      res.status(409).json({ error: 'Environment busy' });
+      return;
+    }
     logger.error('execute deployment failed', error, { requestId: req.requestId });
-    res.status(400).json({ error: 'Failed to execute deployment', message: String(error) });
+    res.status(400).json({ error: 'Failed to execute deployment' });
   }
 });
 

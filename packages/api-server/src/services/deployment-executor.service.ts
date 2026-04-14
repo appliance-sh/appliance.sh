@@ -1,4 +1,11 @@
-import { Deployment, DeploymentInput, DeploymentStatus, DeploymentAction, EnvironmentStatus } from '@appliance.sh/sdk';
+import {
+  Deployment,
+  DeploymentStatus,
+  DeploymentAction,
+  EnvironmentStatus,
+  deploymentInput,
+  z,
+} from '@appliance.sh/sdk';
 import { createApplianceDeploymentService, type ApplianceStackMetadata } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
@@ -7,11 +14,24 @@ import { logger } from '../logger';
 
 const COLLECTION = 'deployments';
 
-export interface WorkerEvent {
-  deploymentId: string;
-  input: DeploymentInput;
-  metadata: ApplianceStackMetadata;
-}
+// Annotated with z.ZodType<ApplianceStackMetadata> so the compiler flags
+// drift if the infra-side interface changes shape.
+const applianceStackMetadataSchema: z.ZodType<ApplianceStackMetadata> = z.object({
+  projectId: z.string().min(1),
+  projectName: z.string().min(1),
+  environmentId: z.string().min(1),
+  environmentName: z.string().min(1),
+  deploymentId: z.string().min(1),
+  stackName: z.string().min(1),
+});
+
+export const workerEventSchema = z.object({
+  deploymentId: z.string().min(1),
+  input: deploymentInput,
+  metadata: applianceStackMetadataSchema,
+});
+
+export type WorkerEvent = z.infer<typeof workerEventSchema>;
 
 /**
  * Execute a deployment job: resolve build, run Pulumi, update status.
@@ -39,21 +59,31 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
     const infraService = createApplianceDeploymentService();
 
     let result;
-    if (input.action === DeploymentAction.Deploy) {
-      const build = input.buildId
-        ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deployment.id}`)
-        : undefined;
+    switch (input.action) {
+      case DeploymentAction.Deploy: {
+        const build = input.buildId
+          ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deployment.id}`)
+          : undefined;
 
-      if (input.environment) {
-        if (!build) {
-          throw new Error('Environment variables require a build');
+        if (input.environment) {
+          if (!build) {
+            throw new Error('Environment variables require a build');
+          }
+          build.environment = { ...input.environment, ...build.environment };
         }
-        build.environment = { ...input.environment, ...build.environment };
-      }
 
-      result = await infraService.deploy(metadata.stackName, metadata, build);
-    } else {
-      result = await infraService.destroy(metadata.stackName, metadata.projectId);
+        result = await infraService.deploy(metadata.stackName, metadata, build);
+        break;
+      }
+      case DeploymentAction.Destroy: {
+        result = await infraService.destroy(metadata.stackName, metadata.projectId);
+        break;
+      }
+      default: {
+        // Exhaustiveness check — unreachable if DeploymentAction is exhaustive.
+        const _exhaustive: never = input.action;
+        throw new Error(`Unknown deployment action: ${String(_exhaustive)}`);
+      }
     }
 
     deployment.status = DeploymentStatus.Succeeded;

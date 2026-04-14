@@ -107,6 +107,18 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       { parent: this, provider: opts?.provider }
     );
 
+    new aws.s3.BucketPublicAccessBlock(
+      `${name}-state-pab`,
+      {
+        bucket: state.bucket,
+        blockPublicAcls: true,
+        blockPublicPolicy: true,
+        ignorePublicAcls: true,
+        restrictPublicBuckets: true,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
     new aws.s3.BucketVersioning(
       `${name}-state-versioning`,
       {
@@ -130,6 +142,18 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       {
         acl: 'private',
         forceDestroy: true,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
+    new aws.s3.BucketPublicAccessBlock(
+      `${name}-data-pab`,
+      {
+        bucket: this.dataBucket.bucket,
+        blockPublicAcls: true,
+        blockPublicPolicy: true,
+        ignorePublicAcls: true,
+        restrictPublicBuckets: true,
       },
       { parent: this, provider: opts?.provider }
     );
