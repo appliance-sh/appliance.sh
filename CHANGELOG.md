@@ -1,3 +1,13 @@
+## 1.27.2 (2026-04-14)
+
+### Bug Fixes
+
+- **api:** dispatch worker ([#39](https://github.com/appliance-sh/appliance.sh/pull/39))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.27.1 (2026-04-06)
 
 ### Bug Fixes
