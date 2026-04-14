@@ -6,5 +6,8 @@
   },
   "type": "container",
   "port": 3000,
-  "platform": "linux/amd64"
+  "platform": "linux/amd64",
+  "memory": 2048,
+  "timeout": 900,
+  "storage": 4096
 }

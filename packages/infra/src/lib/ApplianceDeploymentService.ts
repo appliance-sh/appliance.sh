@@ -1,8 +1,17 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 import { ApplianceStack, ApplianceStackMetadata, toResourceId } from './aws/ApplianceStack';
 import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
+
+// Shared across every deployment on a given worker. Plugins cached at
+// build time into /opt/pulumi-cache/plugins are symlinked into
+// ${PULUMI_HOME}/plugins on first use so cold starts avoid downloading
+// them.
+const PULUMI_HOME = '/tmp/.pulumi';
+const PLUGIN_CACHE_DIR = '/opt/pulumi-cache/plugins';
 
 export type PulumiAction = 'deploy' | 'destroy';
 
@@ -24,6 +33,7 @@ export interface ResolvedBuildParams {
   environment?: Record<string, string>;
   memory?: number;
   timeout?: number;
+  storage?: number;
 }
 
 export interface ApplianceDeploymentServiceOptions {
@@ -79,6 +89,7 @@ export class ApplianceDeploymentService {
           environment: build?.environment,
           memory: build?.memory,
           timeout: build?.timeout,
+          storage: build?.storage,
         },
         {
           globalProvider,
@@ -94,43 +105,82 @@ export class ApplianceDeploymentService {
     };
   }
 
+  /**
+   * Build the env vars passed to the Pulumi Automation API workspace.
+   * PULUMI_HOME is shared across every project the worker handles — this
+   * keeps one plugin cache (pre-seeded from /opt at image build time)
+   * reused across projects. Per-project isolation is handled via
+   * `workDir` instead.
+   */
+  private buildEnvVars(): Record<string, string> {
+    if (!this.baseConfig) {
+      throw new Error('Missing base config');
+    }
+    this.ensurePluginCache();
+    return {
+      AWS_REGION: this.region,
+      PULUMI_BACKEND_URL: this.baseConfig.stateBackendUrl,
+      PULUMI_HOME,
+    };
+  }
+
+  /**
+   * Idempotently symlink each precached plugin subdir from
+   * /opt/pulumi-cache/plugins into ${PULUMI_HOME}/plugins. Linking
+   * individual subdirs (not the parent) keeps the plugins/ dir itself
+   * writable so Pulumi can still drop its own metadata/lock files while
+   * reading plugin binaries from the read-only /opt cache.
+   */
+  private ensurePluginCache(): void {
+    if (!fs.existsSync(PLUGIN_CACHE_DIR)) return;
+    const target = path.join(PULUMI_HOME, 'plugins');
+    fs.mkdirSync(target, { recursive: true });
+    for (const entry of fs.readdirSync(PLUGIN_CACHE_DIR)) {
+      const linkPath = path.join(target, entry);
+      try {
+        fs.lstatSync(linkPath);
+      } catch {
+        fs.symlinkSync(path.join(PLUGIN_CACHE_DIR, entry), linkPath);
+      }
+    }
+  }
+
+  /**
+   * Per-project scratch directory that Pulumi uses as the inline program's
+   * workDir. Isolating this dir per project prevents concurrent deploys
+   * across projects from racing on Pulumi.yaml or the local tmp state
+   * that the Automation API writes during a run.
+   */
+  private workDirFor(projectId?: string): string {
+    const dir = projectId ? `/tmp/pulumi-workdir-${projectId}` : '/tmp/pulumi-workdir';
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
   private async getOrCreateStack(
     stackName: string,
     metadata?: ApplianceStackMetadata,
     build?: ResolvedBuildParams
   ): Promise<auto.Stack> {
     const program = this.inlineProgram(stackName, metadata, build);
-    const envVars: Record<string, string> = {
-      AWS_REGION: this.region,
-    };
-    if (!this.baseConfig) {
-      throw new Error('Missing base config');
-    }
-    if (this.baseConfig) {
-      envVars['PULUMI_BACKEND_URL'] = this.baseConfig.stateBackendUrl;
-    }
+    const envVars = this.buildEnvVars();
+    const workDir = this.workDirFor(metadata?.projectId);
 
     const stack = await auto.LocalWorkspace.createOrSelectStack(
       { projectName: this.projectName, stackName, program },
-      { envVars }
+      { envVars, workDir }
     );
-    await stack.setConfig('aws:region', { value: this.baseConfig.aws.region });
+    await stack.setConfig('aws:region', { value: this.baseConfig!.aws.region });
     return stack;
   }
 
-  private async selectExistingStack(stackName: string): Promise<auto.Stack> {
-    const envVars: Record<string, string> = {
-      AWS_REGION: this.region,
-    };
-    if (!this.baseConfig) {
-      throw new Error('Missing base config');
-    }
-    if (this.baseConfig) {
-      envVars['PULUMI_BACKEND_URL'] = this.baseConfig.stateBackendUrl;
-    }
+  private async selectExistingStack(stackName: string, projectId?: string): Promise<auto.Stack> {
+    const envVars = this.buildEnvVars();
+    const workDir = this.workDirFor(projectId);
 
     const ws = await auto.LocalWorkspace.create({
       projectSettings: { name: this.projectName, runtime: 'nodejs' },
+      workDir,
       envVars,
     });
 
@@ -158,9 +208,9 @@ export class ApplianceDeploymentService {
     };
   }
 
-  async destroy(stackName: string): Promise<PulumiResult> {
+  async destroy(stackName: string, projectId?: string): Promise<PulumiResult> {
     try {
-      const stack = await this.selectExistingStack(stackName);
+      const stack = await this.selectExistingStack(stackName, projectId);
       await stack.destroy({ onOutput: (m) => console.log(m) });
       return { action: 'destroy', ok: true, idempotentNoop: false, message: 'Stack resources deleted', stackName };
     } catch (e) {

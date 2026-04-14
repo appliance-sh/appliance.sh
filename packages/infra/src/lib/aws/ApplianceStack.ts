@@ -56,6 +56,9 @@ export interface ApplianceStackArgs {
   environment?: Record<string, string>;
   memory?: number;
   timeout?: number;
+  // Ephemeral scratch storage in MB — maps to Lambda ephemeralStorage
+  // (the /tmp size). Optional; Lambda defaults to 512 MB when omitted.
+  storage?: number;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -152,6 +155,8 @@ export class ApplianceStack extends pulumi.ComponentResource {
       policyArn: this.lambdaRolePolicy.arn,
     });
 
+    const ephemeralStorage = args.storage ? { size: args.storage } : undefined;
+
     if (args.imageUri) {
       this.lambda = new aws.lambda.Function(
         `${rid}-handler`,
@@ -161,6 +166,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
           role: this.lambdaRole.arn,
           timeout: args.timeout ?? 30,
           memorySize: args.memory ?? 512,
+          ephemeralStorage,
           environment: args.environment ? { variables: args.environment } : undefined,
           tags: defaultTags,
         },
@@ -178,6 +184,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
           role: this.lambdaRole.arn,
           timeout: args.timeout ?? 30,
           memorySize: args.memory ?? 512,
+          ephemeralStorage,
           layers: args.layers,
           architectures: args.architectures,
           environment: args.environment ? { variables: args.environment } : undefined,
