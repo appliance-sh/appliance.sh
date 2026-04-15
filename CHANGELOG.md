@@ -1,3 +1,13 @@
+## 1.27.3 (2026-04-15)
+
+### Bug Fixes
+
+- **api-server:** improve integration ([d3a362a](https://github.com/appliance-sh/appliance.sh/commit/d3a362a))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.27.2 (2026-04-14)
 
 ### Bug Fixes

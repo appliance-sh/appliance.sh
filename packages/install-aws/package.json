@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/install-aws",
-  "version": "1.27.2",
+  "version": "1.27.3",
   "private": true,
   "description": "Install the Appliance platform on AWS",
   "repository": {
