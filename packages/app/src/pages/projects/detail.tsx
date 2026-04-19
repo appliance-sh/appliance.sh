@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
+import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
 
@@ -50,6 +51,12 @@ export function ProjectDetailPage() {
     },
     refetchInterval: 5_000,
   });
+
+  const envsById = React.useMemo(() => {
+    const m = new Map<string, string>();
+    (environmentsQuery.data ?? []).forEach((e) => m.set(e.id, e.name));
+    return m;
+  }, [environmentsQuery.data]);
 
   const [actionError, setActionError] = React.useState<string | null>(null);
 
@@ -181,7 +188,7 @@ export function ProjectDetailPage() {
                       <StatusDot status={d.status} />
                       <div className="min-w-0 text-sm">
                         <div className="font-medium">
-                          {d.action} · {d.environmentId}
+                          {d.action} · <EntityLabel id={d.environmentId} name={envsById.get(d.environmentId)} />
                         </div>
                         {d.message ? (
                           <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message}</div>

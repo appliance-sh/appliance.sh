@@ -1,13 +1,16 @@
 import { Link } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { StatusDot } from '@/components/ui/status-dot';
+import { EntityLabel } from '@/components/ui/entity-label';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useEnvironmentsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 
 export function DeploymentsPage() {
   const host = useHost();
   const client = useApplianceClient();
+  const envs = useEnvironmentsMap();
 
   const { data: config } = useQuery({
     queryKey: ['host', 'config'],
@@ -73,7 +76,7 @@ export function DeploymentsPage() {
                 <StatusDot status={d.status} />
                 <div className="min-w-0">
                   <div className="text-sm font-medium">
-                    {d.action} · {d.environmentId}
+                    {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
                   </div>
                   {d.message ? (
                     <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message}</div>

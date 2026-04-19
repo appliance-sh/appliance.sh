@@ -3,8 +3,10 @@ import { useQuery, useQueries } from '@tanstack/react-query';
 import { Rocket, Folder, Box, Plug, Wand } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
+import { EntityLabel } from '@/components/ui/entity-label';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useEnvironmentsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 
 export function DashboardPage() {
@@ -108,6 +110,7 @@ function RecentActivity({
   deployments: import('@appliance.sh/sdk/models').Deployment[] | undefined;
   loading: boolean;
 }) {
+  const envs = useEnvironmentsMap();
   return (
     <section className="rounded-md border border-[var(--color-border)]">
       <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
@@ -130,7 +133,7 @@ function RecentActivity({
                 <StatusDot status={d.status} />
                 <div className="min-w-0 text-sm">
                   <div className="font-medium">
-                    {d.action} · {d.environmentId}
+                    {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
                   </div>
                   <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message ?? '—'}</div>
                 </div>

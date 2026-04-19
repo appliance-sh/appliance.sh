@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { ChevronLeft } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
+import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { durationMs, relativeTime } from '@/lib/time';
 import type { Deployment } from '@appliance.sh/sdk/models';
@@ -30,9 +31,29 @@ export function DeploymentDetailPage() {
     },
   });
 
-  if (!id) return <Navigate to="/deployments" replace />;
-
   const d = deploymentQuery.data;
+
+  const projectQuery = useQuery({
+    queryKey: ['project', d?.projectId],
+    enabled: !!client && !!d?.projectId,
+    queryFn: async () => {
+      const r = await client!.getProject(d!.projectId);
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+  });
+
+  const environmentQuery = useQuery({
+    queryKey: ['environment', d?.projectId, d?.environmentId],
+    enabled: !!client && !!d?.projectId && !!d?.environmentId,
+    queryFn: async () => {
+      const r = await client!.getEnvironment(d!.projectId, d!.environmentId);
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+  });
+
+  if (!id) return <Navigate to="/deployments" replace />;
 
   return (
     <div className="space-y-6">
@@ -60,7 +81,7 @@ export function DeploymentDetailPage() {
             <StatusDot status={d.status} size="md" />
             <div>
               <h1 className="text-xl font-semibold">
-                {d.action} · {d.environmentId}
+                {d.action} · <EntityLabel id={d.environmentId} name={environmentQuery.data?.name} />
               </h1>
               <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
                 <code className="font-mono">{d.id}</code>
@@ -77,8 +98,33 @@ export function DeploymentDetailPage() {
           <section className="grid gap-x-6 gap-y-3 rounded-md border border-[var(--color-border)] p-4 sm:grid-cols-2">
             <Row label="Status" value={d.status} />
             <Row label="Action" value={d.action} />
-            <Row label="Project" value={<code className="font-mono text-xs">{d.projectId}</code>} />
-            <Row label="Environment" value={<code className="font-mono text-xs">{d.environmentId}</code>} />
+            <Row
+              label="Project"
+              value={
+                projectQuery.data ? (
+                  <Link to={`/projects/${d.projectId}`} className="underline-offset-2 hover:underline">
+                    {projectQuery.data.name}
+                  </Link>
+                ) : (
+                  <EntityLabel id={d.projectId} />
+                )
+              }
+            />
+            <Row
+              label="Environment"
+              value={
+                environmentQuery.data ? (
+                  <Link
+                    to={`/environments/${d.projectId}/${d.environmentId}`}
+                    className="underline-offset-2 hover:underline"
+                  >
+                    {environmentQuery.data.name}
+                  </Link>
+                ) : (
+                  <EntityLabel id={d.environmentId} />
+                )
+              }
+            />
             {d.buildId ? <Row label="Build" value={<code className="font-mono text-xs">{d.buildId}</code>} /> : null}
             {d.idempotentNoop ? <Row label="Idempotent" value="yes (no-op)" /> : null}
             <Row
