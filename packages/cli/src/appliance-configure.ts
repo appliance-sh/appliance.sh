@@ -71,11 +71,16 @@ try {
       port,
       platform,
     };
-  } else {
+  } else if (type === ApplianceType.other) {
     updatedApplianceFile = {
       ...updatedApplianceFile,
       type,
     };
+  } else {
+    // promptForApplianceType only offers framework/container/other
+    // today. Desktop appliances are configured by hand (or via a
+    // future wizard that knows about platforms + builder).
+    throw new Error(`Interactive configuration for type '${type}' is not implemented`);
   }
 
   console.log(diff.colorize(diff.diff(applianceFileResult.data, updatedApplianceFile)));

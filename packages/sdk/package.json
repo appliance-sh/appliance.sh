@@ -12,13 +12,35 @@
   "type": "commonjs",
   "main": "index.js",
   "exports": {
-    "require": "./dist/cjs/index.js",
-    "import": "./dist/esm/index.js",
-    "types": "./dist/types/index.d.ts"
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./models": {
+      "types": "./dist/types/models/index.d.ts",
+      "import": "./dist/esm/models/index.js",
+      "require": "./dist/cjs/models/index.js"
+    },
+    "./client": {
+      "types": "./dist/types/client/index.d.ts",
+      "import": "./dist/esm/client/index.js",
+      "require": "./dist/cjs/client/index.js"
+    },
+    "./signing": {
+      "types": "./dist/types/signing/index.d.ts",
+      "import": "./dist/esm/signing/index.js",
+      "require": "./dist/cjs/signing/index.js"
+    },
+    "./storage": {
+      "types": "./dist/types/object-store/index.d.ts",
+      "import": "./dist/esm/object-store/index.js",
+      "require": "./dist/cjs/object-store/index.js"
+    }
   },
   "types": "./dist/types",
   "scripts": {
-    "build": "tsc --module commonjs --outDir dist/cjs && tsc --moduleResolution nodenext --module NodeNext --outDir dist/esm && pnpm run postbuild",
+    "build": "tsc --module commonjs --outDir dist/cjs && tsc --module esnext --moduleResolution bundler --outDir dist/esm && pnpm run postbuild",
     "build:watch": "tsc --module commonjs --outDir dist/cjs --watch --preserveWatchOutput",
     "clean": "rm -rf ./dist/",
     "dev:setup": "echo 'pnpm workspaces handle linking automatically'",

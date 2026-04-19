@@ -5,6 +5,11 @@ import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
 
 export type ApplianceBaseAwsPublicArgs = {
   config: ApplianceBaseConfigInput;
+  // Protects the self-hosted Pulumi state bucket from accidental deletion.
+  // Default true; the desktop's two-phase destroy flow flips this to false
+  // only after verifying no managed stacks remain in the backend.
+  stateProtect?: boolean;
+  stateForceDestroy?: boolean;
 };
 
 export interface ApplianceBaseAwsPublicOpts extends pulumi.ComponentResourceOptions {
@@ -21,6 +26,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
   public readonly cloudfrontDistribution?: aws.cloudfront.Distribution;
 
   public readonly dataBucket: aws.s3.Bucket;
+  public readonly stateBucket: aws.s3.Bucket;
   public readonly ecrRepository: aws.ecr.Repository;
   public readonly config;
 
@@ -98,19 +104,22 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       ).arn;
     }
 
-    const state = new aws.s3.Bucket(
+    const stateProtect = args.stateProtect ?? true;
+    const stateForceDestroy = args.stateForceDestroy ?? false;
+
+    this.stateBucket = new aws.s3.Bucket(
       `${name}-state`,
       {
         acl: 'private',
-        forceDestroy: true,
+        forceDestroy: stateForceDestroy,
       },
-      { parent: this, provider: opts?.provider }
+      { parent: this, provider: opts?.provider, protect: stateProtect }
     );
 
     new aws.s3.BucketPublicAccessBlock(
       `${name}-state-pab`,
       {
-        bucket: state.bucket,
+        bucket: this.stateBucket.bucket,
         blockPublicAcls: true,
         blockPublicPolicy: true,
         ignorePublicAcls: true,
@@ -122,7 +131,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
     new aws.s3.BucketVersioning(
       `${name}-state-versioning`,
       {
-        bucket: state.bucket,
+        bucket: this.stateBucket.bucket,
         versioningConfiguration: { status: 'Enabled' },
       },
       { parent: this, provider: opts?.provider }
@@ -131,7 +140,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
     new aws.s3.BucketServerSideEncryptionConfiguration(
       `${name}-state-sse`,
       {
-        bucket: state.bucket,
+        bucket: this.stateBucket.bucket,
         rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: 'AES256' } }],
       },
       { parent: this, provider: opts?.provider }
@@ -531,7 +540,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
 
     this.config = {
       name: name,
-      stateBackendUrl: pulumi.interpolate`s3://${state.bucket}`,
+      stateBackendUrl: pulumi.interpolate`s3://${this.stateBucket.bucket}`,
       domainName: args.config.dns.domainName,
       type: ApplianceBaseType.ApplianceAwsPublic,
       aws: {
@@ -541,6 +550,8 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         cloudfrontDistributionDomainName: this.cloudfrontDistribution.domainName,
         edgeRouterRoleArn: edgeRouterRole.arn,
         dataBucketName: this.dataBucket.bucket,
+        stateBucketName: this.stateBucket.bucket,
+        stateBucketArn: this.stateBucket.arn,
         ecrRepositoryUrl: this.ecrRepository.repositoryUrl,
       },
     };

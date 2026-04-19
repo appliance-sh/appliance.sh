@@ -8,6 +8,7 @@ import { buildRoutes } from './routes/builds';
 import { bootstrapRoutes } from './routes/bootstrap';
 import { internalRoutes } from './routes/internal';
 import { signatureAuth } from './middleware/auth';
+import { corsMiddleware } from './middleware/cors';
 import { requestLogger, logger } from './logger';
 
 export type ApplianceMode = 'server' | 'worker';
@@ -28,6 +29,7 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
   }
 
   app.use(requestLogger);
+  app.use(corsMiddleware);
 
   app.use(
     express.json({

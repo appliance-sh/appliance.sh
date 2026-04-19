@@ -2,51 +2,94 @@ import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 import * as pulumi from '@pulumi/pulumi';
 import { lookup } from './controller';
-import { applianceBaseConfigInput } from '@appliance.sh/sdk';
+import { applianceBaseConfigInput, ApplianceBaseConfigInput } from '@appliance.sh/sdk';
 import { ApplianceBaseAwsPublic } from './aws/ApplianceBaseAwsPublic';
 import { ApplianceBaseAwsVpc } from './aws/ApplianceBaseAwsVpc';
-import { ApplianceBaseConfigInput } from '@appliance.sh/sdk';
+import { ApplianceApiServer } from './aws/ApplianceApiServer';
 
-const name = 'appliance-infra';
+export interface ApplianceInfraInput {
+  bases: Record<string, ApplianceBaseConfigInput>;
+  enableApiServer?: boolean;
+  apiServerImageUri?: pulumi.Input<string>;
+  bootstrapToken?: pulumi.Input<string>;
+  // Self-hosted state bucket protection. Default: protected and
+  // non-force-destroy. The desktop's two-phase destroy flow flips
+  // both after confirming no managed stacks remain in the backend.
+  protectState?: boolean;
+  forceDestroyState?: boolean;
+}
 
-export async function applianceInfra() {
-  const applianceConfig = new pulumi.Config(name);
-  const bases = applianceConfig.requireObject<Record<string, ApplianceBaseConfigInput>>('bases');
+export interface ApplianceInfraOutput {
+  applianceBases: (ApplianceBaseAwsPublic | ApplianceBaseAwsVpc)[];
+  apiServers: ApplianceApiServer[];
+}
+
+export async function applianceInfra(input: ApplianceInfraInput): Promise<ApplianceInfraOutput> {
+  if (input.enableApiServer) {
+    if (!input.apiServerImageUri) {
+      throw new Error('apiServerImageUri is required when enableApiServer is true');
+    }
+    if (!input.bootstrapToken) {
+      throw new Error('bootstrapToken is required when enableApiServer is true');
+    }
+  }
 
   const applianceBases: (ApplianceBaseAwsPublic | ApplianceBaseAwsVpc)[] = [];
-  for (const base in bases) {
-    const baseConfig = applianceBaseConfigInput.safeParse({
-      ...bases[base],
-      name: base,
+  const apiServers: ApplianceApiServer[] = [];
+
+  for (const baseName in input.bases) {
+    const parsed = applianceBaseConfigInput.safeParse({
+      ...input.bases[baseName],
+      name: baseName,
     });
 
-    if (!baseConfig.success) {
-      throw baseConfig.error;
+    if (!parsed.success) {
+      throw parsed.error;
     }
 
-    const baseController = lookup(baseConfig.data);
+    const baseConfig = parsed.data;
+    const baseController = lookup(baseConfig);
 
-    const baseGlobalProvider = new aws.Provider(`${base}-global-provider`, { region: 'us-east-1' });
-    const baseRegionalProvider = new aws.Provider(`${base}-region-provider`, { region: baseConfig.data.region });
-
-    const baseNativeGlobalProvider = new awsNative.Provider(`${base}-native-global-provider`, { region: 'us-east-1' });
-    const baseNativeRegionalProvider = new awsNative.Provider(`${base}-native-region-provider`, {
-      region: baseConfig.data.region as awsNative.Region,
+    const globalProvider = new aws.Provider(`${baseName}-global-provider`, { region: 'us-east-1' });
+    const regionalProvider = new aws.Provider(`${baseName}-region-provider`, { region: baseConfig.region });
+    const nativeGlobalProvider = new awsNative.Provider(`${baseName}-native-global-provider`, { region: 'us-east-1' });
+    const nativeRegionalProvider = new awsNative.Provider(`${baseName}-native-region-provider`, {
+      region: baseConfig.region as awsNative.Region,
     });
+
     const applianceBase = new baseController(
-      `${base}`,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      { config: baseConfig.data },
+      baseName,
       {
-        globalProvider: baseGlobalProvider,
-        provider: baseRegionalProvider,
-        nativeProvider: baseNativeRegionalProvider,
-        nativeGlobalProvider: baseNativeGlobalProvider,
+        config: baseConfig,
+        stateProtect: input.protectState ?? true,
+        stateForceDestroy: input.forceDestroyState ?? false,
+      },
+      {
+        globalProvider,
+        provider: regionalProvider,
+        nativeProvider: nativeRegionalProvider,
+        nativeGlobalProvider,
       }
     );
 
     applianceBases.push(applianceBase);
+
+    if (input.enableApiServer && applianceBase instanceof ApplianceBaseAwsPublic) {
+      const apiServer = new ApplianceApiServer(
+        `${baseName}-api-server`,
+        {
+          imageUri: input.apiServerImageUri!,
+          bootstrapToken: input.bootstrapToken!,
+          stateBackendUrl: applianceBase.config.stateBackendUrl,
+          baseConfig: applianceBase.config,
+          stateBucketArn: applianceBase.stateBucket.arn,
+          dataBucketArn: applianceBase.dataBucket.arn,
+        },
+        { parent: applianceBase, provider: regionalProvider }
+      );
+      apiServers.push(apiServer);
+    }
   }
 
-  return { applianceBases };
+  return { applianceBases, apiServers };
 }

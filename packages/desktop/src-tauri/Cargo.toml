@@ -1,0 +1,24 @@
+[package]
+name = "appliance-desktop"
+version = "1.27.3"
+description = "Appliance Desktop — Tauri shell"
+authors = ["Eliot Lim"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "appliance_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+thiserror = "2"
+tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros"] }

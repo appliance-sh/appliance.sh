@@ -1,0 +1,37 @@
+{
+  "name": "@appliance.sh/bootstrap",
+  "version": "1.27.3",
+  "private": true,
+  "description": "Shared bootstrap orchestrator for the Appliance CLI and Desktop shells",
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch --preserveWatchOutput",
+    "clean": "rm -rf ./dist",
+    "typecheck": "tsc --noEmit",
+    "dev:setup": "echo 'pnpm workspaces handle linking automatically'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@appliance.sh/infra": "workspace:*",
+    "@appliance.sh/sdk": "workspace:*",
+    "@pulumi/pulumi": "^3.216.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1",
+    "typescript": "^5.7.3"
+  }
+}

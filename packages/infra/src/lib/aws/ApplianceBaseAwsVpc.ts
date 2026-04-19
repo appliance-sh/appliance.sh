@@ -3,6 +3,8 @@ import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
 
 export type ApplianceBaseAwsVpcArgs = {
   config: ApplianceBaseConfigInput;
+  stateProtect?: boolean;
+  stateForceDestroy?: boolean;
 };
 
 export interface ApplianceBaseAwsVpcOpts extends pulumi.ComponentResourceOptions {

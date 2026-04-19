@@ -41,9 +41,18 @@ COPY src/ packages/api-server/src/
 RUN pnpm --filter @appliance.sh/api-server run build
 
 # --- Production stage ---
+FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 AS lwa
+
 FROM node:22-slim
 
 WORKDIR /app
+
+# Lambda Web Adapter: copied in as an extension, inert outside Lambda
+# (activates only when AWS_LAMBDA_RUNTIME_API is set). Lets this same
+# image run as a regular HTTP container locally and as a Lambda
+# container in AWS without code changes.
+COPY --from=lwa /lambda-adapter /opt/extensions/lambda-adapter
+ENV AWS_LWA_PORT=3000
 
 RUN corepack enable && corepack prepare pnpm@10 --activate
 

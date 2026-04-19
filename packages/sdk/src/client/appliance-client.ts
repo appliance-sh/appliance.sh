@@ -216,6 +216,21 @@ export class ApplianceClient {
     return this.request<Deployment>('GET', `/api/v1/deployments/${id}`);
   }
 
+  async listDeployments(options?: {
+    limit?: number;
+    offset?: number;
+    environmentId?: string;
+    projectId?: string;
+  }): Promise<Result<Deployment[]>> {
+    const params = new URLSearchParams();
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.offset !== undefined) params.set('offset', String(options.offset));
+    if (options?.environmentId) params.set('environmentId', options.environmentId);
+    if (options?.projectId) params.set('projectId', options.projectId);
+    const query = params.toString();
+    return this.request<Deployment[]>('GET', `/api/v1/deployments${query ? `?${query}` : ''}`);
+  }
+
   // Build methods
   async uploadBuild(data: Buffer | Uint8Array): Promise<Result<{ buildId: string }>> {
     try {

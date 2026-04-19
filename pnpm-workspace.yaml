@@ -5,6 +5,10 @@ packages:
   - packages/api-server
   - packages/install-aws
   - packages/appliance.sh
+  - packages/app
+  - packages/console
+  - packages/desktop
+  - packages/bootstrap
 
 onlyBuiltDependencies:
   - '@pulumi/aws-native'

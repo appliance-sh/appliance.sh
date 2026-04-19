@@ -1,0 +1,7 @@
+{
+  "manifest": "v1",
+  "type": "desktop",
+  "name": "appliance-desktop",
+  "builder": "tauri",
+  "artifactDir": "src-tauri/target/release/bundle"
+}

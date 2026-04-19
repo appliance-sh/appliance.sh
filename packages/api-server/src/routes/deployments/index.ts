@@ -54,6 +54,23 @@ deploymentRoutes.post('/', async (req, res) => {
   }
 });
 
+// Ordered before the :id route so `/deployments/` with no id falls
+// through to list instead of getting parsed as an empty id.
+deploymentRoutes.get('/', async (req, res) => {
+  try {
+    const limit = parseIntParam(req.query.limit);
+    const offset = parseIntParam(req.query.offset);
+    const environmentId = typeof req.query.environmentId === 'string' ? req.query.environmentId : undefined;
+    const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+
+    const deployments = await deploymentService.list({ limit, offset, environmentId, projectId });
+    res.json(deployments);
+  } catch (error) {
+    logger.error('list deployments failed', error, { requestId: req.requestId });
+    res.status(500).json({ error: 'Failed to list deployments', message: String(error) });
+  }
+});
+
 deploymentRoutes.get('/:id', async (req, res) => {
   try {
     const deployment = await deploymentService.get(req.params.id);
@@ -67,3 +84,9 @@ deploymentRoutes.get('/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to get deployment', message: String(error) });
   }
 });
+
+function parseIntParam(v: unknown): number | undefined {
+  if (typeof v !== 'string') return undefined;
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) ? n : undefined;
+}

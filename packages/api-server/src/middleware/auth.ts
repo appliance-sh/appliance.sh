@@ -29,7 +29,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       return;
     }
 
-    const expected = computeContentDigest(req.rawBody.toString());
+    const expected = await computeContentDigest(req.rawBody.toString());
     if (
       contentDigest.length !== expected.length ||
       !timingSafeEqual(Buffer.from(contentDigest), Buffer.from(expected))
@@ -67,6 +67,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       requestId: req.requestId,
       path: req.originalUrl,
       error: result.error,
+      diag: buildAuthDiag(req, url),
     });
     res.status(401).json({ error: 'Unauthorized' });
     return;
@@ -79,4 +80,33 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   }
 
   next();
+}
+
+// Redacted snapshot of the inbound request to help diagnose signature
+// mismatches. No secrets, no signature bytes — just the derivation
+// inputs (method, URL, headers that affect @authority / @path /
+// trust-proxy behavior) plus a list of header names so we can spot
+// missing/unexpected fields.
+function buildAuthDiag(req: Request, reconstructedUrl: string): Record<string, unknown> {
+  const sigInputHeader = req.headers['signature-input'];
+  const sigInputRaw = Array.isArray(sigInputHeader) ? sigInputHeader[0] : sigInputHeader;
+
+  return {
+    method: req.method,
+    originalUrl: req.originalUrl,
+    reconstructedUrl,
+    protocol: req.protocol,
+    trustProxy: req.app.get('trust proxy'),
+    host: req.get('host'),
+    xForwardedHost: req.get('x-forwarded-host'),
+    xForwardedProto: req.get('x-forwarded-proto'),
+    xForwardedFor: req.get('x-forwarded-for'),
+    // The signature-input header carries the fields + params the
+    // client signed over. Logging it lets us see the client's view
+    // of @authority / @path / created / expires. No secret material.
+    signatureInput: typeof sigInputRaw === 'string' ? sigInputRaw : null,
+    signaturePresent: typeof req.headers['signature'] === 'string',
+    contentDigestPresent: typeof req.headers['content-digest'] === 'string',
+    headerNames: Object.keys(req.headers).sort(),
+  };
 }

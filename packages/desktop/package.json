@@ -1,0 +1,38 @@
+{
+  "name": "@appliance.sh/desktop",
+  "version": "1.27.3",
+  "private": true,
+  "description": "Tauri shell for the Appliance desktop app",
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf ./dist ./sidecar/dist",
+    "sidecar:build": "tsc -p sidecar/tsconfig.json",
+    "tauri": "tauri",
+    "tauri:dev": "pnpm sidecar:build && tauri dev",
+    "tauri:build": "pnpm sidecar:build && tauri build",
+    "dev:setup": "echo 'pnpm workspaces handle linking automatically'"
+  },
+  "dependencies": {
+    "@appliance.sh/app": "workspace:*",
+    "@appliance.sh/bootstrap": "workspace:*",
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-notification": "^2.2.0",
+    "@tauri-apps/plugin-shell": "^2.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.3"
+  }
+}

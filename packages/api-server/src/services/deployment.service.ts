@@ -165,6 +165,38 @@ export class DeploymentService {
     const storage = getStorageService();
     return storage.filter<Deployment>(COLLECTION, (d) => d.environmentId === environmentId);
   }
+
+  /**
+   * List deployments sorted by `startedAt` descending (most recent
+   * first). Optional filters narrow by environment or project.
+   * `limit` is clamped to [1, 200] to keep any single S3 page
+   * materialization bounded.
+   */
+  async list(options?: {
+    limit?: number;
+    offset?: number;
+    environmentId?: string;
+    projectId?: string;
+  }): Promise<Deployment[]> {
+    const storage = getStorageService();
+    const all = await storage.getAll<Deployment>(COLLECTION);
+
+    const filtered = all.filter((d) => {
+      if (options?.environmentId && d.environmentId !== options.environmentId) return false;
+      if (options?.projectId && d.projectId !== options.projectId) return false;
+      return true;
+    });
+
+    filtered.sort((a, b) => {
+      const at = new Date(a.startedAt).getTime();
+      const bt = new Date(b.startedAt).getTime();
+      return bt - at;
+    });
+
+    const offset = Math.max(0, options?.offset ?? 0);
+    const limit = Math.min(Math.max(1, options?.limit ?? 50), 200);
+    return filtered.slice(offset, offset + limit);
+  }
 }
 
 export const deploymentService = new DeploymentService();

@@ -1,0 +1,77 @@
+import type { ApplianceBaseConfigInput } from '@appliance.sh/sdk';
+
+export type BootstrapPhase = 'phase1' | 'phase2' | 'phase3';
+
+export interface BootstrapInput {
+  /**
+   * The single base to install. Multi-base bootstraps are out of
+   * scope for v1; they can be driven as subsequent stack updates
+   * once the installer stack exists.
+   */
+  base: {
+    name: string;
+    config: ApplianceBaseConfigInput;
+  };
+}
+
+export type BootstrapEngineKind = 'workspace' | 'download';
+
+export interface BootstrapOptions {
+  /**
+   * Root cache directory for the installer stack. Contains the
+   * Pulumi state backend (phase 1), workdir, plugin cache, and —
+   * for the download engine — the extracted bootstrapper bundle.
+   * Defaults to `~/.appliance`.
+   */
+  cacheDir?: string;
+
+  /**
+   * `workspace`: use the in-repo `@appliance.sh/infra` package
+   * directly via Pulumi Automation API. Intended for dev and CI.
+   *
+   * `download`: fetch a pinned, pre-built bootstrapper bundle for
+   * the current platform, extract to cacheDir, spawn its Node
+   * entrypoint with this input, and forward events. Intended for
+   * production CLI + Desktop installs. Not implemented in v1.
+   *
+   * Defaults to `workspace`.
+   */
+  engine?: BootstrapEngineKind;
+
+  /** Override the pinned bootstrapper version (download engine only). */
+  bootstrapperVersion?: string;
+
+  /** Stream of progress events. Drivers plug in their own UI here. */
+  onEvent?: (event: BootstrapEvent) => void;
+
+  /**
+   * Phase gating. Defaults to running all three. Setting this to
+   * e.g. `['phase1']` runs only the base infra and stops — useful
+   * when the api-server image isn't ready yet.
+   */
+  phases?: BootstrapPhase[];
+}
+
+export interface BootstrapResult {
+  /** Pulumi state backend URL for this installation (phase 1). */
+  stateBackendUrl: string;
+  /** Lambda Function URL of the hoisted api-server (phase 2). */
+  apiServerUrl?: string;
+  /** First-boot API key returned by `/bootstrap/create-key` (phase 2). */
+  apiKey?: { id: string; secret: string };
+  /** `true` once state has been moved from local file to S3 (phase 3). */
+  statePromoted?: boolean;
+}
+
+export type BootstrapEvent =
+  | { type: 'phase-started'; phase: BootstrapPhase }
+  | { type: 'phase-skipped'; phase: BootstrapPhase; reason: string }
+  | { type: 'phase-completed'; phase: BootstrapPhase }
+  | { type: 'phase-failed'; phase: BootstrapPhase; error: string }
+  | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string }
+  | {
+      type: 'resource';
+      op: 'create' | 'update' | 'delete' | 'same' | 'replace';
+      resourceType: string;
+      name: string;
+    };

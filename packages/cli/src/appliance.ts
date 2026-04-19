@@ -11,6 +11,7 @@ program
   .version(sdk.VERSION)
   .command('app', 'manage applications (setup, status, list)')
   .alias('application')
+  .command('bootstrap', 'provision a new Appliance installation on AWS')
   .command('build', 'builds the appliance in the current working directory')
   .command('configure', 'configures the appliance in the current working directory')
   .command('deploy <project> <environment>', 'deploy a named project/environment')
