@@ -23,6 +23,8 @@ export interface WizardValues {
   region: string;
   domain: string;
   createZone: boolean;
+  deployApiServer: boolean;
+  apiServerImageUri?: string;
 }
 
 export function BootstrapWizardPage() {
@@ -33,8 +35,14 @@ export function BootstrapWizardPage() {
   const [region, setRegion] = React.useState('us-east-1');
   const [domain, setDomain] = React.useState('');
   const [createZone, setCreateZone] = React.useState(true);
+  const [deployApiServer, setDeployApiServer] = React.useState(false);
+  const [apiServerImageUri, setApiServerImageUri] = React.useState('');
 
-  const canSubmit = name.length > 0 && domain.includes('.');
+  // Image URI is fully optional — phase 2 falls back to the pinned
+  // ghcr.io/appliance-sh/api-server:<version> default. If the user
+  // types something, it must at least look like a registry reference.
+  const imageUriValid = apiServerImageUri.length === 0 || apiServerImageUri.includes('/');
+  const canSubmit = name.length > 0 && domain.includes('.') && imageUriValid;
   const bootstrapAvailable = Boolean(host.bootstrap);
 
   if (!bootstrapAvailable) {
@@ -53,7 +61,14 @@ export function BootstrapWizardPage() {
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    const values: WizardValues = { name, region, domain, createZone };
+    const values: WizardValues = {
+      name,
+      region,
+      domain,
+      createZone,
+      deployApiServer,
+      apiServerImageUri: deployApiServer && apiServerImageUri ? apiServerImageUri : undefined,
+    };
     navigate('/bootstrap/run', { state: values });
   };
 
@@ -104,6 +119,24 @@ export function BootstrapWizardPage() {
           <input type="checkbox" checked={createZone} onChange={(e) => setCreateZone(e.target.checked)} />
           <span>Create a new Route53 zone for this domain</span>
         </label>
+
+        <div className="space-y-3 rounded-md border border-[var(--color-border)] p-3">
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={deployApiServer} onChange={(e) => setDeployApiServer(e.target.checked)} />
+            <span>Also deploy api-server (phase 2)</span>
+          </label>
+          {deployApiServer ? (
+            <Field label="API server image (override)" hint="optional — defaults to ghcr.io/appliance-sh/api-server">
+              <input
+                type="text"
+                value={apiServerImageUri}
+                onChange={(e) => setApiServerImageUri(e.target.value)}
+                placeholder="ghcr.io/appliance-sh/api-server:latest"
+                className={`${inputCls} font-mono`}
+              />
+            </Field>
+          ) : null}
+        </div>
 
         <Button type="submit" disabled={!canSubmit} className="w-full">
           Start bootstrap

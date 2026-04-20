@@ -1,9 +1,9 @@
 import * as path from 'node:path';
-import * as os from 'node:os';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
 import type { BootstrapEvent, BootstrapInput } from '../types';
+import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 
 export interface Phase1Options {
   cacheDir: string;
@@ -87,65 +87,4 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
   }
 
   return { stateBackendUrl };
-}
-
-function homeEnv(): Record<string, string> {
-  // LocalWorkspace spawns the pulumi CLI, which needs HOME set so it
-  // can find plugins and creds. Nodejs spawn inherits env but being
-  // explicit avoids platform quirks.
-  return {
-    HOME: process.env.HOME ?? os.homedir(),
-    PATH: process.env.PATH ?? '',
-  };
-}
-
-function awsCredsFromEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const k of [
-    'AWS_ACCESS_KEY_ID',
-    'AWS_SECRET_ACCESS_KEY',
-    'AWS_SESSION_TOKEN',
-    'AWS_PROFILE',
-    'AWS_DEFAULT_REGION',
-    'AWS_SHARED_CREDENTIALS_FILE',
-    'AWS_CONFIG_FILE',
-  ]) {
-    const v = process.env[k];
-    if (v !== undefined) out[k] = v;
-  }
-  return out;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function forwardPulumiEvent(e: any, emit: (e: BootstrapEvent) => void): void {
-  // Pulumi's engine events are richer than we need at the public
-  // surface. Map just the resource lifecycle to the bootstrap
-  // event type; raw stream goes through onOutput as `log`.
-  const rp = e?.resourcePreEvent?.metadata;
-  const ro = e?.resOutputsEvent?.metadata;
-  const meta = rp ?? ro;
-  if (!meta) return;
-
-  const opMap: Record<string, 'create' | 'update' | 'delete' | 'same' | 'replace'> = {
-    create: 'create',
-    'create-replacement': 'replace',
-    update: 'update',
-    delete: 'delete',
-    'delete-replaced': 'replace',
-    replace: 'replace',
-    same: 'same',
-  };
-
-  const op = opMap[String(meta.op)];
-  if (!op) return;
-
-  emit({
-    type: 'resource',
-    op,
-    resourceType: String(meta.type ?? ''),
-    name:
-      String(meta.urn ?? '')
-        .split('::')
-        .pop() ?? '',
-  });
 }

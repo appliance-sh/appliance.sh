@@ -83,10 +83,13 @@ export function BootstrapProgressPage() {
           },
         },
       },
+      apiServerImageUri: values.apiServerImageUri,
     };
 
+    const phases: BootstrapPhase[] = values.deployApiServer ? ['phase1', 'phase2'] : ['phase1'];
+
     host.bootstrap
-      .run(input, { phases: ['phase1'] }, handleEvent)
+      .run(input, { phases }, handleEvent)
       .then((r) => setResult(r))
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   }, [values, host.bootstrap, handleEvent]);

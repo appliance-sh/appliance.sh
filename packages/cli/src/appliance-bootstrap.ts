@@ -38,6 +38,10 @@ program
     'phase1'
   )
   .option('--cache-dir <dir>', 'override ~/.appliance cache directory')
+  .option(
+    '--image-uri <uri>',
+    'override the default api-server image (default: `ghcr.io/appliance-sh/api-server:<version>`)'
+  )
   .option('-y, --yes', 'skip the confirmation prompt')
   .action(
     async (options: {
@@ -48,6 +52,7 @@ program
       attachZone?: boolean;
       phases: string;
       cacheDir?: string;
+      imageUri?: string;
       yes?: boolean;
     }) => {
       const name =
@@ -95,6 +100,11 @@ program
 
       const phases = parsePhases(options.phases);
 
+      // --image-uri is optional. When absent, phase 2 falls back to
+      // the pinned `ghcr.io/appliance-sh/api-server:<version>` default
+      // baked into @appliance.sh/bootstrap.
+      const imageUri = options.imageUri;
+
       if (!options.yes) {
         console.log();
         console.log(chalk.bold('Bootstrap plan'));
@@ -103,6 +113,7 @@ program
         console.log(`  Domain:  ${domain}`);
         console.log(`  Zone:    ${createZone ? 'create new' : 'attach existing'}`);
         console.log(`  Phases:  ${phases.join(', ')}`);
+        console.log(`  Image:   ${imageUri ?? '(default ghcr.io/appliance-sh/api-server)'}`);
         if (options.cacheDir) console.log(`  Cache:   ${options.cacheDir}`);
         console.log();
         const ok = await prompts.confirm({ message: 'Proceed?', default: true });
@@ -114,7 +125,7 @@ program
 
       try {
         const result = await runBootstrap(
-          { base: { name, config: baseConfig } },
+          { base: { name, config: baseConfig }, apiServerImageUri: imageUri },
           {
             phases,
             cacheDir: options.cacheDir,

@@ -12,6 +12,18 @@ export interface BootstrapInput {
     name: string;
     config: ApplianceBaseConfigInput;
   };
+
+  /**
+   * OCI image URI for the api-server container that phase 2 will
+   * deploy as a Lambda. Required for phase 2; ignored for phase 1.
+   *
+   * In workspace engine the caller supplies a pre-pushed image
+   * reference (e.g. `ghcr.io/appliance-sh/api-server:1.27.3` or an
+   * image in the user's own ECR). The download engine will source
+   * this from the bundled OCI tarball + crane push to the base's
+   * ECR in a follow-up commit.
+   */
+  apiServerImageUri?: string;
 }
 
 export type BootstrapEngineKind = 'workspace' | 'download';

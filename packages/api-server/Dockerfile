@@ -66,12 +66,23 @@ ENV HUSKY=0
 # Pulumi installs to /root/.pulumi/bin by default. On Lambda the container runs
 # as a non-root user that cannot traverse /root (mode 0700), so we relocate the
 # binaries to /usr/local/bin where they are world-executable.
+#
+# TARGETARCH is set automatically by buildx for multi-platform builds
+# (amd64 / arm64). crane's release asset naming uses x86_64 / arm64 —
+# map from Docker's TARGETARCH before pulling. Pulumi's installer
+# picks the right binary on its own.
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://get.pulumi.com | sh \
     && cp /root/.pulumi/bin/* /usr/local/bin/ \
     && rm -rf /root/.pulumi \
-    && curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+    && case "${TARGETARCH:-amd64}" in \
+         amd64) CRANE_ARCH=x86_64 ;; \
+         arm64) CRANE_ARCH=arm64 ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -sL "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz" \
        | tar -xzf - -C /usr/local/bin crane
 
 # Crane writes its auth config to $DOCKER_CONFIG (or $HOME/.docker by default).
