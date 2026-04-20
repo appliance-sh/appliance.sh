@@ -1,3 +1,15 @@
+## 1.28.0 (2026-04-20)
+
+### Features
+
+- **api-server:** image build ([7439dae](https://github.com/appliance-sh/appliance.sh/commit/7439dae))
+- **console:** improved project environment ux ([51b7dba](https://github.com/appliance-sh/appliance.sh/commit/51b7dba))
+- **desktop,sdk,api-server:** introduce appliance desktop ([ef8fb3b](https://github.com/appliance-sh/appliance.sh/commit/ef8fb3b))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.27.3 (2026-04-15)
 
 ### Bug Fixes
