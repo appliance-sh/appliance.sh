@@ -1,3 +1,13 @@
+## 1.28.1 (2026-04-22)
+
+### Bug Fixes
+
+- **ci:** image version resolution ([cb080d5](https://github.com/appliance-sh/appliance.sh/commit/cb080d5))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.28.0 (2026-04-20)
 
 ### Features
