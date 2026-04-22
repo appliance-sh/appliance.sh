@@ -63,10 +63,28 @@ const rewriteImportsInDir = (dir: string): void => {
   }
 };
 
+/**
+ * Resolve the version to stamp into dist. Prefers the latest Git tag
+ * (for release pipelines that cut tags before building); falls back
+ * to `package.json`'s `version` field when no tags exist — e.g.
+ * shallow-cloned CI runs without `fetch-tags`, or pre-release repos.
+ */
+const resolveVersion = (): string => {
+  try {
+    const tag = execSync('git describe --tags --abbrev=0', { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+    if (tag) return tag;
+  } catch {
+    // fall through
+  }
+  const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as { version: string };
+  return `v${pkg.version}`;
+};
+
 const main = (): void => {
   try {
-    // Get the latest Git tag
-    const latestTag = execSync('git describe --tags --abbrev=0').toString().trim();
+    const latestTag = resolveVersion();
 
     // Define file paths to update
     const filesToUpdate = [join(__dirname, '../dist/cjs/version.js'), join(__dirname, '../dist/esm/version.js')];

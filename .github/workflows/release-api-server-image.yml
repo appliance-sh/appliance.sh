@@ -26,7 +26,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # fetch-depth: 0 pulls full history incl. tags. The SDK's
+          # postbuild step runs `git describe --tags --abbrev=0` to
+          # stamp the built dist with the latest release tag, so the
+          # workflow must see them. (Shallow clones without tags
+          # cause `postbuild` to fall back to package.json, but
+          # having tags available makes the release stamp accurate.)
+          fetch-depth: 0
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
