@@ -1,3 +1,13 @@
+## 1.29.0 (2026-04-22)
+
+### Features
+
+- **api-server:** support for remote build uris ([b85cd83](https://github.com/appliance-sh/appliance.sh/commit/b85cd83))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.28.1 (2026-04-22)
 
 ### Bug Fixes
