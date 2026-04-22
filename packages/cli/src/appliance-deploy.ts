@@ -100,14 +100,22 @@ program
   .argument('<project>', 'project name')
   .argument('<environment>', 'environment name')
   .option('-a, --build <path>', 'appliance.zip build to deploy', 'appliance.zip')
+  .option(
+    '--image-uri <uri>',
+    'reference an already-published image (e.g. ghcr.io/org/app:tag) instead of uploading a build'
+  )
   .option('-e, --env-file <path>', 'env file with runtime environment variables')
   .action(async (projectName: string, environmentName: string) => {
-    const opts = program.opts();
-    const buildPath = path.resolve(opts.build as string);
+    const opts = program.opts<{
+      build: string;
+      imageUri?: string;
+      envFile?: string;
+    }>();
 
-    if (!fs.existsSync(buildPath)) {
-      console.error(chalk.red(`Build not found: ${buildPath}`));
-      console.error(chalk.dim('Run `appliance build` first to create appliance.zip'));
+    // --image-uri and --build are mutually exclusive; detect the
+    // explicit --build override by looking for a non-default path.
+    if (opts.imageUri && opts.build !== 'appliance.zip') {
+      console.error(chalk.red('Provide either --image-uri or --build, not both.'));
       process.exit(1);
     }
 
@@ -126,18 +134,39 @@ program
       const project = await findOrCreateProject(client, projectName);
       const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
-      // Upload the build
-      const buildData = fs.readFileSync(buildPath);
-      const sizeMb = (buildData.length / 1024 / 1024).toFixed(1);
-      console.log(chalk.dim(`Uploading build (${sizeMb} MB)...`));
-
-      const uploadResult = await client.uploadBuild(buildData);
-      if (!uploadResult.success) {
-        console.error(chalk.red(`Upload failed: ${uploadResult.error.message}`));
-        process.exit(1);
+      // Resolve the build source. Both paths end at a buildId the
+      // deploy references:
+      //   --image-uri → createBuild({ uploadUrl: <image> }) records
+      //                 an external-reference build (no upload).
+      //   default    → zip upload via uploadBuild().
+      let buildId: string;
+      if (opts.imageUri) {
+        console.log(chalk.dim(`Using image: ${opts.imageUri}`));
+        const createResult = await client.createBuild({ uploadUrl: opts.imageUri });
+        if (!createResult.success) {
+          console.error(chalk.red(`Failed to create external build: ${createResult.error.message}`));
+          process.exit(1);
+        }
+        buildId = createResult.data.buildId;
+        console.log(chalk.dim(`External build created: ${buildId}`));
+      } else {
+        const buildPath = path.resolve(opts.build);
+        if (!fs.existsSync(buildPath)) {
+          console.error(chalk.red(`Build not found: ${buildPath}`));
+          console.error(chalk.dim('Run `appliance build` first, or pass --image-uri <uri>.'));
+          process.exit(1);
+        }
+        const buildData = fs.readFileSync(buildPath);
+        const sizeMb = (buildData.length / 1024 / 1024).toFixed(1);
+        console.log(chalk.dim(`Uploading build (${sizeMb} MB)...`));
+        const uploadResult = await client.uploadBuild(buildData);
+        if (!uploadResult.success) {
+          console.error(chalk.red(`Upload failed: ${uploadResult.error.message}`));
+          process.exit(1);
+        }
+        buildId = uploadResult.data.buildId;
+        console.log(chalk.dim(`Build uploaded: ${buildId}`));
       }
-
-      console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
 
       // Load environment variables: explicit --env-file, or auto-detect .env.<environment>
       let envVars: Record<string, string> | undefined;
@@ -152,9 +181,8 @@ program
         process.exit(1);
       }
 
-      // Deploy with the build
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
-      const result = await client.deploy(environment.id, uploadResult.data.buildId, envVars);
+      const result = await client.deploy(environment.id, { buildId, environment: envVars });
       if (!result.success) {
         console.error(chalk.red(`Deploy failed: ${result.error.message}`));
         process.exit(1);

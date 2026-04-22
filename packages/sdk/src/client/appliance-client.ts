@@ -184,8 +184,12 @@ export class ApplianceClient {
   // Deployment methods
   async deploy(
     environmentId: string,
-    buildId?: string,
-    environment?: Record<string, string>
+    options?: {
+      /** Reference a build created via POST /api/v1/builds (either uploaded or external). */
+      buildId?: string;
+      /** Runtime environment variables. */
+      environment?: Record<string, string>;
+    }
   ): Promise<Result<Deployment>> {
     return this.request<Deployment>(
       'POST',
@@ -193,8 +197,8 @@ export class ApplianceClient {
       {
         environmentId,
         action: 'deploy',
-        ...(buildId ? { buildId } : {}),
-        ...(environment ? { environment } : {}),
+        ...(options?.buildId ? { buildId: options.buildId } : {}),
+        ...(options?.environment ? { environment: options.environment } : {}),
       },
       600000
     );
@@ -232,15 +236,34 @@ export class ApplianceClient {
   }
 
   // Build methods
+
+  /**
+   * Create a Build record.
+   *   - `createBuild()` — type: upload. Response includes a presigned
+   *     `uploadUrl` the caller PUTs their zip to.
+   *   - `createBuild({ uploadUrl: "<uri>" })` — type: remote-image.
+   *     Caller references an image/content URL that already exists.
+   *     Response is `{ buildId }` only.
+   */
+  async createBuild(options?: { uploadUrl?: string }): Promise<Result<{ buildId: string; uploadUrl?: string }>> {
+    const body = options?.uploadUrl
+      ? { type: 'remote-image' as const, uploadUrl: options.uploadUrl }
+      : { type: 'upload' as const };
+    return this.request<{ buildId: string; uploadUrl?: string }>('POST', '/api/v1/builds', body);
+  }
+
   async uploadBuild(data: Buffer | Uint8Array): Promise<Result<{ buildId: string }>> {
     try {
       // Step 1: Request a presigned upload URL
-      const createResult = await this.request<{ buildId: string; uploadUrl: string }>('POST', '/api/v1/builds');
+      const createResult = await this.createBuild();
       if (!createResult.success) {
         return createResult;
       }
 
       const { buildId, uploadUrl } = createResult.data;
+      if (!uploadUrl) {
+        return { success: false, error: new Error('createBuild did not return an uploadUrl') };
+      }
 
       // Step 2: Upload directly to the presigned URL
       const controller = new AbortController();

@@ -1,11 +1,12 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
-import { applianceBaseConfig, applianceInput } from '@appliance.sh/sdk';
+import { applianceBaseConfig, applianceInput, BuildType } from '@appliance.sh/sdk';
 import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { buildUploadService } from './build-upload.service';
 
 export interface ResolvedBuild {
   imageUri?: string;
@@ -48,7 +49,18 @@ export class BuildService {
     const config = getBaseConfig();
     if (!config.aws.dataBucketName) throw new Error('Data bucket not configured');
 
-    const s3Key = `builds/${buildId}.zip`;
+    // Look up the Build record. `remote-image` builds short-circuit
+    // straight to an imageUri — no zip download, no manifest parse.
+    // The `upload` flow falls through to the zip-extract path below.
+    // (A missing record implies an older upload-flow build created
+    // before build-record persistence; tolerate by treating it as
+    // upload-flow with the derived S3 key.)
+    const stored = await buildUploadService.get(buildId);
+    if (stored?.type === BuildType.RemoteImage) {
+      return { imageUri: stored.source };
+    }
+
+    const s3Key = stored?.source ?? `builds/${buildId}.zip`;
     const s3 = new S3Client({ region: config.aws.region });
 
     // Download the build zip
