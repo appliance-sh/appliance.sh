@@ -20,7 +20,7 @@ program
 
 const cmd = program.parse(process.argv);
 
-const applianceFileResult = extractApplianceFile(cmd);
+const applianceFileResult = await extractApplianceFile(cmd);
 
 // If a file or directory was specified, but the file was not found, exit with an error.
 if (

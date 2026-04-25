@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { useLocation, useNavigate, Navigate } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
 import { ApplianceBaseType } from '@appliance.sh/sdk/models';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
@@ -15,9 +16,12 @@ interface LogLine {
   message: string;
 }
 
+type HandoffState = 'idle' | 'saving' | 'saved' | 'failed' | 'skipped';
+
 export function BootstrapProgressPage() {
   const host = useHost();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { state } = useLocation();
   const values = state as WizardValues | undefined;
 
@@ -29,7 +33,10 @@ export function BootstrapProgressPage() {
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [result, setResult] = React.useState<BootstrapResult | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [handoff, setHandoff] = React.useState<HandoffState>('idle');
+  const [handoffError, setHandoffError] = React.useState<string | null>(null);
   const startedRef = React.useRef(false);
+  const handoffStartedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
@@ -94,6 +101,39 @@ export function BootstrapProgressPage() {
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   }, [values, host.bootstrap, handleEvent]);
 
+  // Handoff: once bootstrap returns a reachable api-server + fresh
+  // API key, persist them to the host (OS keychain in Tauri,
+  // sessionStorage in the web shell) and invalidate the cached
+  // config query so Dashboard/Settings re-read the connected state.
+  // Phase 1–only results have no apiKey/apiServerUrl — nothing to
+  // save, handoff marks itself `skipped`.
+  React.useEffect(() => {
+    if (!result || handoffStartedRef.current) return;
+    handoffStartedRef.current = true;
+
+    if (!result.apiServerUrl || !result.apiKey) {
+      setHandoff('skipped');
+      return;
+    }
+
+    const apiServerUrl = result.apiServerUrl;
+    const apiKey = result.apiKey;
+    setHandoff('saving');
+    (async () => {
+      try {
+        if (host.saveApiServerUrl) {
+          await host.saveApiServerUrl(apiServerUrl);
+        }
+        await host.saveApiKey(apiKey);
+        await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+        setHandoff('saved');
+      } catch (err) {
+        setHandoff('failed');
+        setHandoffError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+  }, [result, host, queryClient]);
+
   if (!values) {
     return <Navigate to="/bootstrap" replace />;
   }
@@ -139,7 +179,16 @@ export function BootstrapProgressPage() {
 
       {result ? (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ Phase 1 complete</div>
+          <div className="flex items-center gap-2 text-sm font-medium text-green-400">
+            ✓ Bootstrap complete
+            {handoff === 'saving' ? (
+              <span className="text-[var(--color-muted-foreground)]">· saving credentials…</span>
+            ) : handoff === 'saved' ? (
+              <span className="text-[var(--color-muted-foreground)]">· credentials saved</span>
+            ) : handoff === 'failed' ? (
+              <span className="text-red-400">· save failed</span>
+            ) : null}
+          </div>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
             <dt className="text-[var(--color-muted-foreground)]">State backend</dt>
             <dd className="font-mono">{result.stateBackendUrl}</dd>
@@ -149,8 +198,27 @@ export function BootstrapProgressPage() {
                 <dd className="font-mono">{result.apiServerUrl}</dd>
               </>
             ) : null}
+            {result.apiKey ? (
+              <>
+                <dt className="text-[var(--color-muted-foreground)]">API key</dt>
+                <dd className="font-mono">{result.apiKey.id}</dd>
+              </>
+            ) : null}
+            {result.statePromoted ? (
+              <>
+                <dt className="text-[var(--color-muted-foreground)]">State</dt>
+                <dd>promoted to S3</dd>
+              </>
+            ) : null}
           </dl>
-          <Button onClick={() => navigate('/')}>Open dashboard</Button>
+          {handoff === 'failed' && handoffError ? (
+            <div className="rounded-md border border-red-500/50 bg-red-500/5 p-2 text-xs text-red-400">
+              {handoffError} — connect manually via Settings.
+            </div>
+          ) : null}
+          <Button onClick={() => navigate('/')} disabled={handoff === 'saving'}>
+            {handoff === 'saving' ? 'Saving…' : 'Open dashboard'}
+          </Button>
         </div>
       ) : null}
 

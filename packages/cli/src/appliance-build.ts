@@ -20,10 +20,9 @@ program
   .option('-o, --output <output>', 'output file', DEFAULT_OUTPUT)
   .action(async () => {
     const opts = program.opts();
-    const manifestPath = opts.file as string;
 
-    // Read appliance.json
-    const applianceFile = extractApplianceFile(program);
+    // Read the appliance manifest (JSON or TS/JS, resolved by loader).
+    const applianceFile = await extractApplianceFile(program);
     if (!applianceFile.success) {
       console.error(chalk.red('Could not read appliance manifest. Run `appliance configure` first.'));
       process.exit(1);
@@ -54,8 +53,11 @@ program
 
     archive.pipe(output);
 
-    // Always include the manifest
-    archive.file(path.resolve(manifestPath), { name: 'appliance.json' });
+    // Always include the resolved manifest as JSON. For TS/JS
+    // manifests the source isn't parseable server-side, so we ship
+    // the resolved object (functions already invoked) — the server
+    // only ever reads appliance.json from the zip.
+    archive.append(JSON.stringify(appliance, null, 2), { name: 'appliance.json' });
 
     if (appliance.type === ApplianceType.container) {
       await packageContainer(archive, appliance);

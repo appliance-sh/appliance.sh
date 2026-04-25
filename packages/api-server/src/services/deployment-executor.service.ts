@@ -65,11 +65,18 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
           ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deployment.id}`)
           : undefined;
 
-        if (input.environment) {
-          if (!build) {
-            throw new Error('Environment variables require a build');
-          }
-          build.environment = { ...input.environment, ...build.environment };
+        if (build) {
+          // Precedence: resolver env (build.environment — system
+          // correctness, e.g. AWS_LWA_PORT) > runtime deploy env
+          // (input.environment) > manifest env (build.manifestEnv —
+          // static defaults baked into the appliance).
+          build.environment = {
+            ...(build.manifestEnv ?? {}),
+            ...(input.environment ?? {}),
+            ...(build.environment ?? {}),
+          };
+        } else if (input.environment) {
+          throw new Error('Environment variables require a build');
         }
 
         result = await infraService.deploy(metadata.stackName, metadata, build);

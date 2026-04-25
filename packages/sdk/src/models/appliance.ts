@@ -54,6 +54,12 @@ export const applianceTypeBase = z.object({
   // the backend maps it to the target's equivalent (AWS: Lambda
   // ephemeralStorage, i.e. /tmp size).
   storage: z.number().int().min(512).max(10240).optional(),
+  // Static environment variables baked into the build. Merged with
+  // runtime env passed at deploy time (runtime wins on conflict).
+  // Declared at the manifest level so a TS manifest can compute them
+  // from build-time context (APPLIANCE_MODE=server/worker, VERSION,
+  // etc.) without round-tripping through the deploy call.
+  env: z.record(z.string(), z.string()).optional(),
 });
 
 export const applianceTypeContainerInput = applianceTypeBase.extend({
