@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { extractApplianceFile, saveApplianceFile } from './utils/common.js';
+import { extractApplianceFile, registerManifestOptions, saveApplianceFile } from './utils/common.js';
 import {
   promptForApplianceFramework,
   promptForApplianceName,
@@ -14,9 +14,7 @@ import { ApplianceInput, ApplianceType } from '@appliance.sh/sdk';
 
 const program = new Command();
 
-program
-  .option('-f, --file <file>', 'appliance manifest file', 'appliance.json')
-  .option('-d, --directory <directory>', 'appliance directory');
+registerManifestOptions(program);
 
 const cmd = program.parse(process.argv);
 

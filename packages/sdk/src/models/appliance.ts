@@ -102,6 +102,30 @@ export const applianceInput = z.discriminatedUnion('type', [
 
 export type ApplianceInput = z.infer<typeof applianceInput>;
 export type Appliance = z.output<typeof applianceInput>;
+
+// Context passed to function-form default exports of programmatic
+// (.ts/.js) manifests. Lets a single manifest module return
+// different shapes depending on the CLI invocation — e.g. one file
+// that emits a server config or a worker config based on `variant`,
+// or that reads project/environment to produce per-target env vars.
+//
+// `variant` is populated at both build and deploy time. `project`
+// and `environment` are populated only at deploy time (undefined
+// during `appliance build`); the build artifact itself is meant to
+// be environment-invariant — only env vars are re-rendered per
+// deploy from the same artifact.
+export interface ManifestContext {
+  /** Directory the CLI was invoked from (process.cwd at load time). */
+  cwd: string;
+  /** Value passed via `--variant <name>`; undefined when the flag is absent. */
+  variant?: string;
+  /** Project name being deployed; undefined during `appliance build`. */
+  project?: string;
+  /** Environment name being deployed; undefined during `appliance build`. */
+  environment?: string;
+  /** Snapshot of process.env at load time. */
+  env: Record<string, string | undefined>;
+}
 export type ApplianceContainer = z.output<typeof applianceTypeContainerInput>;
 export type ApplianceFrameworkApp = z.output<typeof applianceTypeFrameworkInput>;
 export type ApplianceDesktop = z.output<typeof applianceTypeDesktopInput>;

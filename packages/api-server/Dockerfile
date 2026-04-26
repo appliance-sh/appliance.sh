@@ -37,6 +37,7 @@ COPY .docker-deps/infra/dist/ packages/infra/dist/
 # Copy api-server source and build
 COPY .docker-deps/root-tsconfig.json tsconfig.json
 COPY tsconfig.json packages/api-server/
+COPY tsconfig.build.json packages/api-server/
 COPY src/ packages/api-server/src/
 RUN pnpm --filter @appliance.sh/api-server run build
 

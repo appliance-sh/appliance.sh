@@ -6,17 +6,15 @@ import * as path from 'node:path';
 import archiver from 'archiver';
 import { ApplianceType } from '@appliance.sh/sdk';
 import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
-import { extractApplianceFile } from './utils/common.js';
+import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
 import chalk from 'chalk';
 
 const DEFAULT_OUTPUT = 'appliance.zip';
 
 const program = new Command();
 
-program
+registerManifestOptions(program)
   .description('build an appliance and package it as appliance.zip')
-  .option('-f, --file <file>', 'appliance manifest file', 'appliance.json')
-  .option('-d, --directory <directory>', 'appliance directory')
   .option('-o, --output <output>', 'output file', DEFAULT_OUTPUT)
   .action(async () => {
     const opts = program.opts();
@@ -24,7 +22,7 @@ program
     // Read the appliance manifest (JSON or TS/JS, resolved by loader).
     const applianceFile = await extractApplianceFile(program);
     if (!applianceFile.success) {
-      console.error(chalk.red('Could not read appliance manifest. Run `appliance configure` first.'));
+      console.error(chalk.red(applianceFile.error.message));
       process.exit(1);
     }
 
@@ -57,7 +55,14 @@ program
     // manifests the source isn't parseable server-side, so we ship
     // the resolved object (functions already invoked) — the server
     // only ever reads appliance.json from the zip.
-    archive.append(JSON.stringify(appliance, null, 2), { name: 'appliance.json' });
+    //
+    // Strip `env` before archiving: env is rendered fresh at deploy
+    // time with full context (project, environment, variant), so the
+    // build artifact stays environment-invariant. One zip → many
+    // deploys. Server-side env arrives via the deploy payload's
+    // `environment` parameter.
+    const { env: _env, ...manifestForZip } = appliance;
+    archive.append(JSON.stringify(manifestForZip, null, 2), { name: 'appliance.json' });
 
     if (appliance.type === ApplianceType.container) {
       await packageContainer(archive, appliance);

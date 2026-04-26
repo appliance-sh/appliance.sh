@@ -1,10 +1,11 @@
 import { Command } from 'commander';
 import path from 'path';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { Appliance, applianceInput, ApplianceInput, Result } from '@appliance.sh/sdk';
+import { confirm } from '@inquirer/prompts';
+import { Appliance, applianceInput, ApplianceInput, ManifestContext, Result } from '@appliance.sh/sdk';
 import chalk from 'chalk';
+import { addTrustedProject, isTrustedProject, settingsFilePath } from './settings.js';
 
 // Ordered by precedence. First hit wins when the user passes neither
 // --file nor --directory (or --directory without --file).
@@ -24,7 +25,14 @@ const CODE_EXTENSIONS = new Set(['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs']);
 // manifests doesn't spam the same warnings.
 const warnedLoads = new Set<string>();
 
-export async function extractApplianceFile(cmd: Command): Promise<Result<ApplianceInput>> {
+export interface ExtractOptions {
+  /** Project name forwarded into ManifestContext (deploy time only). */
+  project?: string;
+  /** Environment name forwarded into ManifestContext (deploy time only). */
+  environment?: string;
+}
+
+export async function extractApplianceFile(cmd: Command, opts: ExtractOptions = {}): Promise<Result<ApplianceInput>> {
   const filePath = resolveManifestPath(cmd);
   if (!filePath) {
     return {
@@ -37,15 +45,23 @@ export async function extractApplianceFile(cmd: Command): Promise<Result<Applian
   const isCode = CODE_EXTENSIONS.has(ext);
 
   if (isCode) {
-    const trustCheck = checkManifestTrust(filePath);
+    const trustCheck = await checkManifestTrust(filePath);
     if (!trustCheck.trusted) {
       return { success: false, error: new Error(trustCheck.reason) };
     }
     warnOnFirstCodeLoad(filePath);
   }
 
+  const ctx: ManifestContext = {
+    cwd: process.cwd(),
+    variant: (cmd.getOptionValue('variant') as string | undefined) || undefined,
+    project: opts.project,
+    environment: opts.environment,
+    env: { ...process.env },
+  };
+
   try {
-    const raw = await loadManifest(filePath, ext);
+    const raw = await loadManifest(filePath, ext, ctx);
     const parsed = applianceInput.safeParse(raw);
     if (!parsed.success) return parsed;
 
@@ -57,6 +73,17 @@ export async function extractApplianceFile(cmd: Command): Promise<Result<Applian
   } catch (err) {
     return { success: false, error: err as Error };
   }
+}
+
+// Standard manifest options every command that loads a manifest
+// should accept. Centralised so the variant/file/directory triplet
+// stays consistent across `appliance build`, `appliance configure`,
+// etc., and so the loader can read each option uniformly.
+export function registerManifestOptions(program: Command): Command {
+  return program
+    .option('-f, --file <file>', 'appliance manifest file', 'appliance.json')
+    .option('-d, --directory <directory>', 'appliance directory')
+    .option('--variant <name>', 'variant to load from a programmatic (.ts/.js) manifest');
 }
 
 function resolveManifestPath(cmd: Command): string | null {
@@ -103,44 +130,70 @@ function resolveManifestPath(cmd: Command): string | null {
   return picked;
 }
 
-// Trust check: code manifests execute arbitrary code. Either the
-// user opts in via env var (CI-friendly) or the manifest's directory
-// is listed in ~/.appliance/trusted-manifests (one absolute path per
-// line). File-based trust is per-user, so a `git clone` never
-// inherits trust from the author.
+// Trust check: code manifests execute arbitrary code. Three ways
+// in, in priority order:
+//   1. APPLIANCE_TRUST_MANIFEST=1 env var (CI / one-off bypass)
+//   2. trustedProjects entry in ~/.appliance/settings.json (auto-
+//      managed by this CLI; persists across runs)
+//   3. interactive y/N prompt on a TTY — yes appends the directory
+//      to trustedProjects so it's silent next time
+// Non-TTY without env or settings entry → hard error with both
+// remediations.
 interface TrustResult {
   trusted: boolean;
   reason: string;
 }
 
-function checkManifestTrust(filePath: string): TrustResult {
+async function checkManifestTrust(filePath: string): Promise<TrustResult> {
   if (process.env.APPLIANCE_TRUST_MANIFEST === '1') {
     return { trusted: true, reason: 'env var' };
   }
 
-  const trustFile = path.join(os.homedir(), '.appliance', 'trusted-manifests');
   const manifestDir = path.dirname(path.resolve(filePath));
-
-  if (fs.existsSync(trustFile)) {
-    const lines = fs
-      .readFileSync(trustFile, 'utf-8')
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith('#'));
-    if (lines.some((line) => path.resolve(line) === manifestDir)) {
-      return { trusted: true, reason: 'trust file' };
-    }
+  if (isTrustedProject(manifestDir)) {
+    return { trusted: true, reason: 'settings.trustedProjects' };
   }
 
   const rel = path.basename(filePath);
+
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    console.warn(
+      chalk.yellow(
+        `\n⚠  ${rel} executes arbitrary code from ${manifestDir}.\n` +
+          `   Only trust projects you would also run \`pnpm install && pnpm build\` for.`
+      )
+    );
+    let answer: boolean;
+    try {
+      answer = await confirm({
+        message: 'Trust this directory and remember the choice?',
+        default: false,
+      });
+    } catch {
+      return {
+        trusted: false,
+        reason: `Refusing to load ${rel}: trust prompt cancelled.`,
+      };
+    }
+    if (answer) {
+      addTrustedProject(manifestDir);
+      console.log(chalk.dim(`Added to trustedProjects in ${settingsFilePath()}`));
+      return { trusted: true, reason: 'TTY prompt' };
+    }
+    return {
+      trusted: false,
+      reason: `Refusing to load ${rel}: declined at trust prompt.`,
+    };
+  }
+
   return {
     trusted: false,
     reason:
-      `Refusing to load ${rel}: TypeScript/JavaScript manifests execute arbitrary code. ` +
-      `Trust this project by either:\n` +
+      `Refusing to load ${rel}: TypeScript/JavaScript manifests execute arbitrary code, ` +
+      `and this directory is not in trustedProjects. Trust it by either:\n` +
       `  • setting APPLIANCE_TRUST_MANIFEST=1 (CI / one-off runs), or\n` +
-      `  • appending this directory to ~/.appliance/trusted-manifests:\n` +
-      `      mkdir -p ~/.appliance && echo "${manifestDir}" >> ~/.appliance/trusted-manifests`,
+      `  • running this command interactively (the CLI will prompt and persist your choice), or\n` +
+      `  • adding "${manifestDir}" to trustedProjects in ${settingsFilePath()}`,
   };
 }
 
@@ -195,14 +248,14 @@ function shannonEntropy(s: string): number {
   return h;
 }
 
-async function loadManifest(filePath: string, ext: string): Promise<unknown> {
+async function loadManifest(filePath: string, ext: string, ctx: ManifestContext): Promise<unknown> {
   if (ext === '.json') {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   }
   if (CODE_EXTENSIONS.has(ext)) {
     const mod = await importManifestModule(filePath);
     let raw: unknown = (mod as { default?: unknown }).default ?? mod;
-    if (typeof raw === 'function') raw = await (raw as () => unknown)();
+    if (typeof raw === 'function') raw = await (raw as (ctx: ManifestContext) => unknown)(ctx);
     return raw;
   }
   throw new Error(`Unsupported manifest extension: ${ext}`);

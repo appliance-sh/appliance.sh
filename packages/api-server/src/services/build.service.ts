@@ -16,13 +16,11 @@ export interface ResolvedBuild {
   layers?: string[];
   architectures?: string[];
   // Resolver-owned env — system correctness keys (AWS_LWA_PORT,
-  // AWS_LAMBDA_EXEC_WRAPPER). Beats runtime and manifest env at
-  // deploy time; a malicious manifest cannot hijack these.
+  // AWS_LAMBDA_EXEC_WRAPPER). Manifest-declared env vars travel
+  // through the deploy payload's `environment` parameter (rendered
+  // client-side at deploy time with full ManifestContext); the
+  // executor merges them under these resolver values.
   environment?: Record<string, string>;
-  // Manifest-declared env from applianceTypeBase.env. Kept separate
-  // from `environment` so the executor can layer runtime-deploy env
-  // on top (precedence: resolver > runtime > manifest).
-  manifestEnv?: Record<string, string>;
   memory?: number;
   timeout?: number;
   storage?: number;
@@ -106,15 +104,15 @@ export class BuildService {
       if (!fs.existsSync(manifestPath)) throw new Error('Build missing appliance.json');
       const manifest = applianceInput.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf-8')));
 
-      const base: ResolvedBuild =
-        manifest.type === 'container'
-          ? await this.resolveContainer(tmpDir, manifest, tag, config)
-          : manifest.type === 'framework'
-            ? this.resolveFramework(manifest, s3Key, config)
-            : { codeS3Key: s3Key };
-
-      if (manifest.env) base.manifestEnv = manifest.env;
-      return base;
+      // The build artifact is environment-invariant: env was stripped
+      // before archiving (CLI's appliance-build.ts) and is rendered
+      // fresh per-deploy with full ManifestContext. Anything left in
+      // manifest.env here is a stale/legacy build and is ignored.
+      return manifest.type === 'container'
+        ? await this.resolveContainer(tmpDir, manifest, tag, config)
+        : manifest.type === 'framework'
+          ? this.resolveFramework(manifest, s3Key, config)
+          : { codeS3Key: s3Key };
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

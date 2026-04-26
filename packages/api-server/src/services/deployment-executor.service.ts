@@ -67,11 +67,11 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
 
         if (build) {
           // Precedence: resolver env (build.environment — system
-          // correctness, e.g. AWS_LWA_PORT) > runtime deploy env
-          // (input.environment) > manifest env (build.manifestEnv —
-          // static defaults baked into the appliance).
+          // correctness, e.g. AWS_LWA_PORT) > deploy-time env
+          // (input.environment, which the CLI populates from
+          // manifest render + --env-file). Manifest env no longer
+          // travels through the build artifact.
           build.environment = {
-            ...(build.manifestEnv ?? {}),
             ...(input.environment ?? {}),
             ...(build.environment ?? {}),
           };

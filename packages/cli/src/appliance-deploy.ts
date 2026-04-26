@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import type { Project, Environment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
 import chalk from 'chalk';
 
 const POLL_INTERVAL_MS = 3000;
@@ -69,6 +70,52 @@ async function findOrCreateEnvironment(
   return createResult.data;
 }
 
+// Re-render the manifest at deploy time with project + environment
+// context so the manifest function (if any) can produce per-target
+// env vars. Returns undefined when there's no manifest source
+// reachable from cwd or when the manifest declares no env — in
+// either case the deploy proceeds with just --env-file values.
+async function renderManifestEnv(
+  program: Command,
+  projectName: string,
+  environmentName: string
+): Promise<Record<string, string> | undefined> {
+  const result = await extractApplianceFile(program, {
+    project: projectName,
+    environment: environmentName,
+  });
+  if (!result.success) {
+    if (result.error.name === 'File Not Found') {
+      // Deploy from a location without the manifest source is
+      // legitimate (e.g. promoting a prebuilt zip). No manifest
+      // env, just continue.
+      return undefined;
+    }
+    console.error(chalk.red(`Failed to render manifest env: ${result.error.message}`));
+    process.exit(1);
+  }
+  const env = result.data.env;
+  if (env && Object.keys(env).length > 0) {
+    console.log(chalk.dim(`Rendered ${Object.keys(env).length} env vars from manifest`));
+    return env;
+  }
+  return undefined;
+}
+
+function loadEnvFile(explicit: string | undefined, environmentName: string): Record<string, string> | undefined {
+  const envFilePath = path.resolve(explicit ?? `.env.${environmentName}`);
+  if (fs.existsSync(envFilePath)) {
+    const vars = parseEnvFile(envFilePath);
+    console.log(chalk.dim(`Loaded ${Object.keys(vars).length} env vars from ${path.basename(envFilePath)}`));
+    return vars;
+  }
+  if (explicit) {
+    console.error(chalk.red(`Env file not found: ${envFilePath}`));
+    process.exit(1);
+  }
+  return undefined;
+}
+
 async function pollDeployment(client: ReturnType<typeof createApplianceClient>, deploymentId: string) {
   while (true) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
@@ -95,7 +142,7 @@ async function pollDeployment(client: ReturnType<typeof createApplianceClient>, 
 
 const program = new Command();
 
-program
+registerManifestOptions(program)
   .description('deploy a named project/environment')
   .argument('<project>', 'project name')
   .argument('<environment>', 'environment name')
@@ -110,6 +157,9 @@ program
       build: string;
       imageUri?: string;
       envFile?: string;
+      file?: string;
+      directory?: string;
+      variant?: string;
     }>();
 
     // --image-uri and --build are mutually exclusive; detect the
@@ -168,18 +218,22 @@ program
         console.log(chalk.dim(`Build uploaded: ${buildId}`));
       }
 
-      // Load environment variables: explicit --env-file, or auto-detect .env.<environment>
-      let envVars: Record<string, string> | undefined;
-      const envFilePath = path.resolve(opts.envFile ?? `.env.${environmentName}`);
-      if (fs.existsSync(envFilePath)) {
-        envVars = parseEnvFile(envFilePath);
-        console.log(
-          chalk.dim(`Loaded ${Object.keys(envVars).length} environment variables from ${path.basename(envFilePath)}`)
-        );
-      } else if (opts.envFile) {
-        console.error(chalk.red(`Env file not found: ${envFilePath}`));
-        process.exit(1);
-      }
+      // Render env from the manifest, merge with --env-file. The
+      // build artifact is environment-invariant — env is rendered
+      // fresh per-deploy with full ManifestContext (project,
+      // environment, variant) so the same zip can deploy to many
+      // environments. Manifest source is best-effort: deploys from
+      // a checkout-less location (e.g. promoting a prebuilt zip)
+      // degrade gracefully to env-file-only.
+      const manifestEnv = await renderManifestEnv(program, projectName, environmentName);
+
+      const envFileVars = loadEnvFile(opts.envFile, environmentName);
+
+      // --env-file wins on conflict: it's the most local, ad-hoc
+      // override surface (typically holds secrets or per-deploy
+      // values), while manifest env represents declared defaults.
+      const envVars: Record<string, string> | undefined =
+        manifestEnv || envFileVars ? { ...(manifestEnv ?? {}), ...(envFileVars ?? {}) } : undefined;
 
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
       const result = await client.deploy(environment.id, { buildId, environment: envVars });
