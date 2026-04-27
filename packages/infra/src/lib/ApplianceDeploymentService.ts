@@ -13,7 +13,7 @@ import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
 const PULUMI_HOME = '/tmp/.pulumi';
 const PLUGIN_CACHE_DIR = '/opt/pulumi-cache/plugins';
 
-export type PulumiAction = 'deploy' | 'destroy';
+export type PulumiAction = 'deploy' | 'destroy' | 'refresh';
 
 export interface PulumiResult {
   action: PulumiAction;
@@ -190,9 +190,11 @@ export class ApplianceDeploymentService {
   async deploy(
     stackName: string,
     metadata?: ApplianceStackMetadata,
-    build?: ResolvedBuildParams
+    build?: ResolvedBuildParams,
+    opts?: PulumiOpOptions
   ): Promise<PulumiResult> {
     const stack = await this.getOrCreateStack(stackName, metadata, build);
+    opts?.onStack?.(stack);
     const result = await stack.up({ onOutput: (m) => console.log(m) });
     const changes = result.summary.resourceChanges || {};
     const totalChanges = Object.entries(changes)
@@ -208,9 +210,10 @@ export class ApplianceDeploymentService {
     };
   }
 
-  async destroy(stackName: string, projectId?: string): Promise<PulumiResult> {
+  async destroy(stackName: string, projectId?: string, opts?: PulumiOpOptions): Promise<PulumiResult> {
     try {
       const stack = await this.selectExistingStack(stackName, projectId);
+      opts?.onStack?.(stack);
       await stack.destroy({ onOutput: (m) => console.log(m) });
       return { action: 'destroy', ok: true, idempotentNoop: false, message: 'Stack resources deleted', stackName };
     } catch (e) {
@@ -228,6 +231,55 @@ export class ApplianceDeploymentService {
       throw e;
     }
   }
+
+  async refresh(stackName: string, projectId?: string, opts?: PulumiOpOptions): Promise<PulumiResult> {
+    try {
+      const stack = await this.selectExistingStack(stackName, projectId);
+      opts?.onStack?.(stack);
+      const result = await stack.refresh({ onOutput: (m) => console.log(m) });
+      const changes = result.summary.resourceChanges || {};
+      const totalChanges = Object.entries(changes)
+        .filter(([k]) => k !== 'same')
+        .reduce((acc, [, v]) => acc + (v || 0), 0);
+      const idempotentNoop = totalChanges === 0;
+      return {
+        action: 'refresh',
+        ok: true,
+        idempotentNoop,
+        message: idempotentNoop ? 'No drift (state matched reality)' : 'State refreshed',
+        stackName,
+      };
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      const msg = String(e?.message || e);
+      if (msg.includes('no stack named') || msg.includes('not found')) {
+        return {
+          action: 'refresh',
+          ok: true,
+          idempotentNoop: true,
+          message: 'Stack not found (nothing to refresh)',
+          stackName,
+        };
+      }
+      throw e;
+    }
+  }
+}
+
+// Options for in-flight Pulumi operations. `onStack` hands the
+// caller a structural handle to the live Pulumi Stack so it can
+// invoke stack.cancel() / stack.refresh() out of band — used by the
+// api-server's cancel-aware executor. Structural typing here avoids
+// pinning consumers to a specific @pulumi/pulumi resolution
+// (workspace packages can otherwise end up with two parallel copies
+// that fail nominal type identity).
+export interface PulumiOpOptions {
+  onStack?: (stack: PulumiStackHandle) => void;
+}
+
+export interface PulumiStackHandle {
+  cancel(): Promise<void>;
+  refresh(opts?: { onOutput?: (m: string) => void }): Promise<unknown>;
 }
 
 // Factory function to create the service

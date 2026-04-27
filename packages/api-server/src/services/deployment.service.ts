@@ -40,11 +40,15 @@ export class DeploymentService {
 
     // Refuse to start a new deployment while a transition is in flight
     // for this environment — overlapping Pulumi runs on the same stack
-    // would race on state. Only `Deploying` and `Destroying` are rejected:
-    // `Pending` is the initial state (must allow the first deploy), and
-    // terminal states (`Deployed`, `Destroyed`, `Failed`) are all safe to
-    // start a new deployment from.
-    if (environment.status === EnvironmentStatus.Deploying || environment.status === EnvironmentStatus.Destroying) {
+    // would race on state. `Deploying`, `Destroying`, and `Refreshing`
+    // are rejected: `Pending` is the initial state (must allow the
+    // first deploy), and terminal states (`Deployed`, `Destroyed`,
+    // `Failed`) are all safe to start a new deployment from.
+    if (
+      environment.status === EnvironmentStatus.Deploying ||
+      environment.status === EnvironmentStatus.Destroying ||
+      environment.status === EnvironmentStatus.Refreshing
+    ) {
       throw new EnvironmentBusyError(environment.id, environment.status);
     }
 
@@ -66,8 +70,17 @@ export class DeploymentService {
 
     await storage.set(COLLECTION, deployment.id, deployment);
 
+    // Capture the prior env status BEFORE flipping it. Refresh
+    // restores this on success; Deploy/Destroy ignore it (they
+    // compute their own terminal status — Deployed/Destroyed/Failed).
+    const priorEnvStatus = environment.status;
+
     const envStatus =
-      input.action === DeploymentAction.Deploy ? EnvironmentStatus.Deploying : EnvironmentStatus.Destroying;
+      input.action === DeploymentAction.Deploy
+        ? EnvironmentStatus.Deploying
+        : input.action === DeploymentAction.Destroy
+          ? EnvironmentStatus.Destroying
+          : EnvironmentStatus.Refreshing;
     await environmentService.updateStatus(environment.id, envStatus);
 
     const workerEvent: WorkerEvent = {
@@ -81,6 +94,7 @@ export class DeploymentService {
         deploymentId: deployment.id,
         stackName: environment.stackName,
       },
+      priorEnvStatus,
     };
 
     try {
@@ -159,6 +173,62 @@ export class DeploymentService {
   async get(id: string): Promise<Deployment | null> {
     const storage = getStorageService();
     return storage.get<Deployment>(COLLECTION, id);
+  }
+
+  /**
+   * Request cancellation of a deployment.
+   *
+   * Cooperative ({ force: false } — default): sets status to
+   * Cancelling on Pending/InProgress records; the worker observes
+   * the flag on its next status poll, calls stack.cancel() on the
+   * running Pulumi op, then runs stack.refresh to reconcile state
+   * and writes the final Cancelled status. Terminal-state and
+   * already-cancelling deployments are returned unchanged.
+   *
+   * Force ({ force: true }): bypasses worker cooperation. Writes a
+   * terminal Cancelled status directly and flips the environment
+   * to Failed. Used to unstick a deployment whose worker is dead
+   * (Lambda timeout, container crashed). Pulumi state is NOT
+   * refreshed — operators run `pulumi refresh` after reaping the
+   * stale worker. Already-terminal deployments are returned
+   * unchanged.
+   */
+  async cancel(id: string, options: { force?: boolean } = {}): Promise<Deployment | null> {
+    const storage = getStorageService();
+    const deployment = await storage.get<Deployment>(COLLECTION, id);
+    if (!deployment) return null;
+
+    // Already terminal — nothing to do regardless of force.
+    if (
+      deployment.status === DeploymentStatus.Cancelled ||
+      deployment.status === DeploymentStatus.Succeeded ||
+      deployment.status === DeploymentStatus.Failed
+    ) {
+      return deployment;
+    }
+
+    if (options.force) {
+      deployment.status = DeploymentStatus.Cancelled;
+      deployment.completedAt = new Date().toISOString();
+      deployment.message =
+        'Force-cancelled. Worker cooperation was bypassed; Pulumi state may not match reality. ' +
+        'Run `pulumi refresh` after the worker is reaped if you suspect drift.';
+      await storage.set(COLLECTION, deployment.id, deployment);
+      await environmentService.updateStatus(deployment.environmentId, EnvironmentStatus.Failed);
+      logger.warn('deployment force-cancelled', { deploymentId: deployment.id });
+      return deployment;
+    }
+
+    // Cooperative cancel — already cancelling means a previous
+    // request is in flight. Don't churn the record.
+    if (deployment.status === DeploymentStatus.Cancelling) {
+      return deployment;
+    }
+
+    deployment.status = DeploymentStatus.Cancelling;
+    await storage.set(COLLECTION, deployment.id, deployment);
+    logger.info('deployment cancellation requested', { deploymentId: deployment.id });
+    return deployment;
   }
 
   async listByEnvironment(environmentId: string): Promise<Deployment[]> {

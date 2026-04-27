@@ -85,6 +85,24 @@ deploymentRoutes.get('/:id', async (req, res) => {
   }
 });
 
+deploymentRoutes.post('/:id/cancel', async (req, res) => {
+  try {
+    const force = req.body?.force === true;
+    const deployment = await deploymentService.cancel(req.params.id, { force });
+    if (!deployment) {
+      res.status(404).json({ error: 'Deployment not found' });
+      return;
+    }
+    // Cooperative cancel: 202 — worker observes the flag on its next
+    // status poll and converges to a terminal status.
+    // Force cancel: 200 — terminal status is already written.
+    res.status(force ? 200 : 202).json(deployment);
+  } catch (error) {
+    logger.error('cancel deployment failed', error, { requestId: req.requestId, deploymentId: req.params.id });
+    res.status(500).json({ error: 'Failed to cancel deployment', message: String(error) });
+  }
+});
+
 function parseIntParam(v: unknown): number | undefined {
   if (typeof v !== 'string') return undefined;
   const n = Number.parseInt(v, 10);

@@ -7,6 +7,10 @@ export enum EnvironmentStatus {
   Deployed = 'deployed',
   Destroying = 'destroying',
   Destroyed = 'destroyed',
+  // Transient: Pulumi `refresh` is reconciling state with reality.
+  // Settles back to whatever the environment's prior status was on
+  // success, or Failed on error.
+  Refreshing = 'refreshing',
   Failed = 'failed',
 }
 

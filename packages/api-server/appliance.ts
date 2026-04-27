@@ -9,8 +9,8 @@ import { AppliancePlatform, ApplianceType, type ApplianceContainer, type Manifes
 // main.ts:getMode() reads APPLIANCE_MODE to pick the route set.
 // Worker has a longer timeout because it executes Pulumi runs;
 // server requests are short HTTP exchanges.
-export default ({ variant }: ManifestContext): ApplianceContainer => {
-  const isWorker = variant === 'worker';
+export default ({ environment }: ManifestContext): ApplianceContainer => {
+  const isWorker = environment?.startsWith('worker');
   return {
     manifest: 'v1',
     type: ApplianceType.container,
@@ -18,7 +18,7 @@ export default ({ variant }: ManifestContext): ApplianceContainer => {
     port: 3000,
     platform: AppliancePlatform.LinuxAmd64,
     memory: 2048,
-    timeout: 900,
+    timeout: isWorker ? 900 : 30,
     storage: 4096,
     scripts: {
       build: 'bash scripts/docker-prep.sh',

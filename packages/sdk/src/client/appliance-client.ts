@@ -216,8 +216,51 @@ export class ApplianceClient {
     );
   }
 
+  /**
+   * Run `pulumi refresh` against the environment's stack to reconcile
+   * the Pulumi state file with live cloud reality. Topology is
+   * unchanged. Useful after manual cloud-side edits, after a
+   * force-cancel, or when investigating drift.
+   */
+  async refresh(environmentId: string): Promise<Result<Deployment>> {
+    return this.request<Deployment>(
+      'POST',
+      '/api/v1/deployments',
+      {
+        environmentId,
+        action: 'refresh',
+      },
+      600000
+    );
+  }
+
   async getDeployment(id: string): Promise<Result<Deployment>> {
     return this.request<Deployment>('GET', `/api/v1/deployments/${id}`);
+  }
+
+  /**
+   * Request cancellation of an in-flight deployment.
+   *
+   * Cooperative (default): flips the deployment to `cancelling`;
+   * the worker observes the flag on its next status poll, calls
+   * stack.cancel() on the running Pulumi op, then runs
+   * stack.refresh to reconcile state. Final terminal status is
+   * `cancelled` — or `succeeded`/`failed` if the underlying
+   * operation finished before cancel was observed.
+   *
+   * Force ({ force: true }): bypasses worker cooperation. The
+   * server immediately writes a terminal `cancelled` status without
+   * waiting for the worker. Pulumi state is NOT refreshed, so it
+   * may diverge from reality — run `pulumi refresh` manually after
+   * the worker is reaped. Use only when the worker is presumed
+   * dead/stuck and a graceful cancel isn't completing.
+   */
+  async cancelDeployment(id: string, opts?: { force?: boolean }): Promise<Result<Deployment>> {
+    return this.request<Deployment>(
+      'POST',
+      `/api/v1/deployments/${id}/cancel`,
+      opts?.force ? { force: true } : undefined
+    );
   }
 
   async listDeployments(options?: {
