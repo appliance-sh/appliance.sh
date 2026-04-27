@@ -4,18 +4,14 @@ import { useQuery, useQueries, useQueryClient, useMutation } from '@tanstack/rea
 import { Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
-import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { relativeTime } from '@/lib/time';
 import type { Environment, Project } from '@appliance.sh/sdk/models';
 
 export function EnvironmentsPage() {
-  const host = useHost();
-  const { data: config } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
-  });
-  if (!config?.apiServerUrl) return <Disconnected />;
+  const { cluster } = useSelectedCluster();
+  if (!cluster) return <Disconnected />;
   return <ConnectedEnvironments />;
 }
 

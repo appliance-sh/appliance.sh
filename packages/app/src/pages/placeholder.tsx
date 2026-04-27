@@ -1,5 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
-import { useHost } from '@/providers/host-provider';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 
 export function PlaceholderPage({
   title,
@@ -10,13 +9,8 @@ export function PlaceholderPage({
   description?: string;
   emptyWhenDisconnected?: string;
 }) {
-  const host = useHost();
-  const { data: config } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
-  });
-
-  const connected = Boolean(config?.apiServerUrl);
+  const { cluster } = useSelectedCluster();
+  const connected = Boolean(cluster);
 
   return (
     <div className="space-y-6">

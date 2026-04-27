@@ -8,14 +8,17 @@ use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-// Keychain service + account identifiers. Service is shared across
-// all Appliance Desktop installs on the machine; the account label
-// is stable and host-config-agnostic, which means one keychain
-// entry per user on the OS — enough for v1 (single-cluster shell).
-// Multi-cluster shell support would key on cluster ID here.
+// Keychain service is shared across all Appliance Desktop installs on
+// the machine. Each cluster's API key lives at account
+// `cluster:<uuid>`. The legacy single-cluster account (`api-key`) is
+// migrated to the new layout on first launch and then removed.
 const KEYCHAIN_SERVICE: &str = "sh.appliance.desktop";
-const KEYCHAIN_ACCOUNT: &str = "api-key";
+const LEGACY_KEYCHAIN_ACCOUNT: &str = "api-key";
 const CONFIG_FILE: &str = "config.json";
+
+fn cluster_keychain_account(cluster_id: &str) -> String {
+    format!("cluster:{cluster_id}")
+}
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
@@ -27,6 +30,8 @@ enum HostError {
     Keyring(#[from] keyring::Error),
     #[error("tauri: {0}")]
     Tauri(#[from] tauri::Error),
+    #[error("cluster not found: {0}")]
+    ClusterNotFound(String),
 }
 
 impl serde::Serialize for HostError {
@@ -41,17 +46,45 @@ struct ApiKey {
     secret: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Cluster {
+    id: String,
+    name: String,
+    api_server_url: String,
+    created_at: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostConfig {
-    api_server_url: Option<String>,
+    clusters: Vec<Cluster>,
+    selected_cluster_id: Option<String>,
     api_key: Option<ApiKey>,
 }
 
+// Persisted config supports both the new multi-cluster shape and the
+// legacy `apiServerUrl`-only shape. Legacy reads are migrated on first
+// `get_config` call (see `migrate_legacy`).
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PersistedConfig {
+    #[serde(default)]
+    clusters: Vec<Cluster>,
+    #[serde(default)]
+    selected_cluster_id: Option<String>,
+    // Legacy single-cluster field. Kept (skipped when serialising
+    // the new shape) only as a migration source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     api_server_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddClusterInput {
+    name: String,
+    api_server_url: String,
+    api_key: ApiKey,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
@@ -76,59 +109,147 @@ fn write_persisted_config(app: &AppHandle, cfg: &PersistedConfig) -> Result<(), 
     Ok(())
 }
 
-fn keychain_entry() -> Result<keyring::Entry, HostError> {
-    Ok(keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?)
+fn keychain_entry(account: &str) -> Result<keyring::Entry, HostError> {
+    Ok(keyring::Entry::new(KEYCHAIN_SERVICE, account)?)
+}
+
+fn read_api_key(account: &str) -> Option<ApiKey> {
+    keychain_entry(account)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .and_then(|raw| serde_json::from_str::<ApiKey>(&raw).ok())
+}
+
+fn write_api_key(account: &str, key: &ApiKey) -> Result<(), HostError> {
+    let entry = keychain_entry(account)?;
+    let payload = serde_json::to_string(key)?;
+    entry.set_password(&payload)?;
+    Ok(())
+}
+
+fn delete_api_key(account: &str) {
+    if let Ok(entry) = keychain_entry(account) {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(_) => {
+                // Best-effort: a stuck keychain entry shouldn't block the rest of the operation.
+            }
+        }
+    }
+}
+
+// On read, fold any legacy single-cluster state into the new shape.
+// Idempotent: once migrated, the legacy fields are gone and this is a
+// no-op. Returns true if the persisted file was rewritten so the
+// caller can persist + clean up the old keychain slot.
+fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, HostError> {
+    if !cfg.clusters.is_empty() {
+        // Already migrated. Drop the legacy field if it lingered.
+        if cfg.api_server_url.take().is_some() {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let Some(legacy_url) = cfg.api_server_url.take() else {
+        return Ok(false);
+    };
+    let Some(legacy_key) = read_api_key(LEGACY_KEYCHAIN_ACCOUNT) else {
+        // URL but no key — drop the orphan URL silently.
+        return Ok(true);
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let cluster = Cluster {
+        id: id.clone(),
+        name: derive_name_from_url(&legacy_url),
+        api_server_url: legacy_url,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    write_api_key(&cluster_keychain_account(&id), &legacy_key)?;
+    delete_api_key(LEGACY_KEYCHAIN_ACCOUNT);
+    cfg.clusters.push(cluster);
+    cfg.selected_cluster_id = Some(id);
+    write_persisted_config(app, cfg)?;
+    Ok(true)
+}
+
+fn derive_name_from_url(url: &str) -> String {
+    // Strip scheme + path so the cluster shows a recognisable hostname.
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    host.strip_prefix("api.").unwrap_or(host).to_string()
 }
 
 #[tauri::command]
 fn get_config(app: AppHandle) -> Result<HostConfig, HostError> {
-    let persisted = read_persisted_config(&app)?;
-    let api_key = keychain_entry()
-        .ok()
-        .and_then(|entry| entry.get_password().ok())
-        .and_then(|raw| serde_json::from_str::<ApiKey>(&raw).ok());
+    let mut persisted = read_persisted_config(&app)?;
+    migrate_legacy(&app, &mut persisted)?;
+
+    let api_key = persisted
+        .selected_cluster_id
+        .as_deref()
+        .and_then(|id| read_api_key(&cluster_keychain_account(id)));
+
     Ok(HostConfig {
-        api_server_url: persisted.api_server_url,
+        clusters: persisted.clusters,
+        selected_cluster_id: persisted.selected_cluster_id,
         api_key,
     })
 }
 
 #[tauri::command]
-fn save_api_server_url(app: AppHandle, url: String) -> Result<(), HostError> {
-    let mut cfg = read_persisted_config(&app)?;
-    cfg.api_server_url = Some(url);
-    write_persisted_config(&app, &cfg)
+fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostError> {
+    let mut persisted = read_persisted_config(&app)?;
+    migrate_legacy(&app, &mut persisted)?;
+
+    let cluster = Cluster {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: input.name,
+        api_server_url: input.api_server_url,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    write_api_key(&cluster_keychain_account(&cluster.id), &input.api_key)?;
+    persisted.clusters.push(cluster.clone());
+    persisted.selected_cluster_id = Some(cluster.id.clone());
+    write_persisted_config(&app, &persisted)?;
+    Ok(cluster)
 }
 
 #[tauri::command]
-fn save_api_key(id: String, secret: String) -> Result<(), HostError> {
-    let entry = keychain_entry()?;
-    let payload = serde_json::to_string(&ApiKey { id, secret })?;
-    entry.set_password(&payload)?;
-    Ok(())
-}
+fn select_cluster(app: AppHandle, cluster_id: Option<String>) -> Result<(), HostError> {
+    let mut persisted = read_persisted_config(&app)?;
+    migrate_legacy(&app, &mut persisted)?;
 
-#[tauri::command]
-fn clear_api_key() -> Result<(), HostError> {
-    let entry = keychain_entry()?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        // Idempotent: missing entry is fine.
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
+    if let Some(ref id) = cluster_id {
+        if !persisted.clusters.iter().any(|c| &c.id == id) {
+            return Err(HostError::ClusterNotFound(id.clone()));
+        }
     }
+    persisted.selected_cluster_id = cluster_id;
+    write_persisted_config(&app, &persisted)
 }
 
 #[tauri::command]
-fn disconnect(app: AppHandle) -> Result<(), HostError> {
-    // Clear keychain entry (idempotent).
-    if let Ok(entry) = keychain_entry() {
-        let _ = entry.delete_credential();
+fn remove_cluster(app: AppHandle, cluster_id: String) -> Result<(), HostError> {
+    let mut persisted = read_persisted_config(&app)?;
+    migrate_legacy(&app, &mut persisted)?;
+
+    let before = persisted.clusters.len();
+    persisted.clusters.retain(|c| c.id != cluster_id);
+    if persisted.clusters.len() == before {
+        return Err(HostError::ClusterNotFound(cluster_id));
     }
-    // Clear api_server_url from the persisted config.
-    let mut cfg = read_persisted_config(&app)?;
-    cfg.api_server_url = None;
-    write_persisted_config(&app, &cfg)
+
+    delete_api_key(&cluster_keychain_account(&cluster_id));
+
+    // If we removed the selected cluster, fall back to the first
+    // remaining one (or null when the list is now empty).
+    if persisted.selected_cluster_id.as_deref() == Some(cluster_id.as_str()) {
+        persisted.selected_cluster_id = persisted.clusters.first().map(|c| c.id.clone());
+    }
+    write_persisted_config(&app, &persisted)
 }
 
 // Resolve the path to the compiled bootstrap sidecar. Dev-only: uses
@@ -260,10 +381,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_config,
-            save_api_server_url,
-            save_api_key,
-            clear_api_key,
-            disconnect,
+            add_cluster,
+            select_cluster,
+            remove_cluster,
             run_bootstrap
         ])
         .run(tauri::generate_context!())

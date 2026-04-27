@@ -4,9 +4,10 @@ import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/c
 import { useHost } from '@/providers/host-provider';
 
 /**
- * Memoized ApplianceClient bound to the current host config. Returns
- * null while loading or when no cluster is configured — consumers
- * gate queries on its presence via TanStack Query's `enabled` flag.
+ * Memoized ApplianceClient bound to the currently selected cluster.
+ * Returns null while loading, when no cluster is selected, or when the
+ * selected cluster's key is missing — consumers gate queries on its
+ * presence via TanStack Query's `enabled` flag.
  */
 export function useApplianceClient(): ApplianceClient | null {
   const host = useHost();
@@ -15,11 +16,16 @@ export function useApplianceClient(): ApplianceClient | null {
     queryFn: () => host.getConfig(),
   });
 
+  const selected = React.useMemo(
+    () => config?.clusters.find((c) => c.id === config.selectedClusterId) ?? null,
+    [config?.clusters, config?.selectedClusterId]
+  );
+
   return React.useMemo(() => {
-    if (!config?.apiServerUrl || !config.apiKey) return null;
+    if (!selected || !config?.apiKey) return null;
     return createApplianceClient({
-      baseUrl: config.apiServerUrl,
+      baseUrl: selected.apiServerUrl,
       credentials: { keyId: config.apiKey.id, secret: config.apiKey.secret },
     });
-  }, [config?.apiServerUrl, config?.apiKey?.id, config?.apiKey?.secret]);
+  }, [selected, config?.apiKey?.id, config?.apiKey?.secret]);
 }

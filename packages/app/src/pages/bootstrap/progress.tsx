@@ -118,13 +118,11 @@ export function BootstrapProgressPage() {
 
     const apiServerUrl = result.apiServerUrl;
     const apiKey = result.apiKey;
+    const clusterName = values?.name ?? deriveNameFromUrl(apiServerUrl);
     setHandoff('saving');
     (async () => {
       try {
-        if (host.saveApiServerUrl) {
-          await host.saveApiServerUrl(apiServerUrl);
-        }
-        await host.saveApiKey(apiKey);
+        await host.addCluster({ name: clusterName, apiServerUrl, apiKey });
         await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
         setHandoff('saved');
       } catch (err) {
@@ -132,7 +130,7 @@ export function BootstrapProgressPage() {
         setHandoffError(err instanceof Error ? err.message : String(err));
       }
     })();
-  }, [result, host, queryClient]);
+  }, [result, host, queryClient, values?.name]);
 
   if (!values) {
     return <Navigate to="/bootstrap" replace />;
@@ -235,6 +233,14 @@ export function BootstrapProgressPage() {
       ) : null}
     </div>
   );
+}
+
+function deriveNameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^api\./, '');
+  } catch {
+    return url;
+  }
 }
 
 function PhaseCard({ phase, label, state }: { phase: BootstrapPhase; label: string; state: PhaseState }) {

@@ -4,22 +4,34 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 
-// Shown when getConfig() returns no apiServerUrl/apiKey. Users either
-// connect to an existing api-server or — on shells that can drive a
-// local bootstrap (Tauri desktop) — jump straight to the setup wizard.
+// Adds a cluster: probes the URL, then calls host.addCluster() which
+// persists the entry, stores the key in the OS keychain (Tauri) or
+// sessionStorage (web), and selects it. On shells that can drive a
+// local bootstrap (Tauri desktop) we link to the wizard instead.
 export function ConnectPage() {
   const host = useHost();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const canBootstrap = Boolean(host.bootstrap);
 
+  const [name, setName] = React.useState('');
   const [url, setUrl] = React.useState('');
   const [keyId, setKeyId] = React.useState('');
   const [secret, setSecret] = React.useState('');
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const canSubmit = url.length > 0 && keyId.startsWith('ak') && secret.startsWith('sk_') && !submitting;
+  // Auto-name the cluster from the URL hostname unless the user has
+  // typed something. Stops once they edit the name field.
+  const userTouchedName = React.useRef(false);
+  React.useEffect(() => {
+    if (userTouchedName.current) return;
+    const derived = deriveNameFromUrl(url);
+    if (derived) setName(derived);
+  }, [url]);
+
+  const canSubmit =
+    name.length > 0 && url.length > 0 && keyId.startsWith('ak') && secret.startsWith('sk_') && !submitting;
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,10 +41,11 @@ export function ConnectPage() {
     try {
       const normalizedUrl = url.replace(/\/+$/, '');
       await verifyApiServer(normalizedUrl);
-      if (host.saveApiServerUrl) {
-        await host.saveApiServerUrl(normalizedUrl);
-      }
-      await host.saveApiKey({ id: keyId, secret });
+      await host.addCluster({
+        name,
+        apiServerUrl: normalizedUrl,
+        apiKey: { id: keyId, secret },
+      });
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       navigate('/');
     } catch (err) {
@@ -78,7 +91,7 @@ export function ConnectPage() {
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">Connect to a cluster</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Enter the URL of an Appliance api-server and an API key to get started.
+          Enter the URL of an Appliance api-server and an API key to add it to this shell.
           {canBootstrap ? null : (
             <>
               {' '}
@@ -96,6 +109,20 @@ export function ConnectPage() {
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder="https://api.example.appliance.sh"
+            required
+            className={inputCls}
+          />
+        </Field>
+
+        <Field label="Cluster name" hint="how this cluster appears in the sidebar">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => {
+              userTouchedName.current = true;
+              setName(e.target.value);
+            }}
+            placeholder="production"
             required
             className={inputCls}
           />
@@ -128,7 +155,7 @@ export function ConnectPage() {
         ) : null}
 
         <Button type="submit" disabled={!canSubmit} className="w-full">
-          {submitting ? 'Connecting…' : 'Connect'}
+          {submitting ? 'Connecting…' : 'Add cluster'}
         </Button>
       </form>
 
@@ -145,6 +172,16 @@ export function ConnectPage() {
       ) : null}
     </div>
   );
+}
+
+function deriveNameFromUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    // Strip an "api." prefix so https://api.foo.example → "foo.example".
+    return u.hostname.replace(/^api\./, '');
+  } catch {
+    return '';
+  }
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {

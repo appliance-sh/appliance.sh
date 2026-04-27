@@ -6,9 +6,31 @@ import type {
   BootstrapResult,
 } from '@appliance.sh/bootstrap';
 
+// A cluster is one (api-server URL, API key) pair the user has either
+// connected to manually or bootstrapped from this shell. Identity is a
+// stable local UUID — the api-server doesn't know it; it's just how
+// the shell keys storage (config + keychain) and references the
+// cluster from the UI.
+export interface Cluster {
+  id: string;
+  name: string;
+  apiServerUrl: string;
+  createdAt: string;
+}
+
 export interface HostConfig {
-  apiServerUrl: string | null;
+  clusters: Cluster[];
+  selectedClusterId: string | null;
+  // The selected cluster's key, denormalised onto the config so
+  // useApplianceClient can construct an SDK client without a second
+  // host round-trip per render. Null when no cluster is selected.
   apiKey: { id: string; secret: string } | null;
+}
+
+export interface AddClusterInput {
+  name: string;
+  apiServerUrl: string;
+  apiKey: { id: string; secret: string };
 }
 
 // Drives a bootstrap run from the UI. Tauri host implements this by
@@ -31,11 +53,12 @@ export interface BootstrapHost {
 // fields so the web host can omit them entirely.
 export interface ConsoleHost {
   getConfig(): Promise<HostConfig>;
-  saveApiKey(key: { id: string; secret: string }): Promise<void>;
-  clearApiKey(): Promise<void>;
-  saveApiServerUrl?(url: string): Promise<void>;
-  /** Clears both the api-server URL and the API key. Idempotent. */
-  disconnect?(): Promise<void>;
+  /** Persist a new cluster + its key, and select it. Returns the stored Cluster. */
+  addCluster(input: AddClusterInput): Promise<Cluster>;
+  /** Switch the active cluster. Pass null to deselect (UI shows "no cluster"). */
+  selectCluster(clusterId: string | null): Promise<void>;
+  /** Remove a cluster + its key. If it was selected, selection falls back to the first remaining cluster (or null). */
+  removeCluster(clusterId: string): Promise<void>;
   openExternal(url: string): Promise<void>;
   notify?(opts: { title: string; body?: string }): Promise<void>;
   bootstrap?: BootstrapHost;

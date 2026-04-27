@@ -2,38 +2,37 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import type {
+  AddClusterInput,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
   BootstrapResult,
+  Cluster,
   ConsoleHost,
   HostConfig,
 } from '@appliance.sh/app';
 
-// Tauri host: api-server URL lives in a JSON config file under the
-// app config dir; the API key lives in the OS keychain. Both are
-// read/written through Rust commands defined in src-tauri/src/lib.rs.
-// Bootstrap runs through a Node sidecar the Rust side spawns —
-// progress events stream back over a Tauri Channel.
+// Tauri host: each cluster's URL/name lives in a JSON config file
+// under the app config dir; each cluster's API key lives in the OS
+// keychain at account `cluster:<id>`. Both are read/written through
+// Rust commands defined in src-tauri/src/lib.rs. Bootstrap runs
+// through a Node sidecar the Rust side spawns — progress events
+// stream back over a Tauri Channel.
 export const tauriHost: ConsoleHost = {
   async getConfig(): Promise<HostConfig> {
     return invoke<HostConfig>('get_config');
   },
 
-  async saveApiKey(key) {
-    await invoke('save_api_key', { id: key.id, secret: key.secret });
+  async addCluster(input: AddClusterInput): Promise<Cluster> {
+    return invoke<Cluster>('add_cluster', { input });
   },
 
-  async clearApiKey() {
-    await invoke('clear_api_key');
+  async selectCluster(clusterId: string | null): Promise<void> {
+    await invoke('select_cluster', { clusterId });
   },
 
-  async saveApiServerUrl(url) {
-    await invoke('save_api_server_url', { url });
-  },
-
-  async disconnect() {
-    await invoke('disconnect');
+  async removeCluster(clusterId: string): Promise<void> {
+    await invoke('remove_cluster', { clusterId });
   },
 
   async openExternal(url) {

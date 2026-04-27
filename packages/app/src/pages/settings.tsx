@@ -1,33 +1,39 @@
 import * as React from 'react';
 import { Link } from 'react-router';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { Plus, Trash2, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import type { Cluster } from '@/lib/host';
 
 export function SettingsPage() {
   const host = useHost();
   const queryClient = useQueryClient();
   const canBootstrap = Boolean(host.bootstrap);
+  const { config, isLoading } = useSelectedCluster();
+  const clusters = config?.clusters ?? [];
+  const selectedId = config?.selectedClusterId ?? null;
 
-  const { data: config, isLoading } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
+  const selectMutation = useMutation({
+    mutationFn: async (id: string | null) => host.selectCluster(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['host', 'config'] }),
   });
 
-  const [disconnecting, setDisconnecting] = React.useState(false);
-  const onDisconnect = async () => {
-    setDisconnecting(true);
-    try {
-      if (host.disconnect) {
-        await host.disconnect();
-      } else {
-        await host.clearApiKey();
-        if (host.saveApiServerUrl) await host.saveApiServerUrl('');
-      }
-      await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
-    } finally {
-      setDisconnecting(false);
-    }
+  const removeMutation = useMutation({
+    mutationFn: async (id: string) => host.removeCluster(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['host', 'config'] }),
+  });
+
+  const onRemove = (cluster: Cluster) => {
+    const ok =
+      typeof window !== 'undefined'
+        ? window.confirm(
+            `Remove cluster "${cluster.name}"? This forgets the URL and API key on this machine but does not destroy any infrastructure.`
+          )
+        : true;
+    if (!ok) return;
+    removeMutation.mutate(cluster.id);
   };
 
   return (
@@ -35,41 +41,78 @@ export function SettingsPage() {
       <div>
         <h1 className="text-xl font-semibold">Settings</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Connection details for the Appliance cluster this shell is attached to.
+          Clusters this shell is connected to, and shell info.
         </p>
       </div>
 
-      <Section title="Cluster" description="The api-server this shell talks to and the credentials it uses.">
+      <Section
+        title="Clusters"
+        description="Each cluster is one (api-server URL, API key) pair stored on this machine."
+      >
         {isLoading ? (
           <Row label="Status" value={<span className="text-[var(--color-muted-foreground)]">Loading…</span>} />
-        ) : config?.apiServerUrl ? (
+        ) : clusters.length === 0 ? (
           <>
-            <Row label="API server" value={<code className="font-mono text-xs">{config.apiServerUrl}</code>} />
-            <Row
-              label="API key"
-              value={
-                config.apiKey ? (
-                  <code className="font-mono text-xs">{config.apiKey.id}</code>
-                ) : (
-                  <span className="text-[var(--color-muted-foreground)]">not set</span>
-                )
-              }
-            />
+            <Row label="Status" value={<span className="text-[var(--color-muted-foreground)]">No clusters</span>} />
             <div className="flex gap-2 pt-2">
-              <Button asChild variant="outline">
-                <Link to="/connect">Change</Link>
+              <Button asChild>
+                <Link to="/connect">
+                  <Plus className="h-4 w-4" /> Add cluster
+                </Link>
               </Button>
-              <Button variant="destructive" onClick={onDisconnect} disabled={disconnecting}>
-                {disconnecting ? 'Disconnecting…' : 'Disconnect'}
-              </Button>
+              {canBootstrap ? (
+                <Button asChild variant="outline">
+                  <Link to="/bootstrap">Bootstrap new installation</Link>
+                </Button>
+              ) : null}
             </div>
           </>
         ) : (
           <>
-            <Row label="Status" value={<span className="text-[var(--color-muted-foreground)]">Not connected</span>} />
-            <div className="flex gap-2 pt-2">
-              <Button asChild>
-                <Link to="/connect">Connect</Link>
+            <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
+              {clusters.map((c) => {
+                const isSelected = c.id === selectedId;
+                return (
+                  <li key={c.id} className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2">
+                    <div className="w-4">
+                      {isSelected ? <Check className="h-4 w-4 text-[var(--color-accent)]" /> : null}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">{c.name}</div>
+                      <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
+                        {c.apiServerUrl}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {!isSelected ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => selectMutation.mutate(c.id)}
+                          disabled={selectMutation.isPending}
+                        >
+                          Switch
+                        </Button>
+                      ) : null}
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => onRemove(c)}
+                        disabled={removeMutation.isPending}
+                        aria-label={`Remove ${c.name}`}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="flex gap-2 pt-3">
+              <Button asChild variant="outline">
+                <Link to="/connect">
+                  <Plus className="h-4 w-4" /> Add cluster
+                </Link>
               </Button>
               {canBootstrap ? (
                 <Button asChild variant="outline">

@@ -6,25 +6,22 @@ import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 
 export function DashboardPage() {
   const host = useHost();
   const canBootstrap = Boolean(host.bootstrap);
-
-  const { data: config, isLoading } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
-  });
+  const { cluster, isLoading } = useSelectedCluster();
 
   if (isLoading) return null;
-  if (!config?.apiServerUrl) return <GetStarted canBootstrap={canBootstrap} />;
+  if (!cluster) return <GetStarted canBootstrap={canBootstrap} />;
 
-  return <ConnectedDashboard serverUrl={config.apiServerUrl} />;
+  return <ConnectedDashboard serverUrl={cluster.apiServerUrl} clusterName={cluster.name} />;
 }
 
-function ConnectedDashboard({ serverUrl }: { serverUrl: string }) {
+function ConnectedDashboard({ serverUrl, clusterName }: { serverUrl: string; clusterName: string }) {
   const client = useApplianceClient();
 
   const projectsQuery = useQuery({
@@ -70,7 +67,7 @@ function ConnectedDashboard({ serverUrl }: { serverUrl: string }) {
       <div>
         <h1 className="text-xl font-semibold">Dashboard</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Connected to <code className="font-mono">{serverUrl}</code>
+          {clusterName} · <code className="font-mono">{serverUrl}</code>
         </p>
       </div>
 

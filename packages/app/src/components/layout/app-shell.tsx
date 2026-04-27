@@ -1,6 +1,7 @@
 import { NavLink, Outlet } from 'react-router';
 import { LayoutDashboard, Folder, Box, Rocket, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ClusterSwitcher } from './cluster-switcher';
 
 const nav = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -36,7 +37,7 @@ export function AppShell() {
       </aside>
 
       <header className="col-start-2 flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
-        <div className="text-sm text-[var(--color-muted-foreground)]">{/* cluster switcher slot */}</div>
+        <ClusterSwitcher />
         <div className="flex items-center gap-2">{/* search / notifications slot */}</div>
       </header>
 

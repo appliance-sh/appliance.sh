@@ -3,19 +3,14 @@ import { Link } from 'react-router';
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import type { Project } from '@appliance.sh/sdk/models';
 
 export function ProjectsPage() {
-  const host = useHost();
-  const { data: config } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
-  });
-  const connected = Boolean(config?.apiServerUrl);
+  const { cluster } = useSelectedCluster();
 
-  if (!connected) {
+  if (!cluster) {
     return <Disconnected />;
   }
 

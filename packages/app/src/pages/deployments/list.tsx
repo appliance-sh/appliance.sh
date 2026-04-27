@@ -2,20 +2,15 @@ import { Link } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
-import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 
 export function DeploymentsPage() {
-  const host = useHost();
   const client = useApplianceClient();
   const envs = useEnvironmentsMap();
-
-  const { data: config } = useQuery({
-    queryKey: ['host', 'config'],
-    queryFn: () => host.getConfig(),
-  });
+  const { cluster } = useSelectedCluster();
 
   const deploymentsQuery = useQuery({
     queryKey: ['deployments', 'all'],
@@ -28,7 +23,7 @@ export function DeploymentsPage() {
     refetchInterval: 5_000,
   });
 
-  if (!config?.apiServerUrl) {
+  if (!cluster) {
     return (
       <div className="space-y-4">
         <div>
