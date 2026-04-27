@@ -345,7 +345,33 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
               const method = request.method;
               const service = 'lambda';
               const canonicalUri = request.uri || '/';
-              const canonicalQuerystring = request.querystring || '';
+
+              // SigV4 canonical query string: sort by URI-encoded key,
+              // re-encode each key/value per RFC 3986 (only A-Z a-z
+              // 0-9 -_.~ unreserved). encodeURIComponent leaves
+              // !*'() unencoded — escape those manually. Without
+              // sorting, multi-param GETs (e.g. ?limit=50&environmentId=…)
+              // fail Lambda Function URL signature verification because
+              // CloudFront forwards insertion order while the verifier
+              // canonicalizes alphabetically.
+              const encodeRfc3986 = (s) =>
+                encodeURIComponent(s).replace(/[!*'()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+              const rawQuery = request.querystring || '';
+              const canonicalQuerystring = rawQuery
+                ? rawQuery
+                    .split('&')
+                    .map((kv) => {
+                      const eq = kv.indexOf('=');
+                      const k = eq === -1 ? kv : kv.slice(0, eq);
+                      const v = eq === -1 ? '' : kv.slice(eq + 1);
+                      // decode then re-encode so input encoding (e.g.
+                      // `+` for space) is normalized.
+                      return [encodeRfc3986(decodeURIComponent(k)), encodeRfc3986(decodeURIComponent(v))];
+                    })
+                    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+                    .map(([k, v]) => k + '=' + v)
+                    .join('&')
+                : '';
 
               const now = new Date();
               const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
