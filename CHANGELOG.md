@@ -1,3 +1,19 @@
+## 1.30.0 (2026-04-27)
+
+### Features
+
+- **api-server:** improved env handling ([3ccfc6a](https://github.com/appliance-sh/appliance.sh/commit/3ccfc6a))
+- **api-server:** support for cancellation and refresh ([d88e508](https://github.com/appliance-sh/appliance.sh/commit/d88e508))
+- **cli,sdk,api-server:** support for env and dynamic manifests ([0ef56c7](https://github.com/appliance-sh/appliance.sh/commit/0ef56c7))
+
+### Bug Fixes
+
+- **infra:** querystring canonicalisation ([8888d31](https://github.com/appliance-sh/appliance.sh/commit/8888d31))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.29.0 (2026-04-22)
 
 ### Features
