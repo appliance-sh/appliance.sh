@@ -20,7 +20,7 @@
   },
   "packageManager": "pnpm@10.28.2",
   "engines": {
-    "node": "24.1.0"
+    "node": "24.14.1"
   },
   "scripts": {
     "build": "nx run-many --target=build --all",
@@ -41,6 +41,9 @@
     "includedScripts": []
   },
   "pnpm": {
+    "executionEnv": {
+      "nodeVersion": "24.14.1"
+    },
     "overrides": {
       "@pulumi/pulumi": "3.227.0"
     }
