@@ -19,19 +19,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-push:
-    name: Build + push api-server image
-    runs-on: ubuntu-latest
+  # Per-platform native build. Each matrix shard runs on a runner of
+  # the matching architecture and pushes a digest-only image. The
+  # multi-arch manifest is assembled in the merge job below — that's
+  # the docker/buildx-recommended pattern for matrix builds and lets
+  # us drop the QEMU emulation that was making linux/arm64 builds
+  # take ~10× longer than they needed to.
+  build:
+    name: Build ${{ matrix.platform.docker }}
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      fail-fast: true
+      matrix:
+        platform:
+          - docker: linux/amd64
+            runs-on: ubuntu-latest
+            slug: amd64
+          - docker: linux/arm64
+            runs-on: ubuntu-24.04-arm
+            slug: arm64
+    outputs:
+      image: ${{ steps.image.outputs.image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           # fetch-depth: 0 pulls full history incl. tags. The SDK's
           # postbuild step runs `git describe --tags --abbrev=0` to
-          # stamp the built dist with the latest release tag, so the
-          # workflow must see them. (Shallow clones without tags
-          # cause `postbuild` to fall back to package.json, but
-          # having tags available makes the release stamp accurate.)
+          # stamp the built dist with the latest release tag.
           fetch-depth: 0
 
       - name: Install pnpm
@@ -50,10 +65,94 @@ jobs:
         working-directory: packages/api-server
         run: ./scripts/docker-prep.sh
 
+      - name: Derive image name
+        id: image
+        run: |
+          OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER_LOWER}/api-server" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/api-server
+          file: packages/api-server/Dockerfile
+          platforms: ${{ matrix.platform.docker }}
+          # push-by-digest pushes an unnamed image to the registry and
+          # surfaces its digest. The merge job below stitches the
+          # platform-specific digests into a tagged multi-arch manifest.
+          outputs: type=image,name=${{ steps.image.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          provenance: true
+          sbom: true
+          # Per-platform GHA cache scope so amd64 + arm64 don't thrash
+          # each other's layer cache.
+          cache-from: type=gha,scope=api-server-${{ matrix.platform.slug }}
+          cache-to: type=gha,mode=max,scope=api-server-${{ matrix.platform.slug }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Multi-arch manifest assembly. Reads each platform's digest, runs
+  # `imagetools create` with the human-readable tags pointing at the
+  # combined manifest. Cheap (no build, just registry API calls).
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (package.json only)
+        uses: actions/checkout@v4
+        with:
+          # Sparse checkout — we only need package.json for the version.
+          sparse-checkout: |
+            packages/api-server/package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Derive image tags
         id: tags
         env:
-          PKG_VERSION: ${{ hashFiles('packages/api-server/package.json') }}
           INPUT_TAG: ${{ inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -83,32 +182,21 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Create manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Each digest file is named after the sha256 hash (no prefix);
+          # `<image>@sha256:<hash>` is the canonical form imagetools
+          # consumes. The shell glob expands one source per platform.
+          IMAGE='${{ steps.tags.outputs.image }}'
+          TAG_ARGS=$(printf -- '-t %s ' ${{ steps.tags.outputs.tags }})
+          SOURCES=$(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: packages/api-server
-          file: packages/api-server/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=MIT
-          provenance: true
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Inspect resulting manifest
+        run: |
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            echo "::group::${tag}"
+            docker buildx imagetools inspect "${tag}"
+            echo "::endgroup::"
+          done
