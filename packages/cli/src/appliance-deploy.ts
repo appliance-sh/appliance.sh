@@ -70,16 +70,24 @@ async function findOrCreateEnvironment(
   return createResult.data;
 }
 
+interface RenderedRuntime {
+  env?: Record<string, string>;
+  memory?: number;
+  timeout?: number;
+  storage?: number;
+}
+
 // Re-render the manifest at deploy time with project + environment
 // context so the manifest function (if any) can produce per-target
-// env vars. Returns undefined when there's no manifest source
-// reachable from cwd or when the manifest declares no env — in
-// either case the deploy proceeds with just --env-file values.
-async function renderManifestEnv(
+// runtime config (env vars + Lambda memory/timeout/storage). Returns
+// undefined when there's no manifest source reachable from cwd — in
+// that case the deploy proceeds with just --env-file values and
+// whatever defaults the api-server applies.
+async function renderRuntimeConfig(
   program: Command,
   projectName: string,
   environmentName: string
-): Promise<Record<string, string> | undefined> {
+): Promise<RenderedRuntime | undefined> {
   const result = await extractApplianceFile(program, {
     project: projectName,
     environment: environmentName,
@@ -87,19 +95,24 @@ async function renderManifestEnv(
   if (!result.success) {
     if (result.error.name === 'File Not Found') {
       // Deploy from a location without the manifest source is
-      // legitimate (e.g. promoting a prebuilt zip). No manifest
-      // env, just continue.
+      // legitimate (e.g. promoting a prebuilt zip). No runtime
+      // overrides, just continue.
       return undefined;
     }
-    console.error(chalk.red(`Failed to render manifest env: ${result.error.message}`));
+    console.error(chalk.red(`Failed to render manifest runtime config: ${result.error.message}`));
     process.exit(1);
   }
-  const env = result.data.env;
+  const { env, memory, timeout, storage } = result.data;
+  const runtime: RenderedRuntime = {};
   if (env && Object.keys(env).length > 0) {
     console.log(chalk.dim(`Rendered ${Object.keys(env).length} env vars from manifest`));
-    return env;
+    runtime.env = env;
   }
-  return undefined;
+  if (memory !== undefined) runtime.memory = memory;
+  if (timeout !== undefined) runtime.timeout = timeout;
+  if (storage !== undefined) runtime.storage = storage;
+  if (Object.keys(runtime).length === 0) return undefined;
+  return runtime;
 }
 
 function loadEnvFile(explicit: string | undefined, environmentName: string): Record<string, string> | undefined {
@@ -218,14 +231,14 @@ registerManifestOptions(program)
         console.log(chalk.dim(`Build uploaded: ${buildId}`));
       }
 
-      // Render env from the manifest, merge with --env-file. The
-      // build artifact is environment-invariant — env is rendered
-      // fresh per-deploy with full ManifestContext (project,
-      // environment, variant) so the same zip can deploy to many
-      // environments. Manifest source is best-effort: deploys from
+      // Render runtime config from the manifest. The build artifact
+      // is environment-invariant — env / memory / timeout / storage
+      // are rendered fresh per-deploy with full ManifestContext so
+      // the same zip can deploy to many environments with different
+      // runtime config. Manifest source is best-effort: deploys from
       // a checkout-less location (e.g. promoting a prebuilt zip)
       // degrade gracefully to env-file-only.
-      const manifestEnv = await renderManifestEnv(program, projectName, environmentName);
+      const manifestRuntime = await renderRuntimeConfig(program, projectName, environmentName);
 
       const envFileVars = loadEnvFile(opts.envFile, environmentName);
 
@@ -233,10 +246,16 @@ registerManifestOptions(program)
       // override surface (typically holds secrets or per-deploy
       // values), while manifest env represents declared defaults.
       const envVars: Record<string, string> | undefined =
-        manifestEnv || envFileVars ? { ...(manifestEnv ?? {}), ...(envFileVars ?? {}) } : undefined;
+        manifestRuntime?.env || envFileVars ? { ...(manifestRuntime?.env ?? {}), ...(envFileVars ?? {}) } : undefined;
 
       console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
-      const result = await client.deploy(environment.id, { buildId, environment: envVars });
+      const result = await client.deploy(environment.id, {
+        buildId,
+        environment: envVars,
+        memory: manifestRuntime?.memory,
+        timeout: manifestRuntime?.timeout,
+        storage: manifestRuntime?.storage,
+      });
       if (!result.success) {
         console.error(chalk.red(`Deploy failed: ${result.error.message}`));
         process.exit(1);

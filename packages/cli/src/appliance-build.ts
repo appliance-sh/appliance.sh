@@ -56,12 +56,19 @@ registerManifestOptions(program)
     // the resolved object (functions already invoked) — the server
     // only ever reads appliance.json from the zip.
     //
-    // Strip `env` before archiving: env is rendered fresh at deploy
-    // time with full context (project, environment, variant), so the
-    // build artifact stays environment-invariant. One zip → many
-    // deploys. Server-side env arrives via the deploy payload's
-    // `environment` parameter.
-    const { env: _env, ...manifestForZip } = appliance;
+    // Strip per-environment runtime config (env, memory, timeout,
+    // storage) before archiving so the build artifact stays
+    // environment-invariant. The CLI re-renders the manifest with
+    // deploy-time context and forwards these via the deploy payload
+    // instead — one zip, many deploys, each with its own runtime
+    // config.
+    const {
+      env: _env,
+      memory: _memory,
+      timeout: _timeout,
+      storage: _storage,
+      ...manifestForZip
+    } = appliance as typeof appliance & { memory?: number; timeout?: number; storage?: number };
     archive.append(JSON.stringify(manifestForZip, null, 2), { name: 'appliance.json' });
 
     if (appliance.type === ApplianceType.container) {

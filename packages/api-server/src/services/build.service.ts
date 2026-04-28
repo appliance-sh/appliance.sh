@@ -1,7 +1,7 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { applianceBaseConfig, applianceInput, BuildType } from '@appliance.sh/sdk';
-import type { ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
+import type { ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -109,12 +109,13 @@ export class BuildService {
       if (!fs.existsSync(manifestPath)) throw new Error('Build missing appliance.json');
       const manifest = applianceInput.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf-8')));
 
-      // The build artifact is environment-invariant: env was stripped
-      // before archiving (CLI's appliance-build.ts) and is rendered
-      // fresh per-deploy with full ManifestContext. Anything left in
-      // manifest.env here is a stale/legacy build and is ignored.
+      // The build artifact is environment-invariant: per-environment
+      // runtime config (env, memory, timeout, storage) is stripped at
+      // archive time and rendered fresh per-deploy from the source
+      // manifest, then forwarded on the deploy payload. Anything in
+      // appliance.json beyond the build-time schema is ignored here.
       return manifest.type === 'container'
-        ? await this.resolveContainer(tmpDir, manifest, tag, config)
+        ? await this.resolveContainer(tmpDir, tag, config)
         : manifest.type === 'framework'
           ? this.resolveFramework(manifest, s3Key, config)
           : { codeS3Key: s3Key };
@@ -125,8 +126,10 @@ export class BuildService {
 
   /**
    * Framework builds are fully pre-processed by the CLI (dependencies installed,
-   * run.sh generated). The server just resolves Lambda-specific params from the
-   * manifest metadata and points at the original uploaded zip.
+   * run.sh generated). The server resolves the platform-specific Lambda wiring
+   * from the manifest (runtime, handler, adapter layer, architecture). Memory /
+   * timeout / storage are runtime configuration — they travel through the
+   * deploy payload, not the build artifact.
    */
   private resolveFramework(
     manifest: ApplianceFrameworkApp,
@@ -153,9 +156,6 @@ export class BuildService {
         AWS_LAMBDA_EXEC_WRAPPER: '/opt/bootstrap',
         AWS_LWA_PORT: String(port),
       },
-      memory: manifest.memory,
-      timeout: manifest.timeout,
-      storage: manifest.storage,
     };
   }
 
@@ -167,7 +167,6 @@ export class BuildService {
    */
   private async resolveContainer(
     tmpDir: string,
-    manifest: ApplianceContainer,
     tag: string,
     config: ReturnType<typeof getBaseConfig>
   ): Promise<ResolvedBuild> {
@@ -209,7 +208,7 @@ export class BuildService {
       imageUri = remoteTag;
     }
 
-    return { imageUri, memory: manifest.memory, timeout: manifest.timeout, storage: manifest.storage };
+    return { imageUri };
   }
 }
 

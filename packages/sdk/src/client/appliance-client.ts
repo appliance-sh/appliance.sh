@@ -189,6 +189,12 @@ export class ApplianceClient {
       buildId?: string;
       /** Runtime environment variables. */
       environment?: Record<string, string>;
+      /** Lambda memory in MB. Overrides the build resolver's default. */
+      memory?: number;
+      /** Lambda timeout in seconds. Overrides the build resolver's default. */
+      timeout?: number;
+      /** Lambda ephemeral /tmp storage in MB. Overrides the build resolver's default. */
+      storage?: number;
     }
   ): Promise<Result<Deployment>> {
     return this.request<Deployment>(
@@ -199,6 +205,9 @@ export class ApplianceClient {
         action: 'deploy',
         ...(options?.buildId ? { buildId: options.buildId } : {}),
         ...(options?.environment ? { environment: options.environment } : {}),
+        ...(options?.memory !== undefined ? { memory: options.memory } : {}),
+        ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}),
+        ...(options?.storage !== undefined ? { storage: options.storage } : {}),
       },
       600000
     );

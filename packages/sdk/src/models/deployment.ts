@@ -27,6 +27,14 @@ export const deploymentInput = z.object({
   action: z.nativeEnum(DeploymentAction),
   buildId: z.string().optional(),
   environment: z.record(z.string(), z.string()).optional(),
+  // Per-deploy Lambda runtime overrides. When set, they win over the
+  // build resolver's defaults (which come from the manifest in the
+  // upload-zip flow, and are absent in the remote-image flow). Useful
+  // for remote-image deploys where the manifest never reaches the
+  // server, and as a per-deploy escape hatch in general.
+  memory: z.number().int().positive().optional(),
+  timeout: z.number().int().positive().optional(),
+  storage: z.number().int().positive().optional(),
 });
 
 export type DeploymentInput = z.infer<typeof deploymentInput>;

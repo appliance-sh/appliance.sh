@@ -43,24 +43,40 @@ export enum ApplianceFramework {
 
 export const applianceTypeSchema = z.enum(ApplianceType);
 
+// Build-time-only manifest fields. These describe *how the appliance
+// is packaged* (artifact format, port, scripts) and end up persisted
+// in the zip's `appliance.json` — environment-invariant by design.
+// Per-environment runtime config (env vars, memory, timeout, storage)
+// lives separately in `applianceRuntimeConfig` and travels through
+// the deploy call, never the build artifact.
 export const applianceTypeBase = z.object({
   manifest: z.literal('v1'),
   name: dnsName,
   version: z.string().optional(),
   scripts: z.record(z.string(), z.string()).optional(),
+});
+
+// Runtime configuration applied to a deployed appliance instance.
+// Authored alongside the build manifest in a programmatic appliance
+// file (a TS function can return both shapes), but never persisted
+// into the build artifact. The CLI evaluates the manifest at deploy
+// time and forwards these fields on the deploy payload, where
+// per-environment overrides can also be merged.
+export const applianceRuntimeConfig = z.object({
+  // Lambda memory in MB.
   memory: z.number().int().min(128).max(10240).optional(),
+  // Lambda timeout in seconds.
   timeout: z.number().int().min(1).max(900).optional(),
-  // Ephemeral scratch storage in MB. Cloud-agnostic at the manifest level;
+  // Ephemeral /tmp storage in MB. Cloud-agnostic at the schema level;
   // the backend maps it to the target's equivalent (AWS: Lambda
-  // ephemeralStorage, i.e. /tmp size).
+  // ephemeralStorage).
   storage: z.number().int().min(512).max(10240).optional(),
-  // Static environment variables baked into the build. Merged with
-  // runtime env passed at deploy time (runtime wins on conflict).
-  // Declared at the manifest level so a TS manifest can compute them
-  // from build-time context (APPLIANCE_MODE=server/worker, VERSION,
-  // etc.) without round-tripping through the deploy call.
+  // Runtime environment variables. Merged with deploy-time
+  // overrides; the deploy call wins on conflict.
   env: z.record(z.string(), z.string()).optional(),
 });
+
+export type ApplianceRuntimeConfig = z.infer<typeof applianceRuntimeConfig>;
 
 export const applianceTypeContainerInput = applianceTypeBase.extend({
   type: z.literal(applianceTypeSchema.enum.container),
@@ -102,6 +118,15 @@ export const applianceInput = z.discriminatedUnion('type', [
 
 export type ApplianceInput = z.infer<typeof applianceInput>;
 export type Appliance = z.output<typeof applianceInput>;
+
+// What a programmatic manifest function is allowed to return: build
+// fields + runtime config inline. The CLI extracts each half via the
+// matching schema (applianceInput strips runtime, applianceRuntimeConfig
+// strips build). Static appliance.json files validate against
+// applianceInput alone and don't carry runtime config.
+export const applianceFullInput = z.intersection(applianceInput, applianceRuntimeConfig);
+export type ApplianceFullInput = z.infer<typeof applianceFullInput>;
+export type ApplianceFull = z.output<typeof applianceFullInput>;
 
 // Context passed to function-form default exports of programmatic
 // (.ts/.js) manifests. Lets a single manifest module return

@@ -186,6 +186,10 @@ export class ApplianceStack extends pulumi.ComponentResource {
 
     const ephemeralStorage = args.storage ? { size: args.storage } : undefined;
 
+    pulumi.log.info(
+      `ApplianceStack ${name}: timeout=${args.timeout ?? 30}s memory=${args.memory ?? 512}MB storage=${args.storage ?? 'default'}`
+    );
+
     if (args.imageUri) {
       this.lambda = new aws.lambda.Function(
         `${rid}-handler`,

@@ -57,7 +57,29 @@ function runSync(args: string[], opts: RunOptions = {}): RunResult {
 
 export function pullImage(image: string, emit?: (e: BootstrapEvent) => void): void {
   emit?.({ type: 'log', level: 'info', message: `pulling ${image}` });
-  runSync(['pull', image]);
+  try {
+    runSync(['pull', image]);
+  } catch (err) {
+    // Pull failure is fatal unless the image is already on disk
+    // (typical dev workflow: a freshly-built local tag with no
+    // registry to pull from). In that case we proceed with the
+    // local copy and warn the operator that we couldn't refresh.
+    if (imageExistsLocally(image)) {
+      emit?.({
+        type: 'log',
+        level: 'warn',
+        message: `pull failed for ${image}; using locally-cached image (${err instanceof Error ? err.message : String(err)})`,
+      });
+      return;
+    }
+    throw err;
+  }
+}
+
+function imageExistsLocally(image: string): boolean {
+  const runtime = detectRuntime();
+  const r = spawnSync(runtime, ['image', 'inspect', image], { stdio: 'ignore' });
+  return r.status === 0;
 }
 
 export function tagImage(src: string, dst: string): void {

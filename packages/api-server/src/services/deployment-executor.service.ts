@@ -23,9 +23,9 @@ import { logger } from '../logger';
 // IAM than ApplianceStack's per-appliance role grants. When a deploy
 // targets one of these well-known names, the executor binds the
 // resulting Lambda to the pre-existing role.
-const SYSTEM_PROJECT = 'system';
-const SYSTEM_API_SERVER_ENV = 'api-server';
-const SYSTEM_WORKER_ENV = 'worker';
+const SYSTEM_PROJECT = 'api';
+const SYSTEM_API_SERVER_ENV = 'server';
+const SYSTEM_API_WORKER_ENV = 'worker';
 
 const COLLECTION = 'deployments';
 
@@ -118,8 +118,30 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
             ...(build.environment ?? {}),
           };
 
+          // Lambda runtime overrides flow the OPPOSITE way: deploy
+          // input wins over the build resolver's default. The
+          // remote-image flow doesn't carry manifest memory/timeout/
+          // storage at all, so callers need a way to set them
+          // per-deploy; the dogfooded bootstrap relies on this to
+          // give the worker its 900s Pulumi-friendly timeout.
+          if (input.memory !== undefined) build.memory = input.memory;
+          if (input.timeout !== undefined) build.timeout = input.timeout;
+          if (input.storage !== undefined) build.storage = input.storage;
+
           const systemRoleArn = resolveSystemRoleArn(metadata);
           if (systemRoleArn) build.lambdaRoleArn = systemRoleArn;
+
+          logger.info('resolved deploy params', {
+            deploymentId,
+            stackName: metadata.stackName,
+            memory: build.memory,
+            timeout: build.timeout,
+            storage: build.storage,
+            lambdaRoleArn: build.lambdaRoleArn,
+            inputMemory: input.memory,
+            inputTimeout: input.timeout,
+            inputStorage: input.storage,
+          });
         } else if (input.environment) {
           throw new Error('Environment variables require a build');
         }
@@ -240,7 +262,7 @@ function resolveSystemRoleArn(metadata: ApplianceStackMetadata): string | undefi
   const roles = parsed.aws.systemRoleArns;
   if (!roles) return undefined;
   if (metadata.environmentName === SYSTEM_API_SERVER_ENV) return roles.apiServer;
-  if (metadata.environmentName === SYSTEM_WORKER_ENV) return roles.worker;
+  if (metadata.environmentName === SYSTEM_API_WORKER_ENV) return roles.worker;
   return undefined;
 }
 

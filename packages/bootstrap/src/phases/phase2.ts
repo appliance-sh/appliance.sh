@@ -18,9 +18,25 @@ import { sleep } from './helpers';
 // feature-branch build).
 const DEFAULT_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.replace(/^v/, '')}`;
 
-const SYSTEM_PROJECT = 'system';
-const API_SERVER_ENV = 'api-server';
+// System project + env names. Must match
+// deployment-executor.service.ts's SYSTEM_PROJECT / SYSTEM_API_SERVER_ENV
+// / SYSTEM_API_WORKER_ENV — the executor uses those constants to
+// decide when to bind the Lambda to the base-pre-created system roles.
+const SYSTEM_PROJECT = 'api';
+const API_SERVER_ENV = 'server';
 const WORKER_ENV = 'worker';
+
+// Lambda runtime params for the system api-server + worker. Mirrors
+// packages/api-server/appliance.ts — the worker gets a long timeout
+// because it executes Pulumi runs end-to-end; the server only needs
+// it for short HTTP requests. The remote-image build flow doesn't
+// carry manifest memory/timeout/storage, so we set them per-deploy.
+const API_SERVER_MEMORY_MB = 2048;
+const API_SERVER_STORAGE_MB = 4096;
+const API_SERVER_TIMEOUT_S = 30;
+const WORKER_MEMORY_MB = 2048;
+const WORKER_STORAGE_MB = 4096;
+const WORKER_TIMEOUT_S = 900;
 
 const LOCAL_HEALTH_TIMEOUT_MS = 180_000;
 const LOCAL_HEALTH_POLL_MS = 2_000;
@@ -131,7 +147,11 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     const apiServerUrl = `https://${SYSTEM_PROJECT}-${API_SERVER_ENV}.${baseConfig.domainName}`;
     const workerUrl = `https://${SYSTEM_PROJECT}-${WORKER_ENV}.${baseConfig.domainName}`;
 
-    emit({ type: 'log', level: 'info', message: 'creating system project + envs…' });
+    emit({
+      type: 'log',
+      level: 'info',
+      message: `creating ${SYSTEM_PROJECT} project + ${API_SERVER_ENV}/${WORKER_ENV} envs…`,
+    });
     const project = await ensureSuccess(localClient.createProject({ name: SYSTEM_PROJECT }), 'createProject');
     const apiServerEnv = await ensureSuccess(
       localClient.createEnvironment({ projectId: project.id, name: API_SERVER_ENV }),
@@ -163,22 +183,38 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
       APPLIANCE_MODE: 'worker',
     };
 
-    emit({ type: 'log', level: 'info', message: 'deploying system/api-server…' });
+    emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${API_SERVER_ENV}…` });
     const apiServerDeployment = await ensureSuccess(
-      localClient.deploy(apiServerEnv.id, { buildId: imageBuild.buildId, environment: apiServerEnvVars }),
+      localClient.deploy(apiServerEnv.id, {
+        buildId: imageBuild.buildId,
+        environment: apiServerEnvVars,
+        memory: API_SERVER_MEMORY_MB,
+        timeout: API_SERVER_TIMEOUT_S,
+        storage: API_SERVER_STORAGE_MB,
+      }),
       'deploy(api-server)'
     );
 
-    emit({ type: 'log', level: 'info', message: 'deploying system/worker…' });
+    emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${WORKER_ENV}…` });
     const workerDeployment = await ensureSuccess(
-      localClient.deploy(workerEnv.id, { buildId: imageBuild.buildId, environment: workerEnvVars }),
+      localClient.deploy(workerEnv.id, {
+        buildId: imageBuild.buildId,
+        environment: workerEnvVars,
+        memory: WORKER_MEMORY_MB,
+        timeout: WORKER_TIMEOUT_S,
+        storage: WORKER_STORAGE_MB,
+      }),
       'deploy(worker)'
     );
 
-    emit({ type: 'log', level: 'info', message: 'waiting for system/api-server deployment to settle…' });
+    emit({
+      type: 'log',
+      level: 'info',
+      message: `waiting for ${SYSTEM_PROJECT}/${API_SERVER_ENV} deployment to settle…`,
+    });
     await pollDeploymentToTerminal(localClient, apiServerDeployment.id, emit);
 
-    emit({ type: 'log', level: 'info', message: 'waiting for system/worker deployment to settle…' });
+    emit({ type: 'log', level: 'info', message: `waiting for ${SYSTEM_PROJECT}/${WORKER_ENV} deployment to settle…` });
     await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
 
     emit({ type: 'log', level: 'info', message: `waiting for ${apiServerUrl} to come up…` });

@@ -1,28 +1,31 @@
-import { AppliancePlatform, ApplianceType, type ApplianceContainer, type ManifestContext } from '@appliance.sh/sdk';
+import { AppliancePlatform, ApplianceType, type ApplianceFull, type ManifestContext } from '@appliance.sh/sdk';
 
-// Single programmatic manifest for the api-server image. Same Docker
-// build serves two appliances differentiated by APPLIANCE_MODE:
+// Single programmatic manifest for the api-server image. The same
+// Docker build serves two appliances differentiated only by deploy-
+// time runtime config: the server env runs `APPLIANCE_MODE=server`
+// (HTTP routes); the worker env runs `APPLIANCE_MODE=worker`
+// (/api/internal only) with a longer Lambda timeout because it
+// executes Pulumi runs.
 //
-//   appliance build                     → server (default)
-//   appliance build --variant worker    → worker (/api/internal only)
-//
-// main.ts:getMode() reads APPLIANCE_MODE to pick the route set.
-// Worker has a longer timeout because it executes Pulumi runs;
-// server requests are short HTTP exchanges.
-export default ({ environment }: ManifestContext): ApplianceContainer => {
-  const isWorker = environment?.startsWith('worker');
+// Build-time fields (manifest/type/name/port/platform/scripts) are
+// the same in both cases — the artifact is environment-invariant.
+// Per-environment runtime config (env, memory, timeout, storage) is
+// rendered at deploy time using the `environment` context the CLI
+// provides, and forwarded on the deploy payload.
+export default ({ environment }: ManifestContext): ApplianceFull => {
+  const isWorker = environment === 'worker';
   return {
     manifest: 'v1',
     type: ApplianceType.container,
     name: 'appliance-api-server',
     port: 3000,
     platform: AppliancePlatform.LinuxAmd64,
-    memory: 2048,
-    timeout: isWorker ? 900 : 30,
-    storage: 4096,
     scripts: {
       build: 'bash scripts/docker-prep.sh',
     },
+    memory: 2048,
+    timeout: isWorker ? 900 : 30,
+    storage: 4096,
     env: {
       APPLIANCE_MODE: isWorker ? 'worker' : 'server',
       APPLIANCE_TRUST_PROXY: 'true',

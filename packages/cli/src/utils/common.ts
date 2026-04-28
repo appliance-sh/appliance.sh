@@ -3,7 +3,7 @@ import path from 'path';
 import * as fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { confirm } from '@inquirer/prompts';
-import { Appliance, applianceInput, ApplianceInput, ManifestContext, Result } from '@appliance.sh/sdk';
+import { Appliance, applianceFullInput, ApplianceFullInput, ManifestContext, Result } from '@appliance.sh/sdk';
 import chalk from 'chalk';
 import { addTrustedProject, isTrustedProject, settingsFilePath } from './settings.js';
 
@@ -32,7 +32,10 @@ export interface ExtractOptions {
   environment?: string;
 }
 
-export async function extractApplianceFile(cmd: Command, opts: ExtractOptions = {}): Promise<Result<ApplianceInput>> {
+export async function extractApplianceFile(
+  cmd: Command,
+  opts: ExtractOptions = {}
+): Promise<Result<ApplianceFullInput>> {
   const filePath = resolveManifestPath(cmd);
   if (!filePath) {
     return {
@@ -62,7 +65,11 @@ export async function extractApplianceFile(cmd: Command, opts: ExtractOptions = 
 
   try {
     const raw = await loadManifest(filePath, ext, ctx);
-    const parsed = applianceInput.safeParse(raw);
+    // Parse against the combined build+runtime schema so callers can
+    // pull either half: `appliance build` archives only the build
+    // fields; `appliance deploy` forwards env / memory / timeout /
+    // storage on the deploy payload.
+    const parsed = applianceFullInput.safeParse(raw);
     if (!parsed.success) return parsed;
 
     if (!isCode) {
