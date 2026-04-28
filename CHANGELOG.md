@@ -1,3 +1,23 @@
+## 1.32.0 (2026-04-28)
+
+### Features
+
+- **bootstrap,desktop:** aws profile support ([ddb2825](https://github.com/appliance-sh/appliance.sh/commit/ddb2825))
+- **ci:** matrix api-server build ([87f2842](https://github.com/appliance-sh/appliance.sh/commit/87f2842))
+- **cli:** teardown support ([0e41b42](https://github.com/appliance-sh/appliance.sh/commit/0e41b42))
+
+### Bug Fixes
+
+- **all:** pin pulumi and node versions ([22fecbd](https://github.com/appliance-sh/appliance.sh/commit/22fecbd))
+- **ci:** set node to v24.14.1 ([656950e](https://github.com/appliance-sh/appliance.sh/commit/656950e))
+- **ci:** update pnpm lockfile ([c74ceb6](https://github.com/appliance-sh/appliance.sh/commit/c74ceb6))
+- **infra:** unique lambda oac naming ([469b65a](https://github.com/appliance-sh/appliance.sh/commit/469b65a))
+- **infra:** lambda functionurl region ([98c0dcd](https://github.com/appliance-sh/appliance.sh/commit/98c0dcd))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.31.0 (2026-04-28)
 
 ### Features
