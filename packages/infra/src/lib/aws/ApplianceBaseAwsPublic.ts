@@ -286,7 +286,6 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
           exposeHeaders: ['keep-alive', 'date'],
           maxAge: 60,
         },
-        region: 'ap-southeast-1',
       },
       { parent: this, provider: opts?.provider }
     );
