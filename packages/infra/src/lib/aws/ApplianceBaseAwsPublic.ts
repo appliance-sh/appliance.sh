@@ -294,7 +294,10 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
     const lambdaOac = new aws.cloudfront.OriginAccessControl(
       `${name}-origin-access-control`,
       {
-        name: 'MyLambdaOAC',
+        // OAC names must be unique within an AWS account. Prefix with
+        // the base name so multiple clusters in the same account don't
+        // collide on a hardcoded literal.
+        name: `${name.replaceAll('.', '-')}-lambda-oac`,
         originAccessControlOriginType: 'lambda',
         signingBehavior: 'always',
         signingProtocol: 'sigv4',
