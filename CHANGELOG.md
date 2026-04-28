@@ -1,3 +1,18 @@
+## 1.31.0 (2026-04-28)
+
+### Features
+
+- **api-server,bootstrap,infra:** bootstrap support ([2aa9f1f](https://github.com/appliance-sh/appliance.sh/commit/2aa9f1f))
+- **app,desktop,console:** multi-cluster host ([c446e8f](https://github.com/appliance-sh/appliance.sh/commit/c446e8f))
+
+### Bug Fixes
+
+- **api-server,bootstrap,infra:** build and runtime manifest routing ([a429bc7](https://github.com/appliance-sh/appliance.sh/commit/a429bc7))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.30.0 (2026-04-27)
 
 ### Features
