@@ -185,6 +185,48 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       { parent: this, provider: opts?.provider }
     );
 
+    // Pre-created Lambda execution roles for the system api-server +
+    // worker appliances (RFC 0018). The dogfooded bootstrap deploys
+    // those two appliances via the normal ApplianceStack path, but
+    // they need broader IAM than user workloads — Pulumi automation
+    // against the cluster's AWS account, ECR push for build relays,
+    // S3 read/write on the cluster's state + data buckets. Granting
+    // AdministratorAccess matches the v1 surface of the legacy
+    // ApplianceApiServer component; tightening this is tracked
+    // alongside ApplianceStack's own per-appliance policy.
+    const systemAssume = aws.iam.assumeRolePolicyForPrincipal({ Service: 'lambda.amazonaws.com' });
+    const systemApiServerRole = new aws.iam.Role(
+      `${name}-system-api-server-role`,
+      { assumeRolePolicy: systemAssume },
+      { parent: this, provider: opts?.provider }
+    );
+    new aws.iam.RolePolicyAttachment(
+      `${name}-system-api-server-role-basic`,
+      { role: systemApiServerRole.name, policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole },
+      { parent: this, provider: opts?.provider }
+    );
+    new aws.iam.RolePolicyAttachment(
+      `${name}-system-api-server-role-admin`,
+      { role: systemApiServerRole.name, policyArn: 'arn:aws:iam::aws:policy/AdministratorAccess' },
+      { parent: this, provider: opts?.provider }
+    );
+
+    const systemWorkerRole = new aws.iam.Role(
+      `${name}-system-worker-role`,
+      { assumeRolePolicy: systemAssume },
+      { parent: this, provider: opts?.provider }
+    );
+    new aws.iam.RolePolicyAttachment(
+      `${name}-system-worker-role-basic`,
+      { role: systemWorkerRole.name, policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole },
+      { parent: this, provider: opts?.provider }
+    );
+    new aws.iam.RolePolicyAttachment(
+      `${name}-system-worker-role-admin`,
+      { role: systemWorkerRole.name, policyArn: 'arn:aws:iam::aws:policy/AdministratorAccess' },
+      { parent: this, provider: opts?.provider }
+    );
+
     this.ecrRepository = new aws.ecr.Repository(
       `${name}-ecr`,
       {
@@ -579,6 +621,10 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         stateBucketName: this.stateBucket.bucket,
         stateBucketArn: this.stateBucket.arn,
         ecrRepositoryUrl: this.ecrRepository.repositoryUrl,
+        systemRoleArns: {
+          apiServer: systemApiServerRole.arn,
+          worker: systemWorkerRole.arn,
+        },
       },
     };
 

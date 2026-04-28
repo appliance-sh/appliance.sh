@@ -1,4 +1,5 @@
 import {
+  applianceBaseConfig,
   Deployment,
   DeploymentStatus,
   DeploymentAction,
@@ -15,6 +16,16 @@ import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
 import { buildService } from './build.service';
 import { logger } from '../logger';
+
+// Project + env name pair that triggers the dogfood role override.
+// The cluster's base provisions two pre-existing Lambda roles
+// (systemRoleArns.apiServer / systemRoleArns.worker) carrying broader
+// IAM than ApplianceStack's per-appliance role grants. When a deploy
+// targets one of these well-known names, the executor binds the
+// resulting Lambda to the pre-existing role.
+const SYSTEM_PROJECT = 'system';
+const SYSTEM_API_SERVER_ENV = 'api-server';
+const SYSTEM_WORKER_ENV = 'worker';
 
 const COLLECTION = 'deployments';
 
@@ -106,6 +117,9 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
             ...(input.environment ?? {}),
             ...(build.environment ?? {}),
           };
+
+          const systemRoleArn = resolveSystemRoleArn(metadata);
+          if (systemRoleArn) build.lambdaRoleArn = systemRoleArn;
         } else if (input.environment) {
           throw new Error('Environment variables require a build');
         }
@@ -211,6 +225,23 @@ function startCancelPoller(deploymentId: string, onCancelObserved: () => void): 
     stopped = true;
     clearInterval(interval);
   };
+}
+
+function resolveSystemRoleArn(metadata: ApplianceStackMetadata): string | undefined {
+  if (metadata.projectName !== SYSTEM_PROJECT) return undefined;
+  const raw = process.env.APPLIANCE_BASE_CONFIG;
+  if (!raw) return undefined;
+  let parsed;
+  try {
+    parsed = applianceBaseConfig.parse(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+  const roles = parsed.aws.systemRoleArns;
+  if (!roles) return undefined;
+  if (metadata.environmentName === SYSTEM_API_SERVER_ENV) return roles.apiServer;
+  if (metadata.environmentName === SYSTEM_WORKER_ENV) return roles.worker;
+  return undefined;
 }
 
 async function refreshAfterCancel(stack: PulumiStackHandle | null, deploymentId: string): Promise<string> {

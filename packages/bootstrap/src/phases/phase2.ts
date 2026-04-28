@@ -1,23 +1,37 @@
 import * as crypto from 'node:crypto';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as auto from '@pulumi/pulumi/automation';
-import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
-import { VERSION } from '@appliance.sh/sdk';
+import {
+  createApplianceClient,
+  DeploymentStatus,
+  VERSION,
+  type ApplianceBaseConfig,
+  type Deployment,
+} from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
-import { awsCredsFromEnv, forwardPulumiEvent, homeEnv, sleep } from './helpers';
+import { findFreePort, runDetached, type ContainerHandle } from '../runtime/container';
+import { mirrorImageToEcr } from '../runtime/ecr-mirror';
+import { sleep } from './helpers';
 
-// Published by .github/workflows/release-api-server-image.yml on every
-// version tag. Pinned to the SDK's VERSION so bootstrap installs a
-// Lambda image that matches the Pulumi program + client shapes it's
-// being deployed with. The caller can override via
-// BootstrapInput.apiServerImageUri (e.g. a self-hosted ECR mirror or
-// a feature-branch build).
+// Default api-server image. Pinned to the SDK's VERSION so bootstrap
+// installs an image that matches the Pulumi program + client shapes
+// it's being deployed with. The caller can override via
+// BootstrapInput.apiServerImageUri (e.g. a self-hosted mirror or a
+// feature-branch build).
 const DEFAULT_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.replace(/^v/, '')}`;
+
+const SYSTEM_PROJECT = 'system';
+const API_SERVER_ENV = 'api-server';
+const WORKER_ENV = 'worker';
+
+const LOCAL_HEALTH_TIMEOUT_MS = 180_000;
+const LOCAL_HEALTH_POLL_MS = 2_000;
+const CLOUD_HEALTH_TIMEOUT_MS = 600_000;
+const CLOUD_HEALTH_POLL_MS = 5_000;
+const DEPLOY_POLL_MS = 5_000;
+const DEPLOY_TIMEOUT_MS = 900_000;
 
 export interface Phase2Options {
   cacheDir: string;
-  stateBackendUrl: string;
+  baseConfig: ApplianceBaseConfig;
   emit: (event: BootstrapEvent) => void;
 }
 
@@ -26,108 +40,165 @@ export interface Phase2Output {
   apiKey: { id: string; secret: string };
 }
 
-const PROJECT_NAME = 'appliance-installer';
-const STACK_NAME = 'bootstrap';
-const HEALTH_TIMEOUT_MS = 60_000;
-const HEALTH_POLL_MS = 2_000;
-
 /**
- * Phase 2: hoist api-server into the installer stack.
+ * Phase 2: dogfooded api-server bootstrap.
  *
- * Runs `pulumi up` against the same `appliance-installer/bootstrap`
- * stack from phase 1, this time with `enableApiServer: true` so
- * applianceInfra() instantiates the ApplianceApiServer component
- * alongside the base. The state backend remains the local file
- * backend (phase 3 migrates to S3 later).
- *
- * After the stack update finishes it polls the api-server's
- * `/bootstrap/status` endpoint until the Lambda's cold start
- * completes, then POSTs `/bootstrap/create-key` with the freshly
- * generated bootstrap token to mint the installation's first API
- * key. The secret is returned to the driver for keychain storage.
+ * Spawns the api-server image as a local container with the cluster's
+ * S3 state bucket as its Pulumi backend, mints a first API key, then
+ * uses the public deploy API to ship api-server + worker as ordinary
+ * appliances on the cluster. Once both are reachable, the local
+ * container is torn down. From this point, the cloud api-server runs
+ * the data plane; further updates to it go through the same deploy
+ * path users hit for any appliance (no "special" IaC for the control
+ * plane).
  */
 export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Promise<Phase2Output> {
-  const imageUri = input.apiServerImageUri ?? DEFAULT_API_SERVER_IMAGE;
-  opts.emit({ type: 'log', level: 'info', message: `api-server image: ${imageUri}` });
+  const { baseConfig, emit } = opts;
 
-  const bootstrapToken = crypto.randomBytes(32).toString('base64url');
-  const workDir = path.join(opts.cacheDir, 'pulumi-workdir');
-  const stateDir = path.join(opts.cacheDir, 'pulumi-state');
-  const pulumiHome = path.join(opts.cacheDir, 'pulumi-home');
-  fs.mkdirSync(workDir, { recursive: true });
+  if (!baseConfig.aws.systemRoleArns) {
+    throw new Error(
+      'phase 2 requires base config with systemRoleArns. Re-run phase 1 against this branch ' +
+        'to provision the pre-created system api-server / worker roles.'
+    );
+  }
+  if (!baseConfig.aws.ecrRepositoryUrl) {
+    throw new Error('phase 2 requires base config with ecrRepositoryUrl');
+  }
+  if (!baseConfig.domainName) {
+    throw new Error('phase 2 requires base config with domainName');
+  }
 
-  const region = input.base.config.region ?? 'us-east-1';
+  const region = baseConfig.aws.region;
+  const sourceImage = input.apiServerImageUri ?? DEFAULT_API_SERVER_IMAGE;
+  const versionTag = VERSION.replace(/^v/, '');
 
-  const program = async () => {
-    const out = await applianceInfra({
-      bases: { [input.base.name]: input.base.config },
-      enableApiServer: true,
-      apiServerImageUri: imageUri,
-      bootstrapToken,
-    });
-    const base = out.applianceBases[0];
-    if (!(base instanceof ApplianceBaseAwsPublic)) {
-      throw new Error('phase 2 only supports aws-public bases in v1');
-    }
-    const apiServer = out.apiServers[0];
-    if (!apiServer) {
-      throw new Error('phase 2 expected an api-server component to be instantiated');
-    }
-    return {
-      stateBackendUrl: base.config.stateBackendUrl,
-      apiServerUrl: apiServer.functionUrl,
-    };
-  };
-
-  const stack = await auto.LocalWorkspace.createOrSelectStack(
-    { projectName: PROJECT_NAME, stackName: STACK_NAME, program },
-    {
-      workDir,
-      envVars: {
-        PULUMI_BACKEND_URL: `file://${stateDir}`,
-        PULUMI_HOME: pulumiHome,
-        PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
-        AWS_REGION: region,
-        ...awsCredsFromEnv(),
-        ...homeEnv(),
-      },
-    }
-  );
-
-  await stack.setConfig('aws:region', { value: region });
-
-  const result = await stack.up({
-    onEvent: (e) => forwardPulumiEvent(e, opts.emit),
-    onOutput: (line) => opts.emit({ type: 'log', level: 'info', message: line.trimEnd() }),
+  emit({ type: 'log', level: 'info', message: `mirroring ${sourceImage} → cluster ECR…` });
+  const ecrImageUri = await mirrorImageToEcr({
+    sourceImage,
+    ecrRepositoryUrl: baseConfig.aws.ecrRepositoryUrl,
+    tag: `api-server-${versionTag}`,
+    region,
+    emit,
   });
+  emit({ type: 'log', level: 'info', message: `ECR image: ${ecrImageUri}` });
 
-  if (result.summary.result !== 'succeeded') {
-    throw new Error(`pulumi up failed: ${result.summary.result}`);
+  // Spawn the local api-server container. It uses the same image as
+  // the cloud Lambdas — single artifact, one source of truth — but
+  // talks to localhost rather than CloudFront. The Lambda Web Adapter
+  // lets us run the Express app outside Lambda transparently.
+  const localPort = await findFreePort();
+  const bootstrapToken = crypto.randomBytes(32).toString('base64url');
+
+  emit({ type: 'log', level: 'info', message: `starting local api-server on 127.0.0.1:${localPort}…` });
+  const container = runDetached({
+    image: sourceImage,
+    port: { hostPort: localPort, containerPort: 8080 },
+    env: {
+      APPLIANCE_MODE: 'server',
+      APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
+      BOOTSTRAP_TOKEN: bootstrapToken,
+      PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
+      AWS_REGION: region,
+      AWS_DEFAULT_REGION: region,
+      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
+      AWS_PROFILE: process.env.AWS_PROFILE,
+      // The local api-server runs Pulumi inline (no separate worker
+      // container). Subsequent deploys after the cloud comes up use
+      // the cloud worker via the WORKER_URL env we set below.
+    },
+  });
+  const logsHandle = container.attachLogs(emit);
+
+  try {
+    const localBaseUrl = `http://127.0.0.1:${localPort}`;
+    await waitForBootstrapStatus(localBaseUrl, LOCAL_HEALTH_TIMEOUT_MS, LOCAL_HEALTH_POLL_MS, emit);
+
+    emit({ type: 'log', level: 'info', message: 'minting operator API key on local api-server…' });
+    const operatorKey = await createFirstApiKey(localBaseUrl, bootstrapToken);
+
+    const localClient = createApplianceClient({
+      baseUrl: localBaseUrl,
+      credentials: { keyId: operatorKey.id, secret: operatorKey.secret },
+    });
+
+    // Compute the cloud URLs up front. ApplianceStack creates a
+    // CNAME at `<dnsLabel>.<domain>` per stack, where stack name is
+    // `${projectName}-${envName}`. The api-server's CloudFront-fronted
+    // URL is the api-server appliance's record; the worker's URL is
+    // the matching worker record.
+    const apiServerUrl = `https://${SYSTEM_PROJECT}-${API_SERVER_ENV}.${baseConfig.domainName}`;
+    const workerUrl = `https://${SYSTEM_PROJECT}-${WORKER_ENV}.${baseConfig.domainName}`;
+
+    emit({ type: 'log', level: 'info', message: 'creating system project + envs…' });
+    const project = await ensureSuccess(localClient.createProject({ name: SYSTEM_PROJECT }), 'createProject');
+    const apiServerEnv = await ensureSuccess(
+      localClient.createEnvironment({ projectId: project.id, name: API_SERVER_ENV }),
+      'createEnvironment(api-server)'
+    );
+    const workerEnv = await ensureSuccess(
+      localClient.createEnvironment({ projectId: project.id, name: WORKER_ENV }),
+      'createEnvironment(worker)'
+    );
+
+    emit({ type: 'log', level: 'info', message: 'registering remote-image build for api-server appliances…' });
+    const imageBuild = await ensureSuccess(
+      localClient.createBuild({ uploadUrl: ecrImageUri }),
+      'createBuild(remote-image)'
+    );
+
+    // Trust-proxy is required on the api-server appliance because
+    // CloudFront's edge router rewrites Host to the Function URL's
+    // hostname; the api-server reconstructs @authority for HTTP
+    // Message Signature verification from X-Forwarded-Host. The
+    // worker only sees server-to-server calls (no edge rewrite), so
+    // it doesn't need it.
+    const apiServerEnvVars: Record<string, string> = {
+      APPLIANCE_MODE: 'server',
+      APPLIANCE_TRUST_PROXY: 'true',
+      WORKER_URL: workerUrl,
+    };
+    const workerEnvVars: Record<string, string> = {
+      APPLIANCE_MODE: 'worker',
+    };
+
+    emit({ type: 'log', level: 'info', message: 'deploying system/api-server…' });
+    const apiServerDeployment = await ensureSuccess(
+      localClient.deploy(apiServerEnv.id, { buildId: imageBuild.buildId, environment: apiServerEnvVars }),
+      'deploy(api-server)'
+    );
+
+    emit({ type: 'log', level: 'info', message: 'deploying system/worker…' });
+    const workerDeployment = await ensureSuccess(
+      localClient.deploy(workerEnv.id, { buildId: imageBuild.buildId, environment: workerEnvVars }),
+      'deploy(worker)'
+    );
+
+    emit({ type: 'log', level: 'info', message: 'waiting for system/api-server deployment to settle…' });
+    await pollDeploymentToTerminal(localClient, apiServerDeployment.id, emit);
+
+    emit({ type: 'log', level: 'info', message: 'waiting for system/worker deployment to settle…' });
+    await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
+
+    emit({ type: 'log', level: 'info', message: `waiting for ${apiServerUrl} to come up…` });
+    await waitForBootstrapStatus(apiServerUrl, CLOUD_HEALTH_TIMEOUT_MS, CLOUD_HEALTH_POLL_MS, emit);
+
+    return { apiServerUrl, apiKey: operatorKey };
+  } finally {
+    logsHandle.stop();
+    container.stop();
   }
-
-  const outputs = await stack.outputs();
-  const apiServerUrl = String(outputs.apiServerUrl?.value ?? '').replace(/\/$/, '');
-  if (!apiServerUrl) {
-    throw new Error('phase 2 succeeded but apiServerUrl output is missing');
-  }
-
-  opts.emit({ type: 'log', level: 'info', message: `waiting for ${apiServerUrl} to become healthy…` });
-  await waitForApiServer(apiServerUrl, opts.emit);
-
-  opts.emit({ type: 'log', level: 'info', message: 'creating first API key…' });
-  const apiKey = await createFirstApiKey(apiServerUrl, bootstrapToken);
-
-  return { apiServerUrl, apiKey };
 }
 
-/**
- * Poll /bootstrap/status until it responds with a parseable
- * `{ initialized: boolean }`. The api-server is a Lambda behind a
- * Function URL, so the first request after deploy can trigger a
- * cold start; 60s covers that plus container image pulls.
- */
-async function waitForApiServer(baseUrl: string, emit: (e: BootstrapEvent) => void): Promise<void> {
-  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+async function waitForBootstrapStatus(
+  baseUrl: string,
+  timeoutMs: number,
+  pollMs: number,
+  emit: (e: BootstrapEvent) => void,
+  containerOnFailure?: ContainerHandle
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   let lastError: string | null = null;
   while (Date.now() < deadline) {
     try {
@@ -135,26 +206,20 @@ async function waitForApiServer(baseUrl: string, emit: (e: BootstrapEvent) => vo
       if (r.ok) {
         const body = (await r.json().catch(() => null)) as { initialized?: boolean } | null;
         if (body && typeof body.initialized === 'boolean') return;
-        lastError = `unexpected response shape from /bootstrap/status`;
+        lastError = 'unexpected response shape from /bootstrap/status';
       } else {
         lastError = `HTTP ${r.status}`;
       }
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
     }
-    await sleep(HEALTH_POLL_MS);
+    await sleep(pollMs);
   }
   emit({ type: 'log', level: 'error', message: `health poll failed: ${lastError ?? 'timeout'}` });
-  throw new Error(`api-server did not become healthy within ${HEALTH_TIMEOUT_MS / 1000}s`);
+  containerOnFailure?.stop();
+  throw new Error(`${baseUrl} did not become healthy within ${timeoutMs / 1000}s`);
 }
 
-/**
- * Mint the first API key. Bootstrap-token auth is a single-use path
- * in spirit — after the first key exists, `/bootstrap/status` will
- * start reporting `initialized: true`, and subsequent API-key
- * creation goes through the authenticated `POST /api/v1/api-keys`
- * path (not yet implemented client-side).
- */
 async function createFirstApiKey(baseUrl: string, token: string): Promise<{ id: string; secret: string }> {
   const r = await fetch(`${baseUrl}/bootstrap/create-key`, {
     method: 'POST',
@@ -173,4 +238,46 @@ async function createFirstApiKey(baseUrl: string, token: string): Promise<{ id: 
     throw new Error('/bootstrap/create-key returned unexpected shape (missing id/secret)');
   }
   return { id: body.id, secret: body.secret };
+}
+
+async function pollDeploymentToTerminal(
+  client: ReturnType<typeof createApplianceClient>,
+  deploymentId: string,
+  emit: (e: BootstrapEvent) => void
+): Promise<Deployment> {
+  const deadline = Date.now() + DEPLOY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const r = await client.getDeployment(deploymentId);
+    if (!r.success) {
+      throw new Error(`getDeployment(${deploymentId}) failed: ${r.error.message}`);
+    }
+    if (isTerminal(r.data.status)) {
+      if (r.data.status === DeploymentStatus.Succeeded) {
+        emit({
+          type: 'log',
+          level: 'info',
+          message: `deployment ${deploymentId} succeeded${r.data.idempotentNoop ? ' (no-op)' : ''}`,
+        });
+        return r.data;
+      }
+      throw new Error(`deployment ${deploymentId} ${r.data.status}: ${r.data.message ?? '<no message>'}`);
+    }
+    await sleep(DEPLOY_POLL_MS);
+  }
+  throw new Error(`deployment ${deploymentId} did not settle within ${DEPLOY_TIMEOUT_MS / 1000}s`);
+}
+
+function isTerminal(s: DeploymentStatus): boolean {
+  return s === DeploymentStatus.Succeeded || s === DeploymentStatus.Failed || s === DeploymentStatus.Cancelled;
+}
+
+async function ensureSuccess<T>(
+  promise: Promise<{ success: true; data: T } | { success: false; error: Error }>,
+  op: string
+): Promise<T> {
+  const r = await promise;
+  if (!r.success) {
+    throw new Error(`${op} failed: ${r.error.message}`);
+  }
+  return r.data;
 }

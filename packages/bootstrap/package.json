@@ -28,6 +28,7 @@
   "dependencies": {
     "@appliance.sh/infra": "workspace:*",
     "@appliance.sh/sdk": "workspace:*",
+    "@aws-sdk/client-ecr": "^3.1005.0",
     "@pulumi/pulumi": "^3.216.0"
   },
   "devDependencies": {

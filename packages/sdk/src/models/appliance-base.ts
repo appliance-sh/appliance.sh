@@ -56,6 +56,17 @@ export const applianceBaseConfig = z.object({
     edgeRouterRoleArn: z.string().optional(),
     dataBucketName: z.string().optional(),
     ecrRepositoryUrl: z.string().optional(),
+    // Pre-created Lambda execution roles for the system api-server and
+    // worker appliances. The dogfooded bootstrap deploys those two
+    // appliances using these ARNs instead of letting ApplianceStack
+    // mint a fresh role per deploy — they need broader IAM than user
+    // workloads (Pulumi automation, ECR push, S3 state read/write).
+    systemRoleArns: z
+      .object({
+        apiServer: z.string(),
+        worker: z.string(),
+      })
+      .optional(),
   }),
 });
 

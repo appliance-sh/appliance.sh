@@ -1,6 +1,7 @@
 import { runPhase1 } from '../phases/phase1';
 import { runPhase2 } from '../phases/phase2';
 import { runPhase3 } from '../phases/phase3';
+import type { ApplianceBaseConfig } from '@appliance.sh/sdk';
 import type { BootstrapInput, BootstrapOptions, BootstrapPhase, BootstrapResult } from '../types';
 
 /**
@@ -18,12 +19,14 @@ export async function runWorkspaceEngine(
   const runs = (p: BootstrapPhase) => requested.includes(p);
 
   const result: BootstrapResult = { stateBackendUrl: '' };
+  let baseConfig: ApplianceBaseConfig | undefined;
 
   if (runs('phase1')) {
     emit({ type: 'phase-started', phase: 'phase1' });
     try {
       const out = await runPhase1(input, { cacheDir: opts.cacheDir, emit });
       result.stateBackendUrl = out.stateBackendUrl;
+      baseConfig = out.baseConfig;
       emit({ type: 'phase-completed', phase: 'phase1' });
     } catch (err) {
       emit({ type: 'phase-failed', phase: 'phase1', error: formatError(err) });
@@ -35,10 +38,15 @@ export async function runWorkspaceEngine(
 
   if (runs('phase2')) {
     emit({ type: 'phase-started', phase: 'phase2' });
+    if (!baseConfig) {
+      const err = new Error('phase 2 requires phase 1 to run first (base config unavailable)');
+      emit({ type: 'phase-failed', phase: 'phase2', error: err.message });
+      throw err;
+    }
     try {
       const out = await runPhase2(input, {
         cacheDir: opts.cacheDir,
-        stateBackendUrl: result.stateBackendUrl,
+        baseConfig,
         emit,
       });
       result.apiServerUrl = out.apiServerUrl;

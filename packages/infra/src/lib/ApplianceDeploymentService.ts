@@ -34,6 +34,11 @@ export interface ResolvedBuildParams {
   memory?: number;
   timeout?: number;
   storage?: number;
+  // Pre-existing IAM role ARN. When set, ApplianceStack binds the
+  // Lambda to this role instead of minting one. Used by the dogfooded
+  // bootstrap path for the system api-server + worker appliances,
+  // which need broader IAM than ApplianceStack's per-appliance role.
+  lambdaRoleArn?: string;
 }
 
 export interface ApplianceDeploymentServiceOptions {
@@ -90,6 +95,7 @@ export class ApplianceDeploymentService {
           memory: build?.memory,
           timeout: build?.timeout,
           storage: build?.storage,
+          lambdaRoleArn: build?.lambdaRoleArn,
         },
         {
           globalProvider,

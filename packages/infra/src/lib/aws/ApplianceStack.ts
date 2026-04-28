@@ -59,6 +59,12 @@ export interface ApplianceStackArgs {
   // Ephemeral scratch storage in MB — maps to Lambda ephemeralStorage
   // (the /tmp size). Optional; Lambda defaults to 512 MB when omitted.
   storage?: number;
+  // When set, the Lambda binds to this pre-existing IAM role instead
+  // of one created here. Used by the dogfooded bootstrap to deploy
+  // the system api-server + worker appliances against roles
+  // pre-created by the base (which carry broader Pulumi/AWS perms
+  // than ApplianceStack's per-appliance role grants).
+  lambdaRoleArn?: pulumi.Input<string>;
 }
 
 export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
@@ -69,8 +75,12 @@ export interface ApplianceStackOpts extends pulumi.ComponentResourceOptions {
 }
 
 export class ApplianceStack extends pulumi.ComponentResource {
-  lambdaRole: aws.iam.Role;
-  lambdaRolePolicy: aws.iam.Policy;
+  // lambdaRole / lambdaRolePolicy are present only when the stack
+  // mints its own role. When `lambdaRoleArn` is supplied via args,
+  // both are undefined and the Lambda binds to the supplied ARN.
+  lambdaRole?: aws.iam.Role;
+  lambdaRolePolicy?: aws.iam.Policy;
+  lambdaRoleArn: pulumi.Output<string>;
   lambda: aws.lambda.Function;
   lambdaUrl: aws.lambda.FunctionUrl;
   dnsRecord: pulumi.Output<string>;
@@ -107,63 +117,72 @@ export class ApplianceStack extends pulumi.ComponentResource {
       defaultTags['appliance:deployment-id'] = args.metadata.deploymentId;
     }
 
-    this.lambdaRole = new aws.iam.Role(`${rid}-role`, {
-      path: `/appliance/${name}/`,
-      assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({ Service: 'lambda.amazonaws.com' }),
-      tags: defaultTags,
-    });
-
-    const policyStatements = [
-      { Effect: 'Allow' as const, Action: 'logs:CreateLogGroup', Resource: '*' },
-      { Effect: 'Allow' as const, Action: 'logs:CreateLogStream', Resource: '*' },
-      { Effect: 'Allow' as const, Action: 'logs:PutLogEvents', Resource: '*' },
-    ];
-
-    if (args.imageUri) {
-      policyStatements.push(
-        {
-          Effect: 'Allow' as const,
-          Action: 'ecr:GetDownloadUrlForLayer',
-          Resource: '*',
-        },
-        {
-          Effect: 'Allow' as const,
-          Action: 'ecr:BatchGetImage',
-          Resource: '*',
-        },
-        {
-          Effect: 'Allow' as const,
-          Action: 'ecr:BatchCheckLayerAvailability',
-          Resource: '*',
-        },
-        {
-          Effect: 'Allow' as const,
-          Action: 'ecr:GetAuthorizationToken',
-          Resource: '*',
-        }
-      );
-    }
-
-    if (args.codeS3Key && args.config.aws.dataBucketName) {
-      policyStatements.push({
-        Effect: 'Allow' as const,
-        Action: 's3:GetObject',
-        Resource: `arn:aws:s3:::${args.config.aws.dataBucketName}/${args.codeS3Key}`,
+    if (args.lambdaRoleArn) {
+      // Caller supplied a pre-existing role (system api-server / worker
+      // appliances bootstrap-deployed against base-pre-created roles).
+      // Skip role + policy creation; bind the Lambda to the ARN below.
+      this.lambdaRoleArn = pulumi.output(args.lambdaRoleArn);
+    } else {
+      this.lambdaRole = new aws.iam.Role(`${rid}-role`, {
+        path: `/appliance/${name}/`,
+        assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({ Service: 'lambda.amazonaws.com' }),
+        tags: defaultTags,
       });
+
+      const policyStatements = [
+        { Effect: 'Allow' as const, Action: 'logs:CreateLogGroup', Resource: '*' },
+        { Effect: 'Allow' as const, Action: 'logs:CreateLogStream', Resource: '*' },
+        { Effect: 'Allow' as const, Action: 'logs:PutLogEvents', Resource: '*' },
+      ];
+
+      if (args.imageUri) {
+        policyStatements.push(
+          {
+            Effect: 'Allow' as const,
+            Action: 'ecr:GetDownloadUrlForLayer',
+            Resource: '*',
+          },
+          {
+            Effect: 'Allow' as const,
+            Action: 'ecr:BatchGetImage',
+            Resource: '*',
+          },
+          {
+            Effect: 'Allow' as const,
+            Action: 'ecr:BatchCheckLayerAvailability',
+            Resource: '*',
+          },
+          {
+            Effect: 'Allow' as const,
+            Action: 'ecr:GetAuthorizationToken',
+            Resource: '*',
+          }
+        );
+      }
+
+      if (args.codeS3Key && args.config.aws.dataBucketName) {
+        policyStatements.push({
+          Effect: 'Allow' as const,
+          Action: 's3:GetObject',
+          Resource: `arn:aws:s3:::${args.config.aws.dataBucketName}/${args.codeS3Key}`,
+        });
+      }
+
+      this.lambdaRolePolicy = new aws.iam.Policy(`${rid}-policy`, {
+        path: `/appliance/${name}/`,
+        policy: {
+          Version: '2012-10-17',
+          Statement: policyStatements,
+        },
+      });
+
+      new aws.iam.RolePolicyAttachment(`${rid}-role-policy-attachment`, {
+        role: this.lambdaRole.name,
+        policyArn: this.lambdaRolePolicy.arn,
+      });
+
+      this.lambdaRoleArn = this.lambdaRole.arn;
     }
-
-    this.lambdaRolePolicy = new aws.iam.Policy(`${rid}-policy`, {
-      path: `/appliance/${name}/`,
-      policy: {
-        Version: '2012-10-17',
-        Statement: policyStatements,
-      },
-    });
-
-    new aws.iam.RolePolicyAttachment(`${rid}-role-policy-attachment`, {
-      role: this.lambdaRole.name,
-      policyArn: this.lambdaRolePolicy.arn,
-    });
 
     const ephemeralStorage = args.storage ? { size: args.storage } : undefined;
 
@@ -173,7 +192,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
         {
           packageType: 'Image',
           imageUri: args.imageUri,
-          role: this.lambdaRole.arn,
+          role: this.lambdaRoleArn,
           timeout: args.timeout ?? 30,
           memorySize: args.memory ?? 512,
           ephemeralStorage,
@@ -191,7 +210,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
           handler: args.handler ?? 'index.handler',
           s3Bucket: args.config.aws.dataBucketName,
           s3Key: args.codeS3Key,
-          role: this.lambdaRole.arn,
+          role: this.lambdaRoleArn,
           timeout: args.timeout ?? 30,
           memorySize: args.memory ?? 512,
           ephemeralStorage,

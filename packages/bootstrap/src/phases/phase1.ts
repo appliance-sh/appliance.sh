@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
+import type { ApplianceBaseConfig } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
 import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 
@@ -12,16 +13,20 @@ export interface Phase1Options {
 
 export interface Phase1Output {
   stateBackendUrl: string;
+  /** Full resolved base config — passed to phase 2's local api-server via APPLIANCE_BASE_CONFIG. */
+  baseConfig: ApplianceBaseConfig;
 }
 
 const PROJECT_NAME = 'appliance-installer';
 const STACK_NAME = 'bootstrap';
 
 /**
- * Phase 1: deploy the base infra with `enableApiServer: false`
- * against a local file-backed Pulumi state. The base component
- * creates its own S3 state bucket — phase 3 later moves the
- * installer stack's state into that bucket.
+ * Phase 1: deploy the base infra against a local file-backed Pulumi
+ * state. The base component creates its own S3 state bucket — phase 3
+ * later moves the installer stack's state into that bucket. Outputs
+ * the resolved baseConfig so phase 2 can hand it to the local
+ * api-server (which then deploys api-server + worker as ordinary
+ * appliances on this base).
  */
 export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Promise<Phase1Output> {
   const workDir = path.join(opts.cacheDir, 'pulumi-workdir');
@@ -35,7 +40,6 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
   const program = async () => {
     const { applianceBases } = await applianceInfra({
       bases: { [input.base.name]: input.base.config },
-      enableApiServer: false,
     });
 
     // Return a flat map so Automation API reads them via stack.outputs().
@@ -47,6 +51,9 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
     }
     return {
       stateBackendUrl: base.config.stateBackendUrl,
+      // Full base config for phase 2's local api-server. Whatever the
+      // SDK schema doesn't recognise gets stripped on the consumer side.
+      baseConfig: base.config,
     };
   };
 
@@ -85,6 +92,10 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
   if (!stateBackendUrl) {
     throw new Error('phase 1 succeeded but stateBackendUrl output is missing');
   }
+  const baseConfig = outputs.baseConfig?.value as ApplianceBaseConfig | undefined;
+  if (!baseConfig) {
+    throw new Error('phase 1 succeeded but baseConfig output is missing');
+  }
 
-  return { stateBackendUrl };
+  return { stateBackendUrl, baseConfig };
 }

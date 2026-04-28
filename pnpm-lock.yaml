@@ -204,6 +204,9 @@ importers:
       '@appliance.sh/sdk':
         specifier: workspace:*
         version: link:../sdk
+      '@aws-sdk/client-ecr':
+        specifier: ^3.1005.0
+        version: 3.1014.0
       '@pulumi/pulumi':
         specifier: ^3.216.0
         version: 3.227.0(ts-node@10.9.2(@swc/core@1.15.21)(@types/node@24.12.0)(typescript@5.9.3))(typescript@5.9.3)

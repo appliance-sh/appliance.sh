@@ -24,6 +24,11 @@ export interface ResolvedBuild {
   memory?: number;
   timeout?: number;
   storage?: number;
+  // Pre-existing IAM role ARN injected by the executor for system
+  // appliances (project=`system`). Threaded through to ApplianceStack
+  // so the dogfood-deployed api-server / worker bind to the
+  // base-pre-created roles instead of getting per-deploy roles.
+  lambdaRoleArn?: string;
 }
 
 function getBaseConfig() {
