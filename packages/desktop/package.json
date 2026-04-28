@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf ./dist ./sidecar/dist",
-    "sidecar:build": "tsc -p sidecar/tsconfig.json",
+    "sidecar:build": "tsc -p sidecar/tsconfig.json && mv sidecar/dist/main.js sidecar/dist/main.cjs && (mv sidecar/dist/main.js.map sidecar/dist/main.cjs.map 2>/dev/null || true)",
     "tauri": "tauri",
     "tauri:dev": "pnpm sidecar:build && tauri dev",
     "tauri:build": "pnpm sidecar:build && tauri build",

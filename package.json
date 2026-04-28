@@ -19,6 +19,9 @@
     ]
   },
   "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": "24.1.0"
+  },
   "scripts": {
     "build": "nx run-many --target=build --all",
     "clean": "rm -rf ./node_modules && pnpm -r run clean",
@@ -36,6 +39,11 @@
   "nx": {
     "name": "appliance-workspace",
     "includedScripts": []
+  },
+  "pnpm": {
+    "overrides": {
+      "@pulumi/pulumi": "3.227.0"
+    }
   },
   "devDependencies": {
     "@appliance.sh/sdk": "workspace:*",
