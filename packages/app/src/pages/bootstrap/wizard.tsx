@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { useNavigate } from 'react-router';
+import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 
@@ -25,6 +26,7 @@ export interface WizardValues {
   createZone: boolean;
   deployApiServer: boolean;
   apiServerImageUri?: string;
+  awsProfile?: string;
 }
 
 export function BootstrapWizardPage() {
@@ -37,6 +39,25 @@ export function BootstrapWizardPage() {
   const [createZone, setCreateZone] = React.useState(true);
   const [deployApiServer, setDeployApiServer] = React.useState(false);
   const [apiServerImageUri, setApiServerImageUri] = React.useState('');
+  const [awsProfile, setAwsProfile] = React.useState('');
+
+  // List AWS profiles from ~/.aws/{config,credentials}. Tauri reads
+  // the files; web shell omits the capability and the wizard falls
+  // back to a free-text input.
+  const profilesQuery = useQuery({
+    queryKey: ['aws-profiles'],
+    enabled: Boolean(host.bootstrap?.listAwsProfiles),
+    queryFn: () => host.bootstrap!.listAwsProfiles!(),
+  });
+  const profiles = profilesQuery.data ?? [];
+  const canEnumerateProfiles = Boolean(host.bootstrap?.listAwsProfiles);
+
+  // Default to "default" if the user has it; otherwise leave empty
+  // (operator's shell env wins as the credential source).
+  React.useEffect(() => {
+    if (awsProfile) return;
+    if (profiles.some((p) => p.name === 'default')) setAwsProfile('default');
+  }, [profiles, awsProfile]);
 
   // Image URI is fully optional — phase 2 falls back to the pinned
   // ghcr.io/appliance-sh/api-server:<version> default. If the user
@@ -68,6 +89,7 @@ export function BootstrapWizardPage() {
       createZone,
       deployApiServer,
       apiServerImageUri: deployApiServer && apiServerImageUri ? apiServerImageUri : undefined,
+      awsProfile: awsProfile || undefined,
     };
     navigate('/bootstrap/run', { state: values });
   };
@@ -77,12 +99,37 @@ export function BootstrapWizardPage() {
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">New installation</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Provision the base AWS infrastructure for a new Appliance cluster. Uses the AWS credentials from your current
-          shell environment.
+          Provision the base AWS infrastructure for a new Appliance cluster. AWS credentials are sourced from the
+          selected profile (or your shell environment if none is selected).
         </p>
       </div>
 
       <form className="space-y-4" onSubmit={onSubmit}>
+        <Field
+          label="AWS profile"
+          hint={canEnumerateProfiles ? '~/.aws/config + credentials' : 'shell env will be used'}
+        >
+          {canEnumerateProfiles ? (
+            <select value={awsProfile} onChange={(e) => setAwsProfile(e.target.value)} className={inputCls}>
+              <option value="">— shell environment —</option>
+              {profiles.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name}
+                  {p.isSso ? '  (SSO)' : ''}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              value={awsProfile}
+              onChange={(e) => setAwsProfile(e.target.value)}
+              placeholder="leave empty to use shell env"
+              className={`${inputCls} font-mono`}
+            />
+          )}
+        </Field>
+
         <Field label="Base name" hint="lowercase letters, digits, dashes">
           <input
             type="text"

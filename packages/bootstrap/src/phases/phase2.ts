@@ -1,4 +1,6 @@
 import * as crypto from 'node:crypto';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   createApplianceClient,
   DeploymentStatus,
@@ -88,6 +90,17 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
   const sourceImage = input.apiServerImageUri ?? DEFAULT_API_SERVER_IMAGE;
   const versionTag = VERSION.replace(/^v/, '');
 
+  // The ECR mirror runs in the bootstrap process itself, so the AWS
+  // SDK in this process needs the wizard-selected profile. Setting
+  // process.env up front is the cheapest way; it also covers any
+  // other AWS SDK calls phase 2 might make later (none today).
+  if (input.aws?.profile) {
+    process.env.AWS_PROFILE = input.aws.profile;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    delete process.env.AWS_SESSION_TOKEN;
+  }
+
   emit({ type: 'log', level: 'info', message: `mirroring ${sourceImage} → cluster ECR…` });
   const ecrImageUri = await mirrorImageToEcr({
     sourceImage,
@@ -106,9 +119,27 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
   const bootstrapToken = crypto.randomBytes(32).toString('base64url');
 
   emit({ type: 'log', level: 'info', message: `starting local api-server on 127.0.0.1:${localPort}…` });
+
+  // AWS auth into the container. With a wizard-supplied profile, we
+  // mount the operator's ~/.aws read-only and force HOME=/root so the
+  // SDK inside the container resolves the named profile + SSO token
+  // cache the same way the host does. Without a profile we fall back
+  // to forwarding access-key env vars from the operator's shell.
+  const awsEnv: Record<string, string | undefined> = input.aws?.profile
+    ? { AWS_PROFILE: input.aws.profile, HOME: '/root' }
+    : {
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+        AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
+        AWS_PROFILE: process.env.AWS_PROFILE,
+      };
+  const awsConfigDir = path.join(os.homedir(), '.aws');
+  const volumes = input.aws?.profile ? [{ host: awsConfigDir, container: '/root/.aws', readOnly: true }] : undefined;
+
   const container = runDetached({
     image: sourceImage,
     port: { hostPort: localPort, containerPort: 8080 },
+    volumes,
     env: {
       APPLIANCE_MODE: 'server',
       APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
@@ -116,10 +147,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
       PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
       AWS_REGION: region,
       AWS_DEFAULT_REGION: region,
-      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
-      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
-      AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
-      AWS_PROFILE: process.env.AWS_PROFILE,
+      ...awsEnv,
       // The local api-server runs Pulumi inline (no separate worker
       // container). Subsequent deploys after the cloud comes up use
       // the cloud worker via the WORKER_URL env we set below.

@@ -24,6 +24,21 @@ export interface BootstrapInput {
    * ECR in a follow-up commit.
    */
   apiServerImageUri?: string;
+
+  /**
+   * AWS auth source. When `profile` is set, every AWS-touching
+   * subprocess (Pulumi workspace, the local api-server container in
+   * phase 2) is launched with `AWS_PROFILE=<profile>` and any
+   * existing access-key env vars are cleared, so the AWS SDK loads
+   * credentials from `~/.aws/config` + `~/.aws/credentials` instead
+   * of the operator's shell. SSO profiles work transparently — the
+   * SDK reads cached tokens from `~/.aws/sso/cache/`. When this
+   * field is omitted the bootstrap falls back to whatever AWS env
+   * vars are already in the operator's shell.
+   */
+  aws?: {
+    profile?: string;
+  };
 }
 
 export type BootstrapEngineKind = 'workspace' | 'download';

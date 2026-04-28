@@ -91,6 +91,7 @@ export function BootstrapProgressPage() {
         },
       },
       apiServerImageUri: values.apiServerImageUri,
+      aws: values.awsProfile ? { profile: values.awsProfile } : undefined,
     };
 
     const phases: BootstrapPhase[] = values.deployApiServer ? ['phase1', 'phase2'] : ['phase1'];

@@ -6,6 +6,7 @@ export type {
   HostConfig,
   Cluster,
   AddClusterInput,
+  AwsProfile,
   BootstrapHost,
   BootstrapInput,
   BootstrapOptions,

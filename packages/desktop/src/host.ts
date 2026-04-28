@@ -3,6 +3,7 @@ import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import type {
   AddClusterInput,
+  AwsProfile,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
@@ -55,6 +56,9 @@ export const tauriHost: ConsoleHost = {
         input: { bootstrapInput: input, options: options ?? {} },
         onEvent: channel,
       });
+    },
+    async listAwsProfiles(): Promise<AwsProfile[]> {
+      return invoke<AwsProfile[]>('list_aws_profiles');
     },
   },
 };

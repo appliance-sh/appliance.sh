@@ -66,6 +66,7 @@ export async function runWorkspaceEngine(
       await runPhase3({
         cacheDir: opts.cacheDir,
         stateBackendUrl: result.stateBackendUrl,
+        awsProfile: input.aws?.profile,
         emit,
       });
       result.statePromoted = true;

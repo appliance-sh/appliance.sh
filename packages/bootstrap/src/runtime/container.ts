@@ -101,6 +101,10 @@ export interface RunContainerOptions {
   port: { hostPort: number; containerPort: number };
   /** Environment variables. Undefined values are skipped. */
   env: Record<string, string | undefined>;
+  /** Bind mounts (`-v <host>:<container>[:ro]`). Used by the dogfood
+   *  bootstrap to expose the operator's `~/.aws` to the container so
+   *  AWS_PROFILE / SSO token cache resolution works inside it. */
+  volumes?: Array<{ host: string; container: string; readOnly?: boolean }>;
   /** Optional name for the container — useful for log readability. */
   name?: string;
 }
@@ -123,6 +127,9 @@ export function runDetached(opts: RunContainerOptions): ContainerHandle {
   for (const [key, value] of Object.entries(opts.env)) {
     if (value === undefined) continue;
     args.push('-e', `${key}=${value}`);
+  }
+  for (const volume of opts.volumes ?? []) {
+    args.push('-v', `${volume.host}:${volume.container}${volume.readOnly ? ':ro' : ''}`);
   }
   args.push(opts.image);
 

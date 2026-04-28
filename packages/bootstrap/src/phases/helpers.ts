@@ -17,9 +17,25 @@ export function homeEnv(): Record<string, string> {
 /**
  * Standard AWS credential-chain env vars. We don't mint credentials;
  * we pass whatever the caller already has to the subprocess.
+ *
+ * When `profile` is supplied (from BootstrapInput.aws.profile), we
+ * scrub explicit access-key env vars and force `AWS_PROFILE` —
+ * otherwise a stray AWS_ACCESS_KEY_ID in the operator's shell would
+ * shadow the wizard's profile selection.
  */
-export function awsCredsFromEnv(): Record<string, string> {
+export function awsCredsFromEnv(profile?: string): Record<string, string> {
   const out: Record<string, string> = {};
+  if (profile) {
+    out.AWS_PROFILE = profile;
+    // Skip access-key vars on purpose so the SDK chain falls through
+    // to the named profile. AWS_DEFAULT_REGION / AWS_*_FILE pass
+    // through because they don't conflict with profile auth.
+    for (const k of ['AWS_DEFAULT_REGION', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE']) {
+      const v = process.env[k];
+      if (v !== undefined) out[k] = v;
+    }
+    return out;
+  }
   for (const k of [
     'AWS_ACCESS_KEY_ID',
     'AWS_SECRET_ACCESS_KEY',

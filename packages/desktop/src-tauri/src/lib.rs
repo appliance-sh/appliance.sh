@@ -252,6 +252,111 @@ fn remove_cluster(app: AppHandle, cluster_id: String) -> Result<(), HostError> {
     write_persisted_config(&app, &persisted)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AwsProfile {
+    name: String,
+    /// True when the profile is configured for SSO (sso_session = ...
+    /// or legacy sso_start_url). Surfaced to the wizard so the UI can
+    /// hint at `aws sso login` failures distinctly from access-key
+    /// profiles.
+    is_sso: bool,
+    /// Source file the profile was discovered in — purely informational.
+    source: AwsProfileSource,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AwsProfileSource {
+    Config,
+    Credentials,
+}
+
+/// Enumerate AWS profiles from `~/.aws/config` and `~/.aws/credentials`.
+/// Returns an empty list if neither file exists. Parses INI lazily —
+/// any malformed section is skipped silently rather than aborting the
+/// whole listing, so the wizard always has *something* to show.
+#[tauri::command]
+fn list_aws_profiles() -> Result<Vec<AwsProfile>, HostError> {
+    let home = match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        Some(h) => PathBuf::from(h),
+        None => return Ok(Vec::new()),
+    };
+    let aws_dir = home.join(".aws");
+    let mut out: Vec<AwsProfile> = Vec::new();
+
+    let config_path = aws_dir.join("config");
+    if config_path.exists() {
+        if let Ok(text) = fs::read_to_string(&config_path) {
+            for (name, body) in parse_ini_sections(&text) {
+                // Strip the `profile ` prefix that ~/.aws/config uses
+                // for everything except `[default]`. Skip sso-session
+                // sections — they're not profiles, just shared config.
+                let profile_name = if name == "default" {
+                    Some("default".to_string())
+                } else if let Some(rest) = name.strip_prefix("profile ") {
+                    Some(rest.trim().to_string())
+                } else {
+                    None
+                };
+                if let Some(profile_name) = profile_name {
+                    let is_sso = body.contains("sso_session") || body.contains("sso_start_url");
+                    out.push(AwsProfile {
+                        name: profile_name,
+                        is_sso,
+                        source: AwsProfileSource::Config,
+                    });
+                }
+            }
+        }
+    }
+
+    let creds_path = aws_dir.join("credentials");
+    if creds_path.exists() {
+        if let Ok(text) = fs::read_to_string(&creds_path) {
+            for (name, _body) in parse_ini_sections(&text) {
+                if out.iter().any(|p| p.name == name) {
+                    continue;
+                }
+                out.push(AwsProfile {
+                    name,
+                    is_sso: false,
+                    source: AwsProfileSource::Credentials,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Tiny INI section parser — yields (section_name, section_body) for
+/// each `[section]` block. Good enough for `~/.aws/*`; doesn't try to
+/// be a general-purpose INI reader.
+fn parse_ini_sections(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_body = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(name) = current_name.take() {
+                out.push((name, std::mem::take(&mut current_body)));
+            }
+            current_name = Some(line[1..line.len() - 1].trim().to_string());
+            continue;
+        }
+        if current_name.is_some() {
+            current_body.push_str(raw_line);
+            current_body.push('\n');
+        }
+    }
+    if let Some(name) = current_name {
+        out.push((name, current_body));
+    }
+    out
+}
+
 // Resolve the path to the compiled bootstrap sidecar. Dev-only: uses
 // CARGO_MANIFEST_DIR to find the sibling `sidecar/dist/main.cjs`.
 // Production packaging (bundling the sidecar into the installer as a
@@ -384,6 +489,7 @@ pub fn run() {
             add_cluster,
             select_cluster,
             remove_cluster,
+            list_aws_profiles,
             run_bootstrap
         ])
         .run(tauri::generate_context!())

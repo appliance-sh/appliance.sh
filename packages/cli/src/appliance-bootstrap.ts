@@ -42,6 +42,7 @@ program
     '--image-uri <uri>',
     'override the default api-server image (default: `ghcr.io/appliance-sh/api-server:<version>`)'
   )
+  .option('--profile <name>', 'AWS profile to authenticate with (overrides shell env credentials)')
   .option('-y, --yes', 'skip the confirmation prompt')
   .action(
     async (options: {
@@ -53,6 +54,7 @@ program
       phases: string;
       cacheDir?: string;
       imageUri?: string;
+      profile?: string;
       yes?: boolean;
     }) => {
       const name =
@@ -114,6 +116,7 @@ program
         console.log(`  Zone:    ${createZone ? 'create new' : 'attach existing'}`);
         console.log(`  Phases:  ${phases.join(', ')}`);
         console.log(`  Image:   ${imageUri ?? '(default ghcr.io/appliance-sh/api-server)'}`);
+        console.log(`  Profile: ${options.profile ?? '(shell env)'}`);
         if (options.cacheDir) console.log(`  Cache:   ${options.cacheDir}`);
         console.log();
         const ok = await prompts.confirm({ message: 'Proceed?', default: true });
@@ -125,7 +128,11 @@ program
 
       try {
         const result = await runBootstrap(
-          { base: { name, config: baseConfig }, apiServerImageUri: imageUri },
+          {
+            base: { name, config: baseConfig },
+            apiServerImageUri: imageUri,
+            aws: options.profile ? { profile: options.profile } : undefined,
+          },
           {
             phases,
             cacheDir: options.cacheDir,

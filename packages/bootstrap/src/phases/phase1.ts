@@ -70,7 +70,7 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
         PULUMI_HOME: pulumiHome,
         PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
         AWS_REGION: input.base.config.region ?? 'us-east-1',
-        ...awsCredsFromEnv(),
+        ...awsCredsFromEnv(input.aws?.profile),
         ...homeEnv(),
       },
     }

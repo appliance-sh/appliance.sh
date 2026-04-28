@@ -7,6 +7,7 @@ import { awsCredsFromEnv, homeEnv } from './helpers';
 export interface Phase3Options {
   cacheDir: string;
   stateBackendUrl: string;
+  awsProfile?: string;
   emit: (event: BootstrapEvent) => void;
 }
 
@@ -85,7 +86,7 @@ export async function runPhase3(opts: Phase3Options): Promise<void> {
         PULUMI_BACKEND_URL: `file://${localStateDir}`,
         PULUMI_HOME: pulumiHome,
         PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
-        ...awsCredsFromEnv(),
+        ...awsCredsFromEnv(opts.awsProfile),
         ...homeEnv(),
       },
     }
@@ -109,7 +110,7 @@ export async function runPhase3(opts: Phase3Options): Promise<void> {
         PULUMI_BACKEND_URL: stateBackendUrl,
         PULUMI_HOME: pulumiHome,
         PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
-        ...awsCredsFromEnv(),
+        ...awsCredsFromEnv(opts.awsProfile),
         ...homeEnv(),
       },
     }

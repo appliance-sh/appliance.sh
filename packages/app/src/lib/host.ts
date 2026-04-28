@@ -44,6 +44,21 @@ export interface BootstrapHost {
     options: BootstrapOptions | undefined,
     onEvent: (event: BootstrapEvent) => void
   ): Promise<BootstrapResult>;
+  /**
+   * Enumerate AWS profiles from `~/.aws/config` + `~/.aws/credentials`
+   * for the wizard's profile picker. Optional — hosts without
+   * filesystem access (web shell) can omit it; the wizard then
+   * gracefully degrades to a free-text input.
+   */
+  listAwsProfiles?(): Promise<AwsProfile[]>;
+}
+
+export interface AwsProfile {
+  name: string;
+  /** True when the profile is configured for SSO. */
+  isSso: boolean;
+  /** Which file the profile was found in. */
+  source: 'config' | 'credentials';
 }
 
 // Capabilities the surrounding shell (web PWA, future Tauri/Electron)
