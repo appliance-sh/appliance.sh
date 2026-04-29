@@ -138,13 +138,24 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
 
   const container = runDetached({
     image: sourceImage,
-    port: { hostPort: localPort, containerPort: 8080 },
+    // The api-server listens on PORT=3000 inside the image (set in
+    // both the Dockerfile and main.ts's default). The Lambda Web
+    // Adapter is inert outside Lambda — it only intercepts when
+    // AWS_LAMBDA_RUNTIME_API is set — so we connect directly to the
+    // Express server on 3000, not the LWA's typical 8080.
+    port: { hostPort: localPort, containerPort: 3000 },
     volumes,
     env: {
       APPLIANCE_MODE: 'server',
       APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
       BOOTSTRAP_TOKEN: bootstrapToken,
       PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
+      // New stacks initialise with an awskms:// secrets provider
+      // (configured per-deploy by ApplianceDeploymentService). This
+      // empty passphrase is a safety net for any code path that
+      // momentarily defaults to the passphrase provider before the
+      // KMS provider is read.
+      PULUMI_CONFIG_PASSPHRASE: '',
       AWS_REGION: region,
       AWS_DEFAULT_REGION: region,
       ...awsEnv,

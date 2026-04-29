@@ -163,6 +163,19 @@ export class ApplianceDeploymentService {
     return dir;
   }
 
+  /**
+   * Build the AWS KMS secrets provider URL for stack init. Pulumi's
+   * `awskms://` form takes the key ARN/ID + region. Returns undefined
+   * when the base hasn't been provisioned with a state KMS key (older
+   * clusters), in which case the workspace falls back to whatever
+   * PULUMI_CONFIG_PASSPHRASE is set to.
+   */
+  private secretsProvider(): string | undefined {
+    const arn = this.baseConfig?.aws.kmsKeyArn;
+    if (!arn) return undefined;
+    return `awskms://${arn}?region=${this.region}`;
+  }
+
   private async getOrCreateStack(
     stackName: string,
     metadata?: ApplianceStackMetadata,
@@ -171,10 +184,11 @@ export class ApplianceDeploymentService {
     const program = this.inlineProgram(stackName, metadata, build);
     const envVars = this.buildEnvVars();
     const workDir = this.workDirFor(metadata?.projectId);
+    const secretsProvider = this.secretsProvider();
 
     const stack = await auto.LocalWorkspace.createOrSelectStack(
       { projectName: this.projectName, stackName, program },
-      { envVars, workDir }
+      { envVars, workDir, ...(secretsProvider ? { secretsProvider } : {}) }
     );
     await stack.setConfig('aws:region', { value: this.baseConfig!.aws.region });
     return stack;

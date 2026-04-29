@@ -56,6 +56,12 @@ export const applianceBaseConfig = z.object({
     edgeRouterRoleArn: z.string().optional(),
     dataBucketName: z.string().optional(),
     ecrRepositoryUrl: z.string().optional(),
+    // KMS key (ARN) used as the Pulumi stack secrets provider for
+    // every stack the api-server creates against this base. Replaces
+    // PULUMI_CONFIG_PASSPHRASE-based encryption — operator and
+    // system Lambda roles authenticate to the key via IAM rather than
+    // a shared passphrase.
+    kmsKeyArn: z.string().optional(),
     // Pre-created Lambda execution roles for the system api-server and
     // worker appliances. The dogfooded bootstrap deploys those two
     // appliances using these ARNs instead of letting ApplianceStack

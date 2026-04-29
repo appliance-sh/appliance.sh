@@ -185,6 +185,34 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       { parent: this, provider: opts?.provider }
     );
 
+    // KMS key used as the Pulumi stack secrets provider for every
+    // stack the cluster's api-server initialises. Avoids the shared
+    // PULUMI_CONFIG_PASSPHRASE model — operator (running phase 1) and
+    // the system Lambda roles authenticate to this key via IAM. The
+    // default key policy already grants account root + delegates the
+    // rest through IAM, so the system roles' AdministratorAccess
+    // grants are sufficient without a custom key policy.
+    const stateKey = new aws.kms.Key(
+      `${name}-state-kms`,
+      {
+        description: `Appliance Pulumi stack secrets for base ${name}`,
+        enableKeyRotation: true,
+        deletionWindowInDays: 7,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+    new aws.kms.Alias(
+      `${name}-state-kms-alias`,
+      {
+        // Aliases are namespaced to the account+region; prefix with
+        // the base name so multiple clusters in one account don't
+        // collide. Hyphenate any DNS dots out of the base name.
+        name: `alias/appliance/${name.replaceAll('.', '-')}-state`,
+        targetKeyId: stateKey.keyId,
+      },
+      { parent: this, provider: opts?.provider }
+    );
+
     // Pre-created Lambda execution roles for the system api-server +
     // worker appliances (RFC 0018). The dogfooded bootstrap deploys
     // those two appliances via the normal ApplianceStack path, but
@@ -623,6 +651,7 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
         stateBucketName: this.stateBucket.bucket,
         stateBucketArn: this.stateBucket.arn,
         ecrRepositoryUrl: this.ecrRepository.repositoryUrl,
+        kmsKeyArn: stateKey.arn,
         systemRoleArns: {
           apiServer: systemApiServerRole.arn,
           worker: systemWorkerRole.arn,
