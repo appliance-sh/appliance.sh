@@ -1,3 +1,17 @@
+## 1.33.0 (2026-04-29)
+
+### Features
+
+- **infra:** enable awskms ([2401e62](https://github.com/appliance-sh/appliance.sh/commit/2401e62))
+
+### Bug Fixes
+
+- **infra:** symlink pulumi plugin files directly ([29a66e6](https://github.com/appliance-sh/appliance.sh/commit/29a66e6))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.32.6 (2026-04-29)
 
 ### Bug Fixes
