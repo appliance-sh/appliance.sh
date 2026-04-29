@@ -224,19 +224,37 @@ jobs:
 
       - name: Create manifest
         working-directory: ${{ runner.temp }}/digests
+        env:
+          # Pass via env so the multi-line tags value (one tag per line)
+          # is preserved verbatim. Inlining `${{ steps.tags.outputs.tags }}`
+          # directly into the script body splits the value across raw
+          # script lines and bash interprets the trailing tags as
+          # separate commands.
+          IMAGE: ${{ steps.tags.outputs.image }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          # Each digest file is named after the sha256 hash (no prefix);
-          # `<image>@sha256:<hash>` is the canonical form imagetools
-          # consumes. The shell glob expands one source per platform.
-          IMAGE='${{ steps.tags.outputs.image }}'
-          TAG_ARGS=$(printf -- '-t %s ' ${{ steps.tags.outputs.tags }})
-          SOURCES=$(printf "${IMAGE}@sha256:%s " *)
-          docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
+          set -euo pipefail
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            TAG_ARGS+=(-t "$tag")
+          done <<< "$TAGS"
+
+          SOURCES=()
+          for digest in *; do
+            SOURCES+=("${IMAGE}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
 
       - name: Inspect resulting manifest
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          for tag in ${{ steps.tags.outputs.tags }}; do
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
             echo "::group::${tag}"
             docker buildx imagetools inspect "${tag}"
             echo "::endgroup::"
-          done
+          done <<< "$TAGS"
