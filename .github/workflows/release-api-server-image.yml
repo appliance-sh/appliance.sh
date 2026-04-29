@@ -95,18 +95,21 @@ jobs:
           OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           echo "image=ghcr.io/${OWNER_LOWER}/api-server" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        # Safety net for cross-arch emulation when the runner doesn't
-        # match the matrix platform (e.g. private repos without arm64
-        # runner access falling back to amd64). On a native-matching
-        # runner this is effectively a no-op — buildx prefers the
-        # host's native execution and only invokes QEMU on mismatch.
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: ${{ matrix.platform.target }}
+      # Skipping `docker/setup-qemu-action` — on a native-matching
+      # runner it's a no-op, and registering binfmt handlers can
+      # confuse buildx's default-platform inference. Smallest-change
+      # test: remove it and see if TARGETPLATFORM stops resolving to
+      # linux/amd64 on the native arm64 shard.
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Inspect buildx builder
+        # Confirms the buildx daemon's reported platform list. On the
+        # arm64 runner we expect linux/arm64 first; if linux/amd64
+        # appears as the default platform, that explains TARGETPLATFORM
+        # defaulting to amd64 even when --platform is passed.
+        run: docker buildx inspect
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
