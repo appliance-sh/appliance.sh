@@ -37,10 +37,21 @@ cp "$REPO_ROOT/tsconfig.json" "$STAGE_DIR/root-tsconfig.json"
 
 echo "Docker deps staged in .docker-deps/"
 
-# Build the Docker image (the CLI skips docker build when scripts.build is set)
-SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PLATFORM="${APPLIANCE_PLATFORM:-linux/amd64}"
-IMAGE_NAME="appliance-api-server"
+# Build a local Docker image as a dev-convenience after staging.
+# Skipped in CI: the matrix release workflow runs its own per-shard
+# `docker buildx build` with the right --platform, and a hardcoded
+# `--platform linux/amd64` here would cross-compile to the wrong arch
+# on a native arm64 runner (manifests as `exec /bin/sh: exec format
+# error` in the base stage). Set APPLIANCE_FORCE_DOCKER_BUILD=1 to
+# opt back in if you need the script to build inside CI for some
+# reason.
+if [ -z "${CI:-}" ] || [ -n "${APPLIANCE_FORCE_DOCKER_BUILD:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+  PLATFORM="${APPLIANCE_PLATFORM:-linux/amd64}"
+  IMAGE_NAME="appliance-api-server"
 
-echo "Building Docker image: $IMAGE_NAME (platform: $PLATFORM)..."
-docker build --platform "$PLATFORM" --provenance=false -t "$IMAGE_NAME" "$SCRIPT_DIR"
+  echo "Building Docker image: $IMAGE_NAME (platform: $PLATFORM)..."
+  docker build --platform "$PLATFORM" --provenance=false -t "$IMAGE_NAME" "$SCRIPT_DIR"
+else
+  echo "CI detected — skipping local Docker image build (the workflow handles per-platform builds)."
+fi
