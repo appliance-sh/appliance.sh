@@ -1,3 +1,13 @@
+## 1.32.4 (2026-04-29)
+
+### Bug Fixes
+
+- **ci:** update container image build 5 ([cd5388f](https://github.com/appliance-sh/appliance.sh/commit/cd5388f))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.32.3 (2026-04-29)
 
 ### Bug Fixes
