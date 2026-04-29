@@ -131,22 +131,43 @@ export class ApplianceDeploymentService {
   }
 
   /**
-   * Idempotently symlink each precached plugin subdir from
-   * /opt/pulumi-cache/plugins into ${PULUMI_HOME}/plugins. Linking
-   * individual subdirs (not the parent) keeps the plugins/ dir itself
-   * writable so Pulumi can still drop its own metadata/lock files while
-   * reading plugin binaries from the read-only /opt cache.
+   * Materialise each precached plugin from /opt/pulumi-cache/plugins
+   * into ${PULUMI_HOME}/plugins. Plugin *directories* must be real
+   * directories at the target path — pulumi's plugin scanner skips
+   * symlinks-to-directories (verified against pulumi 3.231) — so for
+   * each precached subdir we create a real dir and symlink each file
+   * inside. Loose top-level files (e.g. `<plugin>.lock`) get a
+   * straight symlink.
+   *
+   * The result: plugin binaries stay on the read-only /opt cache
+   * (no copy, no /tmp bloat), while ${PULUMI_HOME}/plugins remains
+   * writable for pulumi's own metadata.
    */
   private ensurePluginCache(): void {
     if (!fs.existsSync(PLUGIN_CACHE_DIR)) return;
     const target = path.join(PULUMI_HOME, 'plugins');
     fs.mkdirSync(target, { recursive: true });
     for (const entry of fs.readdirSync(PLUGIN_CACHE_DIR)) {
-      const linkPath = path.join(target, entry);
+      const sourcePath = path.join(PLUGIN_CACHE_DIR, entry);
+      const targetPath = path.join(target, entry);
+      // lstatSync the SOURCE to know whether it's a dir; lstatSync
+      // the TARGET to skip work when already materialised.
+      const sourceStat = fs.lstatSync(sourcePath);
+      let targetExists = true;
       try {
-        fs.lstatSync(linkPath);
+        fs.lstatSync(targetPath);
       } catch {
-        fs.symlinkSync(path.join(PLUGIN_CACHE_DIR, entry), linkPath);
+        targetExists = false;
+      }
+      if (targetExists) continue;
+
+      if (sourceStat.isDirectory()) {
+        fs.mkdirSync(targetPath, { recursive: true });
+        for (const inner of fs.readdirSync(sourcePath)) {
+          fs.symlinkSync(path.join(sourcePath, inner), path.join(targetPath, inner));
+        }
+      } else {
+        fs.symlinkSync(sourcePath, targetPath);
       }
     }
   }
