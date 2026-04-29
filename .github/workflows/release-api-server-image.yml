@@ -26,21 +26,45 @@ jobs:
   # us drop the QEMU emulation that was making linux/arm64 builds
   # take ~10× longer than they needed to.
   build:
-    name: Build ${{ matrix.platform.docker }}
-    runs-on: ${{ matrix.platform.runs-on }}
+    name: Build ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: true
       matrix:
         platform:
-          - docker: linux/amd64
-            runs-on: ubuntu-latest
+          # Renamed from { docker, runs-on, slug } to plain identifiers
+          # — `runs-on` (with dash) and `docker` (potential GHA-context
+          # keyword) were suspected of confusing the expression parser
+          # such that `matrix.platform.docker` resolved to amd64 on
+          # the arm64 shard.
+          - target: linux/amd64
+            runner: ubuntu-latest
             slug: amd64
-          - docker: linux/arm64
-            runs-on: ubuntu-24.04-arm
+          - target: linux/arm64
+            runner: ubuntu-24.04-arm
             slug: arm64
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
+      - name: Diagnostic — runner arch + platform env
+        # Confirms the matrix value resolved correctly and surfaces
+        # any DOCKER_DEFAULT_PLATFORM override that might steer
+        # buildx to a different platform than the matrix asked for.
+        # Expect `aarch64` + `linux/arm64` on the arm64 shard, and
+        # `x86_64` + `linux/amd64` on the amd64 shard.
+        run: |
+          echo "matrix.platform.target:  '${{ matrix.platform.target }}'"
+          echo "matrix.platform.runner:  '${{ matrix.platform.runner }}'"
+          echo "uname -m:                $(uname -m)"
+          echo "DOCKER_DEFAULT_PLATFORM: ${DOCKER_DEFAULT_PLATFORM:-(unset)}"
+
+      - name: Unset DOCKER_DEFAULT_PLATFORM
+        # If the runner image ships with DOCKER_DEFAULT_PLATFORM set,
+        # buildx honours it ahead of `--platform` from build-push-action
+        # in some scenarios. Strip it so the matrix's `target` is the
+        # only platform input that matters.
+        run: echo "DOCKER_DEFAULT_PLATFORM=" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -79,7 +103,7 @@ jobs:
         # host's native execution and only invokes QEMU on mismatch.
         uses: docker/setup-qemu-action@v3
         with:
-          platforms: ${{ matrix.platform.docker }}
+          platforms: ${{ matrix.platform.target }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -97,7 +121,7 @@ jobs:
         with:
           context: packages/api-server
           file: packages/api-server/Dockerfile
-          platforms: ${{ matrix.platform.docker }}
+          platforms: ${{ matrix.platform.target }}
           # push-by-digest pushes an unnamed image to the registry and
           # surfaces its digest. The merge job below stitches the
           # platform-specific digests into a tagged multi-arch manifest.
