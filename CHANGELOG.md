@@ -1,3 +1,13 @@
+## 1.32.2 (2026-04-29)
+
+### Bug Fixes
+
+- **ci:** update container image build 3 ([65882e2](https://github.com/appliance-sh/appliance.sh/commit/65882e2))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.32.1 (2026-04-29)
 
 ### Bug Fixes
