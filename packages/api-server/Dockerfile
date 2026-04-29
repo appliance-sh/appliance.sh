@@ -1,4 +1,4 @@
-FROM node:22-slim AS build
+FROM --platform=$BUILDPLATFORM node:24-slim AS build
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Install curl (not included in node:22-slim) and Pulumi (needed by postinstall).
+# Install curl (not included in node:24-slim) and Pulumi (needed by postinstall).
 # Pulumi installs into $HOME/.pulumi/bin (here, /root/.pulumi/bin). On Lambda
 # the container runs as a non-root user that cannot traverse /root (mode 0700),
 # so we copy the binaries into /usr/local/bin where they are world-executable.
@@ -42,9 +42,12 @@ COPY src/ packages/api-server/src/
 RUN pnpm --filter @appliance.sh/api-server run build
 
 # --- Production stage ---
-FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 AS lwa
+# LWA stage pulls the adapter binary; pin to TARGETPLATFORM so each
+# matrix shard gets the right-arch lambda-adapter binary.
+FROM --platform=$TARGETPLATFORM public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 AS lwa
 
-FROM node:22-slim
+# Final image runs on TARGETPLATFORM (the deploy target's arch).
+FROM --platform=$TARGETPLATFORM node:24-slim
 
 WORKDIR /app
 
@@ -60,7 +63,7 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 # Disable husky git hooks (not needed in Docker)
 ENV HUSKY=0
 
-# Install curl and unzip (not included in node:22-slim), then Pulumi and crane.
+# Install curl and unzip (not included in node:24-slim), then Pulumi and crane.
 # unzip provides both `unzip` and `zipinfo`, which build.service.ts uses to
 # validate and extract uploaded appliance builds.
 #
