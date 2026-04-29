@@ -109,9 +109,12 @@ jobs:
           provenance: true
           sbom: true
           # Per-platform GHA cache scope so amd64 + arm64 don't thrash
-          # each other's layer cache.
-          cache-from: type=gha,scope=api-server-${{ matrix.platform.slug }}
-          cache-to: type=gha,mode=max,scope=api-server-${{ matrix.platform.slug }}
+          # each other's layer cache. Scope suffix bumped to v2 to
+          # invalidate cached layers from earlier QEMU-emulated runs
+          # that may have written wrong-arch blobs under the previous
+          # scope name.
+          cache-from: type=gha,scope=api-server-${{ matrix.platform.slug }}-v2
+          cache-to: type=gha,mode=max,scope=api-server-${{ matrix.platform.slug }}-v2
 
       - name: Export digest
         run: |

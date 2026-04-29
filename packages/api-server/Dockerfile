@@ -1,21 +1,43 @@
-FROM --platform=$BUILDPLATFORM node:24-slim AS build
+# Shared base for both the build and final stages. Pinned to the
+# exact Node version used everywhere else (see /.nvmrc and the root
+# package.json's `engines.node`) so the in-image runtime matches the
+# host runtime devs and CI use to compile the workspace. Buildkit
+# resolves this to the appropriate platform manifest per shard.
+#
+# Steps placed here are the universally-needed setup: corepack
+# (pnpm), HUSKY=0, curl + ca-certificates, Pulumi CLI. Anything else
+# (crane, unzip, app deps) belongs to the stage that needs it so the
+# layer cache stays granular.
+FROM node:24.14.1-slim AS base
 
-WORKDIR /app
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+RUN printf 'base stage: BUILDPLATFORM=%s TARGETPLATFORM=%s uname=%s\n' \
+    "$BUILDPLATFORM" "$TARGETPLATFORM" "$(uname -m)"
 
-RUN corepack enable && corepack prepare pnpm@10 --activate
-
-# Disable husky git hooks (not needed in Docker)
+# Disable husky git hooks (not needed in Docker).
 ENV HUSKY=0
 
-# Install curl (not included in node:24-slim) and Pulumi (needed by postinstall).
-# Pulumi installs into $HOME/.pulumi/bin (here, /root/.pulumi/bin). On Lambda
-# the container runs as a non-root user that cannot traverse /root (mode 0700),
-# so we copy the binaries into /usr/local/bin where they are world-executable.
+# Install curl + ca-certificates (slim image lacks them) and Pulumi.
+# Pulumi installs to /root/.pulumi/bin by default. On Lambda the
+# container runs as a non-root user that cannot traverse /root
+# (mode 0700), so we relocate the binaries to /usr/local/bin where
+# they are world-executable.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://get.pulumi.com | sh \
     && cp /root/.pulumi/bin/* /usr/local/bin/ \
     && rm -rf /root/.pulumi
+
+# corepack/pnpm — both stages drive workspace installs through pnpm.
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
+WORKDIR /app
+
+# --- Build stage ---
+# Native build on the runner's architecture for speed; output is
+# arch-independent JavaScript so cross-compiling isn't needed.
+FROM --platform=$BUILDPLATFORM base AS build
 
 # Copy root workspace config (staged by docker-prep.sh)
 COPY .docker-deps/root-package.json package.json
@@ -41,15 +63,12 @@ COPY tsconfig.build.json packages/api-server/
 COPY src/ packages/api-server/src/
 RUN pnpm --filter @appliance.sh/api-server run build
 
-# --- Production stage ---
-# LWA stage pulls the adapter binary; pin to TARGETPLATFORM so each
-# matrix shard gets the right-arch lambda-adapter binary.
-FROM --platform=$TARGETPLATFORM public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 AS lwa
+# --- LWA stage (pulls the lambda-adapter binary) ---
+FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.9.0 AS lwa
 
-# Final image runs on TARGETPLATFORM (the deploy target's arch).
-FROM --platform=$TARGETPLATFORM node:24-slim
-
-WORKDIR /app
+# --- Final stage ---
+# Defaults to TARGETPLATFORM; buildkit warns if we make that explicit.
+FROM base
 
 # Lambda Web Adapter: copied in as an extension, inert outside Lambda
 # (activates only when AWS_LAMBDA_RUNTIME_API is set). Lets this same
@@ -58,29 +77,15 @@ WORKDIR /app
 COPY --from=lwa /lambda-adapter /opt/extensions/lambda-adapter
 ENV AWS_LWA_PORT=3000
 
-RUN corepack enable && corepack prepare pnpm@10 --activate
-
-# Disable husky git hooks (not needed in Docker)
-ENV HUSKY=0
-
-# Install curl and unzip (not included in node:24-slim), then Pulumi and crane.
-# unzip provides both `unzip` and `zipinfo`, which build.service.ts uses to
-# validate and extract uploaded appliance builds.
+# Final-stage-only tooling: unzip (used by build.service.ts to
+# validate + extract uploaded appliance build zips) and crane (used
+# to push container images to ECR without a Docker daemon).
 #
-# Pulumi installs to /root/.pulumi/bin by default. On Lambda the container runs
-# as a non-root user that cannot traverse /root (mode 0700), so we relocate the
-# binaries to /usr/local/bin where they are world-executable.
-#
-# TARGETARCH is set automatically by buildx for multi-platform builds
-# (amd64 / arm64). crane's release asset naming uses x86_64 / arm64 —
-# map from Docker's TARGETARCH before pulling. Pulumi's installer
-# picks the right binary on its own.
+# TARGETARCH is auto-set by buildx; crane's release asset naming
+# uses x86_64 / arm64 so we map from Docker's amd64 / arm64 form.
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip \
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://get.pulumi.com | sh \
-    && cp /root/.pulumi/bin/* /usr/local/bin/ \
-    && rm -rf /root/.pulumi \
     && case "${TARGETARCH:-amd64}" in \
          amd64) CRANE_ARCH=x86_64 ;; \
          arm64) CRANE_ARCH=arm64 ;; \
