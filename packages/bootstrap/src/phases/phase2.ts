@@ -222,18 +222,19 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
       APPLIANCE_MODE: 'worker',
     };
 
-    emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${API_SERVER_ENV}…` });
-    const apiServerDeployment = await ensureSuccess(
-      localClient.deploy(apiServerEnv.id, {
-        buildId: imageBuild.buildId,
-        environment: apiServerEnvVars,
-        memory: API_SERVER_MEMORY_MB,
-        timeout: API_SERVER_TIMEOUT_S,
-        storage: API_SERVER_STORAGE_MB,
-      }),
-      'deploy(api-server)'
-    );
-
+    // Deploy worker first, then api-server. Two reasons:
+    //
+    // 1. Concurrency: the local api-server inline-executes Pulumi
+    //    (no separate worker container during bootstrap). Two
+    //    overlapping `pulumi` subprocesses race on shared state in
+    //    PULUMI_HOME — observed crashes include a regexp2/chroma
+    //    init segfault during `pulumi version`. Serialising the
+    //    two deploys avoids that entirely.
+    // 2. Ordering: the api-server's WORKER_URL points at the worker
+    //    appliance. Bringing the worker up first means the cloud
+    //    api-server's first deploy dispatch succeeds — otherwise
+    //    DNS for WORKER_URL hasn't resolved yet when the api-server
+    //    Lambda warms up.
     emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${WORKER_ENV}…` });
     const workerDeployment = await ensureSuccess(
       localClient.deploy(workerEnv.id, {
@@ -245,7 +246,20 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
       }),
       'deploy(worker)'
     );
+    emit({ type: 'log', level: 'info', message: `waiting for ${SYSTEM_PROJECT}/${WORKER_ENV} deployment to settle…` });
+    await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
 
+    emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${API_SERVER_ENV}…` });
+    const apiServerDeployment = await ensureSuccess(
+      localClient.deploy(apiServerEnv.id, {
+        buildId: imageBuild.buildId,
+        environment: apiServerEnvVars,
+        memory: API_SERVER_MEMORY_MB,
+        timeout: API_SERVER_TIMEOUT_S,
+        storage: API_SERVER_STORAGE_MB,
+      }),
+      'deploy(api-server)'
+    );
     emit({
       type: 'log',
       level: 'info',
@@ -253,10 +267,16 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     });
     await pollDeploymentToTerminal(localClient, apiServerDeployment.id, emit);
 
-    emit({ type: 'log', level: 'info', message: `waiting for ${SYSTEM_PROJECT}/${WORKER_ENV} deployment to settle…` });
-    await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
+    // Wait for the worker first, then the api-server. The api-server
+    // dispatches every deploy job to WORKER_URL — calling its API
+    // before the worker is reachable means the dispatch fails. Both
+    // Lambdas are deployed concurrently above, so this isn't gating
+    // the deploy itself; we're just making sure CloudFront DNS has
+    // propagated for both before declaring bootstrap complete.
+    emit({ type: 'log', level: 'info', message: `waiting for worker at ${workerUrl} to come up…` });
+    await waitForHttpReachable(workerUrl, CLOUD_HEALTH_TIMEOUT_MS, CLOUD_HEALTH_POLL_MS, emit);
 
-    emit({ type: 'log', level: 'info', message: `waiting for ${apiServerUrl} to come up…` });
+    emit({ type: 'log', level: 'info', message: `waiting for api-server at ${apiServerUrl} to come up…` });
     await waitForBootstrapStatus(apiServerUrl, CLOUD_HEALTH_TIMEOUT_MS, CLOUD_HEALTH_POLL_MS, emit);
 
     return { apiServerUrl, apiKey: operatorKey };
@@ -293,6 +313,35 @@ async function waitForBootstrapStatus(
   emit({ type: 'log', level: 'error', message: `health poll failed: ${lastError ?? 'timeout'}` });
   containerOnFailure?.stop();
   throw new Error(`${baseUrl} did not become healthy within ${timeoutMs / 1000}s`);
+}
+
+/**
+ * Generic reachability probe — polls the URL's index route until it
+ * returns a 2xx. Used for the worker, which only exposes
+ * `/api/internal/*` (signature-protected, no public health endpoint)
+ * and `/`. A successful GET / confirms the Lambda is reachable
+ * through CloudFront and the container has started.
+ */
+async function waitForHttpReachable(
+  baseUrl: string,
+  timeoutMs: number,
+  pollMs: number,
+  emit: (e: BootstrapEvent) => void
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: string | null = null;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${baseUrl}/`);
+      if (r.ok) return;
+      lastError = `HTTP ${r.status}`;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+    await sleep(pollMs);
+  }
+  emit({ type: 'log', level: 'error', message: `reachability poll failed: ${lastError ?? 'timeout'}` });
+  throw new Error(`${baseUrl} did not become reachable within ${timeoutMs / 1000}s`);
 }
 
 async function createFirstApiKey(baseUrl: string, token: string): Promise<{ id: string; secret: string }> {
