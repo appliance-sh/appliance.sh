@@ -221,6 +221,19 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
       'createBuild(remote-image)'
     );
 
+    // Env vars both server and worker need at runtime:
+    //   - APPLIANCE_BASE_CONFIG — drives the S3-backed storage
+    //     service (api-keys, projects, environments, deployments,
+    //     builds) and ECR access for build relays.
+    //   - PULUMI_BACKEND_URL — points the api-server's Pulumi
+    //     automation at the cluster's state bucket so per-appliance
+    //     deploys (system + user) write to the same backend the
+    //     bootstrap initialised.
+    const sharedEnvVars: Record<string, string> = {
+      APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
+      PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
+    };
+
     // Trust-proxy is required on the api-server appliance because
     // CloudFront's edge router rewrites Host to the Function URL's
     // hostname; the api-server reconstructs @authority for HTTP
@@ -228,11 +241,13 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     // worker only sees server-to-server calls (no edge rewrite), so
     // it doesn't need it.
     const apiServerEnvVars: Record<string, string> = {
+      ...sharedEnvVars,
       APPLIANCE_MODE: 'server',
       APPLIANCE_TRUST_PROXY: 'true',
       WORKER_URL: workerUrl,
     };
     const workerEnvVars: Record<string, string> = {
+      ...sharedEnvVars,
       APPLIANCE_MODE: 'worker',
     };
 
