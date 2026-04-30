@@ -100,6 +100,40 @@ export function inspectImageArch(image: string): 'amd64' | 'arm64' | null {
   return null;
 }
 
+/**
+ * Resolve a pushed image's repository digest (`<repo>@sha256:...`).
+ *
+ * After `docker push`, the local image's `RepoDigests` field
+ * includes the immutable digest reference for each registry the
+ * image has been pushed to. Lambda Function URIs that use the digest
+ * form pin to that exact image content, so a subsequent push that
+ * overwrites the tag still triggers a Pulumi diff (the digest URI
+ * string changes) and a real Lambda image-update.
+ *
+ * `registryHostFilter` lets the caller match a specific registry
+ * (e.g. the cluster's ECR) when the image has been pushed to several.
+ */
+export function imageRepoDigest(image: string, registryHostFilter?: string): string | null {
+  const runtime = detectRuntime();
+  const r = spawnSync(runtime, ['inspect', '--format', '{{json .RepoDigests}}', image], {
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) return null;
+  let digests: unknown;
+  try {
+    digests = JSON.parse(r.stdout.trim());
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(digests) || digests.length === 0) return null;
+  const candidates = digests.filter((d): d is string => typeof d === 'string');
+  if (registryHostFilter) {
+    const match = candidates.find((d) => d.startsWith(registryHostFilter));
+    if (match) return match;
+  }
+  return candidates[0] ?? null;
+}
+
 export function tagImage(src: string, dst: string): void {
   runSync(['tag', src, dst]);
 }

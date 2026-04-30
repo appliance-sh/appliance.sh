@@ -1,6 +1,6 @@
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import type { BootstrapEvent } from '../types';
-import { login, pullImage, pushImage, tagImage } from './container';
+import { imageRepoDigest, login, pullImage, pushImage, tagImage } from './container';
 
 interface MirrorOptions {
   /** Source image (e.g. `ghcr.io/appliance-sh/api-server:1.29.0`). */
@@ -48,5 +48,23 @@ export async function mirrorImageToEcr(opts: MirrorOptions): Promise<string> {
   tagImage(sourceImage, remoteTag);
   pushImage(remoteTag, emit);
 
+  // Prefer the digest-pinned URI (`<repo>@sha256:...`) so Lambda
+  // resolves to this exact push's content. Tag-only URIs leave the
+  // Lambda holding whatever digest the *first* deploy resolved —
+  // subsequent pushes that overwrite the tag don't trigger Pulumi
+  // to update the function's image (the URI string didn't change),
+  // and the Lambda keeps running the stale digest. Falling back to
+  // the tag URI if RepoDigests isn't populated is fine for
+  // first-deploy create paths; the symptom only matters on update.
+  const digestUri = imageRepoDigest(remoteTag, ecrRepositoryUrl);
+  if (digestUri) {
+    emit?.({ type: 'log', level: 'info', message: `digest-pinned URI: ${digestUri}` });
+    return digestUri;
+  }
+  emit?.({
+    type: 'log',
+    level: 'warn',
+    message: `could not resolve digest for ${remoteTag}; falling back to tag-only URI (Lambda updates may not see future image changes)`,
+  });
   return remoteTag;
 }
