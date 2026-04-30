@@ -1,3 +1,13 @@
+## 1.34.0 (2026-04-30)
+
+### Features
+
+- **api-server:** handle image arch ([92c0f9e](https://github.com/appliance-sh/appliance.sh/commit/92c0f9e))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.33.1 (2026-04-30)
 
 ### Bug Fixes
