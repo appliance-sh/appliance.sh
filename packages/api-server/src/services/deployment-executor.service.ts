@@ -127,6 +127,7 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
           if (input.memory !== undefined) build.memory = input.memory;
           if (input.timeout !== undefined) build.timeout = input.timeout;
           if (input.storage !== undefined) build.storage = input.storage;
+          if (input.architectures !== undefined) build.architectures = input.architectures;
 
           const systemRoleArn = resolveSystemRoleArn(metadata);
           if (systemRoleArn) build.lambdaRoleArn = systemRoleArn;

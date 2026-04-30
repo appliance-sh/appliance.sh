@@ -196,6 +196,11 @@ export class ApplianceStack extends pulumi.ComponentResource {
         {
           packageType: 'Image',
           imageUri: args.imageUri,
+          // Architectures must match one of the image manifest's
+          // platforms — Lambda doesn't auto-detect, so an arm64-only
+          // image with the default `x86_64` here fails on first
+          // invoke with `exec format error`.
+          architectures: args.architectures,
           role: this.lambdaRoleArn,
           timeout: args.timeout ?? 30,
           memorySize: args.memory ?? 512,

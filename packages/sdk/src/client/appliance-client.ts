@@ -195,6 +195,8 @@ export class ApplianceClient {
       timeout?: number;
       /** Lambda ephemeral /tmp storage in MB. Overrides the build resolver's default. */
       storage?: number;
+      /** Lambda CPU architecture(s). Must match the image's platform for container builds. */
+      architectures?: ('x86_64' | 'arm64')[];
     }
   ): Promise<Result<Deployment>> {
     return this.request<Deployment>(
@@ -208,6 +210,7 @@ export class ApplianceClient {
         ...(options?.memory !== undefined ? { memory: options.memory } : {}),
         ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}),
         ...(options?.storage !== undefined ? { storage: options.storage } : {}),
+        ...(options?.architectures ? { architectures: options.architectures } : {}),
       },
       600000
     );

@@ -35,6 +35,11 @@ export const deploymentInput = z.object({
   memory: z.number().int().positive().optional(),
   timeout: z.number().int().positive().optional(),
   storage: z.number().int().positive().optional(),
+  // Lambda CPU architecture. Must match one of the image manifest's
+  // platforms (for container builds) or the Lambda Web Adapter
+  // layer's arch (for framework builds). Defaults to ['x86_64'] when
+  // omitted, which matches Lambda's own default.
+  architectures: z.array(z.enum(['x86_64', 'arm64'])).optional(),
 });
 
 export type DeploymentInput = z.infer<typeof deploymentInput>;

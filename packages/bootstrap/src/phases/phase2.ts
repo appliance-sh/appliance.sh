@@ -9,7 +9,7 @@ import {
   type Deployment,
 } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
-import { findFreePort, runDetached, type ContainerHandle } from '../runtime/container';
+import { findFreePort, inspectImageArch, runDetached, type ContainerHandle } from '../runtime/container';
 import { mirrorImageToEcr } from '../runtime/ecr-mirror';
 import { sleep } from './helpers';
 
@@ -110,6 +110,20 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     emit,
   });
   emit({ type: 'log', level: 'info', message: `ECR image: ${ecrImageUri}` });
+
+  // Detect the image's architecture so we can deploy the Lambda with
+  // a matching `architectures` value. Locally-built images on arm64
+  // hosts (M-series Macs) are arm64-only by default; deploying to
+  // Lambda's x86_64 default would fail on first invoke with an
+  // `exec format error` from the in-image binaries.
+  const imageArch = inspectImageArch(sourceImage);
+  const lambdaArchitectures: Array<'x86_64' | 'arm64'> | undefined =
+    imageArch === 'arm64' ? ['arm64'] : imageArch === 'amd64' ? ['x86_64'] : undefined;
+  emit({
+    type: 'log',
+    level: 'info',
+    message: `image arch: ${imageArch ?? 'unknown'} → Lambda architectures: ${lambdaArchitectures?.[0] ?? '(default)'}`,
+  });
 
   // Spawn the local api-server container. It uses the same image as
   // the cloud Lambdas — single artifact, one source of truth — but
@@ -243,6 +257,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
         memory: WORKER_MEMORY_MB,
         timeout: WORKER_TIMEOUT_S,
         storage: WORKER_STORAGE_MB,
+        architectures: lambdaArchitectures,
       }),
       'deploy(worker)'
     );
@@ -257,6 +272,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
         memory: API_SERVER_MEMORY_MB,
         timeout: API_SERVER_TIMEOUT_S,
         storage: API_SERVER_STORAGE_MB,
+        architectures: lambdaArchitectures,
       }),
       'deploy(api-server)'
     );

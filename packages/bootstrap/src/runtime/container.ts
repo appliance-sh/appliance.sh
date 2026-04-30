@@ -82,6 +82,24 @@ function imageExistsLocally(image: string): boolean {
   return r.status === 0;
 }
 
+/**
+ * Inspect the architecture of a locally-cached image. Used by the
+ * bootstrap to set Lambda's `architectures` to match — an arm64
+ * image deployed to a default-x86_64 Lambda fails on first invoke
+ * with `exec format error` from any in-image binary (e.g. the
+ * Lambda Web Adapter).
+ */
+export function inspectImageArch(image: string): 'amd64' | 'arm64' | null {
+  const runtime = detectRuntime();
+  const r = spawnSync(runtime, ['image', 'inspect', '--format', '{{.Architecture}}', image], {
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) return null;
+  const arch = r.stdout.trim();
+  if (arch === 'amd64' || arch === 'arm64') return arch;
+  return null;
+}
+
 export function tagImage(src: string, dst: string): void {
   runSync(['tag', src, dst]);
 }
