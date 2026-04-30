@@ -1,3 +1,13 @@
+## 1.33.1 (2026-04-30)
+
+### Bug Fixes
+
+- **bootstrap:** sequential worker and server deployment ([d0cad49](https://github.com/appliance-sh/appliance.sh/commit/d0cad49))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.33.0 (2026-04-29)
 
 ### Features
