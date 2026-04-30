@@ -1,3 +1,13 @@
+## 1.35.0 (2026-04-30)
+
+### Features
+
+- **bootstrap:** improve tag handling ([9eb5801](https://github.com/appliance-sh/appliance.sh/commit/9eb5801))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.34.0 (2026-04-30)
 
 ### Features
