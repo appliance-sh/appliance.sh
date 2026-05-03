@@ -1,3 +1,14 @@
+## 1.36.0 (2026-05-03)
+
+### Features
+
+- **bootstrap:** base config handoff ([e74d3de](https://github.com/appliance-sh/appliance.sh/commit/e74d3de))
+- **bootstrap:** better arch handling ([c0ebbeb](https://github.com/appliance-sh/appliance.sh/commit/c0ebbeb))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.35.0 (2026-04-30)
 
 ### Features
