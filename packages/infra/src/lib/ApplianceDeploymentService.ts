@@ -236,7 +236,14 @@ export class ApplianceDeploymentService {
   ): Promise<PulumiResult> {
     const stack = await this.getOrCreateStack(stackName, metadata, build);
     opts?.onStack?.(stack);
-    const result = await stack.up({ onOutput: (m) => console.log(m) });
+    // `refresh: true` reconciles Pulumi state with AWS reality before
+    // computing the diff. Used by system-stack deploys (dogfood
+    // bootstrap), where an earlier failed update can leave state
+    // recording resource attributes that AWS never actually applied —
+    // a subsequent deploy then sees no diff and skips the fix-up,
+    // freezing the function at its broken state. Refresh adds a few
+    // seconds per deploy but breaks the loop.
+    const result = await stack.up({ onOutput: (m) => console.log(m), refresh: opts?.refresh });
     const changes = result.summary.resourceChanges || {};
     const totalChanges = Object.entries(changes)
       .filter(([k]) => k !== 'same')
@@ -316,6 +323,12 @@ export class ApplianceDeploymentService {
 // that fail nominal type identity).
 export interface PulumiOpOptions {
   onStack?: (stack: PulumiStackHandle) => void;
+  /**
+   * Deploy-only: refresh Pulumi state from AWS before computing the
+   * update plan. Mitigates state-vs-reality drift after a partially
+   * failed prior deploy. Ignored for destroy/refresh.
+   */
+  refresh?: boolean;
 }
 
 export interface PulumiStackHandle {

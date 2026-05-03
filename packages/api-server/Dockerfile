@@ -19,15 +19,23 @@ RUN printf 'base stage: BUILDPLATFORM=%s TARGETPLATFORM=%s uname=%s\n' \
 ENV HUSKY=0
 
 # Install curl + ca-certificates (slim image lacks them) and Pulumi.
+# Pulumi CLI is pinned to match the @pulumi/pulumi node SDK version
+# from the workspace lockfile — version skew between CLI and SDK has
+# caused segfaults in `pulumi stack history` (observed on CLI 3.232
+# against SDK 3.227). Bump this in lockstep with packages/infra's
+# @pulumi/pulumi resolution to avoid drift.
+#
 # Pulumi installs to /root/.pulumi/bin by default. On Lambda the
 # container runs as a non-root user that cannot traverse /root
 # (mode 0700), so we relocate the binaries to /usr/local/bin where
 # they are world-executable.
+ARG PULUMI_CLI_VERSION=3.227.0
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://get.pulumi.com | sh \
+    && curl -fsSL https://get.pulumi.com | sh -s -- --version "${PULUMI_CLI_VERSION}" \
     && cp /root/.pulumi/bin/* /usr/local/bin/ \
-    && rm -rf /root/.pulumi
+    && rm -rf /root/.pulumi \
+    && pulumi version
 
 # corepack/pnpm — both stages drive workspace installs through pnpm.
 RUN corepack enable && corepack prepare pnpm@10 --activate

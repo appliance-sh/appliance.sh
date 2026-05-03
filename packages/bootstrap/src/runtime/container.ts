@@ -55,10 +55,24 @@ function runSync(args: string[], opts: RunOptions = {}): RunResult {
   return { stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
-export function pullImage(image: string, emit?: (e: BootstrapEvent) => void): void {
-  emit?.({ type: 'log', level: 'info', message: `pulling ${image}` });
+export function pullImage(image: string, emit?: (e: BootstrapEvent) => void, platform?: string): void {
+  emit?.({
+    type: 'log',
+    level: 'info',
+    message: platform ? `pulling ${image} (${platform})` : `pulling ${image}`,
+  });
   try {
-    runSync(['pull', image]);
+    const args = ['pull'];
+    // Explicit `--platform` forces single-platform fetch even when
+    // Docker Desktop has the containerd image store enabled. Without
+    // this, containerd-backed `docker pull` of a multi-arch tag
+    // stores the full manifest list locally; the subsequent push
+    // uploads that list to ECR; Lambda then rejects the digest with
+    // `image manifest ... media type is not supported` because it
+    // only accepts a single manifest, not an OCI index.
+    if (platform) args.push('--platform', platform);
+    args.push(image);
+    runSync(args);
   } catch (err) {
     // Pull failure is fatal unless the image is already on disk
     // (typical dev workflow: a freshly-built local tag with no
@@ -73,6 +87,25 @@ export function pullImage(image: string, emit?: (e: BootstrapEvent) => void): vo
       return;
     }
     throw err;
+  }
+}
+
+/**
+ * Translate Node's `process.arch` to a Docker `linux/...` platform
+ * string. Used by the bootstrap to pin pulls to the host's native
+ * arch — see `pullImage` for why explicit platform matters.
+ */
+export function hostDockerPlatform(): 'linux/amd64' | 'linux/arm64' {
+  switch (process.arch) {
+    case 'arm64':
+      return 'linux/arm64';
+    case 'x64':
+      return 'linux/amd64';
+    default:
+      // Lambda's default architecture is x86_64; safe fallback for
+      // any unusual host (e.g. PowerPC, RISC-V) where the operator
+      // is presumably emulating amd64 anyway.
+      return 'linux/amd64';
   }
 }
 
@@ -138,9 +171,42 @@ export function tagImage(src: string, dst: string): void {
   runSync(['tag', src, dst]);
 }
 
-export function pushImage(image: string, emit?: (e: BootstrapEvent) => void): void {
-  emit?.({ type: 'log', level: 'info', message: `pushing ${image}` });
-  runSync(['push', image]);
+export function pushImage(image: string, emit?: (e: BootstrapEvent) => void, platform?: string): void {
+  emit?.({
+    type: 'log',
+    level: 'info',
+    message: platform ? `pushing ${image} (${platform})` : `pushing ${image}`,
+  });
+  // `docker push --platform` (Docker 25.0+) selects a single-platform
+  // manifest from a multi-arch local image and uploads only that one.
+  // Lambda only accepts single image manifests, not OCI indexes — so
+  // pinning the push platform makes the mirror robust even when the
+  // local image is a manifest list (which happens with containerd
+  // image-store users, multi-arch builds, or images pulled from a
+  // registry as a list).
+  const args = ['push'];
+  if (platform) args.push('--platform', platform);
+  args.push(image);
+  try {
+    runSync(args);
+  } catch (err) {
+    // Older docker versions don't know `--platform` on push; the CLI
+    // surfaces this as `unknown flag: --platform`. Retry without —
+    // single-platform local images push correctly that way; the
+    // multi-arch-local case will still fail at Lambda but with a
+    // clearer follow-up error.
+    if (platform && err instanceof Error && /unknown flag.*--platform/i.test(err.message)) {
+      emit?.({
+        type: 'log',
+        level: 'warn',
+        message:
+          '`docker push --platform` not supported by this docker version (need 25.0+). Retrying without — Lambda may reject the digest if the local image is multi-arch.',
+      });
+      runSync(['push', image]);
+      return;
+    }
+    throw err;
+  }
 }
 
 export function login(registryHost: string, username: string, password: string): void {
