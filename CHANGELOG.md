@@ -1,3 +1,13 @@
+## 1.36.1 (2026-05-04)
+
+### Bug Fixes
+
+- **cli:** add typescript devDependency ([4ed42a8](https://github.com/appliance-sh/appliance.sh/commit/4ed42a8))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.36.0 (2026-05-03)
 
 ### Features
