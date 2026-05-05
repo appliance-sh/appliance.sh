@@ -4,11 +4,19 @@ import { useQueryClient } from '@tanstack/react-query';
 import { ApplianceBaseType } from '@appliance.sh/sdk/models';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
-import type { BootstrapEvent, BootstrapInput, BootstrapPhase, BootstrapResult } from '@/lib/host';
+import type {
+  BootstrapEvent,
+  BootstrapInput,
+  BootstrapPhase,
+  BootstrapPriorOutputs,
+  BootstrapResult,
+} from '@/lib/host';
 import type { WizardValues } from './wizard';
 import { cn } from '@/lib/utils';
 
 type PhaseState = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+const PHASE_ORDER: BootstrapPhase[] = ['phase1', 'phase2', 'phase3'];
 
 interface LogLine {
   id: number;
@@ -33,11 +41,24 @@ export function BootstrapProgressPage() {
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [result, setResult] = React.useState<BootstrapResult | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [failedPhase, setFailedPhase] = React.useState<BootstrapPhase | null>(null);
+  const [retrying, setRetrying] = React.useState(false);
   const [handoff, setHandoff] = React.useState<HandoffState>('idle');
   const [handoffError, setHandoffError] = React.useState<string | null>(null);
   const startedRef = React.useRef(false);
   const handoffStartedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
+  // Captured outputs of phases that have succeeded so far. Seeded
+  // back into the engine on retry so phase 2 doesn't have to re-run
+  // phase 1, etc.
+  const priorRef = React.useRef<BootstrapPriorOutputs>({});
+  // The exact BootstrapInput used for the original run. Reused
+  // verbatim on retry — must not change between attempts or the
+  // Pulumi stack would diverge from prior outputs.
+  const inputRef = React.useRef<BootstrapInput | null>(null);
+  // Phases the user originally asked for (e.g. ['phase1', 'phase2'])
+  // — retry from phase N replays this list filtered to N onwards.
+  const requestedRef = React.useRef<BootstrapPhase[]>([]);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
     logIdRef.current += 1;
@@ -55,10 +76,19 @@ export function BootstrapProgressPage() {
           break;
         case 'phase-failed':
           setPhases((p) => ({ ...p, [e.phase]: 'failed' }));
+          setFailedPhase(e.phase);
           appendLog('error', `${e.phase}: ${e.error}`);
           break;
         case 'phase-skipped':
-          setPhases((p) => ({ ...p, [e.phase]: 'skipped' }));
+          // Don't visually demote a phase that has already
+          // completed — on retry, the engine emits "skipped" for
+          // phases not in the retry's phases list, which would
+          // otherwise overwrite the green checkmark.
+          setPhases((p) => (p[e.phase] === 'completed' ? p : { ...p, [e.phase]: 'skipped' }));
+          break;
+        case 'phase-output':
+          if (e.phase === 'phase1') priorRef.current.phase1 = e.output;
+          else if (e.phase === 'phase2') priorRef.current.phase2 = e.output;
           break;
         case 'resource':
           if (e.op === 'same') return;
@@ -72,11 +102,38 @@ export function BootstrapProgressPage() {
     [appendLog]
   );
 
+  const runFrom = React.useCallback(
+    (fromPhase: BootstrapPhase) => {
+      const input = inputRef.current;
+      if (!input || !host.bootstrap) return;
+      const startIdx = PHASE_ORDER.indexOf(fromPhase);
+      const phasesToRun = requestedRef.current.filter((p) => PHASE_ORDER.indexOf(p) >= startIdx);
+      if (phasesToRun.length === 0) return;
+
+      // Reset UI state for phases we're about to (re-)run.
+      setPhases((p) => {
+        const next = { ...p };
+        for (const ph of phasesToRun) next[ph] = 'pending';
+        return next;
+      });
+      setError(null);
+      setFailedPhase(null);
+      setRetrying(true);
+
+      host.bootstrap
+        .run(input, { phases: phasesToRun, prior: priorRef.current }, handleEvent)
+        .then((r) => setResult(r))
+        .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+        .finally(() => setRetrying(false));
+    },
+    [host.bootstrap, handleEvent]
+  );
+
   React.useEffect(() => {
     if (!values || !host.bootstrap || startedRef.current) return;
     startedRef.current = true;
 
-    const input: BootstrapInput = {
+    inputRef.current = {
       base: {
         name: values.name,
         config: {
@@ -93,14 +150,10 @@ export function BootstrapProgressPage() {
       apiServerImageUri: values.apiServerImageUri,
       aws: values.awsProfile ? { profile: values.awsProfile } : undefined,
     };
+    requestedRef.current = values.deployApiServer ? ['phase1', 'phase2'] : ['phase1'];
 
-    const phases: BootstrapPhase[] = values.deployApiServer ? ['phase1', 'phase2'] : ['phase1'];
-
-    host.bootstrap
-      .run(input, { phases }, handleEvent)
-      .then((r) => setResult(r))
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
-  }, [values, host.bootstrap, handleEvent]);
+    runFrom('phase1');
+  }, [values, host.bootstrap, runFrom]);
 
   // Handoff: once bootstrap returns a reachable api-server + fresh
   // API key, persist them to the host (OS keychain in Tauri,
@@ -147,9 +200,27 @@ export function BootstrapProgressPage() {
       </div>
 
       <div className="grid grid-cols-3 gap-3">
-        <PhaseCard phase="phase1" label="Base infrastructure" state={phases.phase1} />
-        <PhaseCard phase="phase2" label="API server" state={phases.phase2} />
-        <PhaseCard phase="phase3" label="Promote state" state={phases.phase3} />
+        <PhaseCard
+          phase="phase1"
+          label="Base infrastructure"
+          state={phases.phase1}
+          canRetry={failedPhase === 'phase1' && !retrying}
+          onRetry={() => runFrom('phase1')}
+        />
+        <PhaseCard
+          phase="phase2"
+          label="API server"
+          state={phases.phase2}
+          canRetry={failedPhase === 'phase2' && !retrying}
+          onRetry={() => runFrom('phase2')}
+        />
+        <PhaseCard
+          phase="phase3"
+          label="Promote state"
+          state={phases.phase3}
+          canRetry={failedPhase === 'phase3' && !retrying}
+          onRetry={() => runFrom('phase3')}
+        />
       </div>
 
       <div className="rounded-md border border-[var(--color-border)] bg-black/30">
@@ -225,9 +296,14 @@ export function BootstrapProgressPage() {
         <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
           <div className="font-medium text-red-400">Bootstrap failed</div>
           <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div>
-          <div className="mt-3">
-            <Button variant="outline" onClick={() => navigate('/bootstrap')}>
-              Retry
+          <div className="mt-3 flex gap-2">
+            {failedPhase ? (
+              <Button onClick={() => runFrom(failedPhase)} disabled={retrying}>
+                {retrying ? 'Retrying…' : `Retry ${failedPhase}`}
+              </Button>
+            ) : null}
+            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
+              Start over
             </Button>
           </div>
         </div>
@@ -244,7 +320,19 @@ function deriveNameFromUrl(url: string): string {
   }
 }
 
-function PhaseCard({ phase, label, state }: { phase: BootstrapPhase; label: string; state: PhaseState }) {
+function PhaseCard({
+  phase,
+  label,
+  state,
+  canRetry,
+  onRetry,
+}: {
+  phase: BootstrapPhase;
+  label: string;
+  state: PhaseState;
+  canRetry: boolean;
+  onRetry: () => void;
+}) {
   const color =
     state === 'completed'
       ? 'text-green-400'
@@ -272,6 +360,11 @@ function PhaseCard({ phase, label, state }: { phase: BootstrapPhase; label: stri
       </div>
       <div className="mt-1 text-sm">{label}</div>
       <div className="mt-1 text-xs text-[var(--color-muted-foreground)]">{state}</div>
+      {canRetry ? (
+        <Button size="sm" variant="outline" className="mt-2 h-7 text-xs" onClick={onRetry}>
+          Retry
+        </Button>
+      ) : null}
     </div>
   );
 }

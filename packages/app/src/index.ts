@@ -12,5 +12,6 @@ export type {
   BootstrapOptions,
   BootstrapEvent,
   BootstrapPhase,
+  BootstrapPriorOutputs,
   BootstrapResult,
 } from './lib/host';

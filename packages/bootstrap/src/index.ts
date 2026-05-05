@@ -7,4 +7,5 @@ export type {
   BootstrapEvent,
   BootstrapPhase,
   BootstrapEngineKind,
+  BootstrapPriorOutputs,
 } from './types';

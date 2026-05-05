@@ -12,14 +12,18 @@ import type { BootstrapInput, BootstrapOptions, BootstrapPhase, BootstrapResult 
  */
 export async function runWorkspaceEngine(
   input: BootstrapInput,
-  opts: Required<Pick<BootstrapOptions, 'cacheDir'>> & Pick<BootstrapOptions, 'onEvent' | 'phases'>
+  opts: Required<Pick<BootstrapOptions, 'cacheDir'>> & Pick<BootstrapOptions, 'onEvent' | 'phases' | 'prior'>
 ): Promise<BootstrapResult> {
   const emit = opts.onEvent ?? (() => {});
   const requested: BootstrapPhase[] = opts.phases ?? ['phase1', 'phase2', 'phase3'];
   const runs = (p: BootstrapPhase) => requested.includes(p);
 
-  const result: BootstrapResult = { stateBackendUrl: '' };
-  let baseConfig: ApplianceBaseConfig | undefined;
+  const result: BootstrapResult = {
+    stateBackendUrl: opts.prior?.phase1?.stateBackendUrl ?? '',
+    apiServerUrl: opts.prior?.phase2?.apiServerUrl,
+    apiKey: opts.prior?.phase2?.apiKey,
+  };
+  let baseConfig: ApplianceBaseConfig | undefined = opts.prior?.phase1?.baseConfig;
 
   if (runs('phase1')) {
     emit({ type: 'phase-started', phase: 'phase1' });
@@ -27,6 +31,7 @@ export async function runWorkspaceEngine(
       const out = await runPhase1(input, { cacheDir: opts.cacheDir, emit });
       result.stateBackendUrl = out.stateBackendUrl;
       baseConfig = out.baseConfig;
+      emit({ type: 'phase-output', phase: 'phase1', output: out });
       emit({ type: 'phase-completed', phase: 'phase1' });
     } catch (err) {
       emit({ type: 'phase-failed', phase: 'phase1', error: formatError(err) });
@@ -39,7 +44,9 @@ export async function runWorkspaceEngine(
   if (runs('phase2')) {
     emit({ type: 'phase-started', phase: 'phase2' });
     if (!baseConfig) {
-      const err = new Error('phase 2 requires phase 1 to run first (base config unavailable)');
+      const err = new Error(
+        'phase 2 requires phase 1 to run first, or its outputs supplied via opts.prior.phase1 (base config unavailable)'
+      );
       emit({ type: 'phase-failed', phase: 'phase2', error: err.message });
       throw err;
     }
@@ -51,6 +58,7 @@ export async function runWorkspaceEngine(
       });
       result.apiServerUrl = out.apiServerUrl;
       result.apiKey = out.apiKey;
+      emit({ type: 'phase-output', phase: 'phase2', output: out });
       emit({ type: 'phase-completed', phase: 'phase2' });
     } catch (err) {
       emit({ type: 'phase-failed', phase: 'phase2', error: formatError(err) });
@@ -62,6 +70,13 @@ export async function runWorkspaceEngine(
 
   if (runs('phase3')) {
     emit({ type: 'phase-started', phase: 'phase3' });
+    if (!result.stateBackendUrl) {
+      const err = new Error(
+        'phase 3 requires phase 1 to run first, or its outputs supplied via opts.prior.phase1 (state backend url unavailable)'
+      );
+      emit({ type: 'phase-failed', phase: 'phase3', error: err.message });
+      throw err;
+    }
     try {
       await runPhase3({
         cacheDir: opts.cacheDir,

@@ -23,5 +23,6 @@ export async function runBootstrap(input: BootstrapInput, options: BootstrapOpti
     cacheDir,
     onEvent: options.onEvent,
     phases: options.phases,
+    prior: options.prior,
   });
 }

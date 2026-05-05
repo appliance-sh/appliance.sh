@@ -3,6 +3,7 @@ import type {
   BootstrapInput,
   BootstrapOptions,
   BootstrapPhase,
+  BootstrapPriorOutputs,
   BootstrapResult,
 } from '@appliance.sh/bootstrap';
 
@@ -79,4 +80,11 @@ export interface ConsoleHost {
   bootstrap?: BootstrapHost;
 }
 
-export type { BootstrapEvent, BootstrapInput, BootstrapOptions, BootstrapPhase, BootstrapResult };
+export type {
+  BootstrapEvent,
+  BootstrapInput,
+  BootstrapOptions,
+  BootstrapPhase,
+  BootstrapPriorOutputs,
+  BootstrapResult,
+};

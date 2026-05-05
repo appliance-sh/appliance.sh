@@ -1,4 +1,4 @@
-import type { ApplianceBaseConfigInput } from '@appliance.sh/sdk';
+import type { ApplianceBaseConfig, ApplianceBaseConfigInput } from '@appliance.sh/sdk';
 
 export type BootstrapPhase = 'phase1' | 'phase2' | 'phase3';
 
@@ -77,6 +77,23 @@ export interface BootstrapOptions {
    * when the api-server image isn't ready yet.
    */
   phases?: BootstrapPhase[];
+
+  /**
+   * Outputs of phases that have already succeeded in a prior run.
+   * When set, the engine seeds its internal state from these instead
+   * of requiring the producing phase to be re-executed. Used to
+   * implement per-phase retry from the UI: a phase 2 failure can
+   * be retried as `{ phases: ['phase2', 'phase3'], prior: { phase1: ... } }`
+   * without re-running phase 1. Each entry must come from a real
+   * prior success of that phase — there is no validation that
+   * `stateBackendUrl` actually points at a live Pulumi backend.
+   */
+  prior?: BootstrapPriorOutputs;
+}
+
+export interface BootstrapPriorOutputs {
+  phase1?: { stateBackendUrl: string; baseConfig: ApplianceBaseConfig };
+  phase2?: { apiServerUrl: string; apiKey: { id: string; secret: string } };
 }
 
 export interface BootstrapResult {
@@ -95,6 +112,8 @@ export type BootstrapEvent =
   | { type: 'phase-skipped'; phase: BootstrapPhase; reason: string }
   | { type: 'phase-completed'; phase: BootstrapPhase }
   | { type: 'phase-failed'; phase: BootstrapPhase; error: string }
+  | { type: 'phase-output'; phase: 'phase1'; output: NonNullable<BootstrapPriorOutputs['phase1']> }
+  | { type: 'phase-output'; phase: 'phase2'; output: NonNullable<BootstrapPriorOutputs['phase2']> }
   | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string }
   | {
       type: 'resource';
