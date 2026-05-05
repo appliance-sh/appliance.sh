@@ -62,9 +62,14 @@ async function bootstrap() {
   const mode = getMode();
   const app = createApp(mode);
   const port = process.env.PORT ?? 3000;
+  // Bind explicitly to 0.0.0.0 so Docker's IPv4 port forward
+  // (host 127.0.0.1:NNNN -> container :3000) reaches us. Without
+  // a host, Node listens on `::` only, which the forward can't
+  // connect to in containers without dual-stack mapping.
+  const host = process.env.HOST ?? '0.0.0.0';
 
-  app.listen(port, () => {
-    logger.info('server started', { port: Number(port), mode });
+  app.listen(Number(port), host, () => {
+    logger.info('server started', { host, port: Number(port), mode });
   });
 }
 
