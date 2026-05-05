@@ -53,6 +53,13 @@ struct Cluster {
     name: String,
     api_server_url: String,
     created_at: String,
+    // Pulumi state backend URL (e.g. `s3://us-east-1-state-...`)
+    // for clusters bootstrapped from this device. Persisted so the
+    // Settings page can run state promotion (phase 3) on demand.
+    // Absent on clusters added via the Connect page (manual entry)
+    // or migrated from the legacy single-cluster shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_backend_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +92,8 @@ struct AddClusterInput {
     name: String,
     api_server_url: String,
     api_key: ApiKey,
+    #[serde(default)]
+    state_backend_url: Option<String>,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
@@ -164,6 +173,7 @@ fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, Ho
         name: derive_name_from_url(&legacy_url),
         api_server_url: legacy_url,
         created_at: chrono::Utc::now().to_rfc3339(),
+        state_backend_url: None,
     };
 
     write_api_key(&cluster_keychain_account(&id), &legacy_key)?;
@@ -208,6 +218,7 @@ fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostEr
         name: input.name,
         api_server_url: input.api_server_url,
         created_at: chrono::Utc::now().to_rfc3339(),
+        state_backend_url: input.state_backend_url,
     };
 
     write_api_key(&cluster_keychain_account(&cluster.id), &input.api_key)?;
@@ -228,6 +239,24 @@ fn select_cluster(app: AppHandle, cluster_id: Option<String>) -> Result<(), Host
         }
     }
     persisted.selected_cluster_id = cluster_id;
+    write_persisted_config(&app, &persisted)
+}
+
+/// Clear the cached `stateBackendUrl` on a cluster. Called after a
+/// successful state promotion so the Settings page stops offering a
+/// "Detach state" action that would now be a no-op (the local
+/// Pulumi state dir has been archived).
+#[tauri::command]
+fn clear_cluster_state_backend(app: AppHandle, cluster_id: String) -> Result<(), HostError> {
+    let mut persisted = read_persisted_config(&app)?;
+    migrate_legacy(&app, &mut persisted)?;
+
+    let cluster = persisted
+        .clusters
+        .iter_mut()
+        .find(|c| c.id == cluster_id)
+        .ok_or_else(|| HostError::ClusterNotFound(cluster_id.clone()))?;
+    cluster.state_backend_url = None;
     write_persisted_config(&app, &persisted)
 }
 
@@ -370,11 +399,15 @@ fn sidecar_path() -> PathBuf {
         .join("main.cjs")
 }
 
-/// Spawn the bootstrap sidecar, pipe input JSON to stdin, stream
-/// NDJSON events back to the frontend via a Tauri Channel, and
-/// return the final BootstrapResult (or an error).
-#[tauri::command]
-async fn run_bootstrap(
+/// Spawn the sidecar with the given JSON input, stream NDJSON events
+/// back to the frontend via the Tauri Channel, and return whatever
+/// the sidecar emits as its final `result` line.
+///
+/// Each sidecar invocation reads one JSON object from stdin and
+/// terminates after emitting `{type: "result", ...}` or
+/// `{type: "error", ...}` on stdout. The sidecar internally
+/// dispatches on the input's `kind` field — see `sidecar/src/main.ts`.
+async fn invoke_sidecar(
     input: serde_json::Value,
     on_event: Channel<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
@@ -479,6 +512,54 @@ async fn run_bootstrap(
     final_result.ok_or_else(|| "sidecar exited without producing a result".to_string())
 }
 
+/// Drive a full bootstrap (phases 1–3) via the sidecar. The frontend
+/// passes `{bootstrapInput, options?}`; this command tags the payload
+/// with `kind: "bootstrap"` so the sidecar dispatches to runBootstrap.
+#[tauri::command]
+async fn run_bootstrap(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(format!(
+                "run_bootstrap expected an object input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("bootstrap".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
+/// Run phase 3 (state promotion) standalone via the sidecar. Used by
+/// the Settings page to detach a cluster's state from this device
+/// after the fact.
+#[tauri::command]
+async fn promote_state(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(format!(
+                "promote_state expected an object input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("promote-state".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -489,8 +570,10 @@ pub fn run() {
             add_cluster,
             select_cluster,
             remove_cluster,
+            clear_cluster_state_backend,
             list_aws_profiles,
-            run_bootstrap
+            run_bootstrap,
+            promote_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

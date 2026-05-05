@@ -1,21 +1,35 @@
-import { runBootstrap, type BootstrapEvent, type BootstrapInput, type BootstrapOptions } from '@appliance.sh/bootstrap';
+import {
+  runBootstrap,
+  runStatePromotion,
+  type BootstrapEvent,
+  type BootstrapInput,
+  type BootstrapOptions,
+  type StatePromotionInput,
+  type StatePromotionOptions,
+} from '@appliance.sh/bootstrap';
 
-interface SidecarInput {
-  bootstrapInput: BootstrapInput;
-  options?: BootstrapOptions;
-}
-
-/**
- * Desktop bootstrap sidecar. Spawned by the Tauri Rust side with
- * piped stdin/stdout. Reads one JSON object from stdin (the
- * bootstrap input + options), drives `runBootstrap`, and emits
- * NDJSON to stdout — one BootstrapEvent per line, plus a final
- * `{type: "result", result}` or `{type: "error", error}` line.
- *
- * The Rust side forwards every non-result/non-error line to the
- * frontend via a Tauri Channel. Final result / error becomes the
- * command return value.
- */
+// The Tauri side spawns this sidecar for any operation that needs the
+// bootstrap package's local-machine capabilities (Pulumi automation,
+// docker shell-out, AWS SDK with the operator's profile). Each
+// invocation reads one JSON object from stdin and emits NDJSON on
+// stdout: progress events, then a final `{type: "result", ...}` or
+// `{type: "error", ...}` line. The Rust side forwards every
+// non-result/non-error line to the frontend via a Tauri Channel.
+//
+// The `kind` discriminator lets one sidecar binary serve multiple
+// operations (full bootstrap vs post-hoc state promotion). New
+// operations land here as additional cases.
+type SidecarInput =
+  | {
+      kind: 'bootstrap';
+      bootstrapInput: BootstrapInput;
+      options?: BootstrapOptions;
+    }
+  | {
+      kind: 'promote-state';
+      input: StatePromotionInput;
+      options?: StatePromotionOptions;
+    };
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -40,12 +54,34 @@ async function main(): Promise<void> {
     return;
   }
 
+  const onEvent = (event: BootstrapEvent): void => emit(event);
+
   try {
-    const result = await runBootstrap(parsed.bootstrapInput, {
-      ...(parsed.options ?? {}),
-      onEvent: (event: BootstrapEvent) => emit(event),
-    });
-    emit({ type: 'result', result });
+    switch (parsed.kind) {
+      case 'bootstrap': {
+        const result = await runBootstrap(parsed.bootstrapInput, {
+          ...(parsed.options ?? {}),
+          onEvent,
+        });
+        emit({ type: 'result', result });
+        break;
+      }
+      case 'promote-state': {
+        await runStatePromotion(parsed.input, {
+          ...(parsed.options ?? {}),
+          onEvent,
+        });
+        // promote-state has no structured result; the frontend just
+        // cares about success vs error. Emit an empty object so the
+        // Rust side has a result line to settle on.
+        emit({ type: 'result', result: {} });
+        break;
+      }
+      default: {
+        const _exhaustive: never = parsed;
+        throw new Error(`unknown sidecar input kind: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
     process.exit(0);
   } catch (e) {
     emit({ type: 'error', error: e instanceof Error ? e.message : String(e) });

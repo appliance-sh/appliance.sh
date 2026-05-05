@@ -25,6 +25,13 @@ export interface WizardValues {
   domain: string;
   createZone: boolean;
   deployApiServer: boolean;
+  // When true, the bootstrap also runs phase 3 (promote installer
+  // Pulumi state from local file backend → cluster S3 backend) so
+  // the install isn't tied to this device. Only meaningful when
+  // deployApiServer is true; phase-1-only runs leave the installer
+  // local on purpose. Settings can run phase 3 later if it's
+  // skipped or fails.
+  promoteState: boolean;
   apiServerImageUri?: string;
   awsProfile?: string;
 }
@@ -38,6 +45,7 @@ export function BootstrapWizardPage() {
   const [domain, setDomain] = React.useState('');
   const [createZone, setCreateZone] = React.useState(true);
   const [deployApiServer, setDeployApiServer] = React.useState(false);
+  const [promoteState, setPromoteState] = React.useState(true);
   const [apiServerImageUri, setApiServerImageUri] = React.useState('');
   const [awsProfile, setAwsProfile] = React.useState('');
 
@@ -88,6 +96,9 @@ export function BootstrapWizardPage() {
       domain,
       createZone,
       deployApiServer,
+      // Phase 3 only makes sense when an api-server is being
+      // deployed — phase-1-only runs are explicitly local-state.
+      promoteState: deployApiServer && promoteState,
       apiServerImageUri: deployApiServer && apiServerImageUri ? apiServerImageUri : undefined,
       awsProfile: awsProfile || undefined,
     };
@@ -173,15 +184,32 @@ export function BootstrapWizardPage() {
             <span>Also deploy api-server (phase 2)</span>
           </label>
           {deployApiServer ? (
-            <Field label="API server image (override)" hint="optional — defaults to ghcr.io/appliance-sh/api-server">
-              <input
-                type="text"
-                value={apiServerImageUri}
-                onChange={(e) => setApiServerImageUri(e.target.value)}
-                placeholder="ghcr.io/appliance-sh/api-server:latest"
-                className={`${inputCls} font-mono`}
-              />
-            </Field>
+            <>
+              <Field label="API server image (override)" hint="optional — defaults to ghcr.io/appliance-sh/api-server">
+                <input
+                  type="text"
+                  value={apiServerImageUri}
+                  onChange={(e) => setApiServerImageUri(e.target.value)}
+                  placeholder="ghcr.io/appliance-sh/api-server:latest"
+                  className={`${inputCls} font-mono`}
+                />
+              </Field>
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={promoteState}
+                  onChange={(e) => setPromoteState(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span>Detach state from this device (phase 3)</span>
+                  <span className="block text-xs text-[var(--color-muted-foreground)]">
+                    Move installer Pulumi state into the cluster&apos;s S3 bucket so future operations don&apos;t
+                    require this machine. You can run this later from Settings.
+                  </span>
+                </span>
+              </label>
+            </>
           ) : null}
         </div>
 

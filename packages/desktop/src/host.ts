@@ -11,6 +11,8 @@ import type {
   Cluster,
   ConsoleHost,
   HostConfig,
+  StatePromotionInput,
+  StatePromotionOptions,
 } from '@appliance.sh/app';
 
 // Tauri host: each cluster's URL/name lives in a JSON config file
@@ -36,6 +38,10 @@ export const tauriHost: ConsoleHost = {
     await invoke('remove_cluster', { clusterId });
   },
 
+  async clearClusterStateBackend(clusterId: string): Promise<void> {
+    await invoke('clear_cluster_state_backend', { clusterId });
+  },
+
   async openExternal(url) {
     await openShell(url);
   },
@@ -54,6 +60,18 @@ export const tauriHost: ConsoleHost = {
       channel.onmessage = onEvent;
       return invoke<BootstrapResult>('run_bootstrap', {
         input: { bootstrapInput: input, options: options ?? {} },
+        onEvent: channel,
+      });
+    },
+    async promoteState(
+      input: StatePromotionInput,
+      options: StatePromotionOptions | undefined,
+      onEvent: (event: BootstrapEvent) => void
+    ): Promise<void> {
+      const channel = new Channel<BootstrapEvent>();
+      channel.onmessage = onEvent;
+      await invoke('promote_state', {
+        input: { input, options: options ?? {} },
         onEvent: channel,
       });
     },

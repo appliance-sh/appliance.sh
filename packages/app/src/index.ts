@@ -14,4 +14,6 @@ export type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  StatePromotionInput,
+  StatePromotionOptions,
 } from './lib/host';

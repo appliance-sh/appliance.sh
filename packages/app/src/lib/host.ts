@@ -5,6 +5,8 @@ import type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  StatePromotionInput,
+  StatePromotionOptions,
 } from '@appliance.sh/bootstrap';
 
 // A cluster is one (api-server URL, API key) pair the user has either
@@ -17,6 +19,12 @@ export interface Cluster {
   name: string;
   apiServerUrl: string;
   createdAt: string;
+  // Pulumi state backend URL (e.g. `s3://us-east-1-state-...`)
+  // for clusters bootstrapped from this device. Settings drives
+  // post-hoc state promotion (phase 3) against this URL when the
+  // bootstrap wizard skipped phase 3 or it failed mid-run. Absent
+  // for clusters added manually via Connect.
+  stateBackendUrl?: string;
 }
 
 export interface HostConfig {
@@ -32,6 +40,7 @@ export interface AddClusterInput {
   name: string;
   apiServerUrl: string;
   apiKey: { id: string; secret: string };
+  stateBackendUrl?: string;
 }
 
 // Drives a bootstrap run from the UI. Tauri host implements this by
@@ -45,6 +54,18 @@ export interface BootstrapHost {
     options: BootstrapOptions | undefined,
     onEvent: (event: BootstrapEvent) => void
   ): Promise<BootstrapResult>;
+  /**
+   * Run phase 3 (state promotion) standalone. Drives the same
+   * runStatePromotion entry point the bootstrap engine uses
+   * internally, but without re-running phases 1–2. Settings calls
+   * this when the user wants to detach an already-bootstrapped
+   * cluster's Pulumi state from this device after the fact.
+   */
+  promoteState(
+    input: StatePromotionInput,
+    options: StatePromotionOptions | undefined,
+    onEvent: (event: BootstrapEvent) => void
+  ): Promise<void>;
   /**
    * Enumerate AWS profiles from `~/.aws/config` + `~/.aws/credentials`
    * for the wizard's profile picker. Optional — hosts without
@@ -75,6 +96,14 @@ export interface ConsoleHost {
   selectCluster(clusterId: string | null): Promise<void>;
   /** Remove a cluster + its key. If it was selected, selection falls back to the first remaining cluster (or null). */
   removeCluster(clusterId: string): Promise<void>;
+  /**
+   * Clear the cluster's stored `stateBackendUrl`. Called after the
+   * Settings page successfully promotes the cluster's installer
+   * state — once promoted, the local Pulumi state dir is archived,
+   * so a re-promote attempt is a no-op. Optional: only the desktop
+   * host implements it (web shell omits bootstrap entirely).
+   */
+  clearClusterStateBackend?(clusterId: string): Promise<void>;
   openExternal(url: string): Promise<void>;
   notify?(opts: { title: string; body?: string }): Promise<void>;
   bootstrap?: BootstrapHost;
@@ -87,4 +116,6 @@ export type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  StatePromotionInput,
+  StatePromotionOptions,
 };
