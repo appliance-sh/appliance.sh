@@ -1,5 +1,4 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import * as net from 'node:net';
 import type { BootstrapEvent } from '../types';
 
 // Thin wrapper around the host's container runtime CLI. Probes for
@@ -215,8 +214,17 @@ export function login(registryHost: string, username: string, password: string):
 
 export interface RunContainerOptions {
   image: string;
-  /** Bind on `127.0.0.1:<hostPort>` → `<containerPort>`. The runtime decides on hostPort if omitted. */
-  port: { hostPort: number; containerPort: number };
+  /**
+   * Container-side port to publish. The runtime picks the host port
+   * (we publish as `127.0.0.1::<containerPort>`) and we read it back
+   * via `docker port`. Letting Docker assign the port avoids a race
+   * we used to hit on Docker Desktop for macOS: pre-allocating an
+   * ephemeral port from Node and handing it to `docker run` left the
+   * port in TIME_WAIT just long enough that vpnkit silently failed
+   * to bind it on the host, leaving an apparently-mapped port that
+   * was unreachable from `127.0.0.1`.
+   */
+  port: { containerPort: number };
   /** Environment variables. Undefined values are skipped. */
   env: Record<string, string | undefined>;
   /** Bind mounts (`-v <host>:<container>[:ro]`). Used by the dogfood
@@ -230,6 +238,8 @@ export interface RunContainerOptions {
 export interface ContainerHandle {
   /** Container ID returned by the runtime's `run -d` command. */
   id: string;
+  /** Host port the runtime bound `containerPort` to (read back from `docker port`). */
+  hostPort: number;
   /** Tail logs through the supplied emit fn. Resolves once the container exits. */
   attachLogs(emit: (e: BootstrapEvent) => void): { stop: () => void };
   /** Stop and remove the container. Idempotent — safe to call after the container has exited. */
@@ -241,7 +251,9 @@ export function runDetached(opts: RunContainerOptions): ContainerHandle {
 
   const args = ['run', '-d', '--rm'];
   if (opts.name) args.push('--name', opts.name);
-  args.push('-p', `127.0.0.1:${opts.port.hostPort}:${opts.port.containerPort}`);
+  // Empty host port → runtime assigns one. Bound to 127.0.0.1 so we
+  // don't accidentally expose the bootstrap api-server to the LAN.
+  args.push('-p', `127.0.0.1::${opts.port.containerPort}`);
   for (const [key, value] of Object.entries(opts.env)) {
     if (value === undefined) continue;
     args.push('-e', `${key}=${value}`);
@@ -256,12 +268,14 @@ export function runDetached(opts: RunContainerOptions): ContainerHandle {
     throw new Error(`${runtime} run failed: ${(result.stderr || result.stdout || '').trim()}`);
   }
   const id = result.stdout.trim();
+  const hostPort = readPublishedHostPort(runtime, id, opts.port.containerPort);
 
   let logsProcess: ChildProcess | null = null;
   let stopped = false;
 
   const handle: ContainerHandle = {
     id,
+    hostPort,
     attachLogs(emit) {
       logsProcess = spawn(runtime, ['logs', '-f', id], { stdio: ['ignore', 'pipe', 'pipe'] });
       const onChunk = (level: 'info' | 'warn') => (chunk: Buffer) => {
@@ -296,26 +310,24 @@ export function runDetached(opts: RunContainerOptions): ContainerHandle {
 }
 
 /**
- * Find an available TCP port on 127.0.0.1. Asks the kernel for a
- * free port (`listen(0)`), then closes the socket. There's a race
- * between this returning and the caller binding the port — but the
- * window is small and the alternative (managing a port pool) is
- * heavier than warranted for a single-shot bootstrap subprocess.
+ * Read back the host port the runtime bound to `containerPort` for
+ * the running container. Output of `docker port <id> <port>/tcp` is
+ * one line per binding, e.g. `127.0.0.1:58964`; we parse the host
+ * port from whichever IPv4 line we get.
  */
-export async function findFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const addr = srv.address();
-      if (typeof addr === 'object' && addr) {
-        const port = addr.port;
-        srv.close(() => resolve(port));
-      } else {
-        srv.close();
-        reject(new Error('failed to allocate ephemeral port'));
-      }
-    });
-  });
+function readPublishedHostPort(runtime: RuntimeKind, id: string, containerPort: number): number {
+  const r = spawnSync(runtime, ['port', id, `${containerPort}/tcp`], { encoding: 'utf8' });
+  if (r.status !== 0) {
+    throw new Error(`${runtime} port ${id} ${containerPort} failed: ${(r.stderr || r.stdout || '').trim()}`);
+  }
+  const lines = r.stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    // `127.0.0.1:NNNN` or `0.0.0.0:NNNN` — skip IPv6 (`[::]:NNNN`).
+    const match = line.match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)$/);
+    if (match) return Number(match[2]);
+  }
+  throw new Error(`could not parse host port from \`${runtime} port\` output: ${r.stdout.trim()}`);
 }

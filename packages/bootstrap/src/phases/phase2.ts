@@ -9,7 +9,7 @@ import {
   type Deployment,
 } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
-import { findFreePort, inspectImageArch, runDetached, type ContainerHandle } from '../runtime/container';
+import { inspectImageArch, runDetached, type ContainerHandle } from '../runtime/container';
 import { mirrorImageToEcr } from '../runtime/ecr-mirror';
 import { sleep } from './helpers';
 
@@ -129,10 +129,9 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
   // the cloud Lambdas — single artifact, one source of truth — but
   // talks to localhost rather than CloudFront. The Lambda Web Adapter
   // lets us run the Express app outside Lambda transparently.
-  const localPort = await findFreePort();
   const bootstrapToken = crypto.randomBytes(32).toString('base64url');
 
-  emit({ type: 'log', level: 'info', message: `starting local api-server on 127.0.0.1:${localPort}…` });
+  emit({ type: 'log', level: 'info', message: 'starting local api-server…' });
 
   // AWS auth into the container. With a wizard-supplied profile, we
   // mount the operator's ~/.aws read-only and force HOME=/root so the
@@ -157,7 +156,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     // Adapter is inert outside Lambda — it only intercepts when
     // AWS_LAMBDA_RUNTIME_API is set — so we connect directly to the
     // Express server on 3000, not the LWA's typical 8080.
-    port: { hostPort: localPort, containerPort: 3000 },
+    port: { containerPort: 3000 },
     volumes,
     env: {
       APPLIANCE_MODE: 'server',
@@ -179,9 +178,10 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     },
   });
   const logsHandle = container.attachLogs(emit);
+  emit({ type: 'log', level: 'info', message: `local api-server bound to 127.0.0.1:${container.hostPort}` });
 
   try {
-    const localBaseUrl = `http://127.0.0.1:${localPort}`;
+    const localBaseUrl = `http://127.0.0.1:${container.hostPort}`;
     await waitForBootstrapStatus(localBaseUrl, LOCAL_HEALTH_TIMEOUT_MS, LOCAL_HEALTH_POLL_MS, emit);
 
     emit({ type: 'log', level: 'info', message: 'minting operator API key on local api-server…' });
@@ -264,6 +264,20 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     //    api-server's first deploy dispatch succeeds — otherwise
     //    DNS for WORKER_URL hasn't resolved yet when the api-server
     //    Lambda warms up.
+    //
+    // Each deploy is preceded by a refresh. On a first bootstrap the
+    // stacks don't exist, so refresh is a fast no-op (the executor
+    // catches "no stack named" and returns idempotentNoop). On a
+    // re-bootstrap after a partial failure, the cluster's S3 state
+    // backend can hold stack records whose recorded resource attrs
+    // diverge from AWS reality (e.g. a Lambda whose tags AWS forgot
+    // mid-update — pulumi-aws@7.23 surfaces this as a TagResource
+    // 404). Refresh reconciles state with reality so the subsequent
+    // deploy diffs from a true baseline.
+    emit({ type: 'log', level: 'info', message: `refreshing ${SYSTEM_PROJECT}/${WORKER_ENV} state…` });
+    const workerRefresh = await ensureSuccess(localClient.refresh(workerEnv.id), 'refresh(worker)');
+    await pollDeploymentToTerminal(localClient, workerRefresh.id, emit);
+
     emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${WORKER_ENV}…` });
     const workerDeployment = await ensureSuccess(
       localClient.deploy(workerEnv.id, {
@@ -278,6 +292,10 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     );
     emit({ type: 'log', level: 'info', message: `waiting for ${SYSTEM_PROJECT}/${WORKER_ENV} deployment to settle…` });
     await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
+
+    emit({ type: 'log', level: 'info', message: `refreshing ${SYSTEM_PROJECT}/${API_SERVER_ENV} state…` });
+    const apiServerRefresh = await ensureSuccess(localClient.refresh(apiServerEnv.id), 'refresh(api-server)');
+    await pollDeploymentToTerminal(localClient, apiServerRefresh.id, emit);
 
     emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${API_SERVER_ENV}…` });
     const apiServerDeployment = await ensureSuccess(
