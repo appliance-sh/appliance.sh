@@ -1,3 +1,17 @@
+## 1.37.0 (2026-05-05)
+
+### Features
+
+- **bootstrap:** phased bootstrap retry ([293bca4](https://github.com/appliance-sh/appliance.sh/commit/293bca4))
+
+### Bug Fixes
+
+- **api-server:** host binding improvements ([fcb36de](https://github.com/appliance-sh/appliance.sh/commit/fcb36de))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.36.1 (2026-05-04)
 
 ### Bug Fixes
