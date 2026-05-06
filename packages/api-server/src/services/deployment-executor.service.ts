@@ -147,7 +147,10 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
           throw new Error('Environment variables require a build');
         }
 
-        result = await infraService.deploy(metadata.stackName, metadata, build, { onStack });
+        result = await infraService.deploy(metadata.stackName, metadata, build, {
+          onStack,
+          refresh: input.refresh,
+        });
         break;
       }
       case DeploymentAction.Destroy: {

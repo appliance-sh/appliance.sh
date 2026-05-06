@@ -2,6 +2,7 @@ import * as React from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Check } from 'lucide-react';
+import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -194,6 +195,7 @@ function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
   const [error, setError] = React.useState<string | null>(null);
   const [awsProfile, setAwsProfile] = React.useState('');
   const [targetVersion, setTargetVersion] = React.useState('');
+  const [baseConfigJson, setBaseConfigJson] = React.useState('');
 
   // Same cluster-info query the migration panels use — TanStack Query
   // dedupes by key so this doesn't generate a second request.
@@ -255,9 +257,25 @@ function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
   }, []);
 
   const targetValid = /^\d+\.\d+\.\d+$/.test(targetVersion);
+  // Older api-server images (deployed before /cluster-info shipped) 404
+  // the cluster-info route. The user can fall back to pasting the
+  // APPLIANCE_BASE_CONFIG env var directly. We only require the paste
+  // when the query has actually errored — TanStack's `isError` covers
+  // 4xx/5xx + network failures.
+  const clusterInfoUnavailable = clusterInfoQuery.isError;
+  const parsedOverride = React.useMemo<ApplianceBaseConfig | null>(() => {
+    if (!baseConfigJson.trim()) return null;
+    try {
+      return applianceBaseConfig.parse(JSON.parse(baseConfigJson));
+    } catch {
+      return null;
+    }
+  }, [baseConfigJson]);
+  const overrideValid = !clusterInfoUnavailable || parsedOverride !== null;
 
   const onRun = async () => {
     if (!targetValid) return;
+    if (!overrideValid) return;
     if (!host.bootstrap?.updateApiServer) return;
     if (!apiKey) {
       setStatus('failed');
@@ -274,6 +292,7 @@ function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
           apiKey,
           targetVersion,
           awsProfile: awsProfile || undefined,
+          baseConfigOverride: clusterInfoUnavailable ? (parsedOverride ?? undefined) : undefined,
         },
         undefined,
         handleEvent
@@ -330,6 +349,36 @@ function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
         </div>
       </div>
 
+      {clusterInfoUnavailable ? (
+        <label className="block space-y-1 text-xs">
+          <span className="text-[var(--color-muted-foreground)]">
+            APPLIANCE_BASE_CONFIG (paste JSON — fallback when /cluster-info isn&apos;t available)
+          </span>
+          <textarea
+            value={baseConfigJson}
+            onChange={(e) => setBaseConfigJson(e.target.value)}
+            disabled={status === 'running'}
+            rows={6}
+            spellCheck={false}
+            placeholder={'{ "name": "...", "type": "appliance-base-aws-public", "stateBackendUrl": "s3://...", ... }'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+          />
+          <span className="text-[var(--color-muted-foreground)]">
+            Recover via{' '}
+            <code className="font-mono">
+              aws lambda get-function-configuration --function-name &lt;api-server-handler&gt; --query
+              &apos;Environment.Variables.APPLIANCE_BASE_CONFIG&apos; --output text
+            </code>
+            . Required only on first update from a pre-/cluster-info api-server.
+          </span>
+          {baseConfigJson.trim() && parsedOverride === null ? (
+            <span className="text-red-400">
+              Invalid JSON or schema mismatch — couldn&apos;t parse as ApplianceBaseConfig.
+            </span>
+          ) : null}
+        </label>
+      ) : null}
+
       <label className="block space-y-1 text-xs">
         <span className="text-[var(--color-muted-foreground)]">Target version</span>
         <input
@@ -373,7 +422,7 @@ function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
       </label>
 
       <div className="flex items-center gap-2">
-        <Button size="sm" onClick={onRun} disabled={status === 'running' || !targetValid}>
+        <Button size="sm" onClick={onRun} disabled={status === 'running' || !targetValid || !overrideValid}>
           {status === 'running' ? 'Updating…' : `Update to ${targetVersion || '…'}`}
         </Button>
         {status === 'succeeded' ? <span className="text-xs text-green-400">✓ Update complete</span> : null}

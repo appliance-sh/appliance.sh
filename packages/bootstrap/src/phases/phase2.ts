@@ -232,14 +232,26 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     const sharedEnvVars: Record<string, string> = {
       APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
       PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
+      // Empty passphrase satisfies pulumi's stack-config read whenever
+      // a stack was created with the passphrase secrets manager
+      // (i.e. clusters bootstrapped before the awskms:// provider
+      // landed, where baseConfig.aws.kmsKeyArn is undefined). Stacks
+      // that *do* have a KMS provider configured ignore this — the
+      // secrets manager declared in stack config takes precedence.
+      // Without it, `pulumi refresh` from the deployed Lambda fails
+      // with "passphrase must be set with PULUMI_CONFIG_PASSPHRASE".
+      PULUMI_CONFIG_PASSPHRASE: '',
     };
 
-    // Trust-proxy is required on the api-server appliance because
-    // CloudFront's edge router rewrites Host to the Function URL's
-    // hostname; the api-server reconstructs @authority for HTTP
-    // Message Signature verification from X-Forwarded-Host. The
-    // worker only sees server-to-server calls (no edge rewrite), so
-    // it doesn't need it.
+    // Trust-proxy is required on BOTH the api-server and the worker.
+    // Both Lambdas sit behind CloudFront → edge-router → Function URL,
+    // and the edge rewrites Host to the Function URL's hostname when
+    // it forwards. Each side reconstructs `@authority` for HTTP
+    // Message Signature verification from X-Forwarded-Host; without
+    // trust-proxy the reconstructed authority is the raw Lambda URL
+    // hostname while the *signer* used the public hostname, so every
+    // server-to-worker dispatch fails verification with
+    // "invalid signature".
     const apiServerEnvVars: Record<string, string> = {
       ...sharedEnvVars,
       APPLIANCE_MODE: 'server',
@@ -249,6 +261,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     const workerEnvVars: Record<string, string> = {
       ...sharedEnvVars,
       APPLIANCE_MODE: 'worker',
+      APPLIANCE_TRUST_PROXY: 'true',
     };
 
     // Deploy worker first, then api-server. Two reasons:
@@ -265,19 +278,15 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     //    DNS for WORKER_URL hasn't resolved yet when the api-server
     //    Lambda warms up.
     //
-    // Each deploy is preceded by a refresh. On a first bootstrap the
-    // stacks don't exist, so refresh is a fast no-op (the executor
-    // catches "no stack named" and returns idempotentNoop). On a
-    // re-bootstrap after a partial failure, the cluster's S3 state
-    // backend can hold stack records whose recorded resource attrs
-    // diverge from AWS reality (e.g. a Lambda whose tags AWS forgot
-    // mid-update — pulumi-aws@7.23 surfaces this as a TagResource
-    // 404). Refresh reconciles state with reality so the subsequent
-    // deploy diffs from a true baseline.
-    emit({ type: 'log', level: 'info', message: `refreshing ${SYSTEM_PROJECT}/${WORKER_ENV} state…` });
-    const workerRefresh = await ensureSuccess(localClient.refresh(workerEnv.id), 'refresh(worker)');
-    await pollDeploymentToTerminal(localClient, workerRefresh.id, emit);
-
+    // Each deploy passes `refresh: true`, which the api-server
+    // translates into `pulumi up --refresh`: re-runs the inline
+    // program (creating fresh providers) before reconciling state
+    // with cloud reality. We avoid a standalone `pulumi refresh`
+    // call because it reuses cached provider state from a prior
+    // deploy, and stale aws-native provider config (observed on
+    // older clusters) can't be recovered that way. The pulumi-aws@7.23
+    // TagResource race that motivated reconciliation in the first
+    // place is also covered — `up --refresh` is strictly stronger.
     emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${WORKER_ENV}…` });
     const workerDeployment = await ensureSuccess(
       localClient.deploy(workerEnv.id, {
@@ -287,15 +296,12 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
         timeout: WORKER_TIMEOUT_S,
         storage: WORKER_STORAGE_MB,
         architectures: lambdaArchitectures,
+        refresh: true,
       }),
       'deploy(worker)'
     );
     emit({ type: 'log', level: 'info', message: `waiting for ${SYSTEM_PROJECT}/${WORKER_ENV} deployment to settle…` });
     await pollDeploymentToTerminal(localClient, workerDeployment.id, emit);
-
-    emit({ type: 'log', level: 'info', message: `refreshing ${SYSTEM_PROJECT}/${API_SERVER_ENV} state…` });
-    const apiServerRefresh = await ensureSuccess(localClient.refresh(apiServerEnv.id), 'refresh(api-server)');
-    await pollDeploymentToTerminal(localClient, apiServerRefresh.id, emit);
 
     emit({ type: 'log', level: 'info', message: `deploying ${SYSTEM_PROJECT}/${API_SERVER_ENV}…` });
     const apiServerDeployment = await ensureSuccess(
@@ -306,6 +312,7 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
         timeout: API_SERVER_TIMEOUT_S,
         storage: API_SERVER_STORAGE_MB,
         architectures: lambdaArchitectures,
+        refresh: true,
       }),
       'deploy(api-server)'
     );

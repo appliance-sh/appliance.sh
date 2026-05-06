@@ -1,4 +1,4 @@
-import { createApplianceClient, DeploymentStatus, type Deployment } from '@appliance.sh/sdk';
+import { createApplianceClient, DeploymentStatus, type ApplianceBaseConfig, type Deployment } from '@appliance.sh/sdk';
 import { mirrorImageToEcr } from './runtime/ecr-mirror';
 import { inspectImageArch } from './runtime/container';
 import { sleep } from './phases/helpers';
@@ -40,6 +40,16 @@ export interface ApiServerUpdateInput {
   imageBase?: string;
   /** AWS profile to use for the ECR mirror. Same shape as bootstrap. */
   awsProfile?: string;
+  /**
+   * Manual base config override. Used when the cluster's running
+   * api-server is too old to expose `/api/v1/cluster-info` — the
+   * very case the update flow needs to fix. Operators recover this
+   * from the api-server Lambda's APPLIANCE_BASE_CONFIG env var,
+   * e.g. `aws lambda get-function-configuration --function-name
+   * <api-server-handler>`. Ignored when cluster-info succeeds (the
+   * remote value is authoritative once it's reachable).
+   */
+  baseConfigOverride?: ApplianceBaseConfig;
 }
 
 export interface ApiServerUpdateOptions {
@@ -90,10 +100,26 @@ export async function runApiServerUpdate(
 
   emit({ type: 'log', level: 'info', message: 'fetching cluster info…' });
   const infoResult = await client.getClusterInfo();
-  if (!infoResult.success) {
-    throw new Error(`getClusterInfo failed: ${infoResult.error.message}`);
+  let baseConfig: ApplianceBaseConfig;
+  if (infoResult.success) {
+    baseConfig = infoResult.data.baseConfig;
+  } else if (input.baseConfigOverride) {
+    emit({
+      type: 'log',
+      level: 'warn',
+      message:
+        `getClusterInfo failed (${infoResult.error.message}); using supplied baseConfig override. ` +
+        `This is expected when the running api-server is too old to expose /api/v1/cluster-info — the update will fix it.`,
+    });
+    baseConfig = input.baseConfigOverride;
+  } else {
+    throw new Error(
+      `getClusterInfo failed: ${infoResult.error.message}. ` +
+        `If the cluster's api-server predates /api/v1/cluster-info, supply baseConfigOverride ` +
+        `(recover via \`aws lambda get-function-configuration --function-name <api-server-handler> ` +
+        `--query 'Environment.Variables.APPLIANCE_BASE_CONFIG' --output text\`).`
+    );
   }
-  const baseConfig = infoResult.data.baseConfig;
   if (!baseConfig.aws.ecrRepositoryUrl) {
     throw new Error('cluster baseConfig is missing ecrRepositoryUrl — cannot mirror new image');
   }
@@ -142,8 +168,17 @@ export async function runApiServerUpdate(
   const sharedEnv: Record<string, string> = {
     APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
     PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,
+    // Same fallback for passphrase-encrypted stacks as phase 2 — see
+    // the comment there for the rationale. Older clusters' system
+    // stacks were created with the passphrase manager and need this
+    // env var present (empty) for refresh/up to read state.
+    PULUMI_CONFIG_PASSPHRASE: '',
   };
   const workerUrl = `https://${SYSTEM_PROJECT}-${WORKER_ENV}.${baseConfig.domainName}`;
+  // Both Lambdas sit behind CloudFront and need APPLIANCE_TRUST_PROXY
+  // so they reconstruct `@authority` from X-Forwarded-Host instead of
+  // the raw Function URL hostname — see phase2.ts for the full
+  // signature-verification rationale. Keep both sides in lockstep.
   const serverEnvVars: Record<string, string> = {
     ...sharedEnv,
     APPLIANCE_MODE: 'server',
@@ -153,13 +188,17 @@ export async function runApiServerUpdate(
   const workerEnvVars: Record<string, string> = {
     ...sharedEnv,
     APPLIANCE_MODE: 'worker',
+    APPLIANCE_TRUST_PROXY: 'true',
   };
 
   // Worker first: the api-server dispatches deploys to the worker,
   // so a worker-incompatible api-server update would break us mid-run.
-  // Refresh-then-deploy reconciles state with reality first — same
-  // mitigation phase 2 added for the pulumi-aws@7.23 TagResource race.
-  await refreshAndPoll(client, workerEnvId, `${SYSTEM_PROJECT}/${WORKER_ENV}`, emit);
+  // We pass `refresh: true` instead of doing a separate refresh
+  // upfront — the standalone `pulumi refresh` reuses cached provider
+  // state and can't recover from bad provider config (a real failure
+  // mode for older clusters with stale aws-native provider state),
+  // whereas `pulumi up --refresh` re-runs the inline program first
+  // and gets fresh providers before touching state.
   await deployAndPoll(
     client,
     workerEnvId,
@@ -171,11 +210,11 @@ export async function runApiServerUpdate(
       timeout: WORKER_TIMEOUT_S,
       storage: WORKER_STORAGE_MB,
       architectures: lambdaArchitectures,
+      refresh: true,
     },
     emit
   );
 
-  await refreshAndPoll(client, serverEnvId, `${SYSTEM_PROJECT}/${API_SERVER_ENV}`, emit);
   await deployAndPoll(
     client,
     serverEnvId,
@@ -187,6 +226,7 @@ export async function runApiServerUpdate(
       timeout: API_SERVER_TIMEOUT_S,
       storage: API_SERVER_STORAGE_MB,
       architectures: lambdaArchitectures,
+      refresh: true,
     },
     emit
   );
@@ -220,20 +260,6 @@ async function resolveSystemEnvIds(
   return { workerEnvId: worker.id, serverEnvId: server.id };
 }
 
-async function refreshAndPoll(
-  client: ReturnType<typeof createApplianceClient>,
-  envId: string,
-  label: string,
-  emit: (e: BootstrapEvent) => void
-): Promise<void> {
-  emit({ type: 'log', level: 'info', message: `refreshing ${label} state…` });
-  const result = await client.refresh(envId);
-  if (!result.success) {
-    throw new Error(`refresh(${label}) failed: ${result.error.message}`);
-  }
-  await pollDeployment(client, result.data.id, emit);
-}
-
 async function deployAndPoll(
   client: ReturnType<typeof createApplianceClient>,
   envId: string,
@@ -245,6 +271,7 @@ async function deployAndPoll(
     timeout: number;
     storage: number;
     architectures?: Array<'x86_64' | 'arm64'>;
+    refresh?: boolean;
   },
   emit: (e: BootstrapEvent) => void
 ): Promise<void> {

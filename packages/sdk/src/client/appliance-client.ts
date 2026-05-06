@@ -198,6 +198,13 @@ export class ApplianceClient {
       storage?: number;
       /** Lambda CPU architecture(s). Must match the image's platform for container builds. */
       architectures?: ('x86_64' | 'arm64')[];
+      /**
+       * Reconcile Pulumi state with cloud reality before applying the
+       * diff (sets `pulumi up --refresh`). Use when state may have
+       * drifted from reality (e.g. partial prior deploy, manual edits).
+       * Adds a few seconds per deploy. Ignored for destroy/refresh.
+       */
+      refresh?: boolean;
     }
   ): Promise<Result<Deployment>> {
     return this.request<Deployment>(
@@ -212,6 +219,7 @@ export class ApplianceClient {
         ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}),
         ...(options?.storage !== undefined ? { storage: options.storage } : {}),
         ...(options?.architectures ? { architectures: options.architectures } : {}),
+        ...(options?.refresh !== undefined ? { refresh: options.refresh } : {}),
       },
       600000
     );

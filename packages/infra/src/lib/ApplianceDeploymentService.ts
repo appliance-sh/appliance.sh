@@ -212,6 +212,7 @@ export class ApplianceDeploymentService {
       { envVars, workDir, ...(secretsProvider ? { secretsProvider } : {}) }
     );
     await stack.setConfig('aws:region', { value: this.baseConfig!.aws.region });
+    await this.clearStaleProfileConfig(stack);
     return stack;
   }
 
@@ -225,7 +226,30 @@ export class ApplianceDeploymentService {
       envVars,
     });
 
-    return auto.Stack.createOrSelect(stackName, ws);
+    const stack = await auto.Stack.createOrSelect(stackName, ws);
+    await this.clearStaleProfileConfig(stack);
+    return stack;
+  }
+
+  /**
+   * Clear any AWS-profile config that may be lingering on the stack.
+   * Lambdas authenticate via their execution role; profile lookups
+   * always fail in-Lambda (no `~/.aws/config` to read) and surface
+   * as `failed to get shared config profile, <X>` errors during
+   * resource refresh. We don't set these keys ourselves but defend
+   * against stack state that picked them up from elsewhere — e.g.
+   * earlier code paths, an operator running `pulumi config set`
+   * out-of-band, or a buggy provider version.
+   */
+  private async clearStaleProfileConfig(stack: auto.Stack): Promise<void> {
+    for (const key of ['aws:profile', 'aws-native:profile']) {
+      try {
+        await stack.removeConfig(key);
+      } catch {
+        // removeConfig throws when the key isn't set — that's the
+        // common case and is fine.
+      }
+    }
   }
 
   async deploy(

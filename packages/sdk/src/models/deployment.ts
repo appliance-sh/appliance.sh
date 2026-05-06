@@ -40,6 +40,14 @@ export const deploymentInput = z.object({
   // layer's arch (for framework builds). Defaults to ['x86_64'] when
   // omitted, which matches Lambda's own default.
   architectures: z.array(z.enum(['x86_64', 'arm64'])).optional(),
+  // Reconcile Pulumi state with cloud reality before computing the
+  // diff (deploys an effective `pulumi up --refresh`). Used by the
+  // dogfood self-update path to recover from stale provider state
+  // — `pulumi refresh` standalone uses cached provider state and
+  // can't recover from bad provider config, but `up --refresh`
+  // re-runs the inline program first and gets fresh providers.
+  // Ignored for destroy / refresh actions.
+  refresh: z.boolean().optional(),
 });
 
 export type DeploymentInput = z.infer<typeof deploymentInput>;
