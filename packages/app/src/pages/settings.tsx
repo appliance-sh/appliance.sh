@@ -136,7 +136,12 @@ function ClusterRow({
   removePending: boolean;
 }) {
   const host = useHost();
-  const canPromote = Boolean(host.bootstrap?.promoteState && cluster.stateBackendUrl);
+  // Show the panel whenever the host can drive a state promotion.
+  // We don't gate on `cluster.stateBackendUrl` being cached because
+  // clusters bootstrapped before that field was persisted (or added
+  // manually via Connect) won't have it — the user types the URL in
+  // when it isn't already known.
+  const canPromote = Boolean(host.bootstrap?.promoteState);
 
   return (
     <li className="px-3 py-2">
@@ -163,20 +168,66 @@ function ClusterRow({
           </Button>
         </div>
       </div>
-      {canPromote ? <DetachStatePanel cluster={cluster} /> : null}
+      {canPromote ? (
+        <>
+          <StateMigrationPanel cluster={cluster} direction="promote" />
+          <StateMigrationPanel cluster={cluster} direction="demote" />
+        </>
+      ) : null}
     </li>
   );
 }
 
-type PromoteStatus = 'idle' | 'running' | 'succeeded' | 'failed';
+type RunStatus = 'idle' | 'running' | 'succeeded' | 'failed';
+type Direction = 'promote' | 'demote';
 
-function DetachStatePanel({ cluster }: { cluster: Cluster }) {
+const COPY: Record<
+  Direction,
+  {
+    title: string;
+    description: React.ReactNode;
+    runLabel: string;
+    runningLabel: string;
+    successLabel: string;
+  }
+> = {
+  promote: {
+    title: 'Detach state from this device',
+    description: (
+      <>
+        Move this cluster&apos;s installer Pulumi state from{' '}
+        <code className="font-mono">~/.appliance/pulumi-state</code> into the cluster&apos;s S3 state bucket so future
+        operations don&apos;t require this machine.
+      </>
+    ),
+    runLabel: 'Detach state',
+    runningLabel: 'Detaching…',
+    successLabel: '✓ State moved to S3',
+  },
+  demote: {
+    title: 'Reattach state to this device',
+    description: (
+      <>
+        Pull installer state from the cluster&apos;s S3 backend back to{' '}
+        <code className="font-mono">~/.appliance/pulumi-state</code>. Refuses to overwrite an existing local state dir —
+        archive or remove it first. The S3 stack is left in place as a backup.
+      </>
+    ),
+    runLabel: 'Reattach state',
+    runningLabel: 'Reattaching…',
+    successLabel: '✓ State copied to local',
+  },
+};
+
+function StateMigrationPanel({ cluster, direction }: { cluster: Cluster; direction: Direction }) {
   const host = useHost();
   const queryClient = useQueryClient();
-  const [status, setStatus] = React.useState<PromoteStatus>('idle');
+  const [status, setStatus] = React.useState<RunStatus>('idle');
   const [logs, setLogs] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [awsProfile, setAwsProfile] = React.useState('');
+  const [stateBackendUrl, setStateBackendUrl] = React.useState(cluster.stateBackendUrl ?? '');
+  const stateBackendUrlValid = stateBackendUrl.startsWith('s3://') && stateBackendUrl.length > 's3://'.length;
   const profilesQuery = useQuery({
     queryKey: ['aws-profiles'],
     enabled: Boolean(host.bootstrap?.listAwsProfiles),
@@ -202,21 +253,23 @@ function DetachStatePanel({ cluster }: { cluster: Cluster }) {
     }
   }, []);
 
-  const onPromote = async () => {
-    if (!host.bootstrap?.promoteState || !cluster.stateBackendUrl) return;
+  const onRun = async () => {
+    if (!stateBackendUrlValid) return;
+    const action = direction === 'promote' ? host.bootstrap?.promoteState : host.bootstrap?.demoteState;
+    if (!action) return;
     setStatus('running');
     setLogs([]);
     setError(null);
     try {
-      await host.bootstrap.promoteState(
-        { stateBackendUrl: cluster.stateBackendUrl, awsProfile: awsProfile || undefined },
+      await action.call(
+        host.bootstrap,
+        { stateBackendUrl, awsProfile: awsProfile || undefined },
         undefined,
         handleEvent
       );
-      // Drop the cached backend URL so this panel goes away on the
-      // next render — the local state has been archived and re-promoting
-      // would hit phase 3's "no local state" error.
-      await clearClusterStateBackendIfPossible(host, cluster.id);
+      // After promote: clear the cached URL — local state is gone.
+      // After demote: cache the URL so a future re-promote can default it.
+      await setClusterStateBackendIfPossible(host, cluster.id, direction === 'promote' ? null : stateBackendUrl);
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       setStatus('succeeded');
     } catch (err) {
@@ -225,19 +278,31 @@ function DetachStatePanel({ cluster }: { cluster: Cluster }) {
     }
   };
 
+  const copy = COPY[direction];
+
   return (
     <div className="ml-7 mt-2 space-y-2 rounded-md border border-[var(--color-border)] p-3">
-      <div className="flex items-baseline justify-between gap-2">
-        <div>
-          <div className="text-sm font-medium">Detach state from this device</div>
-          <div className="text-xs text-[var(--color-muted-foreground)]">
-            Move this cluster&apos;s installer Pulumi state from{' '}
-            <code className="font-mono">~/.appliance/pulumi-state</code> into{' '}
-            <code className="font-mono">{cluster.stateBackendUrl}</code>. Future operations on this cluster won&apos;t
-            need this machine.
-          </div>
-        </div>
+      <div>
+        <div className="text-sm font-medium">{copy.title}</div>
+        <div className="text-xs text-[var(--color-muted-foreground)]">{copy.description}</div>
       </div>
+
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">State backend URL</span>
+        <input
+          type="text"
+          value={stateBackendUrl}
+          onChange={(e) => setStateBackendUrl(e.target.value)}
+          placeholder="s3://us-east-1-state-XXXXXXX"
+          disabled={status === 'running'}
+          spellCheck={false}
+          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+        />
+        <span className="text-[var(--color-muted-foreground)]">
+          The cluster&apos;s state bucket. Find it in S3 under a name like{' '}
+          <code className="font-mono">&lt;region&gt;-state-&lt;7-char hash&gt;</code>.
+        </span>
+      </label>
 
       <label className="block space-y-1 text-xs">
         <span className="text-[var(--color-muted-foreground)]">AWS profile</span>
@@ -269,10 +334,10 @@ function DetachStatePanel({ cluster }: { cluster: Cluster }) {
       </label>
 
       <div className="flex items-center gap-2">
-        <Button size="sm" onClick={onPromote} disabled={status === 'running'}>
-          {status === 'running' ? 'Detaching…' : 'Detach state'}
+        <Button size="sm" onClick={onRun} disabled={status === 'running' || !stateBackendUrlValid}>
+          {status === 'running' ? copy.runningLabel : copy.runLabel}
         </Button>
-        {status === 'succeeded' ? <span className="text-xs text-green-400">✓ State moved to S3</span> : null}
+        {status === 'succeeded' ? <span className="text-xs text-green-400">{copy.successLabel}</span> : null}
         {status === 'failed' ? <span className="text-xs text-red-400">Failed</span> : null}
       </div>
 
@@ -292,14 +357,17 @@ function DetachStatePanel({ cluster }: { cluster: Cluster }) {
   );
 }
 
-async function clearClusterStateBackendIfPossible(host: ConsoleHost, clusterId: string): Promise<void> {
-  if (!host.clearClusterStateBackend) return;
+async function setClusterStateBackendIfPossible(
+  host: ConsoleHost,
+  clusterId: string,
+  url: string | null
+): Promise<void> {
+  if (!host.setClusterStateBackend) return;
   try {
-    await host.clearClusterStateBackend(clusterId);
+    await host.setClusterStateBackend(clusterId, url);
   } catch {
-    // Best-effort: if clearing the cached backend URL fails, the
-    // panel will just continue showing on next render. The promotion
-    // itself already succeeded.
+    // Best-effort: caching the URL is convenience, not correctness.
+    // Failure here doesn't affect the state migration that succeeded.
   }
 }
 

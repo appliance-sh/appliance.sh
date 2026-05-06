@@ -1,5 +1,6 @@
 export { runBootstrap } from './run';
 export { runStatePromotion, type StatePromotionInput, type StatePromotionOptions } from './state-promotion';
+export { runStateDemotion, type StateDemotionInput, type StateDemotionOptions } from './state-demotion';
 export { runTeardown, type TeardownOptions } from './teardown';
 export type {
   BootstrapInput,

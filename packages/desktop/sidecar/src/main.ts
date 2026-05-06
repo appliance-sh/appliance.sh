@@ -1,9 +1,12 @@
 import {
   runBootstrap,
+  runStateDemotion,
   runStatePromotion,
   type BootstrapEvent,
   type BootstrapInput,
   type BootstrapOptions,
+  type StateDemotionInput,
+  type StateDemotionOptions,
   type StatePromotionInput,
   type StatePromotionOptions,
 } from '@appliance.sh/bootstrap';
@@ -29,6 +32,11 @@ type SidecarInput =
       kind: 'promote-state';
       input: StatePromotionInput;
       options?: StatePromotionOptions;
+    }
+  | {
+      kind: 'demote-state';
+      input: StateDemotionInput;
+      options?: StateDemotionOptions;
     };
 
 async function readStdin(): Promise<string> {
@@ -74,6 +82,14 @@ async function main(): Promise<void> {
         // promote-state has no structured result; the frontend just
         // cares about success vs error. Emit an empty object so the
         // Rust side has a result line to settle on.
+        emit({ type: 'result', result: {} });
+        break;
+      }
+      case 'demote-state': {
+        await runStateDemotion(parsed.input, {
+          ...(parsed.options ?? {}),
+          onEvent,
+        });
         emit({ type: 'result', result: {} });
         break;
       }

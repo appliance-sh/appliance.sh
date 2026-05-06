@@ -11,6 +11,8 @@ import type {
   Cluster,
   ConsoleHost,
   HostConfig,
+  StateDemotionInput,
+  StateDemotionOptions,
   StatePromotionInput,
   StatePromotionOptions,
 } from '@appliance.sh/app';
@@ -38,8 +40,8 @@ export const tauriHost: ConsoleHost = {
     await invoke('remove_cluster', { clusterId });
   },
 
-  async clearClusterStateBackend(clusterId: string): Promise<void> {
-    await invoke('clear_cluster_state_backend', { clusterId });
+  async setClusterStateBackend(clusterId: string, url: string | null): Promise<void> {
+    await invoke('set_cluster_state_backend', { clusterId, url });
   },
 
   async openExternal(url) {
@@ -71,6 +73,18 @@ export const tauriHost: ConsoleHost = {
       const channel = new Channel<BootstrapEvent>();
       channel.onmessage = onEvent;
       await invoke('promote_state', {
+        input: { input, options: options ?? {} },
+        onEvent: channel,
+      });
+    },
+    async demoteState(
+      input: StateDemotionInput,
+      options: StateDemotionOptions | undefined,
+      onEvent: (event: BootstrapEvent) => void
+    ): Promise<void> {
+      const channel = new Channel<BootstrapEvent>();
+      channel.onmessage = onEvent;
+      await invoke('demote_state', {
         input: { input, options: options ?? {} },
         onEvent: channel,
       });

@@ -5,6 +5,8 @@ import type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  StateDemotionInput,
+  StateDemotionOptions,
   StatePromotionInput,
   StatePromotionOptions,
 } from '@appliance.sh/bootstrap';
@@ -67,6 +69,18 @@ export interface BootstrapHost {
     onEvent: (event: BootstrapEvent) => void
   ): Promise<void>;
   /**
+   * Inverse of `promoteState`: pull installer Pulumi state out of
+   * S3 back to a local file backend on this device. Refuses to
+   * overwrite an existing local state dir; the operator must
+   * archive or remove it first. The S3 stack is left in place as
+   * a backup.
+   */
+  demoteState(
+    input: StateDemotionInput,
+    options: StateDemotionOptions | undefined,
+    onEvent: (event: BootstrapEvent) => void
+  ): Promise<void>;
+  /**
    * Enumerate AWS profiles from `~/.aws/config` + `~/.aws/credentials`
    * for the wizard's profile picker. Optional — hosts without
    * filesystem access (web shell) can omit it; the wizard then
@@ -97,13 +111,15 @@ export interface ConsoleHost {
   /** Remove a cluster + its key. If it was selected, selection falls back to the first remaining cluster (or null). */
   removeCluster(clusterId: string): Promise<void>;
   /**
-   * Clear the cluster's stored `stateBackendUrl`. Called after the
-   * Settings page successfully promotes the cluster's installer
-   * state — once promoted, the local Pulumi state dir is archived,
-   * so a re-promote attempt is a no-op. Optional: only the desktop
-   * host implements it (web shell omits bootstrap entirely).
+   * Set (or clear, with `null`) the cluster's stored
+   * `stateBackendUrl`. Settings calls this with `null` after a
+   * successful promotion (local state has been archived; no URL to
+   * cache) and with the migration URL after a successful demotion
+   * (so a future re-promotion can default the input field).
+   * Optional: only the desktop host implements it (web shell omits
+   * bootstrap entirely).
    */
-  clearClusterStateBackend?(clusterId: string): Promise<void>;
+  setClusterStateBackend?(clusterId: string, url: string | null): Promise<void>;
   openExternal(url: string): Promise<void>;
   notify?(opts: { title: string; body?: string }): Promise<void>;
   bootstrap?: BootstrapHost;
@@ -116,6 +132,8 @@ export type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  StateDemotionInput,
+  StateDemotionOptions,
   StatePromotionInput,
   StatePromotionOptions,
 };

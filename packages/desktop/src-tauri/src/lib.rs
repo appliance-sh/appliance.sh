@@ -242,12 +242,17 @@ fn select_cluster(app: AppHandle, cluster_id: Option<String>) -> Result<(), Host
     write_persisted_config(&app, &persisted)
 }
 
-/// Clear the cached `stateBackendUrl` on a cluster. Called after a
-/// successful state promotion so the Settings page stops offering a
-/// "Detach state" action that would now be a no-op (the local
-/// Pulumi state dir has been archived).
+/// Set (or clear, with `None`) the cached `stateBackendUrl` on a
+/// cluster. Settings calls this after promotion (clear, since the
+/// local state has been archived) and after demotion (set to the
+/// URL we demoted from, so a future re-promotion can default the
+/// input field). Idempotent.
 #[tauri::command]
-fn clear_cluster_state_backend(app: AppHandle, cluster_id: String) -> Result<(), HostError> {
+fn set_cluster_state_backend(
+    app: AppHandle,
+    cluster_id: String,
+    url: Option<String>,
+) -> Result<(), HostError> {
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -256,7 +261,7 @@ fn clear_cluster_state_backend(app: AppHandle, cluster_id: String) -> Result<(),
         .iter_mut()
         .find(|c| c.id == cluster_id)
         .ok_or_else(|| HostError::ClusterNotFound(cluster_id.clone()))?;
-    cluster.state_backend_url = None;
+    cluster.state_backend_url = url;
     write_persisted_config(&app, &persisted)
 }
 
@@ -560,6 +565,31 @@ async fn promote_state(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
+/// Inverse of `promote_state`: pull installer Pulumi state out of S3
+/// back into the local file backend on this device. Used by Settings
+/// to reattach a cluster's installer state for offline / debugging
+/// work.
+#[tauri::command]
+async fn demote_state(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(format!(
+                "demote_state expected an object input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("demote-state".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -570,10 +600,11 @@ pub fn run() {
             add_cluster,
             select_cluster,
             remove_cluster,
-            clear_cluster_state_backend,
+            set_cluster_state_backend,
             list_aws_profiles,
             run_bootstrap,
-            promote_state
+            promote_state,
+            demote_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
