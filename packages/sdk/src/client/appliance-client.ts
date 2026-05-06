@@ -4,6 +4,7 @@ import { Project, ProjectInput } from '../models/project';
 import { Environment, EnvironmentInput } from '../models/environment';
 import { Deployment } from '../models/deployment';
 import { ApiKeyCreateResponse } from '../models/api-key';
+import { ApplianceBaseConfig } from '../models/appliance-base';
 import { signRequest } from '../signing';
 
 export class ApplianceClient {
@@ -248,6 +249,21 @@ export class ApplianceClient {
 
   async getDeployment(id: string): Promise<Result<Deployment>> {
     return this.request<Deployment>('GET', `/api/v1/deployments/${id}`);
+  }
+
+  /**
+   * Fetch this cluster's metadata: the api-server's running version
+   * and its parsed base config (`APPLIANCE_BASE_CONFIG`). The desktop
+   * Settings page reads `version` to surface "running 1.37.0" and
+   * `baseConfig.stateBackendUrl` to drive state promote/demote
+   * without asking the operator to paste anything.
+   *
+   * Older api-server images that predate this route surface a 404 /
+   * 500 — callers should fall back to "version unknown, allow update
+   * anyway" rather than blocking on the missing data.
+   */
+  async getClusterInfo(): Promise<Result<{ version: string; baseConfig: ApplianceBaseConfig }>> {
+    return this.request<{ version: string; baseConfig: ApplianceBaseConfig }>('GET', '/api/v1/cluster-info');
   }
 
   /**

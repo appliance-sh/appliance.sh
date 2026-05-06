@@ -1,10 +1,13 @@
 import type {
+  ApiServerUpdateInput,
+  ApiServerUpdateOptions,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  LatestGhcrTagInput,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,
@@ -81,6 +84,27 @@ export interface BootstrapHost {
     onEvent: (event: BootstrapEvent) => void
   ): Promise<void>;
   /**
+   * Self-update the cluster's api-server + api-worker to a new image
+   * version. The sidecar mirrors the new image to the cluster ECR
+   * (needs docker — Lambda can't pull/push images) and then drives
+   * deploys via the cluster's existing deployment API. Worker is
+   * updated first; the api-server's deploy goes through the (now
+   * upgraded) worker.
+   */
+  updateApiServer(
+    input: ApiServerUpdateInput,
+    options: ApiServerUpdateOptions | undefined,
+    onEvent: (event: BootstrapEvent) => void
+  ): Promise<void>;
+  /**
+   * Resolve the latest semver-shaped tag on the api-server's ghcr.io
+   * image. Used by Settings to default the target version field of
+   * the self-update flow without making the operator type a number.
+   * Optional — hosts that can't reach ghcr.io should omit it; the UI
+   * falls back to the desktop's bundled version.
+   */
+  latestApiServerVersion?(input?: LatestGhcrTagInput): Promise<{ version: string }>;
+  /**
    * Enumerate AWS profiles from `~/.aws/config` + `~/.aws/credentials`
    * for the wizard's profile picker. Optional — hosts without
    * filesystem access (web shell) can omit it; the wizard then
@@ -126,12 +150,15 @@ export interface ConsoleHost {
 }
 
 export type {
+  ApiServerUpdateInput,
+  ApiServerUpdateOptions,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  LatestGhcrTagInput,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,

@@ -5,6 +5,7 @@ import { Plus, Trash2, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import { useApplianceClient } from '@/hooks/use-appliance-client';
 import type { BootstrapEvent, Cluster, ConsoleHost } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
@@ -136,11 +137,6 @@ function ClusterRow({
   removePending: boolean;
 }) {
   const host = useHost();
-  // Show the panel whenever the host can drive a state promotion.
-  // We don't gate on `cluster.stateBackendUrl` being cached because
-  // clusters bootstrapped before that field was persisted (or added
-  // manually via Connect) won't have it — the user types the URL in
-  // when it isn't already known.
   const canPromote = Boolean(host.bootstrap?.promoteState);
 
   return (
@@ -168,13 +164,235 @@ function ClusterRow({
           </Button>
         </div>
       </div>
-      {canPromote ? (
+      {/* Promote / demote / update panels read cluster metadata from
+          the api-server's `/cluster-info` endpoint — that requires
+          an authenticated SDK client, which we only have for the
+          currently selected cluster. Other clusters get a hint
+          telling the user to switch first. */}
+      {canPromote && isSelected ? (
         <>
+          <UpdateApiServerPanel cluster={cluster} />
           <StateMigrationPanel cluster={cluster} direction="promote" />
           <StateMigrationPanel cluster={cluster} direction="demote" />
         </>
+      ) : canPromote ? (
+        <div className="ml-7 mt-2 rounded-md border border-dashed border-[var(--color-border)] p-3 text-xs text-[var(--color-muted-foreground)]">
+          Switch to this cluster to manage its installer state and run updates.
+        </div>
       ) : null}
     </li>
+  );
+}
+
+function UpdateApiServerPanel({ cluster }: { cluster: Cluster }) {
+  const host = useHost();
+  const client = useApplianceClient();
+  const { config } = useSelectedCluster();
+  const apiKey = config?.apiKey ?? null;
+  const [status, setStatus] = React.useState<RunStatus>('idle');
+  const [logs, setLogs] = React.useState<string[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const [awsProfile, setAwsProfile] = React.useState('');
+  const [targetVersion, setTargetVersion] = React.useState('');
+
+  // Same cluster-info query the migration panels use — TanStack Query
+  // dedupes by key so this doesn't generate a second request.
+  const clusterInfoQuery = useQuery({
+    queryKey: ['cluster-info', cluster.id],
+    enabled: Boolean(client),
+    queryFn: async () => {
+      const r = await client!.getClusterInfo();
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+    retry: false,
+  });
+  const runningVersion = clusterInfoQuery.data?.version ?? null;
+
+  // Latest semver tag on ghcr.io/appliance-sh/api-server. Best-effort:
+  // if the lookup fails (no network, package private, etc.) the user
+  // can still type a version manually.
+  const latestQuery = useQuery({
+    queryKey: ['ghcr-latest', 'appliance-sh/api-server'],
+    enabled: Boolean(host.bootstrap?.latestApiServerVersion),
+    queryFn: async () => host.bootstrap!.latestApiServerVersion!(),
+    retry: false,
+    staleTime: 60_000,
+  });
+  const latestVersion = latestQuery.data?.version ?? null;
+
+  // Default the input to whatever we know: latest from GHCR, else the
+  // running version (so the user can re-pin), else empty.
+  React.useEffect(() => {
+    if (targetVersion) return;
+    if (latestVersion) setTargetVersion(latestVersion);
+    else if (runningVersion) setTargetVersion(runningVersion);
+  }, [latestVersion, runningVersion, targetVersion]);
+
+  const profilesQuery = useQuery({
+    queryKey: ['aws-profiles'],
+    enabled: Boolean(host.bootstrap?.listAwsProfiles),
+    queryFn: () => host.bootstrap!.listAwsProfiles!(),
+  });
+  const profiles = profilesQuery.data ?? [];
+  const canEnumerateProfiles = Boolean(host.bootstrap?.listAwsProfiles);
+
+  const handleEvent = React.useCallback((e: BootstrapEvent) => {
+    switch (e.type) {
+      case 'log':
+        setLogs((prev) => [...prev, e.message]);
+        break;
+      case 'phase-failed':
+        setLogs((prev) => [...prev, `phase failed: ${e.error}`]);
+        break;
+      case 'resource':
+        if (e.op === 'same') return;
+        setLogs((prev) => [...prev, `${e.op.padEnd(7)} ${e.resourceType}  ${e.name}`]);
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const targetValid = /^\d+\.\d+\.\d+$/.test(targetVersion);
+
+  const onRun = async () => {
+    if (!targetValid) return;
+    if (!host.bootstrap?.updateApiServer) return;
+    if (!apiKey) {
+      setStatus('failed');
+      setError('No API key loaded for this cluster — switch to it first.');
+      return;
+    }
+    setStatus('running');
+    setLogs([]);
+    setError(null);
+    try {
+      await host.bootstrap.updateApiServer(
+        {
+          apiServerUrl: cluster.apiServerUrl,
+          apiKey,
+          targetVersion,
+          awsProfile: awsProfile || undefined,
+        },
+        undefined,
+        handleEvent
+      );
+      setStatus('succeeded');
+    } catch (err) {
+      setStatus('failed');
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="ml-7 mt-2 space-y-2 rounded-md border border-[var(--color-border)] p-3">
+      <div>
+        <div className="text-sm font-medium">Update api-server / api-worker</div>
+        <div className="text-xs text-[var(--color-muted-foreground)]">
+          Mirror a new <code className="font-mono">ghcr.io/appliance-sh/api-server</code> tag into this cluster&apos;s
+          ECR and redeploy the system Lambdas. Worker is updated first; the api-server&apos;s deploy goes through the
+          (now upgraded) worker.
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        <div>
+          <span className="text-[var(--color-muted-foreground)]">Running</span>
+          <div className="font-mono">
+            {clusterInfoQuery.isLoading ? (
+              <span className="text-[var(--color-muted-foreground)]">…</span>
+            ) : runningVersion ? (
+              runningVersion
+            ) : (
+              <span className="text-[var(--color-muted-foreground)]" title="version field missing from /cluster-info">
+                unknown
+              </span>
+            )}
+          </div>
+        </div>
+        <div>
+          <span className="text-[var(--color-muted-foreground)]">Latest on ghcr.io</span>
+          <div className="font-mono">
+            {latestQuery.isLoading ? (
+              <span className="text-[var(--color-muted-foreground)]">…</span>
+            ) : latestVersion ? (
+              latestVersion
+            ) : (
+              <span
+                className="text-[var(--color-muted-foreground)]"
+                title={latestQuery.error instanceof Error ? latestQuery.error.message : String(latestQuery.error ?? '')}
+              >
+                unavailable
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">Target version</span>
+        <input
+          type="text"
+          value={targetVersion}
+          onChange={(e) => setTargetVersion(e.target.value)}
+          placeholder="1.37.0"
+          disabled={status === 'running'}
+          spellCheck={false}
+          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+        />
+      </label>
+
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">AWS profile</span>
+        {canEnumerateProfiles ? (
+          <select
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 text-sm disabled:opacity-50"
+          >
+            <option value="">— shell environment —</option>
+            {profiles.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+                {p.isSso ? '  (SSO)' : ''}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            placeholder="leave empty to use shell env"
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+          />
+        )}
+      </label>
+
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={onRun} disabled={status === 'running' || !targetValid}>
+          {status === 'running' ? 'Updating…' : `Update to ${targetVersion || '…'}`}
+        </Button>
+        {status === 'succeeded' ? <span className="text-xs text-green-400">✓ Update complete</span> : null}
+        {status === 'failed' ? <span className="text-xs text-red-400">Failed</span> : null}
+      </div>
+
+      {logs.length > 0 || error ? (
+        <div className="rounded-md border border-[var(--color-border)] bg-black/30">
+          <div className="max-h-48 overflow-auto px-2 py-1.5 font-mono text-xs leading-relaxed">
+            {logs.map((l, i) => (
+              <div key={i} className="whitespace-pre-wrap">
+                {l}
+              </div>
+            ))}
+            {error ? <div className={cn('whitespace-pre-wrap', 'text-red-400')}>{error}</div> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -222,12 +440,28 @@ const COPY: Record<
 function StateMigrationPanel({ cluster, direction }: { cluster: Cluster; direction: Direction }) {
   const host = useHost();
   const queryClient = useQueryClient();
+  const client = useApplianceClient();
   const [status, setStatus] = React.useState<RunStatus>('idle');
   const [logs, setLogs] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [awsProfile, setAwsProfile] = React.useState('');
-  const [stateBackendUrl, setStateBackendUrl] = React.useState(cluster.stateBackendUrl ?? '');
+
+  // Pull the cluster's state backend URL from the api-server's
+  // base config rather than asking the user to paste it. The bucket
+  // is created by `applianceBase` and recorded as `stateBackendUrl`
+  // in APPLIANCE_BASE_CONFIG; `/api/v1/cluster-info` exposes it.
+  const clusterInfoQuery = useQuery({
+    queryKey: ['cluster-info', cluster.id],
+    enabled: Boolean(client),
+    queryFn: async () => {
+      const r = await client!.getClusterInfo();
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+  });
+  const stateBackendUrl = clusterInfoQuery.data?.baseConfig.stateBackendUrl ?? '';
   const stateBackendUrlValid = stateBackendUrl.startsWith('s3://') && stateBackendUrl.length > 's3://'.length;
+
   const profilesQuery = useQuery({
     queryKey: ['aws-profiles'],
     enabled: Boolean(host.bootstrap?.listAwsProfiles),
@@ -287,22 +521,29 @@ function StateMigrationPanel({ cluster, direction }: { cluster: Cluster; directi
         <div className="text-xs text-[var(--color-muted-foreground)]">{copy.description}</div>
       </div>
 
-      <label className="block space-y-1 text-xs">
-        <span className="text-[var(--color-muted-foreground)]">State backend URL</span>
-        <input
-          type="text"
-          value={stateBackendUrl}
-          onChange={(e) => setStateBackendUrl(e.target.value)}
-          placeholder="s3://us-east-1-state-XXXXXXX"
-          disabled={status === 'running'}
-          spellCheck={false}
-          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
-        />
+      <div className="space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">State backend</span>
+        <div className="rounded-md border border-[var(--color-border)] bg-black/20 px-2 py-1.5 font-mono text-sm">
+          {clusterInfoQuery.isLoading ? (
+            <span className="text-[var(--color-muted-foreground)]">Loading from api-server…</span>
+          ) : clusterInfoQuery.isError ? (
+            <span className="text-red-400">
+              Failed to read /api/v1/cluster-info:{' '}
+              {clusterInfoQuery.error instanceof Error
+                ? clusterInfoQuery.error.message
+                : String(clusterInfoQuery.error)}
+            </span>
+          ) : stateBackendUrl ? (
+            stateBackendUrl
+          ) : (
+            <span className="text-[var(--color-muted-foreground)]">no stateBackendUrl in cluster info</span>
+          )}
+        </div>
         <span className="text-[var(--color-muted-foreground)]">
-          The cluster&apos;s state bucket. Find it in S3 under a name like{' '}
-          <code className="font-mono">&lt;region&gt;-state-&lt;7-char hash&gt;</code>.
+          Read from <code className="font-mono">/api/v1/cluster-info</code> — this is the bucket{' '}
+          <code className="font-mono">applianceBase</code> created for the cluster.
         </span>
-      </label>
+      </div>
 
       <label className="block space-y-1 text-xs">
         <span className="text-[var(--color-muted-foreground)]">AWS profile</span>

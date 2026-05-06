@@ -590,6 +590,58 @@ async fn demote_state(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
+/// Self-update the api-server + api-worker on the cluster to a new
+/// image version. The sidecar runs the mirror-to-ECR step (needs
+/// docker, which Lambda doesn't have) then drives the deploys via
+/// the cluster's existing deployment API.
+#[tauri::command]
+async fn update_api_server(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(format!(
+                "update_api_server expected an object input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("update-api-server".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
+/// Resolve the latest semver-shaped tag on a ghcr.io image. The
+/// sidecar talks Docker Registry v2 directly (anonymous pull token).
+/// No event stream — this is a single-shot lookup, but we route it
+/// through the sidecar for consistency with the rest of the
+/// bootstrap-pkg surface.
+#[tauri::command]
+async fn latest_api_server_version(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => {
+            return Err(format!(
+                "latest_api_server_version expected an object or null input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("latest-version".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -604,7 +656,9 @@ pub fn run() {
             list_aws_profiles,
             run_bootstrap,
             promote_state,
-            demote_state
+            demote_state,
+            update_api_server,
+            latest_api_server_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

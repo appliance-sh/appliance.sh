@@ -3,6 +3,8 @@ import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import type {
   AddClusterInput,
+  ApiServerUpdateInput,
+  ApiServerUpdateOptions,
   AwsProfile,
   BootstrapEvent,
   BootstrapInput,
@@ -11,6 +13,7 @@ import type {
   Cluster,
   ConsoleHost,
   HostConfig,
+  LatestGhcrTagInput,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,
@@ -86,6 +89,29 @@ export const tauriHost: ConsoleHost = {
       channel.onmessage = onEvent;
       await invoke('demote_state', {
         input: { input, options: options ?? {} },
+        onEvent: channel,
+      });
+    },
+    async updateApiServer(
+      input: ApiServerUpdateInput,
+      options: ApiServerUpdateOptions | undefined,
+      onEvent: (event: BootstrapEvent) => void
+    ): Promise<void> {
+      const channel = new Channel<BootstrapEvent>();
+      channel.onmessage = onEvent;
+      await invoke('update_api_server', {
+        input: { input, options: options ?? {} },
+        onEvent: channel,
+      });
+    },
+    async latestApiServerVersion(input?: LatestGhcrTagInput): Promise<{ version: string }> {
+      const channel = new Channel<BootstrapEvent>();
+      // We don't surface progress for the version lookup — but the
+      // Tauri command always wires a Channel for parity with the
+      // event-streaming sidecar calls.
+      channel.onmessage = () => {};
+      return invoke<{ version: string }>('latest_api_server_version', {
+        input: { input: input ?? {} },
         onEvent: channel,
       });
     },

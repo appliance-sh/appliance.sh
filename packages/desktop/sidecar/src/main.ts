@@ -1,10 +1,15 @@
 import {
+  latestGhcrTag,
+  runApiServerUpdate,
   runBootstrap,
   runStateDemotion,
   runStatePromotion,
+  type ApiServerUpdateInput,
+  type ApiServerUpdateOptions,
   type BootstrapEvent,
   type BootstrapInput,
   type BootstrapOptions,
+  type LatestGhcrTagInput,
   type StateDemotionInput,
   type StateDemotionOptions,
   type StatePromotionInput,
@@ -37,6 +42,15 @@ type SidecarInput =
       kind: 'demote-state';
       input: StateDemotionInput;
       options?: StateDemotionOptions;
+    }
+  | {
+      kind: 'update-api-server';
+      input: ApiServerUpdateInput;
+      options?: ApiServerUpdateOptions;
+    }
+  | {
+      kind: 'latest-version';
+      input?: LatestGhcrTagInput;
     };
 
 async function readStdin(): Promise<string> {
@@ -91,6 +105,19 @@ async function main(): Promise<void> {
           onEvent,
         });
         emit({ type: 'result', result: {} });
+        break;
+      }
+      case 'update-api-server': {
+        await runApiServerUpdate(parsed.input, {
+          ...(parsed.options ?? {}),
+          onEvent,
+        });
+        emit({ type: 'result', result: {} });
+        break;
+      }
+      case 'latest-version': {
+        const version = await latestGhcrTag(parsed.input ?? {});
+        emit({ type: 'result', result: { version } });
         break;
       }
       default: {
