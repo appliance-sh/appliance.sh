@@ -17,6 +17,7 @@ jobs:
       issues: write # to be able to comment on released issues
       pull-requests: write # to be able to comment on released pull requests
       id-token: write # to enable use of OIDC for npm provenance and trusted publishing
+      actions: write # to dispatch the api-server image build workflow on a fresh release
     outputs:
       publish_required: ${{ steps.semantic_release.outputs.publish_required }}
     steps:
@@ -47,3 +48,25 @@ jobs:
           git config --global user.email "eliot.lim@gmail.com"
           git config --global user.name "Eliot Lim"
           pnpm run release:ci
+
+      - name: Dispatch api-server image build
+        # `nx release` writes a `chore(release): publish X.Y.Z` commit
+        # to HEAD only when a version bump actually happened. Tags it
+        # pushes with GITHUB_TOKEN can't fire the `tags: v*` trigger
+        # on release-api-server-image.yml (that's a deliberate GitHub
+        # safety against workflow recursion), so we kick the image
+        # build manually via workflow_dispatch — which GITHUB_TOKEN
+        # *is* allowed to invoke. Skip the dispatch when no release
+        # was cut so we don't push duplicate image tags on no-op runs.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          msg=$(git log -1 --pretty=%s)
+          if echo "$msg" | grep -qE '^chore\(release\): publish'; then
+            VERSION=$(node -p "require('./packages/api-server/package.json').version")
+            echo "Dispatching api-server image build for v${VERSION}"
+            gh workflow run release-api-server-image.yml --ref main -f tag="${VERSION}"
+          else
+            echo "HEAD ('${msg}') is not a release commit; skipping image dispatch."
+          fi
