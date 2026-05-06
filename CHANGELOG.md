@@ -1,3 +1,20 @@
+## 1.38.0 (2026-05-06)
+
+### Features
+
+- **api-server,bootstrap,desktop:** self-updating ([3f45d8f](https://github.com/appliance-sh/appliance.sh/commit/3f45d8f))
+- **bootstrap:** improved container port management ([92f0767](https://github.com/appliance-sh/appliance.sh/commit/92f0767))
+- **bootstrap:** state promotion ([a730d8d](https://github.com/appliance-sh/appliance.sh/commit/a730d8d))
+- **desktop:** state promotion and detach ([0807a5e](https://github.com/appliance-sh/appliance.sh/commit/0807a5e))
+
+### Bug Fixes
+
+- **ci:** release triggers image build ([cc2b93a](https://github.com/appliance-sh/appliance.sh/commit/cc2b93a))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.37.0 (2026-05-05)
 
 ### Features
