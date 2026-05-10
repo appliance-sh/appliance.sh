@@ -86,13 +86,6 @@ export async function runApiServerUpdate(
   const imageBase = input.imageBase ?? DEFAULT_IMAGE_BASE;
   const sourceImage = `${imageBase}:${input.targetVersion}`;
 
-  if (input.awsProfile) {
-    process.env.AWS_PROFILE = input.awsProfile;
-    delete process.env.AWS_ACCESS_KEY_ID;
-    delete process.env.AWS_SECRET_ACCESS_KEY;
-    delete process.env.AWS_SESSION_TOKEN;
-  }
-
   const client = createApplianceClient({
     baseUrl: input.apiServerUrl,
     credentials: { keyId: input.apiKey.id, secret: input.apiKey.secret },
@@ -133,6 +126,7 @@ export async function runApiServerUpdate(
     ecrRepositoryUrl: baseConfig.aws.ecrRepositoryUrl,
     tag: `api-server-${input.targetVersion}`,
     region: baseConfig.aws.region,
+    awsProfile: input.awsProfile,
     emit,
   });
   emit({ type: 'log', level: 'info', message: `ECR image: ${ecrImageUri}` });

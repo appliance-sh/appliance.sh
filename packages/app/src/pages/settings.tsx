@@ -490,6 +490,8 @@ function StateMigrationPanel({ cluster, direction }: { cluster: Cluster; directi
   const host = useHost();
   const queryClient = useQueryClient();
   const client = useApplianceClient();
+  const { config } = useSelectedCluster();
+  const apiKey = config?.apiKey ?? null;
   const [status, setStatus] = React.useState<RunStatus>('idle');
   const [logs, setLogs] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -546,7 +548,18 @@ function StateMigrationPanel({ cluster, direction }: { cluster: Cluster; directi
     try {
       await action.call(
         host.bootstrap,
-        { stateBackendUrl, awsProfile: awsProfile || undefined },
+        {
+          stateBackendUrl,
+          awsProfile: awsProfile || undefined,
+          // Cluster ref lets the bootstrap pkg verify the URL we're
+          // about to operate on against /cluster-info. This panel
+          // already sources stateBackendUrl from cluster-info via
+          // the same client, so the verification is effectively a
+          // belt + braces check — but it covers the path where the
+          // sidecar is fed a different value somehow (compromised
+          // IPC, future caller changes).
+          cluster: apiKey ? { apiServerUrl: cluster.apiServerUrl, apiKey } : undefined,
+        },
         undefined,
         handleEvent
       );

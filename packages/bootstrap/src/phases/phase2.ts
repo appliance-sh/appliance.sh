@@ -90,23 +90,18 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
   const sourceImage = input.apiServerImageUri ?? DEFAULT_API_SERVER_IMAGE;
   const versionTag = VERSION.replace(/^v/, '');
 
-  // The ECR mirror runs in the bootstrap process itself, so the AWS
-  // SDK in this process needs the wizard-selected profile. Setting
-  // process.env up front is the cheapest way; it also covers any
-  // other AWS SDK calls phase 2 might make later (none today).
-  if (input.aws?.profile) {
-    process.env.AWS_PROFILE = input.aws.profile;
-    delete process.env.AWS_ACCESS_KEY_ID;
-    delete process.env.AWS_SECRET_ACCESS_KEY;
-    delete process.env.AWS_SESSION_TOKEN;
-  }
-
   emit({ type: 'log', level: 'info', message: `mirroring ${sourceImage} → cluster ECR…` });
   const ecrImageUri = await mirrorImageToEcr({
     sourceImage,
     ecrRepositoryUrl: baseConfig.aws.ecrRepositoryUrl,
     tag: `api-server-${versionTag}`,
     region,
+    // Pass the wizard-selected profile explicitly so the ECR client
+    // resolves credentials for it. We deliberately don't mutate
+    // process.env here — every AWS SDK call in this package now
+    // takes credentials as an argument so concurrent operations
+    // can't pollute each other.
+    awsProfile: input.aws?.profile,
     emit,
   });
   emit({ type: 'log', level: 'info', message: `ECR image: ${ecrImageUri}` });

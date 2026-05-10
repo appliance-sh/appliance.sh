@@ -3,6 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as auto from '@pulumi/pulumi/automation';
 import { awsCredsFromEnv, homeEnv } from './phases/helpers';
+import { verifyStateBackendUrl, type ClusterRef } from './cluster-verify';
 import type { BootstrapEvent } from './types';
 
 export interface StateDemotionInput {
@@ -15,6 +16,16 @@ export interface StateDemotionInput {
   stateBackendUrl: string;
   /** AWS profile to use for the S3 read. Same shape as phase 3. */
   awsProfile?: string;
+  /**
+   * When provided, fetch the cluster's `/api/v1/cluster-info` and
+   * assert that `stateBackendUrl` matches what the cluster reports
+   * as canonical. Refuses to import state from a bucket the cluster
+   * doesn't own — important here because demoting from an attacker-
+   * controlled bucket would let them rewrite the operator's local
+   * Pulumi state. Skipped silently if cluster-info is unreachable
+   * (older api-server).
+   */
+  cluster?: ClusterRef;
 }
 
 export interface StateDemotionOptions {
@@ -69,6 +80,15 @@ export async function runStateDemotion(input: StateDemotionInput, options: State
         `Pass the cluster's stateBackendUrl as written by phase 1 (look for the bucket name in S3).`
     );
   }
+
+  // Verify against the cluster's authoritative URL before touching
+  // any filesystem state. Importing from a bucket the cluster doesn't
+  // own would let an attacker overwrite the operator's local Pulumi
+  // state; we'd rather fail loud than silently demote the wrong
+  // installer.
+  await verifyStateBackendUrl(stateBackendUrl, input.cluster, (level, message) =>
+    emit({ type: 'log', level, message })
+  );
 
   const localStateDir = path.join(cacheDir, 'pulumi-state');
   const localWorkDir = path.join(cacheDir, 'pulumi-workdir');

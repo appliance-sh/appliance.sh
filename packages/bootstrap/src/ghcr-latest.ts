@@ -11,6 +11,13 @@ const TOKEN_ENDPOINT = 'https://ghcr.io/token';
 const REGISTRY_ENDPOINT = 'https://ghcr.io/v2';
 
 const SEMVER_TAG = /^\d+\.\d+\.\d+$/;
+// Valid OCI image path: lowercase letters, digits, slashes, and the
+// punctuation characters the registry spec allows in repository
+// names. Deliberately strict — we never need anything outside this
+// set, and refusing odd inputs blocks URL injection (`?`, `#`, `&`,
+// path-traversal segments, etc.) when the input is interpolated
+// into the registry URL below.
+const IMAGE_PATH = /^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$/;
 
 export interface LatestGhcrTagInput {
   /**
@@ -32,6 +39,12 @@ const DEFAULT_IMAGE = 'appliance-sh/api-server';
  */
 export async function latestGhcrTag(input: LatestGhcrTagInput = {}): Promise<string> {
   const image = input.image ?? DEFAULT_IMAGE;
+  if (!IMAGE_PATH.test(image)) {
+    throw new Error(
+      `invalid image path "${image}" — must match ${IMAGE_PATH.source}. ` +
+        `Path components are interpolated into the registry URL, so we refuse anything outside the OCI image-path charset.`
+    );
+  }
 
   const tokenRes = await fetch(`${TOKEN_ENDPOINT}?scope=repository:${image}:pull`);
   if (!tokenRes.ok) {

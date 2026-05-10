@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { runPhase3 } from './phases/phase3';
+import { verifyStateBackendUrl, type ClusterRef } from './cluster-verify';
 import type { BootstrapEvent } from './types';
 
 export interface StatePromotionInput {
@@ -17,6 +18,16 @@ export interface StatePromotionInput {
    * are already in the shell env."
    */
   awsProfile?: string;
+  /**
+   * When provided, fetch the cluster's `/api/v1/cluster-info` and
+   * assert that `stateBackendUrl` matches what the cluster reports
+   * as its canonical state bucket. Recommended for any caller that
+   * sourced the URL from less-trusted input (operator paste,
+   * persisted config). Skipped silently if cluster-info is
+   * unreachable (older api-server) — promotion proceeds with a
+   * warning log.
+   */
+  cluster?: ClusterRef;
 }
 
 export interface StatePromotionOptions {
@@ -48,6 +59,9 @@ export async function runStatePromotion(
   // the same event handler it uses for bootstrap runs.
   emit({ type: 'phase-started', phase: 'phase3' });
   try {
+    await verifyStateBackendUrl(input.stateBackendUrl, input.cluster, (level, message) =>
+      emit({ type: 'log', level, message })
+    );
     await runPhase3({
       cacheDir,
       stateBackendUrl: input.stateBackendUrl,

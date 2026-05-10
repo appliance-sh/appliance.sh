@@ -1,4 +1,5 @@
 import { DescribeImagesCommand, ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import type { BootstrapEvent } from '../types';
 import { hostDockerPlatform, imageRepoDigest, login, pullImage, pushImage, tagImage } from './container';
 
@@ -10,6 +11,14 @@ interface MirrorOptions {
   /** Tag to push under in the cluster's ECR (e.g. the version). */
   tag: string;
   region: string;
+  /**
+   * AWS profile to use for the ECR API calls. When provided, the SDK
+   * resolves credentials from `~/.aws/{config,credentials}` for that
+   * profile (SSO-aware via the standard provider chain). When omitted,
+   * the SDK's default chain runs (env vars → shared config → IMDS).
+   * Passed explicitly so callers don't have to mutate `process.env`.
+   */
+  awsProfile?: string;
   emit?: (e: BootstrapEvent) => void;
 }
 
@@ -24,7 +33,7 @@ interface MirrorOptions {
  * runtime doesn't expose a digest after push.
  */
 export async function mirrorImageToEcr(opts: MirrorOptions): Promise<string> {
-  const { sourceImage, ecrRepositoryUrl, tag, region, emit } = opts;
+  const { sourceImage, ecrRepositoryUrl, tag, region, awsProfile, emit } = opts;
 
   // Pin to the host's native platform so we end up with a
   // single-platform local image. Containerd image-store users would
@@ -35,7 +44,16 @@ export async function mirrorImageToEcr(opts: MirrorOptions): Promise<string> {
   pullImage(sourceImage, emit, hostDockerPlatform());
 
   emit?.({ type: 'log', level: 'info', message: `requesting ECR auth in ${region}` });
-  const ecr = new ECRClient({ region });
+  // Constructing credentials explicitly when a profile is set keeps
+  // the SDK from picking up unrelated env vars (notably stale
+  // AWS_ACCESS_KEY_ID values that would otherwise win in the default
+  // chain). Without a profile we let the default chain run — that's
+  // what gives us Lambda role auth in-cluster and shell-env auth
+  // locally.
+  const ecr = new ECRClient({
+    region,
+    credentials: awsProfile ? fromNodeProviderChain({ profile: awsProfile }) : undefined,
+  });
   const authResult = await ecr.send(new GetAuthorizationTokenCommand({}));
   const authData = authResult.authorizationData?.[0];
   if (!authData?.authorizationToken || !authData?.proxyEndpoint) {
