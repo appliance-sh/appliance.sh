@@ -1,3 +1,14 @@
+## 1.39.0 (2026-05-10)
+
+### Features
+
+- **bootstrap:** improve update mechanism ([b10279f](https://github.com/appliance-sh/appliance.sh/commit/b10279f))
+- **bootstrap:** improve state promotion mechanism ([1471516](https://github.com/appliance-sh/appliance.sh/commit/1471516))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.38.0 (2026-05-06)
 
 ### Features
