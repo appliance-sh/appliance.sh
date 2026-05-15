@@ -1,16 +1,26 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as pulumi from '@pulumi/pulumi';
 import * as auto from '@pulumi/pulumi/automation';
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 import { ApplianceStack, ApplianceStackMetadata, toResourceId } from './aws/ApplianceStack';
 import { applianceBaseConfig, ApplianceBaseConfig } from '@appliance.sh/sdk';
 
-// Shared across every deployment on a given worker. Plugins cached at
-// build time into /opt/pulumi-cache/plugins are symlinked into
-// ${PULUMI_HOME}/plugins on first use so cold starts avoid downloading
-// them.
-const PULUMI_HOME = '/tmp/.pulumi';
+// Plugin cache + PULUMI_HOME layout in the api-server container image.
+// The Dockerfile pre-downloads each pinned Pulumi plugin into
+// PLUGIN_CACHE_DIR at build time so cold starts on Lambda don't have to
+// fetch them; `ensurePluginCache` symlinks those into CONTAINER_PULUMI_HOME
+// on the worker's first deploy. Both paths live under /tmp because
+// Lambda's filesystem is read-only outside of it.
+//
+// LOCAL dev hits neither of these — there's no /opt/pulumi-cache, and
+// forcing PULUMI_HOME under /tmp on a developer machine would just
+// shadow the developer's normal `~/.pulumi` (with its plugin cache,
+// config, telemetry opt-out, etc.). `pulumiHome()` returns undefined
+// in that case, so we leave PULUMI_HOME unset and Pulumi falls back
+// to its default location with normal auto-downloading.
+const CONTAINER_PULUMI_HOME = '/tmp/.pulumi';
 const PLUGIN_CACHE_DIR = '/opt/pulumi-cache/plugins';
 
 export type PulumiAction = 'deploy' | 'destroy' | 'refresh';
@@ -72,13 +82,36 @@ export class ApplianceDeploymentService {
       const globalProvider = new aws.Provider(`${rid}-global`, {
         region: 'us-east-1',
       });
-      const nativeRegionalProvider = new awsNative.Provider(`${rid}-native-regional`, {
-        region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
-      });
+      // `ignoreChanges: ['profile']` defends against state drift on
+      // the provider's `profile` field. Local bootstrap runs spawn
+      // the api-server container with `AWS_PROFILE` in its env (so
+      // SSO / shared-credential profiles work for the local Pulumi
+      // process), which pulumi-aws-native captures into provider
+      // state on first deploy. Cloud-worker runs of the same stack
+      // have no AWS_PROFILE — so the next refresh/up sees a diff
+      // and replaces the provider, which forces a re-import of every
+      // child resource. pulumi-aws-native@1.58 has a panic in
+      // ParseCheckpointObject on that re-import path (`interface
+      // conversion: interface {} is nil, not resource.PropertyMap`),
+      // which corrupts the resource state with `__inputs` missing.
+      // Telling Pulumi to ignore the field stops the replacement and
+      // sidesteps the bug entirely.
+      const nativeProviderOpts: pulumi.ResourceOptions = { ignoreChanges: ['profile'] };
+      const nativeRegionalProvider = new awsNative.Provider(
+        `${rid}-native-regional`,
+        {
+          region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
+        },
+        nativeProviderOpts
+      );
 
-      const nativeGlobalProvider = new awsNative.Provider(`${rid}-native-global`, {
-        region: 'us-east-1',
-      });
+      const nativeGlobalProvider = new awsNative.Provider(
+        `${rid}-native-global`,
+        {
+          region: 'us-east-1',
+        },
+        nativeProviderOpts
+      );
 
       const applianceStack = new ApplianceStack(
         stackName,
@@ -112,21 +145,35 @@ export class ApplianceDeploymentService {
   }
 
   /**
+   * Resolve the PULUMI_HOME the spawned pulumi process should use.
+   * Container image: returns `/tmp/.pulumi` (Lambda's only writable
+   * area), with plugins pre-seeded from /opt. Local dev: returns
+   * undefined so Pulumi uses its own default (`~/.pulumi`) and
+   * auto-downloads plugins normally — overriding to /tmp on a dev
+   * machine would point pulumi at an empty home with no plugins
+   * and no auto-install path.
+   */
+  private pulumiHome(): string | undefined {
+    return fs.existsSync(PLUGIN_CACHE_DIR) ? CONTAINER_PULUMI_HOME : undefined;
+  }
+
+  /**
    * Build the env vars passed to the Pulumi Automation API workspace.
    * PULUMI_HOME is shared across every project the worker handles — this
    * keeps one plugin cache (pre-seeded from /opt at image build time)
    * reused across projects. Per-project isolation is handled via
-   * `workDir` instead.
+   * `workDir` instead. In local dev PULUMI_HOME is left unset.
    */
   private buildEnvVars(): Record<string, string> {
     if (!this.baseConfig) {
       throw new Error('Missing base config');
     }
-    this.ensurePluginCache();
+    const home = this.pulumiHome();
+    if (home) this.ensurePluginCache(home);
     return {
       AWS_REGION: this.region,
       PULUMI_BACKEND_URL: this.baseConfig.stateBackendUrl,
-      PULUMI_HOME,
+      ...(home ? { PULUMI_HOME: home } : {}),
     };
   }
 
@@ -143,9 +190,9 @@ export class ApplianceDeploymentService {
    * (no copy, no /tmp bloat), while ${PULUMI_HOME}/plugins remains
    * writable for pulumi's own metadata.
    */
-  private ensurePluginCache(): void {
+  private ensurePluginCache(pulumiHome: string): void {
     if (!fs.existsSync(PLUGIN_CACHE_DIR)) return;
-    const target = path.join(PULUMI_HOME, 'plugins');
+    const target = path.join(pulumiHome, 'plugins');
     fs.mkdirSync(target, { recursive: true });
     for (const entry of fs.readdirSync(PLUGIN_CACHE_DIR)) {
       const sourcePath = path.join(PLUGIN_CACHE_DIR, entry);
