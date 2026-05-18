@@ -60,6 +60,15 @@ struct Cluster {
     // or migrated from the legacy single-cluster shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_backend_url: Option<String>,
+    // Original BootstrapInput the wizard collected, stored as an
+    // opaque JSON value (the schema lives in @appliance.sh/bootstrap;
+    // the Rust side just round-trips it). Reused by the Settings
+    // page's "Update baseline" action so phase 1 re-runs with the
+    // same dns.createZone / vpc / region choices and doesn't flip
+    // declarative state on the operator. Absent for clusters added
+    // before this field landed, and for clusters added via Connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_bootstrap_input: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -94,6 +103,8 @@ struct AddClusterInput {
     api_key: ApiKey,
     #[serde(default)]
     state_backend_url: Option<String>,
+    #[serde(default)]
+    last_bootstrap_input: Option<serde_json::Value>,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
@@ -174,6 +185,7 @@ fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, Ho
         api_server_url: legacy_url,
         created_at: chrono::Utc::now().to_rfc3339(),
         state_backend_url: None,
+        last_bootstrap_input: None,
     };
 
     write_api_key(&cluster_keychain_account(&id), &legacy_key)?;
@@ -219,6 +231,7 @@ fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostEr
         api_server_url: input.api_server_url,
         created_at: chrono::Utc::now().to_rfc3339(),
         state_backend_url: input.state_backend_url,
+        last_bootstrap_input: input.last_bootstrap_input,
     };
 
     write_api_key(&cluster_keychain_account(&cluster.id), &input.api_key)?;
@@ -615,6 +628,30 @@ async fn update_api_server(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
+/// Re-run phase 1 against the cluster's installer stack to update the
+/// infra baseline (state bucket, ECR, CloudFront, edge router, system
+/// roles, etc.) to whatever ships with this version of @appliance.sh/infra.
+#[tauri::command]
+async fn update_baseline(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        other => {
+            return Err(format!(
+                "update_baseline expected an object input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("update-baseline".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 /// Resolve the latest semver-shaped tag on a ghcr.io image. The
 /// sidecar talks Docker Registry v2 directly (anonymous pull token).
 /// No event stream — this is a single-shot lookup, but we route it
@@ -658,6 +695,7 @@ pub fn run() {
             promote_state,
             demote_state,
             update_api_server,
+            update_baseline,
             latest_api_server_version
         ])
         .run(tauri::generate_context!())

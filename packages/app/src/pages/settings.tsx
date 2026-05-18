@@ -172,6 +172,7 @@ function ClusterRow({
           telling the user to switch first. */}
       {canPromote && isSelected ? (
         <>
+          <UpdateBaselinePanel cluster={cluster} />
           <UpdateApiServerPanel cluster={cluster} />
           <StateMigrationPanel cluster={cluster} direction="promote" />
           <StateMigrationPanel cluster={cluster} direction="demote" />
@@ -182,6 +183,180 @@ function ClusterRow({
         </div>
       ) : null}
     </li>
+  );
+}
+
+function UpdateBaselinePanel({ cluster }: { cluster: Cluster }) {
+  const host = useHost();
+  const client = useApplianceClient();
+  const { config } = useSelectedCluster();
+  const apiKey = config?.apiKey ?? null;
+  const [status, setStatus] = React.useState<RunStatus>('idle');
+  const [logs, setLogs] = React.useState<string[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const [awsProfile, setAwsProfile] = React.useState('');
+
+  const clusterInfoQuery = useQuery({
+    queryKey: ['cluster-info', cluster.id],
+    enabled: Boolean(client),
+    queryFn: async () => {
+      const r = await client!.getClusterInfo();
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+    retry: false,
+  });
+  const stateBackendUrl = clusterInfoQuery.data?.baseConfig.stateBackendUrl ?? cluster.stateBackendUrl ?? '';
+  const runningBaselineVersion = clusterInfoQuery.data?.baseConfig.baselineVersion ?? null;
+  // The desktop ships infra at __APPLIANCE_VERSION__ — every package
+  // in the monorepo moves in lockstep, so the bundled SDK / infra /
+  // bootstrap versions all match the shell's reported version.
+  const bundledVersion = __APPLIANCE_VERSION__;
+
+  const profilesQuery = useQuery({
+    queryKey: ['aws-profiles'],
+    enabled: Boolean(host.bootstrap?.listAwsProfiles),
+    queryFn: () => host.bootstrap!.listAwsProfiles!(),
+  });
+  const profiles = profilesQuery.data ?? [];
+  const canEnumerateProfiles = Boolean(host.bootstrap?.listAwsProfiles);
+
+  const handleEvent = React.useCallback((e: BootstrapEvent) => {
+    switch (e.type) {
+      case 'log':
+        setLogs((prev) => [...prev, e.message]);
+        break;
+      case 'phase-failed':
+        setLogs((prev) => [...prev, `phase failed: ${e.error}`]);
+        break;
+      case 'resource':
+        if (e.op === 'same') return;
+        setLogs((prev) => [...prev, `${e.op.padEnd(7)} ${e.resourceType}  ${e.name}`]);
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const canUpdate = Boolean(host.bootstrap?.updateBaseline && cluster.lastBootstrapInput);
+
+  const onRun = async () => {
+    if (!host.bootstrap?.updateBaseline) return;
+    if (!cluster.lastBootstrapInput) return;
+    setStatus('running');
+    setLogs([]);
+    setError(null);
+    try {
+      await host.bootstrap.updateBaseline(
+        {
+          bootstrap: cluster.lastBootstrapInput,
+          stateBackendUrl: stateBackendUrl || undefined,
+          awsProfile: awsProfile || undefined,
+          cluster: apiKey ? { apiServerUrl: cluster.apiServerUrl, apiKey } : undefined,
+        },
+        undefined,
+        handleEvent
+      );
+      setStatus('succeeded');
+    } catch (err) {
+      setStatus('failed');
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="ml-7 mt-2 space-y-2 rounded-md border border-[var(--color-border)] p-3">
+      <div>
+        <div className="text-sm font-medium">Update infra baseline</div>
+        <div className="text-xs text-[var(--color-muted-foreground)]">
+          Re-run phase 1 against the cluster&apos;s installer stack to apply infra changes that ship with the bundled
+          @appliance.sh/infra package (state bucket policy, ECR, CloudFront, edge router, system roles, etc.). The
+          running api-server keeps its cached APPLIANCE_BASE_CONFIG until its next deploy — run an api-server update
+          afterwards to propagate any baseline value changes.
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        <div>
+          <span className="text-[var(--color-muted-foreground)]">Running</span>
+          <div className="font-mono">
+            {clusterInfoQuery.isLoading ? (
+              <span className="text-[var(--color-muted-foreground)]">…</span>
+            ) : runningBaselineVersion ? (
+              runningBaselineVersion
+            ) : (
+              <span
+                className="text-[var(--color-muted-foreground)]"
+                title="baselineVersion missing — cluster predates the field"
+              >
+                unknown
+              </span>
+            )}
+          </div>
+        </div>
+        <div>
+          <span className="text-[var(--color-muted-foreground)]">Bundled with this shell</span>
+          <div className="font-mono">{bundledVersion}</div>
+        </div>
+      </div>
+
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">AWS profile</span>
+        {canEnumerateProfiles ? (
+          <select
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 text-sm disabled:opacity-50"
+          >
+            <option value="">— shell environment —</option>
+            {profiles.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+                {p.isSso ? '  (SSO)' : ''}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            placeholder="leave empty to use shell env"
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+          />
+        )}
+      </label>
+
+      {!cluster.lastBootstrapInput ? (
+        <div className="rounded-md border border-dashed border-[var(--color-border)] p-2 text-xs text-[var(--color-muted-foreground)]">
+          No cached bootstrap input on this cluster — needed to preserve dns / vpc choices when re-running phase 1.
+          Re-run <code className="font-mono">/bootstrap</code> from this device to cache it, or operate via the CLI.
+        </div>
+      ) : null}
+
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={onRun} disabled={status === 'running' || !canUpdate}>
+          {status === 'running' ? 'Updating…' : `Update baseline to ${bundledVersion}`}
+        </Button>
+        {status === 'succeeded' ? <span className="text-xs text-green-400">✓ Baseline updated</span> : null}
+        {status === 'failed' ? <span className="text-xs text-red-400">Failed</span> : null}
+      </div>
+
+      {logs.length > 0 || error ? (
+        <div className="rounded-md border border-[var(--color-border)] bg-black/30">
+          <div className="max-h-48 overflow-auto px-2 py-1.5 font-mono text-xs leading-relaxed">
+            {logs.map((l, i) => (
+              <div key={i} className="whitespace-pre-wrap">
+                {l}
+              </div>
+            ))}
+            {error ? <div className={cn('whitespace-pre-wrap', 'text-red-400')}>{error}</div> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

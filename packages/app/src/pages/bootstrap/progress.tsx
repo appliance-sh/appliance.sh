@@ -180,12 +180,20 @@ export function BootstrapProgressPage() {
     // didn't already promote it. After promotion the local state
     // is gone, so a Settings-page promote action would have nothing
     // to do — and the cluster doesn't need to track the backend URL
-    // for any other reason.
+    // for any other reason. Stash the BootstrapInput regardless,
+    // since baseline updates need it to preserve dns/vpc choices.
     const stateBackendUrl = result.statePromoted ? undefined : result.stateBackendUrl || undefined;
+    const bootstrapInput = inputRef.current ?? undefined;
     setHandoff('saving');
     (async () => {
       try {
-        await host.addCluster({ name: clusterName, apiServerUrl, apiKey, stateBackendUrl });
+        await host.addCluster({
+          name: clusterName,
+          apiServerUrl,
+          apiKey,
+          stateBackendUrl,
+          lastBootstrapInput: bootstrapInput,
+        });
         await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
         setHandoff('saved');
       } catch (err) {

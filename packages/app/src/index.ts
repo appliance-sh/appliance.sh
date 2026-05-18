@@ -20,5 +20,7 @@ export type {
   StatePromotionOptions,
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
+  BaselineUpdateInput,
+  BaselineUpdateOptions,
   LatestGhcrTagInput,
 } from './lib/host';
