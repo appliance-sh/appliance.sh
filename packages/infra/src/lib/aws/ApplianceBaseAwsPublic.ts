@@ -1,7 +1,7 @@
 import * as pulumi from '@pulumi/pulumi';
 import * as aws from '@pulumi/aws';
 
-import { ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
+import { ApplianceBaseConfigInput, ApplianceBaseType, VERSION } from '@appliance.sh/sdk';
 
 export type ApplianceBaseAwsPublicArgs = {
   config: ApplianceBaseConfigInput;
@@ -641,6 +641,12 @@ export class ApplianceBaseAwsPublic extends pulumi.ComponentResource {
       stateBackendUrl: pulumi.interpolate`s3://${this.stateBucket.bucket}`,
       domainName: args.config.dns.domainName,
       type: ApplianceBaseType.ApplianceAwsPublic,
+      // Stamp the @appliance.sh/sdk version that applied this base.
+      // Resolves to a literal at infra-package build time, so each
+      // `pulumi up` re-stamps with the running infra version. The
+      // desktop reads this back via /cluster-info to decide whether
+      // a baseline update is needed.
+      baselineVersion: VERSION,
       aws: {
         region: args.config.region,
         zoneId: this.zoneId,

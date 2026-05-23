@@ -9,6 +9,14 @@ import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 export interface Phase1Options {
   cacheDir: string;
   emit: (event: BootstrapEvent) => void;
+  /**
+   * Override the Pulumi state backend. Defaults to the local file
+   * backend under `cacheDir/pulumi-state` (the bootstrap path).
+   * The desktop's baseline-update flow points this at the cluster's
+   * S3 backend (the same one phase 3 promoted to) so subsequent
+   * infra changes apply to the already-promoted installer stack.
+   */
+  stateBackendUrl?: string;
 }
 
 export interface Phase1Output {
@@ -34,8 +42,14 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
   const pulumiHome = path.join(opts.cacheDir, 'pulumi-home');
 
   fs.mkdirSync(workDir, { recursive: true });
-  fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(pulumiHome, { recursive: true });
+  // Only mint the local state dir when we're actually going to use
+  // a file backend — if the caller has supplied an S3 backend URL
+  // (the baseline-update path), the local dir is irrelevant.
+  const backendUrl = opts.stateBackendUrl ?? `file://${stateDir}`;
+  if (!opts.stateBackendUrl) {
+    fs.mkdirSync(stateDir, { recursive: true });
+  }
 
   const program = async () => {
     const { applianceBases } = await applianceInfra({
@@ -66,7 +80,7 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
     {
       workDir,
       envVars: {
-        PULUMI_BACKEND_URL: `file://${stateDir}`,
+        PULUMI_BACKEND_URL: backendUrl,
         PULUMI_HOME: pulumiHome,
         PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
         AWS_REGION: input.base.config.region ?? 'us-east-1',

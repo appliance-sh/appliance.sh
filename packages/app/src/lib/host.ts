@@ -1,6 +1,8 @@
 import type {
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
+  BaselineUpdateInput,
+  BaselineUpdateOptions,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
@@ -30,6 +32,12 @@ export interface Cluster {
   // bootstrap wizard skipped phase 3 or it failed mid-run. Absent
   // for clusters added manually via Connect.
   stateBackendUrl?: string;
+  // Original BootstrapInput the wizard collected. Persisted so the
+  // Settings page can run baseline updates against this cluster
+  // without forcing the operator to re-enter dns.createZone/etc.
+  // (which would risk flipping declarative state). Absent for
+  // clusters added via Connect or migrated from older shells.
+  lastBootstrapInput?: BootstrapInput;
 }
 
 export interface HostConfig {
@@ -46,6 +54,7 @@ export interface AddClusterInput {
   apiServerUrl: string;
   apiKey: { id: string; secret: string };
   stateBackendUrl?: string;
+  lastBootstrapInput?: BootstrapInput;
 }
 
 // Drives a bootstrap run from the UI. Tauri host implements this by
@@ -94,6 +103,17 @@ export interface BootstrapHost {
   updateApiServer(
     input: ApiServerUpdateInput,
     options: ApiServerUpdateOptions | undefined,
+    onEvent: (event: BootstrapEvent) => void
+  ): Promise<void>;
+  /**
+   * Re-run phase 1 (the installer stack) against an already-bootstrapped
+   * cluster to apply infra baseline changes that ship with this version
+   * of @appliance.sh/infra. Requires the original BootstrapInput; the
+   * desktop caches it on the Cluster record at handoff time.
+   */
+  updateBaseline(
+    input: BaselineUpdateInput,
+    options: BaselineUpdateOptions | undefined,
     onEvent: (event: BootstrapEvent) => void
   ): Promise<void>;
   /**
@@ -152,6 +172,8 @@ export interface ConsoleHost {
 export type {
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
+  BaselineUpdateInput,
+  BaselineUpdateOptions,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,

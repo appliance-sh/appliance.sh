@@ -48,6 +48,13 @@ export const applianceBaseConfig = z.object({
   type: z.enum(ApplianceBaseType),
   stateBackendUrl: z.string(),
   domainName: z.string().optional(),
+  // SDK version of the `@appliance.sh/infra` package that last
+  // applied this base. Stamped by the infra component on every
+  // `pulumi up`; surfaced via /api/v1/cluster-info so the desktop
+  // can compare against its bundled version and offer a baseline
+  // update. Absent for clusters bootstrapped before this field
+  // was added — treat as "unknown" / "needs update."
+  baselineVersion: z.string().optional(),
   aws: z.object({
     region: z.string(),
     zoneId: z.string(),

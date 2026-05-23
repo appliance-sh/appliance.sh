@@ -6,6 +6,8 @@ import type {
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
   AwsProfile,
+  BaselineUpdateInput,
+  BaselineUpdateOptions,
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
@@ -100,6 +102,18 @@ export const tauriHost: ConsoleHost = {
       const channel = new Channel<BootstrapEvent>();
       channel.onmessage = onEvent;
       await invoke('update_api_server', {
+        input: { input, options: options ?? {} },
+        onEvent: channel,
+      });
+    },
+    async updateBaseline(
+      input: BaselineUpdateInput,
+      options: BaselineUpdateOptions | undefined,
+      onEvent: (event: BootstrapEvent) => void
+    ): Promise<void> {
+      const channel = new Channel<BootstrapEvent>();
+      channel.onmessage = onEvent;
+      await invoke('update_baseline', {
         input: { input, options: options ?? {} },
         onEvent: channel,
       });

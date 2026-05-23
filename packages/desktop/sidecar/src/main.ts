@@ -1,11 +1,14 @@
 import {
   latestGhcrTag,
   runApiServerUpdate,
+  runBaselineUpdate,
   runBootstrap,
   runStateDemotion,
   runStatePromotion,
   type ApiServerUpdateInput,
   type ApiServerUpdateOptions,
+  type BaselineUpdateInput,
+  type BaselineUpdateOptions,
   type BootstrapEvent,
   type BootstrapInput,
   type BootstrapOptions,
@@ -47,6 +50,11 @@ type SidecarInput =
       kind: 'update-api-server';
       input: ApiServerUpdateInput;
       options?: ApiServerUpdateOptions;
+    }
+  | {
+      kind: 'update-baseline';
+      input: BaselineUpdateInput;
+      options?: BaselineUpdateOptions;
     }
   | {
       kind: 'latest-version';
@@ -109,6 +117,14 @@ async function main(): Promise<void> {
       }
       case 'update-api-server': {
         await runApiServerUpdate(parsed.input, {
+          ...(parsed.options ?? {}),
+          onEvent,
+        });
+        emit({ type: 'result', result: {} });
+        break;
+      }
+      case 'update-baseline': {
+        await runBaselineUpdate(parsed.input, {
           ...(parsed.options ?? {}),
           onEvent,
         });
