@@ -1,6 +1,13 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { applianceBaseConfig, BuildType, generateId, type Build } from '@appliance.sh/sdk';
+import {
+  applianceBaseConfig,
+  ApplianceBaseType,
+  BuildType,
+  generateId,
+  type ApplianceBaseConfig,
+  type Build,
+} from '@appliance.sh/sdk';
 import { getStorageService } from './storage.service';
 
 const COLLECTION = 'builds';
@@ -26,11 +33,25 @@ export class BuildUploadService {
   async createUpload(): Promise<BuildUploadResult> {
     const config = getBaseConfig();
     const buildId = generateId('build');
-    const s3Key = `builds/${buildId}.zip`;
 
+    // Local mode has no presigned-URL story — the upload pipeline is
+    // the cloud path's reason for existing. Callers running against a
+    // local base should be using `createRemoteImage` with an image
+    // reference instead (built host-side; imported into k3d). Fail
+    // loud rather than silently returning a useless empty uploadUrl.
+    if (config.type === ApplianceBaseType.ApplianceLocal) {
+      throw new Error(
+        'Upload-flow builds are not supported on local bases. Use a remote-image build referencing a host-built image.'
+      );
+    }
+
+    if (!config.aws?.dataBucketName) {
+      throw new Error('aws.dataBucketName is required for upload-flow builds');
+    }
+    const s3Key = `builds/${buildId}.zip`;
     const s3 = new S3Client({ region: config.aws.region });
     const command = new PutObjectCommand({
-      Bucket: config.aws.dataBucketName!,
+      Bucket: config.aws.dataBucketName,
       Key: s3Key,
       ContentType: 'application/zip',
     });
@@ -68,12 +89,10 @@ export class BuildUploadService {
   }
 }
 
-function getBaseConfig() {
+function getBaseConfig(): ApplianceBaseConfig {
   const raw = process.env.APPLIANCE_BASE_CONFIG;
   if (!raw) throw new Error('APPLIANCE_BASE_CONFIG not set');
-  const config = applianceBaseConfig.parse(JSON.parse(raw));
-  if (!config.aws.dataBucketName) throw new Error('Data bucket not configured');
-  return config;
+  return applianceBaseConfig.parse(JSON.parse(raw));
 }
 
 export const buildUploadService = new BuildUploadService();

@@ -73,27 +73,31 @@ export interface Phase2Output {
 export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Promise<Phase2Output> {
   const { baseConfig, emit } = opts;
 
-  if (!baseConfig.aws.systemRoleArns) {
+  if (!baseConfig.aws) {
+    throw new Error('phase 2 is AWS-only — local bases skip the dogfooded api-server deploy');
+  }
+  const awsConfig = baseConfig.aws;
+  if (!awsConfig.systemRoleArns) {
     throw new Error(
       'phase 2 requires base config with systemRoleArns. Re-run phase 1 against this branch ' +
         'to provision the pre-created system api-server / worker roles.'
     );
   }
-  if (!baseConfig.aws.ecrRepositoryUrl) {
+  if (!awsConfig.ecrRepositoryUrl) {
     throw new Error('phase 2 requires base config with ecrRepositoryUrl');
   }
   if (!baseConfig.domainName) {
     throw new Error('phase 2 requires base config with domainName');
   }
 
-  const region = baseConfig.aws.region;
+  const region = awsConfig.region;
   const sourceImage = input.apiServerImageUri ?? DEFAULT_API_SERVER_IMAGE;
   const versionTag = VERSION.replace(/^v/, '');
 
   emit({ type: 'log', level: 'info', message: `mirroring ${sourceImage} → cluster ECR…` });
   const ecrImageUri = await mirrorImageToEcr({
     sourceImage,
-    ecrRepositoryUrl: baseConfig.aws.ecrRepositoryUrl,
+    ecrRepositoryUrl: awsConfig.ecrRepositoryUrl,
     tag: `api-server-${versionTag}`,
     region,
     // Pass the wizard-selected profile explicitly so the ECR client
@@ -224,6 +228,9 @@ export async function runPhase2(input: BootstrapInput, opts: Phase2Options): Pro
     //     automation at the cluster's state bucket so per-appliance
     //     deploys (system + user) write to the same backend the
     //     bootstrap initialised.
+    if (!baseConfig.stateBackendUrl) {
+      throw new Error('phase 2 requires base config with stateBackendUrl');
+    }
     const sharedEnvVars: Record<string, string> = {
       APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
       PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,

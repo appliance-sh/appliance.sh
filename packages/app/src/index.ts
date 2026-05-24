@@ -23,4 +23,7 @@ export type {
   BaselineUpdateInput,
   BaselineUpdateOptions,
   LatestGhcrTagInput,
+  LocalRuntimeHost,
+  LocalClusterInput,
+  LocalClusterStatus,
 } from './lib/host';

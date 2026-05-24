@@ -1,7 +1,7 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
-import { applianceBaseConfig, applianceInput, BuildType } from '@appliance.sh/sdk';
-import type { ApplianceFrameworkApp } from '@appliance.sh/sdk';
+import { applianceBaseConfig, ApplianceBaseType, applianceInput, BuildType } from '@appliance.sh/sdk';
+import type { ApplianceBaseConfig, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -29,9 +29,16 @@ export interface ResolvedBuild {
   // so the dogfood-deployed api-server / worker bind to the
   // base-pre-created roles instead of getting per-deploy roles.
   lambdaRoleArn?: string;
+  // Container port to expose on the LOCAL runtime's k8s Service.
+  // Threaded through from the appliance manifest at build time so
+  // local deploys don't need a separate "what port does this serve
+  // on" lookup. AWS deploys ignore this — Lambda's exec wrapper sets
+  // the port for the framework path, and container builds embed it
+  // via the LWA env variables.
+  localPort?: number;
 }
 
-function getBaseConfig() {
+function getBaseConfig(): ApplianceBaseConfig {
   const raw = process.env.APPLIANCE_BASE_CONFIG;
   if (!raw) throw new Error('APPLIANCE_BASE_CONFIG not set');
   return applianceBaseConfig.parse(JSON.parse(raw));
@@ -57,7 +64,21 @@ const FRAMEWORK_ARCHITECTURES: Record<string, string> = {
 export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
     const config = getBaseConfig();
-    if (!config.aws.dataBucketName) throw new Error('Data bucket not configured');
+
+    // Local-base shortcut: only `remote-image` builds are supported
+    // (uploads have no S3 path). Pass the stored source through as
+    // imageUri verbatim — the local executor handles k3d import.
+    if (config.type === ApplianceBaseType.ApplianceLocal) {
+      const stored = await buildUploadService.get(buildId);
+      if (!stored) throw new Error(`Build not found: ${buildId}`);
+      if (stored.type !== BuildType.RemoteImage) {
+        throw new Error('Local bases only support remote-image builds');
+      }
+      return { imageUri: stored.source };
+    }
+
+    if (!config.aws?.dataBucketName) throw new Error('Data bucket not configured');
+    const aws = config.aws;
 
     // Look up the Build record. `remote-image` builds short-circuit
     // straight to an imageUri — no zip download, no manifest parse.
@@ -71,10 +92,10 @@ export class BuildService {
     }
 
     const s3Key = stored?.source ?? `builds/${buildId}.zip`;
-    const s3 = new S3Client({ region: config.aws.region });
+    const s3 = new S3Client({ region: aws.region });
 
     // Download the build zip
-    const result = await s3.send(new GetObjectCommand({ Bucket: config.aws.dataBucketName, Key: s3Key }));
+    const result = await s3.send(new GetObjectCommand({ Bucket: aws.dataBucketName, Key: s3Key }));
     const body = await result.Body?.transformToByteArray();
     if (!body) throw new Error('Empty build');
 
@@ -136,6 +157,7 @@ export class BuildService {
     s3Key: string,
     config: ReturnType<typeof getBaseConfig>
   ): ResolvedBuild {
+    if (!config.aws) throw new Error('Framework resolution requires an aws-typed base config');
     const port = manifest.port ?? 8080;
     const framework = manifest.framework ?? 'auto';
     const runtime = FRAMEWORK_RUNTIMES[framework] ?? FRAMEWORK_RUNTIMES['node'];
@@ -170,7 +192,9 @@ export class BuildService {
     tag: string,
     config: ReturnType<typeof getBaseConfig>
   ): Promise<ResolvedBuild> {
-    const ecrRepositoryUrl = config.aws.ecrRepositoryUrl;
+    if (!config.aws) throw new Error('Container build requires an aws-typed base config');
+    const aws = config.aws;
+    const ecrRepositoryUrl = aws.ecrRepositoryUrl;
     if (!ecrRepositoryUrl) throw new Error('ECR repository not configured');
 
     const imageTarPath = path.join(tmpDir, 'image.tar');
@@ -180,7 +204,7 @@ export class BuildService {
     }
 
     // Auth with ECR via crane
-    const ecr = new ECRClient({ region: config.aws.region });
+    const ecr = new ECRClient({ region: aws.region });
     const authResult = await ecr.send(new GetAuthorizationTokenCommand({}));
     const authData = authResult.authorizationData?.[0];
     if (!authData?.authorizationToken || !authData?.proxyEndpoint) {

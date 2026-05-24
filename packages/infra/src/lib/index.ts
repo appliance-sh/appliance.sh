@@ -11,3 +11,6 @@ export * from './controller';
 
 // Core infrastructure
 export * from './appliance-infra';
+
+// Local Kubernetes runtime
+export * from './local';

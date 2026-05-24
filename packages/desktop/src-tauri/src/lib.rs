@@ -679,6 +679,209 @@ async fn latest_api_server_version(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
+// Default k3d cluster name when the desktop manages the local
+// `appliance-base-local` runtime. Must match
+// DEFAULT_LOCAL_CLUSTER_NAME in
+// `packages/infra/src/lib/local/LocalContainerDeploymentService.ts`.
+const DEFAULT_LOCAL_CLUSTER_NAME: &str = "appliance-local";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalClusterStatus {
+    /// True when `k3d` is on PATH and the named cluster shows up in
+    /// `k3d cluster list -o json`. The frontend uses this to decide
+    /// whether to expose Start vs. Stop vs. Create buttons.
+    exists: bool,
+    /// True when the cluster's nodes are reporting `running`. Stop
+    /// flips this to false; the cluster still exists and can be
+    /// restarted without recreating state.
+    running: bool,
+    cluster_name: String,
+    /// Reason a status check couldn't be completed (k3d missing,
+    /// docker not running, etc.). Surfaced verbatim to the UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalClusterInput {
+    #[serde(default)]
+    cluster_name: Option<String>,
+    /// Host port the cluster's LoadBalancer publishes (forwards onto
+    /// the k3d serverlb container, which then hits NodePorts inside).
+    /// Default 8081 — keeps clear of the desktop's 1420 dev server
+    /// and common 8080.
+    #[serde(default)]
+    host_port: Option<u16>,
+}
+
+fn cluster_name_or_default(input: &LocalClusterInput) -> String {
+    input
+        .cluster_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string())
+}
+
+async fn run_status_command(args: &[&str]) -> Result<(bool, String, String), String> {
+    let output = Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn {}: {}", args[0], e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok((output.status.success(), stdout, stderr))
+}
+
+/// Probe k3d for a cluster by name. Returns existence + running
+/// state; absent k3d / docker reports `exists: false, running: false`
+/// with a populated `message` so the UI can render an actionable
+/// install hint instead of a stack trace.
+#[tauri::command]
+async fn local_cluster_status(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
+    let name = cluster_name_or_default(&input);
+    let result = run_status_command(&["k3d", "cluster", "list", "-o", "json"]).await;
+    let (ok, stdout, stderr) = match result {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(LocalClusterStatus {
+                exists: false,
+                running: false,
+                cluster_name: name,
+                message: Some(e),
+            });
+        }
+    };
+    if !ok {
+        return Ok(LocalClusterStatus {
+            exists: false,
+            running: false,
+            cluster_name: name,
+            message: Some(stderr),
+        });
+    }
+    // Each entry in `k3d cluster list -o json` reports a name and a
+    // list of nodes; a cluster is "running" iff every node is in
+    // state `running`. We deliberately scan the raw JSON instead of
+    // shelling out to `k3d cluster get <name>` because the latter
+    // exits non-zero when the cluster is stopped, which would force
+    // us to disambiguate "stopped" from "missing" via stderr parsing.
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    let clusters = parsed.as_array().cloned().unwrap_or_default();
+    for cluster in clusters {
+        if cluster.get("name").and_then(|n| n.as_str()) == Some(name.as_str()) {
+            let nodes = cluster
+                .get("nodes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let running = !nodes.is_empty()
+                && nodes
+                    .iter()
+                    .all(|n| n.get("State").and_then(|s| s.get("Running")).and_then(|b| b.as_bool()).unwrap_or(false));
+            return Ok(LocalClusterStatus {
+                exists: true,
+                running,
+                cluster_name: name,
+                message: None,
+            });
+        }
+    }
+    Ok(LocalClusterStatus {
+        exists: false,
+        running: false,
+        cluster_name: name,
+        message: None,
+    })
+}
+
+/// Create-or-start the named k3d cluster. Idempotent: an existing
+/// stopped cluster is started; an existing running cluster is left
+/// alone. Maps the cluster LoadBalancer's :80 onto `host_port` so
+/// services deployed by the api-server are reachable from the host.
+#[tauri::command]
+async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
+    let name = cluster_name_or_default(&input);
+    let status = local_cluster_status(LocalClusterInput {
+        cluster_name: Some(name.clone()),
+        host_port: input.host_port,
+    })
+    .await?;
+    if status.exists {
+        if status.running {
+            return Ok(status);
+        }
+        // Stopped — start it back up.
+        let (ok, _stdout, stderr) =
+            run_status_command(&["k3d", "cluster", "start", &name]).await?;
+        if !ok {
+            return Err(format!("k3d cluster start failed: {}", stderr));
+        }
+    } else {
+        // Fresh creation. NodePort range exposed so Service NodePorts
+        // (30000-32767) are reachable from the host via the
+        // k3d-managed serverlb container.
+        let host_port = input.host_port.unwrap_or(8081);
+        let port_arg = format!("{}:80@loadbalancer", host_port);
+        let agents_arg = "1";
+        let (ok, _stdout, stderr) = run_status_command(&[
+            "k3d",
+            "cluster",
+            "create",
+            &name,
+            "--agents",
+            agents_arg,
+            "-p",
+            &port_arg,
+            "--wait",
+        ])
+        .await?;
+        if !ok {
+            return Err(format!("k3d cluster create failed: {}", stderr));
+        }
+    }
+    local_cluster_status(LocalClusterInput {
+        cluster_name: Some(name),
+        host_port: input.host_port,
+    })
+    .await
+}
+
+/// Stop the cluster without deleting its state. `start_local_cluster`
+/// brings it back; `delete_local_cluster` removes it entirely.
+#[tauri::command]
+async fn stop_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
+    let name = cluster_name_or_default(&input);
+    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "stop", &name]).await?;
+    if !ok && !stderr.contains("not found") {
+        return Err(format!("k3d cluster stop failed: {}", stderr));
+    }
+    local_cluster_status(LocalClusterInput {
+        cluster_name: Some(name),
+        host_port: input.host_port,
+    })
+    .await
+}
+
+/// Permanently delete the named cluster and all of its state.
+/// Separate from `stop_local_cluster` so the UI can offer a low-risk
+/// "stop" alongside a confirm-gated "delete".
+#[tauri::command]
+async fn delete_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
+    let name = cluster_name_or_default(&input);
+    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "delete", &name]).await?;
+    if !ok && !stderr.contains("not found") {
+        return Err(format!("k3d cluster delete failed: {}", stderr));
+    }
+    Ok(LocalClusterStatus {
+        exists: false,
+        running: false,
+        cluster_name: name,
+        message: None,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -696,7 +899,11 @@ pub fn run() {
             demote_state,
             update_api_server,
             update_baseline,
-            latest_api_server_version
+            latest_api_server_version,
+            local_cluster_status,
+            start_local_cluster,
+            stop_local_cluster,
+            delete_local_cluster
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -16,6 +16,8 @@ import type {
   ConsoleHost,
   HostConfig,
   LatestGhcrTagInput,
+  LocalClusterInput,
+  LocalClusterStatus,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,
@@ -131,6 +133,21 @@ export const tauriHost: ConsoleHost = {
     },
     async listAwsProfiles(): Promise<AwsProfile[]> {
       return invoke<AwsProfile[]>('list_aws_profiles');
+    },
+  },
+
+  local: {
+    async status(input?: LocalClusterInput): Promise<LocalClusterStatus> {
+      return invoke<LocalClusterStatus>('local_cluster_status', { input: input ?? {} });
+    },
+    async start(input?: LocalClusterInput): Promise<LocalClusterStatus> {
+      return invoke<LocalClusterStatus>('start_local_cluster', { input: input ?? {} });
+    },
+    async stop(input?: LocalClusterInput): Promise<LocalClusterStatus> {
+      return invoke<LocalClusterStatus>('stop_local_cluster', { input: input ?? {} });
+    },
+    async delete(input?: LocalClusterInput): Promise<LocalClusterStatus> {
+      return invoke<LocalClusterStatus>('delete_local_cluster', { input: input ?? {} });
     },
   },
 };

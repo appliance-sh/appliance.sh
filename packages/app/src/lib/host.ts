@@ -167,6 +167,35 @@ export interface ConsoleHost {
   openExternal(url: string): Promise<void>;
   notify?(opts: { title: string; body?: string }): Promise<void>;
   bootstrap?: BootstrapHost;
+  /**
+   * Local-runtime lifecycle for `appliance-base-local` clusters. The
+   * desktop drives k3d (start/stop/delete) so the api-server's
+   * LocalContainerDeploymentService can apply k8s manifests against
+   * a running cluster. Optional — the web shell has no shell access
+   * to k3d, so it can omit this entirely.
+   */
+  local?: LocalRuntimeHost;
+}
+
+export interface LocalClusterInput {
+  clusterName?: string;
+  hostPort?: number;
+}
+
+export interface LocalClusterStatus {
+  exists: boolean;
+  running: boolean;
+  clusterName: string;
+  /** Populated when the status check itself failed (k3d/docker missing). */
+  message?: string;
+}
+
+export interface LocalRuntimeHost {
+  status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
+  start(input?: LocalClusterInput): Promise<LocalClusterStatus>;
+  stop(input?: LocalClusterInput): Promise<LocalClusterStatus>;
+  /** Permanently delete the cluster + all of its state. */
+  delete(input?: LocalClusterInput): Promise<LocalClusterStatus>;
 }
 
 export type {

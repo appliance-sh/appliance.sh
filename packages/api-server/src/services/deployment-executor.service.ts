@@ -1,5 +1,6 @@
 import {
   applianceBaseConfig,
+  ApplianceBaseType,
   Deployment,
   DeploymentStatus,
   DeploymentAction,
@@ -9,12 +10,13 @@ import {
 } from '@appliance.sh/sdk';
 import {
   createApplianceDeploymentService,
+  LocalContainerDeploymentService,
   type ApplianceStackMetadata,
   type PulumiStackHandle,
 } from '@appliance.sh/infra';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
-import { buildService } from './build.service';
+import { buildService, type ResolvedBuild } from './build.service';
 import { logger } from '../logger';
 
 // Project + env name pair that triggers the dogfood role override.
@@ -95,77 +97,24 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
   });
 
   try {
-    const infraService = createApplianceDeploymentService();
+    const baseConfigRaw = process.env.APPLIANCE_BASE_CONFIG;
+    const baseConfig = baseConfigRaw ? applianceBaseConfig.parse(JSON.parse(baseConfigRaw)) : undefined;
     const onStack = (s: PulumiStackHandle) => {
       activeStack = s;
     };
 
     let result;
-    switch (input.action) {
-      case DeploymentAction.Deploy: {
-        const build = input.buildId
-          ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deployment.id}`)
-          : undefined;
-
-        if (build) {
-          // Precedence: resolver env (build.environment — system
-          // correctness, e.g. AWS_LWA_PORT) > deploy-time env
-          // (input.environment, which the CLI populates from
-          // manifest render + --env-file). Manifest env no longer
-          // travels through the build artifact.
-          build.environment = {
-            ...(input.environment ?? {}),
-            ...(build.environment ?? {}),
-          };
-
-          // Lambda runtime overrides flow the OPPOSITE way: deploy
-          // input wins over the build resolver's default. The
-          // remote-image flow doesn't carry manifest memory/timeout/
-          // storage at all, so callers need a way to set them
-          // per-deploy; the dogfooded bootstrap relies on this to
-          // give the worker its 900s Pulumi-friendly timeout.
-          if (input.memory !== undefined) build.memory = input.memory;
-          if (input.timeout !== undefined) build.timeout = input.timeout;
-          if (input.storage !== undefined) build.storage = input.storage;
-          if (input.architectures !== undefined) build.architectures = input.architectures;
-
-          const systemRoleArn = resolveSystemRoleArn(metadata);
-          if (systemRoleArn) build.lambdaRoleArn = systemRoleArn;
-
-          logger.info('resolved deploy params', {
-            deploymentId,
-            stackName: metadata.stackName,
-            memory: build.memory,
-            timeout: build.timeout,
-            storage: build.storage,
-            lambdaRoleArn: build.lambdaRoleArn,
-            inputMemory: input.memory,
-            inputTimeout: input.timeout,
-            inputStorage: input.storage,
-          });
-        } else if (input.environment) {
-          throw new Error('Environment variables require a build');
-        }
-
-        result = await infraService.deploy(metadata.stackName, metadata, build, {
-          onStack,
-          refresh: input.refresh,
-        });
-        break;
-      }
-      case DeploymentAction.Destroy: {
-        result = await infraService.destroy(metadata.stackName, metadata.projectId, { onStack });
-        break;
-      }
-      case DeploymentAction.Refresh: {
-        result = await infraService.refresh(metadata.stackName, metadata.projectId, { onStack });
-        break;
-      }
-      default: {
-        // Exhaustiveness check — unreachable if DeploymentAction is exhaustive.
-        const _exhaustive: never = input.action;
-        throw new Error(`Unknown deployment action: ${String(_exhaustive)}`);
-      }
+    if (baseConfig?.type === ApplianceBaseType.ApplianceLocal) {
+      // Local k8s runtime — no Pulumi, no cancel-aware stack handle.
+      // Build resolution still flows through buildService so the
+      // upstream upload/remote-image distinction is preserved, but
+      // the executor maps the resolved bits into LocalResolvedBuild
+      // instead of the AWS-shaped ResolvedBuild.
+      const local = new LocalContainerDeploymentService(baseConfig);
+      result = await executeLocalAction(local, input, metadata, deployment.id);
+    } else {
+      const infraService = createApplianceDeploymentService();
+      result = await executeCloudAction(infraService, input, metadata, deployment.id, onStack);
     }
 
     stopPolling();
@@ -263,11 +212,124 @@ function resolveSystemRoleArn(metadata: ApplianceStackMetadata): string | undefi
   } catch {
     return undefined;
   }
-  const roles = parsed.aws.systemRoleArns;
+  const roles = parsed.aws?.systemRoleArns;
   if (!roles) return undefined;
   if (metadata.environmentName === SYSTEM_API_SERVER_ENV) return roles.apiServer;
   if (metadata.environmentName === SYSTEM_API_WORKER_ENV) return roles.worker;
   return undefined;
+}
+
+interface ExecutionResult {
+  message: string;
+  idempotentNoop: boolean;
+}
+
+async function executeCloudAction(
+  infraService: ReturnType<typeof createApplianceDeploymentService>,
+  input: WorkerEvent['input'],
+  metadata: ApplianceStackMetadata,
+  deploymentId: string,
+  onStack: (s: PulumiStackHandle) => void
+): Promise<ExecutionResult> {
+  switch (input.action) {
+    case DeploymentAction.Deploy: {
+      const build = input.buildId
+        ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deploymentId}`)
+        : undefined;
+
+      if (build) {
+        // Precedence: resolver env (build.environment — system
+        // correctness, e.g. AWS_LWA_PORT) > deploy-time env
+        // (input.environment, which the CLI populates from
+        // manifest render + --env-file). Manifest env no longer
+        // travels through the build artifact.
+        build.environment = {
+          ...(input.environment ?? {}),
+          ...(build.environment ?? {}),
+        };
+
+        if (input.memory !== undefined) build.memory = input.memory;
+        if (input.timeout !== undefined) build.timeout = input.timeout;
+        if (input.storage !== undefined) build.storage = input.storage;
+        if (input.architectures !== undefined) build.architectures = input.architectures;
+
+        const systemRoleArn = resolveSystemRoleArn(metadata);
+        if (systemRoleArn) build.lambdaRoleArn = systemRoleArn;
+
+        logger.info('resolved deploy params', {
+          deploymentId,
+          stackName: metadata.stackName,
+          memory: build.memory,
+          timeout: build.timeout,
+          storage: build.storage,
+          lambdaRoleArn: build.lambdaRoleArn,
+          inputMemory: input.memory,
+          inputTimeout: input.timeout,
+          inputStorage: input.storage,
+        });
+      } else if (input.environment) {
+        throw new Error('Environment variables require a build');
+      }
+
+      const result = await infraService.deploy(metadata.stackName, metadata, build, {
+        onStack,
+        refresh: input.refresh,
+      });
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    case DeploymentAction.Destroy: {
+      const result = await infraService.destroy(metadata.stackName, metadata.projectId, { onStack });
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    case DeploymentAction.Refresh: {
+      const result = await infraService.refresh(metadata.stackName, metadata.projectId, { onStack });
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    default: {
+      const _exhaustive: never = input.action;
+      throw new Error(`Unknown deployment action: ${String(_exhaustive)}`);
+    }
+  }
+}
+
+async function executeLocalAction(
+  local: LocalContainerDeploymentService,
+  input: WorkerEvent['input'],
+  metadata: ApplianceStackMetadata,
+  deploymentId: string
+): Promise<ExecutionResult> {
+  switch (input.action) {
+    case DeploymentAction.Deploy: {
+      const build: ResolvedBuild | undefined = input.buildId
+        ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deploymentId}`)
+        : undefined;
+      if (!build?.imageUri) {
+        throw new Error('Local deploys require a build with an imageUri (remote-image flow)');
+      }
+      const env = {
+        ...(input.environment ?? {}),
+        ...(build.environment ?? {}),
+      };
+      const result = await local.deploy(metadata.stackName, metadata, {
+        imageUri: build.imageUri,
+        port: build.localPort,
+        environment: env,
+      });
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    case DeploymentAction.Destroy: {
+      const result = await local.destroy(metadata.stackName);
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    case DeploymentAction.Refresh: {
+      const result = await local.refresh(metadata.stackName);
+      return { message: result.message, idempotentNoop: result.idempotentNoop };
+    }
+    default: {
+      const _exhaustive: never = input.action;
+      throw new Error(`Unknown deployment action: ${String(_exhaustive)}`);
+    }
+  }
 }
 
 async function refreshAfterCancel(stack: PulumiStackHandle | null, deploymentId: string): Promise<string> {
