@@ -26,4 +26,13 @@ export type {
   LocalRuntimeHost,
   LocalClusterInput,
   LocalClusterStatus,
+  LocalRuntimeInput,
+  LocalRuntimeStatus,
+  ResolvedRuntimeConfig,
+  ApiServerStatus,
+  LocalDeploymentInfo,
+  LocalPodInfo,
+  LocalServiceInfo,
+  LocalWorkloads,
+  LocalPodLogsInput,
 } from './lib/host';

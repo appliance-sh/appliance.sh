@@ -8,6 +8,15 @@ export const DEFAULT_LOCAL_CLUSTER_NAME = 'appliance-local';
 export const DEFAULT_LOCAL_NAMESPACE = 'appliance';
 export const DEFAULT_LOCAL_HOST_PORT = 8081;
 
+// NodePort window the demo k3d cluster maps onto the host. Picked
+// small (51 ports) so the docker-proxy footprint on macOS stays
+// tractable — at ~2700 ports the colima daemon has been observed to
+// fall over. The deployment service derives a deterministic NodePort
+// from the stack name within this range so each appliance ends up
+// reachable on a stable host port.
+export const DEFAULT_LOCAL_NODEPORT_MIN = 30000;
+export const DEFAULT_LOCAL_NODEPORT_MAX = 30050;
+
 export interface LocalDeploymentMetadata {
   projectId: string;
   projectName: string;
@@ -78,11 +87,13 @@ export class LocalContainerDeploymentService {
     // is the desired behaviour for remote images (ghcr.io/...).
     await this.maybeImportImage(build.imageUri);
 
+    const nodePort = deterministicNodePort(stackName);
     const manifest = renderManifest({
       name: stackName,
       namespace: this.cluster.namespace,
       image: build.imageUri,
       port: build.port ?? 8080,
+      nodePort,
       env: build.environment ?? {},
       metadata,
     });
@@ -90,10 +101,13 @@ export class LocalContainerDeploymentService {
     const before = await this.getDeploymentImage(stackName);
     await this.kubectlApply(manifest);
     await this.waitForRollout(stackName);
-    const nodePort = await this.getServiceNodePort(stackName);
+    // Read back the live NodePort — if k8s accepted our pinned value
+    // it'll match `nodePort`; if not (e.g. collision), it picks one
+    // and we report whatever the cluster recorded.
+    const liveNodePort = (await this.getServiceNodePort(stackName)) ?? nodePort;
 
     const idempotentNoop = before === build.imageUri;
-    const url = nodePort ? `http://localhost:${nodePort}` : undefined;
+    const url = liveNodePort ? `http://localhost:${liveNodePort}` : undefined;
 
     return {
       action: 'deploy',
@@ -287,12 +301,33 @@ export interface ManifestParams {
   namespace: string;
   image: string;
   port: number;
+  /** Explicit NodePort the Service should bind. When omitted, k8s
+   *  picks any free port in 30000-32767. The demo cluster only
+   *  publishes a small NodePort window, so the executor sets this
+   *  deterministically per stack via deterministicNodePort(). */
+  nodePort?: number;
   env: Record<string, string>;
   metadata: LocalDeploymentMetadata;
 }
 
+/**
+ * Hash the stack name into [DEFAULT_LOCAL_NODEPORT_MIN,
+ * DEFAULT_LOCAL_NODEPORT_MAX] so each appliance gets a stable
+ * NodePort across deploys. Same name → same port — important for
+ * the demo, where the script wants to curl the deployed Service
+ * without first having to look up the assigned port.
+ */
+export function deterministicNodePort(stackName: string): number {
+  const range = DEFAULT_LOCAL_NODEPORT_MAX - DEFAULT_LOCAL_NODEPORT_MIN + 1;
+  let hash = 0;
+  for (let i = 0; i < stackName.length; i++) {
+    hash = (hash * 31 + stackName.charCodeAt(i)) | 0;
+  }
+  return DEFAULT_LOCAL_NODEPORT_MIN + (Math.abs(hash) % range);
+}
+
 export function renderManifest(params: ManifestParams): string {
-  const { name, namespace, image, port, env, metadata } = params;
+  const { name, namespace, image, port, nodePort, env, metadata } = params;
   // Cluster-IP for in-cluster reachability would be ideal, but the
   // dev story is "hit the appliance from a browser on the host", so
   // we publish via NodePort. k3d's built-in loadbalancer hairpins
@@ -354,7 +389,7 @@ spec:
   ports:
   - port: ${port}
     targetPort: ${port}
-    protocol: TCP
+    protocol: TCP${nodePort ? `\n    nodePort: ${nodePort}` : ''}
 `;
 }
 

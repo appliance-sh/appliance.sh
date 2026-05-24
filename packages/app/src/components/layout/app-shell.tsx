@@ -1,17 +1,39 @@
+import * as React from 'react';
 import { NavLink, Outlet } from 'react-router';
-import { LayoutDashboard, Folder, Box, Rocket, Settings } from 'lucide-react';
+import { LayoutDashboard, Folder, Box, Rocket, Settings, Server } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useHost } from '@/providers/host-provider';
 import { ClusterSwitcher } from './cluster-switcher';
 
-const nav = [
+type NavItem = {
+  to: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  end?: boolean;
+};
+
+const baseNav: NavItem[] = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/projects', label: 'Projects', icon: Folder },
   { to: '/environments', label: 'Environments', icon: Box },
   { to: '/deployments', label: 'Deployments', icon: Rocket },
-  { to: '/settings', label: 'Settings', icon: Settings },
 ];
 
+const tailNav: NavItem[] = [{ to: '/settings', label: 'Settings', icon: Settings }];
+
 export function AppShell() {
+  const host = useHost();
+  // Surface Local Runtime only when the host can actually drive it
+  // (desktop). The web shell omits `local`, so the link would 404 on
+  // first click — better to hide it than disable it.
+  const nav: NavItem[] = [
+    ...baseNav,
+    ...(host.local?.runtimeStatus
+      ? ([{ to: '/local-runtime', label: 'Local Runtime', icon: Server }] as NavItem[])
+      : []),
+    ...tailNav,
+  ];
+
   return (
     <div className="grid h-full grid-cols-[220px_1fr] grid-rows-[auto_1fr_auto]">
       <aside className="row-span-3 border-r border-[var(--color-border)] bg-[var(--color-muted)]">

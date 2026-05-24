@@ -1,12 +1,15 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 // Keychain service is shared across all Appliance Desktop installs on
 // the machine. Each cluster's API key lives at account
@@ -684,8 +687,19 @@ async fn latest_api_server_version(
 // DEFAULT_LOCAL_CLUSTER_NAME in
 // `packages/infra/src/lib/local/LocalContainerDeploymentService.ts`.
 const DEFAULT_LOCAL_CLUSTER_NAME: &str = "appliance-local";
+const DEFAULT_LOCAL_NAMESPACE: &str = "appliance";
+const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
+// NodePort sub-range published from the k3d agent onto the host.
+// Kept small (51 ports) because publishing the full 30000-32767 window
+// crashes colima/docker on macOS at the docker-proxy layer.
+// LocalContainerDeploymentService.deterministicNodePort() picks within
+// the same range so each deployment's NodePort is reachable here.
+const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
+const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
+const DEFAULT_LOCAL_API_PORT: u16 = 3030;
+const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct LocalClusterStatus {
     /// True when `k3d` is on PATH and the named cluster shows up in
@@ -819,11 +833,22 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             return Err(format!("k3d cluster start failed: {}", stderr));
         }
     } else {
-        // Fresh creation. NodePort range exposed so Service NodePorts
-        // (30000-32767) are reachable from the host via the
-        // k3d-managed serverlb container.
-        let host_port = input.host_port.unwrap_or(8081);
+        // Fresh creation. We publish two port ranges:
+        //   1. host_port -> serverlb:80 for the in-cluster ingress/LB
+        //      path (api-server, ingress-managed apps).
+        //   2. A small NodePort window -> agent:0 so the executor's
+        //      Service NodePorts are directly reachable on the host.
+        //      `LocalContainerDeploymentService.deterministicNodePort`
+        //      hashes inside the same window — must stay in sync.
+        let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
         let port_arg = format!("{}:80@loadbalancer", host_port);
+        let nodeport_arg = format!(
+            "{}-{}:{}-{}@agent:0",
+            DEFAULT_LOCAL_NODEPORT_MIN,
+            DEFAULT_LOCAL_NODEPORT_MAX,
+            DEFAULT_LOCAL_NODEPORT_MIN,
+            DEFAULT_LOCAL_NODEPORT_MAX,
+        );
         let agents_arg = "1";
         let (ok, _stdout, stderr) = run_status_command(&[
             "k3d",
@@ -834,6 +859,8 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             agents_arg,
             "-p",
             &port_arg,
+            "-p",
+            &nodeport_arg,
             "--wait",
         ])
         .await?;
@@ -882,11 +909,801 @@ async fn delete_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSt
     })
 }
 
+// ============================================================
+// Local runtime orchestration
+//
+// The "local runtime" is a Docker Desktop-style end-to-end stack:
+//   1. A k3d cluster (lifecycle from local_cluster_*).
+//   2. A node `@appliance.sh/api-server` process pointed at an
+//      `appliance-base-local` config + the user's data dir.
+//   3. An auto-registered Cluster entry in the desktop's persisted
+//      config so every existing Console page (Projects, Environments,
+//      Deployments) lights up against the local api-server with zero
+//      additional wiring.
+// ============================================================
+
+/// Runtime input shared by status / start / stop / delete. All fields
+/// are optional and fall back to baked-in defaults.
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct LocalRuntimeInput {
+    cluster_name: Option<String>,
+    namespace: Option<String>,
+    host_port: Option<u16>,
+    api_port: Option<u16>,
+    data_dir: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedRuntimeConfig {
+    cluster_name: String,
+    namespace: String,
+    host_port: u16,
+    api_port: u16,
+    data_dir: String,
+    api_server_url: String,
+    node_port_min: u16,
+    node_port_max: u16,
+}
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ApiServerStatus {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LocalRuntimeStatus {
+    cluster: LocalClusterStatus,
+    api_server: ApiServerStatus,
+    config: ResolvedRuntimeConfig,
+    /// Cluster id under which the runtime is registered in the
+    /// desktop's persisted config (so the Console can talk to it via
+    /// the normal cluster-selection flow). None until the runtime has
+    /// been started at least once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_id: Option<String>,
+}
+
+/// Held in Tauri's managed state. Wraps the spawned api-server
+/// child + metadata; `None` means no live api-server.
+struct ApiServerHandle {
+    child: Child,
+    port: u16,
+    log_path: PathBuf,
+    started_at: String,
+}
+
+#[derive(Default)]
+struct LocalRuntimeState {
+    api_server: Mutex<Option<ApiServerHandle>>,
+}
+
+fn resolve_runtime_config(
+    app: &AppHandle,
+    input: &LocalRuntimeInput,
+) -> Result<ResolvedRuntimeConfig, String> {
+    let cluster_name = input
+        .cluster_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string());
+    let namespace = input
+        .namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_NAMESPACE.to_string());
+    let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
+    let api_port = input.api_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    let data_dir = match &input.data_dir {
+        Some(p) => PathBuf::from(p),
+        None => app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("resolve app data dir: {e}"))?
+            .join("local-runtime"),
+    };
+    Ok(ResolvedRuntimeConfig {
+        cluster_name,
+        namespace,
+        host_port,
+        api_port,
+        data_dir: data_dir.to_string_lossy().to_string(),
+        api_server_url: format!("http://localhost:{}", api_port),
+        node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
+        node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
+    })
+}
+
+/// Probe TCP + a known endpoint to decide whether a previously-spawned
+/// (or externally-running) api-server is alive on `port`. Used both
+/// for the live-handle case and to detect leftovers after a desktop
+/// restart with no managed handle.
+async fn probe_api_server(port: u16) -> bool {
+    // Off the tokio runtime so we don't need the `net` feature; a 200ms
+    // connect_timeout is plenty against loopback.
+    tokio::task::spawn_blocking(move || {
+        let addr = format!("127.0.0.1:{}", port);
+        let sock_addr: std::net::SocketAddr = match addr.parse() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(200)).is_ok()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn api_server_entry() -> Result<(PathBuf, Vec<String>), String> {
+    // Prefer the compiled dist; fall back to `tsx src/main.ts` for dev
+    // builds where the user runs `pnpm tauri dev` without first
+    // running `pnpm --filter @appliance.sh/api-server build`.
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("api-server");
+    let dist = base.join("dist").join("src").join("main.js");
+    if dist.exists() {
+        return Ok((PathBuf::from("node"), vec![dist.to_string_lossy().to_string()]));
+    }
+    let src = base.join("src").join("main.ts");
+    if !src.exists() {
+        return Err(format!(
+            "api-server entry point not found (looked at {} and {})",
+            dist.display(),
+            src.display()
+        ));
+    }
+    let tsx = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("node_modules")
+        .join(".bin")
+        .join("tsx");
+    if !tsx.exists() {
+        return Err(format!(
+            "api-server dist not built and tsx fallback missing at {}",
+            tsx.display()
+        ));
+    }
+    Ok((tsx, vec![src.to_string_lossy().to_string()]))
+}
+
+/// Build the JSON `APPLIANCE_BASE_CONFIG` env value the api-server
+/// expects. The local-base schema is defined in
+/// packages/sdk/src/models/appliance-base.ts.
+fn build_base_config(cfg: &ResolvedRuntimeConfig) -> String {
+    serde_json::json!({
+        "type": "appliance-base-local",
+        "name": "local-runtime",
+        "local": {
+            "dataDir": cfg.data_dir,
+            "cluster": {
+                "clusterName": cfg.cluster_name,
+                "namespace": cfg.namespace,
+                "hostPort": cfg.host_port,
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Generate a short opaque token used as BOOTSTRAP_TOKEN for the
+/// spawned api-server. It's only valid for the lifetime of this
+/// process — once we mint an api key, the token is forgotten.
+fn random_bootstrap_token() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
+/// Mint an initial api key via the api-server's bootstrap route.
+/// Idempotent at the SERVER level (`/bootstrap/status` reports whether
+/// any key already exists), but creates a fresh "Local Runtime" named
+/// key each time it's called.
+async fn mint_api_key(api_port: u16, token: &str) -> Result<ApiKey, String> {
+    let url = format!("http://localhost:{}/bootstrap/create-key", api_port);
+    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
+    let (ok, stdout, stderr) = run_status_command(&[
+        "curl",
+        "-fsS",
+        "-X",
+        "POST",
+        &url,
+        "-H",
+        &format!("X-Bootstrap-Token: {}", token),
+        "-H",
+        "content-type: application/json",
+        "-d",
+        &body,
+    ])
+    .await?;
+    if !ok {
+        return Err(format!("mint api key failed: {}", stderr));
+    }
+    serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
+}
+
+async fn wait_for_api_server(port: u16, max_wait: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        if probe_api_server(port).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("api-server did not come up on :{} in time", port));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Find the persisted "Local Runtime" cluster (if any). Identified by
+/// its loopback api-server URL — name is user-visible and may have
+/// been renamed.
+fn find_local_runtime_cluster<'a>(
+    persisted: &'a PersistedConfig,
+    api_server_url: &str,
+) -> Option<&'a Cluster> {
+    persisted
+        .clusters
+        .iter()
+        .find(|c| c.api_server_url == api_server_url)
+}
+
+/// Register (or refresh) the Local Runtime cluster + key in persisted
+/// config. Returns the cluster id, whether newly created or refreshed.
+fn register_local_runtime_cluster(
+    app: &AppHandle,
+    cfg: &ResolvedRuntimeConfig,
+    api_key: &ApiKey,
+) -> Result<String, HostError> {
+    let mut persisted = read_persisted_config(app)?;
+    migrate_legacy(app, &mut persisted)?;
+
+    let existing_id = persisted
+        .clusters
+        .iter()
+        .find(|c| c.api_server_url == cfg.api_server_url)
+        .map(|c| c.id.clone());
+
+    let cluster_id = match existing_id {
+        Some(id) => {
+            write_api_key(&cluster_keychain_account(&id), api_key)?;
+            id
+        }
+        None => {
+            let cluster = Cluster {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: LOCAL_RUNTIME_CLUSTER_NAME.to_string(),
+                api_server_url: cfg.api_server_url.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                state_backend_url: None,
+                last_bootstrap_input: None,
+            };
+            write_api_key(&cluster_keychain_account(&cluster.id), api_key)?;
+            let id = cluster.id.clone();
+            persisted.clusters.push(cluster);
+            // Auto-select the local cluster on first start. Users can
+            // switch away in Settings; subsequent starts of the same
+            // runtime won't override an explicit selection.
+            if persisted.selected_cluster_id.is_none() {
+                persisted.selected_cluster_id = Some(id.clone());
+            }
+            id
+        }
+    };
+
+    write_persisted_config(app, &persisted)?;
+    Ok(cluster_id)
+}
+
+/// Remove the persisted cluster entry pointing at a given
+/// api-server URL. Best-effort — silently no-ops if not present.
+fn unregister_local_runtime_cluster(app: &AppHandle, api_server_url: &str) -> Result<(), HostError> {
+    let mut persisted = read_persisted_config(app)?;
+    migrate_legacy(app, &mut persisted)?;
+
+    let before = persisted.clusters.len();
+    let removed_ids: Vec<String> = persisted
+        .clusters
+        .iter()
+        .filter(|c| c.api_server_url == api_server_url)
+        .map(|c| c.id.clone())
+        .collect();
+    persisted.clusters.retain(|c| c.api_server_url != api_server_url);
+    if persisted.clusters.len() == before {
+        return Ok(());
+    }
+    for id in &removed_ids {
+        delete_api_key(&cluster_keychain_account(id));
+    }
+    if let Some(sel) = persisted.selected_cluster_id.as_deref() {
+        if removed_ids.iter().any(|id| id == sel) {
+            persisted.selected_cluster_id = persisted.clusters.first().map(|c| c.id.clone());
+        }
+    }
+    write_persisted_config(app, &persisted)
+}
+
+fn tail_log(path: &Path, lines: usize) -> String {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let collected: Vec<&str> = raw.lines().rev().take(lines).collect();
+    collected.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+async fn current_api_server_status(state: &LocalRuntimeState, cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
+    let mut guard = state.api_server.lock().await;
+    if let Some(handle) = guard.as_mut() {
+        // try_wait drains the exit status without blocking. If the
+        // child has exited, drop the handle so subsequent calls see
+        // a clean Stopped state.
+        match handle.child.try_wait() {
+            Ok(Some(_status)) => {
+                let stale = guard.take().expect("guard checked above");
+                let msg = format!(
+                    "api-server exited unexpectedly. Tail of {}:\n{}",
+                    stale.log_path.display(),
+                    tail_log(&stale.log_path, 40)
+                );
+                return ApiServerStatus {
+                    running: false,
+                    message: Some(msg),
+                    ..Default::default()
+                };
+            }
+            Ok(None) => {
+                return ApiServerStatus {
+                    running: true,
+                    pid: handle.child.id(),
+                    port: Some(handle.port),
+                    started_at: Some(handle.started_at.clone()),
+                    log_path: Some(handle.log_path.to_string_lossy().to_string()),
+                    message: None,
+                };
+            }
+            Err(e) => {
+                return ApiServerStatus {
+                    running: false,
+                    message: Some(format!("try_wait: {e}")),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    drop(guard);
+
+    // No managed handle — check for an externally-launched (or
+    // pre-restart) api-server on the configured port. Useful when the
+    // desktop crashes but the api-server keeps running.
+    if probe_api_server(cfg.api_port).await {
+        return ApiServerStatus {
+            running: true,
+            port: Some(cfg.api_port),
+            message: Some("api-server reachable but not managed by this desktop".to_string()),
+            ..Default::default()
+        };
+    }
+    ApiServerStatus::default()
+}
+
+#[tauri::command]
+async fn local_runtime_status(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<LocalRuntimeState>>,
+    input: Option<LocalRuntimeInput>,
+) -> Result<LocalRuntimeStatus, String> {
+    let input = input.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &input)?;
+    let cluster = local_cluster_status(LocalClusterInput {
+        cluster_name: Some(cfg.cluster_name.clone()),
+        host_port: Some(cfg.host_port),
+    })
+    .await?;
+    let api_server = current_api_server_status(state.inner(), &cfg).await;
+    let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
+    let cluster_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
+    Ok(LocalRuntimeStatus {
+        cluster,
+        api_server,
+        config: cfg,
+        cluster_id,
+    })
+}
+
+#[tauri::command]
+async fn start_local_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<LocalRuntimeState>>,
+    input: Option<LocalRuntimeInput>,
+) -> Result<LocalRuntimeStatus, String> {
+    let input = input.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &input)?;
+
+    // Phase 1: cluster
+    let _ = start_local_cluster(LocalClusterInput {
+        cluster_name: Some(cfg.cluster_name.clone()),
+        host_port: Some(cfg.host_port),
+    })
+    .await?;
+
+    // Phase 2: api-server. Skip if a managed handle is already alive.
+    let already_alive = {
+        let mut guard = state.api_server.lock().await;
+        if let Some(handle) = guard.as_mut() {
+            matches!(handle.child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    };
+
+    if !already_alive {
+        // Drop any stale exited handle before spawning.
+        {
+            let mut guard = state.api_server.lock().await;
+            *guard = None;
+        }
+        let token = random_bootstrap_token();
+        let (program, base_args) = api_server_entry()?;
+        let data_dir = PathBuf::from(&cfg.data_dir);
+        fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
+        let log_dir = app
+            .path()
+            .app_log_dir()
+            .map_err(|e| format!("resolve log dir: {e}"))?;
+        fs::create_dir_all(&log_dir).map_err(|e| format!("create log dir: {e}"))?;
+        let log_path = log_dir.join("local-api-server.log");
+        // Truncate on each start so the log shows only the current
+        // run — keeps the "tail of log" error path useful instead of
+        // showing stale failures from a prior session.
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .map_err(|e| format!("open log file: {e}"))?;
+        let log_file_err = log_file.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&base_args)
+            .env("APPLIANCE_MODE", "server")
+            .env("APPLIANCE_BASE_CONFIG", build_base_config(&cfg))
+            .env("BOOTSTRAP_TOKEN", &token)
+            .env("PORT", cfg.api_port.to_string())
+            .env("HOST", "127.0.0.1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn api-server: {e}"))?;
+        let started_at = chrono::Utc::now().to_rfc3339();
+        {
+            let mut guard = state.api_server.lock().await;
+            *guard = Some(ApiServerHandle {
+                child,
+                port: cfg.api_port,
+                log_path: log_path.clone(),
+                started_at,
+            });
+        }
+
+        if let Err(e) = wait_for_api_server(cfg.api_port, Duration::from_secs(25)).await {
+            // Reap the handle so the next start retries cleanly.
+            if let Some(mut handle) = state.api_server.lock().await.take() {
+                let _ = handle.child.start_kill();
+            }
+            return Err(format!(
+                "{e}. Tail of {}:\n{}",
+                log_path.display(),
+                tail_log(&log_path, 40)
+            ));
+        }
+
+        // Phase 3: mint key + register cluster (idempotent — if a
+        // matching cluster already exists, we just refresh its key).
+        let api_key = mint_api_key(cfg.api_port, &token).await?;
+        register_local_runtime_cluster(&app, &cfg, &api_key).map_err(|e| e.to_string())?;
+    }
+
+    local_runtime_status(app, state, Some(input)).await
+}
+
+#[tauri::command]
+async fn stop_local_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<LocalRuntimeState>>,
+    input: Option<LocalRuntimeInput>,
+) -> Result<LocalRuntimeStatus, String> {
+    let input = input.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &input)?;
+
+    // Kill the api-server first so it doesn't error-log when the
+    // cluster's apiserver vanishes underneath it.
+    if let Some(mut handle) = state.api_server.lock().await.take() {
+        let _ = handle.child.kill().await;
+    }
+
+    let (ok, _stdout, stderr) =
+        run_status_command(&["k3d", "cluster", "stop", &cfg.cluster_name]).await?;
+    if !ok && !stderr.contains("not found") {
+        return Err(format!("k3d cluster stop failed: {}", stderr));
+    }
+
+    local_runtime_status(app, state, Some(input)).await
+}
+
+#[tauri::command]
+async fn delete_local_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<LocalRuntimeState>>,
+    input: Option<LocalRuntimeInput>,
+) -> Result<LocalRuntimeStatus, String> {
+    let input = input.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &input)?;
+
+    if let Some(mut handle) = state.api_server.lock().await.take() {
+        let _ = handle.child.kill().await;
+    }
+
+    let (ok, _stdout, stderr) =
+        run_status_command(&["k3d", "cluster", "delete", &cfg.cluster_name]).await?;
+    if !ok && !stderr.contains("not found") {
+        return Err(format!("k3d cluster delete failed: {}", stderr));
+    }
+
+    // Forget the registered cluster + keychain entry; the data dir is
+    // left alone (the user can wipe it manually if they want to start
+    // fully fresh — we treat it as their data, like Docker volumes).
+    unregister_local_runtime_cluster(&app, &cfg.api_server_url).map_err(|e| e.to_string())?;
+
+    local_runtime_status(app, state, Some(input)).await
+}
+
+// --- kubectl-driven workloads & logs --------------------------------
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalWorkloads {
+    deployments: Vec<DeploymentInfo>,
+    pods: Vec<PodInfo>,
+    services: Vec<ServiceInfo>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentInfo {
+    name: String,
+    image: Option<String>,
+    desired: i64,
+    ready: i64,
+    available: i64,
+    created_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodInfo {
+    name: String,
+    phase: String,
+    ready: bool,
+    restart_count: i64,
+    container_image: Option<String>,
+    created_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceInfo {
+    name: String,
+    service_type: String,
+    cluster_ip: Option<String>,
+    node_port: Option<i64>,
+    target_port: Option<i64>,
+}
+
+fn kube_context(cluster_name: &str) -> String {
+    // k3d prefixes contexts with `k3d-`.
+    format!("k3d-{}", cluster_name)
+}
+
+#[tauri::command]
+async fn list_local_workloads(
+    app: AppHandle,
+    input: Option<LocalRuntimeInput>,
+) -> Result<LocalWorkloads, String> {
+    let input = input.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &input)?;
+    let ctx = kube_context(&cfg.cluster_name);
+
+    let (ok, stdout, stderr) = run_status_command(&[
+        "kubectl",
+        "--context",
+        &ctx,
+        "-n",
+        &cfg.namespace,
+        "get",
+        "deploy,pod,svc",
+        "-o",
+        "json",
+    ])
+    .await?;
+    if !ok {
+        // Namespace-not-found shows up as a "NotFound" error. Treat
+        // that as "no workloads yet" so the UI doesn't flash an error
+        // before the user has deployed anything.
+        if stderr.contains("(NotFound)") || stderr.contains("not found") {
+            return Ok(LocalWorkloads::default());
+        }
+        return Err(format!("kubectl get failed: {}", stderr));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    let mut out = LocalWorkloads::default();
+    if let Some(items) = parsed.get("items").and_then(|i| i.as_array()) {
+        for item in items {
+            let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let created_at = item
+                .pointer("/metadata/creationTimestamp")
+                .and_then(|t| t.as_str())
+                .map(String::from);
+            match kind {
+                "Deployment" => {
+                    let image = item
+                        .pointer("/spec/template/spec/containers/0/image")
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let desired = item.pointer("/spec/replicas").and_then(|n| n.as_i64()).unwrap_or(0);
+                    let ready = item
+                        .pointer("/status/readyReplicas")
+                        .and_then(|n| n.as_i64())
+                        .unwrap_or(0);
+                    let available = item
+                        .pointer("/status/availableReplicas")
+                        .and_then(|n| n.as_i64())
+                        .unwrap_or(0);
+                    out.deployments.push(DeploymentInfo {
+                        name,
+                        image,
+                        desired,
+                        ready,
+                        available,
+                        created_at,
+                    });
+                }
+                "Pod" => {
+                    let phase = item
+                        .pointer("/status/phase")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let container_image = item
+                        .pointer("/spec/containers/0/image")
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let (ready, restart_count) = item
+                        .pointer("/status/containerStatuses")
+                        .and_then(|cs| cs.as_array())
+                        .map(|arr| {
+                            let ready = arr.iter().all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false));
+                            let restarts = arr
+                                .iter()
+                                .map(|c| c.get("restartCount").and_then(|r| r.as_i64()).unwrap_or(0))
+                                .sum::<i64>();
+                            (ready, restarts)
+                        })
+                        .unwrap_or((false, 0));
+                    out.pods.push(PodInfo {
+                        name,
+                        phase,
+                        ready,
+                        restart_count,
+                        container_image,
+                        created_at,
+                    });
+                }
+                "Service" => {
+                    let service_type = item
+                        .pointer("/spec/type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("ClusterIP")
+                        .to_string();
+                    let cluster_ip = item
+                        .pointer("/spec/clusterIP")
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let ports = item.pointer("/spec/ports").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                    let first_port = ports.first();
+                    let node_port = first_port.and_then(|p| p.get("nodePort")).and_then(|n| n.as_i64());
+                    let target_port = first_port
+                        .and_then(|p| p.get("targetPort"))
+                        .and_then(|n| n.as_i64());
+                    out.services.push(ServiceInfo {
+                        name,
+                        service_type,
+                        cluster_ip,
+                        node_port,
+                        target_port,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodLogsInput {
+    pod_name: String,
+    #[serde(default)]
+    container: Option<String>,
+    #[serde(default)]
+    tail_lines: Option<i64>,
+    #[serde(default)]
+    cluster_name: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[tauri::command]
+async fn tail_local_pod_logs(
+    app: AppHandle,
+    input: PodLogsInput,
+) -> Result<String, String> {
+    let runtime_input = LocalRuntimeInput {
+        cluster_name: input.cluster_name.clone(),
+        namespace: input.namespace.clone(),
+        ..Default::default()
+    };
+    let cfg = resolve_runtime_config(&app, &runtime_input)?;
+    let ctx = kube_context(&cfg.cluster_name);
+    let tail = input.tail_lines.unwrap_or(200).to_string();
+    let mut args: Vec<&str> = vec![
+        "kubectl",
+        "--context",
+        &ctx,
+        "-n",
+        &cfg.namespace,
+        "logs",
+        &input.pod_name,
+        "--tail",
+        &tail,
+    ];
+    if let Some(c) = input.container.as_deref() {
+        args.push("-c");
+        args.push(c);
+    }
+    let (ok, stdout, stderr) = run_status_command(&args).await?;
+    if !ok {
+        return Err(format!("kubectl logs failed: {}", stderr));
+    }
+    Ok(stdout)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .manage(Arc::new(LocalRuntimeState::default()))
         .invoke_handler(tauri::generate_handler![
             get_config,
             add_cluster,
@@ -903,7 +1720,13 @@ pub fn run() {
             local_cluster_status,
             start_local_cluster,
             stop_local_cluster,
-            delete_local_cluster
+            delete_local_cluster,
+            local_runtime_status,
+            start_local_runtime,
+            stop_local_runtime,
+            delete_local_runtime,
+            list_local_workloads,
+            tail_local_pod_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

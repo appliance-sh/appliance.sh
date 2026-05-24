@@ -9,6 +9,7 @@ import { EnvironmentDetailPage } from '@/pages/environments/detail';
 import { DeploymentsPage } from '@/pages/deployments/list';
 import { DeploymentDetailPage } from '@/pages/deployments/detail';
 import { SettingsPage } from '@/pages/settings';
+import { LocalRuntimePage } from '@/pages/local-runtime';
 import { BootstrapWizardPage } from '@/pages/bootstrap/wizard';
 import { BootstrapProgressPage } from '@/pages/bootstrap/progress';
 
@@ -27,6 +28,7 @@ export const routes: RouteObject[] = [
       { path: 'environments/:projectId/:id', element: <EnvironmentDetailPage /> },
       { path: 'deployments', element: <DeploymentsPage /> },
       { path: 'deployments/:id', element: <DeploymentDetailPage /> },
+      { path: 'local-runtime', element: <LocalRuntimePage /> },
       { path: 'settings', element: <SettingsPage /> },
     ],
   },

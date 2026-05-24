@@ -19,6 +19,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-appliance-local}"
 NAMESPACE="${NAMESPACE:-appliance}"
 HOST_PORT="${HOST_PORT:-8081}"
 API_PORT="${API_PORT:-3030}"
+NODEPORT_RANGE="${NODEPORT_RANGE:-30000-30050}"
 DATA_DIR="${DATA_DIR:-$HOME/.appliance/local-runtime}"
 BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN:-demo-bootstrap-token}"
 
@@ -58,8 +59,18 @@ start_cluster() {
       k3d cluster start "$CLUSTER_NAME"
     fi
   else
-    echo "==> creating k3d cluster '$CLUSTER_NAME' (host :$HOST_PORT -> lb)"
-    k3d cluster create "$CLUSTER_NAME" --agents 1 -p "$HOST_PORT:80@loadbalancer" --wait
+    echo "==> creating k3d cluster '$CLUSTER_NAME' (host :$HOST_PORT -> lb, NodePort $NODEPORT_RANGE -> agent)"
+    # Map a NodePort sub-range off the agent node so each appliance
+    # Service is reachable on the host at http://localhost:<NodePort>
+    # with no port-forward dance. Default range is small (30000-30050)
+    # because publishing more than ~100 ports has been observed to
+    # crash colima/docker on macOS. Override with NODEPORT_RANGE if
+    # you need more concurrent appliances.
+    k3d cluster create "$CLUSTER_NAME" \
+      --agents 1 \
+      -p "$HOST_PORT:80@loadbalancer" \
+      -p "$NODEPORT_RANGE:$NODEPORT_RANGE@agent:0" \
+      --wait
   fi
 }
 
@@ -67,7 +78,14 @@ build_demo_image() {
   local dir=$1
   local name=$2
   echo "==> docker build $name from $dir"
-  docker build --platform linux/amd64 -t "$name:latest" "$dir"
+  # Default to the host's native architecture so we don't pay for
+  # qemu emulation on Apple Silicon. Override with PLATFORM=linux/amd64
+  # if you need to mirror what the cloud Lambda will run.
+  # The `${arr[@]+"${arr[@]}"}` dance keeps `set -u` happy when the
+  # array is empty (otherwise bash treats it as unbound).
+  local platform_arg=()
+  [[ -n "${PLATFORM:-}" ]] && platform_arg=(--platform "$PLATFORM")
+  docker build ${platform_arg[@]+"${platform_arg[@]}"} -t "$name:latest" "$dir"
   k3d image import -c "$CLUSTER_NAME" "$name:latest"
 }
 
@@ -109,7 +127,9 @@ stop_api_server() {
 trap stop_api_server EXIT
 
 create_api_key() {
-  echo "==> minting initial api key"
+  # Status messages go to stderr so callers can `key=$(create_api_key)`
+  # without polluting the JSON they then pipe into jq.
+  echo "==> minting initial api key" >&2
   curl -fsS -X POST "http://localhost:$API_PORT/bootstrap/create-key" \
     -H "X-Bootstrap-Token: $BOOTSTRAP_TOKEN" \
     -H 'content-type: application/json' \
@@ -172,9 +192,12 @@ deploy_demo() {
     sign_and_call POST /api/v1/builds "{\"type\":\"remote-image\",\"uploadUrl\":\"$image\"}")
   build_id=$(jq -r .buildId <<<"$build")
 
-  echo "==> dispatching deploy"
+  echo "==> dispatching deploy (PORT=$port)"
+  # PORT is forwarded into the container's env AND used by the local
+  # executor to wire the Service / containerPort, so a NodePort actually
+  # routes traffic to the listening process.
   dep=$(API_PORT=$API_PORT KEY_ID=$KEY_ID KEY_SECRET=$KEY_SECRET \
-    sign_and_call POST /api/v1/deployments "{\"environmentId\":\"$env_id\",\"action\":\"deploy\",\"buildId\":\"$build_id\"}")
+    sign_and_call POST /api/v1/deployments "{\"environmentId\":\"$env_id\",\"action\":\"deploy\",\"buildId\":\"$build_id\",\"environment\":{\"PORT\":\"$port\"}}")
   dep_id=$(jq -r .id <<<"$dep")
 
   echo "==> waiting for deploy to finish"
@@ -189,9 +212,22 @@ deploy_demo() {
     esac
   done
 
-  echo "==> exposing service via kubectl port-forward (probe only)"
+  echo "==> waiting for rollout"
   kubectl -n "$NAMESPACE" wait --for=condition=available --timeout=60s "deployment/$project_name-$env_name"
   kubectl -n "$NAMESPACE" get svc "$project_name-$env_name" -o wide
+  url=$(jq -r .message <<<"$out" | sed -n 's/.*URL: //p')
+  if [[ -n "$url" && "$url" != "pending" ]]; then
+    echo "==> probing $url"
+    # Retry briefly — NodePort hairpin can lag a beat behind the
+    # Service appearing in `kubectl get`.
+    for _ in $(seq 1 15); do
+      if body=$(curl -fsS --max-time 3 "$url/"); then
+        echo "    response: $body"
+        break
+      fi
+      sleep 1
+    done
+  fi
   echo "DEMO_PROJECT_ID_$project_name=$project_id" >>/tmp/appliance-demo.env
   echo "DEMO_ENV_ID_$env_name=$env_id" >>/tmp/appliance-demo.env
   echo "DEMO_LAST_DEP=$dep_id" >>/tmp/appliance-demo.env

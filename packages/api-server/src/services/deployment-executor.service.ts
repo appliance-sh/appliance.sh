@@ -310,9 +310,21 @@ async function executeLocalAction(
         ...(input.environment ?? {}),
         ...(build.environment ?? {}),
       };
+      // Port precedence:
+      //   1. Resolved build (set by the manifest path when the
+      //      upload-zip flow lands locally — not the current
+      //      remote-image short-circuit, but kept here for parity).
+      //   2. `env.PORT` — by convention, container apps that read PORT
+      //      from the environment also bind it as their listening port,
+      //      so we lift it into the Service/containerPort so the
+      //      NodePort exposes the right target.
+      //   3. The Service falls back to 8080 inside renderManifest if
+      //      nothing else is supplied.
+      const envPort = env.PORT ? Number.parseInt(env.PORT, 10) : undefined;
+      const port = build.localPort ?? (Number.isFinite(envPort) ? envPort : undefined);
       const result = await local.deploy(metadata.stackName, metadata, {
         imageUri: build.imageUri,
-        port: build.localPort,
+        port,
         environment: env,
       });
       return { message: result.message, idempotentNoop: result.idempotentNoop };

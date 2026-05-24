@@ -4,7 +4,10 @@ import {
   DEFAULT_LOCAL_CLUSTER_NAME,
   DEFAULT_LOCAL_HOST_PORT,
   DEFAULT_LOCAL_NAMESPACE,
+  DEFAULT_LOCAL_NODEPORT_MAX,
+  DEFAULT_LOCAL_NODEPORT_MIN,
   LocalContainerDeploymentService,
+  deterministicNodePort,
   renderManifest,
 } from './LocalContainerDeploymentService';
 
@@ -93,5 +96,29 @@ describe('renderManifest', () => {
     expect(yaml).toContain('containerPort: 8080');
     expect(yaml).toContain('port: 8080');
     expect(yaml).toContain('targetPort: 8080');
+  });
+
+  it('emits an explicit nodePort when supplied', () => {
+    const yaml = renderManifest({ ...baseParams, nodePort: 30005 });
+    expect(yaml).toContain('nodePort: 30005');
+  });
+
+  it('omits the nodePort line when none is supplied (k8s picks one)', () => {
+    const yaml = renderManifest({ ...baseParams });
+    expect(yaml).not.toContain('nodePort:');
+  });
+});
+
+describe('deterministicNodePort', () => {
+  it('returns the same port for the same stack name', () => {
+    expect(deterministicNodePort('demo-node-prod')).toBe(deterministicNodePort('demo-node-prod'));
+  });
+
+  it('stays within the configured NodePort range', () => {
+    for (const name of ['a', 'demo-node-prod', 'demo-python-prod', 'x'.repeat(200)]) {
+      const port = deterministicNodePort(name);
+      expect(port).toBeGreaterThanOrEqual(DEFAULT_LOCAL_NODEPORT_MIN);
+      expect(port).toBeLessThanOrEqual(DEFAULT_LOCAL_NODEPORT_MAX);
+    }
   });
 });

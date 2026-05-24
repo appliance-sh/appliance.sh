@@ -190,12 +190,112 @@ export interface LocalClusterStatus {
   message?: string;
 }
 
+// Runtime-level input — covers the cluster, the api-server sidecar,
+// the bound data dir, and the host-side api port. All optional;
+// host defaults match the demo script (cluster `appliance-local`,
+// namespace `appliance`, host port 8081, api port 3030,
+// data dir = appDataDir/local-runtime).
+export interface LocalRuntimeInput {
+  clusterName?: string;
+  namespace?: string;
+  hostPort?: number;
+  apiPort?: number;
+  dataDir?: string;
+}
+
+export interface ResolvedRuntimeConfig {
+  clusterName: string;
+  namespace: string;
+  hostPort: number;
+  apiPort: number;
+  dataDir: string;
+  apiServerUrl: string;
+  nodePortMin: number;
+  nodePortMax: number;
+}
+
+export interface ApiServerStatus {
+  running: boolean;
+  pid?: number;
+  port?: number;
+  startedAt?: string;
+  logPath?: string;
+  /** Surfaces "api-server exited" or "reachable but unmanaged" hints. */
+  message?: string;
+}
+
+export interface LocalRuntimeStatus {
+  cluster: LocalClusterStatus;
+  apiServer: ApiServerStatus;
+  config: ResolvedRuntimeConfig;
+  /** Persisted cluster id under which the runtime is auto-registered,
+   *  so the Console can select it like any cloud cluster. Absent until
+   *  the first successful start. */
+  clusterId?: string;
+}
+
+export interface LocalDeploymentInfo {
+  name: string;
+  image?: string;
+  desired: number;
+  ready: number;
+  available: number;
+  createdAt?: string;
+}
+
+export interface LocalPodInfo {
+  name: string;
+  phase: string;
+  ready: boolean;
+  restartCount: number;
+  containerImage?: string;
+  createdAt?: string;
+}
+
+export interface LocalServiceInfo {
+  name: string;
+  serviceType: string;
+  clusterIp?: string;
+  nodePort?: number;
+  targetPort?: number;
+}
+
+export interface LocalWorkloads {
+  deployments: LocalDeploymentInfo[];
+  pods: LocalPodInfo[];
+  services: LocalServiceInfo[];
+}
+
+export interface LocalPodLogsInput {
+  podName: string;
+  container?: string;
+  tailLines?: number;
+  clusterName?: string;
+  namespace?: string;
+}
+
 export interface LocalRuntimeHost {
+  /** Legacy cluster-only status (kept for backwards compat). */
   status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
   start(input?: LocalClusterInput): Promise<LocalClusterStatus>;
   stop(input?: LocalClusterInput): Promise<LocalClusterStatus>;
   /** Permanently delete the cluster + all of its state. */
   delete(input?: LocalClusterInput): Promise<LocalClusterStatus>;
+
+  /** Combined cluster + api-server + persisted-cluster snapshot. */
+  runtimeStatus(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
+  /** Idempotently bring up cluster + api-server + auto-register the
+   *  resulting cluster so the Console can talk to it. */
+  startRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
+  /** Kill api-server + stop cluster. Data is preserved. */
+  stopRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
+  /** Kill api-server, delete cluster, forget the registered Console
+   *  cluster + key. The data dir itself is left on disk. */
+  deleteRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
+  /** Snapshot of Deployments / Pods / Services in the appliance namespace. */
+  listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads>;
+  /** One-shot `kubectl logs --tail` for the named pod. */
+  tailPodLogs(input: LocalPodLogsInput): Promise<string>;
 }
 
 export type {
