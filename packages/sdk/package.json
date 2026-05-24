@@ -54,6 +54,7 @@
     "zod-to-ts": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "*"
+    "@types/node": "*",
+    "vitest": "^3.0.4"
   }
 }
