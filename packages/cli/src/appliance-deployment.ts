@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
 import chalk from 'chalk';
 
 const CANCEL_POLL_INTERVAL_MS = 2000;
@@ -67,6 +68,8 @@ async function resolveInFlightDeployment(
 }
 
 const program = new Command();
+
+attachProfileOption(program);
 
 program.description('manage deployments');
 

@@ -1,9 +1,12 @@
 import { Command } from 'commander';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
 import chalk from 'chalk';
 
 const program = new Command();
+
+attachProfileOption(program);
 
 program.action(async () => {
   let failed = false;

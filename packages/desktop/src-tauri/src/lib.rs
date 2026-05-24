@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -116,19 +117,232 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
     Ok(dir.join(CONFIG_FILE))
 }
 
+// ============================================================
+// Shared profile store: ~/.appliance/profiles.json
+//
+// The desktop runs in DUAL-MODE persistence:
+//   1. The OS keychain holds each cluster's API key secret (account
+//      `cluster:<id>`). This is the more-secure store and stays the
+//      primary source for secrets on the desktop side.
+//   2. The legacy <app-config>/config.json holds cluster metadata
+//      (name, URL, createdAt, etc.) — kept as a mirror so a downgrade
+//      to the previous desktop binary remains non-destructive.
+//   3. ~/.appliance/profiles.json mirrors BOTH metadata and secrets in
+//      a format the CLI reads directly. Updated on every persisted
+//      write so the CLI sees the same clusters the desktop sees.
+//
+// Reads prefer the legacy file when it has clusters; otherwise the
+// shared file is ingested into the legacy stores so the rest of the
+// code path is unchanged.
+// ============================================================
+
+const SHARED_PROFILES_DIR: &str = ".appliance";
+const SHARED_PROFILES_FILE: &str = "profiles.json";
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharedProfileEntry {
+    api_url: String,
+    key_id: String,
+    secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_backend_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_bootstrap_input: Option<serde_json::Value>,
+    /// Which surface created the profile ("desktop" | "cli"). Used by
+    /// the desktop's mirror step to only rewrite its own entries and
+    /// leave CLI-managed profiles alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed: Option<String>,
+    /// Human label for the profile; the map key is the slug/id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SharedProfilesFile {
+    #[serde(default = "shared_profiles_version")]
+    version: u32,
+    #[serde(default)]
+    active_profile: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, SharedProfileEntry>,
+}
+
+fn shared_profiles_version() -> u32 {
+    1
+}
+
+impl Default for SharedProfilesFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            active_profile: None,
+            profiles: BTreeMap::new(),
+        }
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn shared_profiles_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join(SHARED_PROFILES_FILE))
+}
+
+fn read_shared_profiles() -> Option<SharedProfilesFile> {
+    let path = shared_profiles_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<SharedProfilesFile>(&raw).ok()
+}
+
+fn write_shared_profiles(file: &SharedProfilesFile) -> Result<(), HostError> {
+    let Some(path) = shared_profiles_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Atomic write so a crash during serialization doesn't leave a
+    // half-truncated file (which would brick both the desktop and the
+    // CLI on next read).
+    let tmp = path.with_extension("json.tmp");
+    let raw = serde_json::to_string_pretty(file)?;
+    fs::write(&tmp, raw)?;
+    fs::rename(&tmp, &path)?;
+    // 0600 on unix so the secrets aren't world-readable. Best-effort
+    // on Windows where there's no equivalent simple permission bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Reflect the current desktop-side state into the shared file. Reads
+/// each cluster's secret out of the keychain; clusters without a
+/// keychain secret get the entry left as-is from any prior write
+/// (defensive — partial state is more useful than a missing entry).
+/// CLI-managed entries (managed != "desktop") are preserved untouched.
+fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
+    let mut file = read_shared_profiles().unwrap_or_default();
+    file.profiles.retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
+    for cluster in &cfg.clusters {
+        let secret = read_api_key(&cluster_keychain_account(&cluster.id));
+        let (key_id, secret_value) = match secret {
+            Some(k) => (k.id, k.secret),
+            None => {
+                // No key on the keychain yet — keep whatever the
+                // shared file already had for this id, or write a
+                // placeholder if absent so the metadata survives.
+                let existing = file.profiles.get(&cluster.id).cloned();
+                let prev = existing.unwrap_or_default();
+                (prev.key_id, prev.secret)
+            }
+        };
+        file.profiles.insert(
+            cluster.id.clone(),
+            SharedProfileEntry {
+                api_url: cluster.api_server_url.clone(),
+                key_id,
+                secret: secret_value,
+                created_at: Some(cluster.created_at.clone()),
+                state_backend_url: cluster.state_backend_url.clone(),
+                last_bootstrap_input: cluster.last_bootstrap_input.clone(),
+                managed: Some("desktop".to_string()),
+                name: Some(cluster.name.clone()),
+            },
+        );
+    }
+    file.active_profile = cfg.selected_cluster_id.clone();
+    write_shared_profiles(&file)
+}
+
+/// Convert a SharedProfilesFile into a PersistedConfig (the desktop's
+/// in-memory shape) and write the secrets back into the OS keychain so
+/// subsequent calls see them through the existing keychain path.
+/// Also writes the legacy config.json so the next read short-circuits.
+fn ingest_shared_into_legacy(
+    app: &AppHandle,
+    shared: SharedProfilesFile,
+) -> Result<PersistedConfig, HostError> {
+    let mut cfg = PersistedConfig::default();
+    for (id, entry) in &shared.profiles {
+        let cluster = Cluster {
+            id: id.clone(),
+            name: entry.name.clone().unwrap_or_else(|| id.clone()),
+            api_server_url: entry.api_url.clone(),
+            created_at: entry
+                .created_at
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            state_backend_url: entry.state_backend_url.clone(),
+            last_bootstrap_input: entry.last_bootstrap_input.clone(),
+        };
+        let _ = write_api_key(
+            &cluster_keychain_account(id),
+            &ApiKey {
+                id: entry.key_id.clone(),
+                secret: entry.secret.clone(),
+            },
+        );
+        cfg.clusters.push(cluster);
+    }
+    cfg.selected_cluster_id = shared.active_profile.clone();
+
+    // Persist to the legacy file so this code path doesn't re-ingest
+    // on every read.
+    let legacy_path = config_path(app)?;
+    let raw = serde_json::to_string_pretty(&cfg)?;
+    fs::write(legacy_path, raw)?;
+    Ok(cfg)
+}
+
 fn read_persisted_config(app: &AppHandle) -> Result<PersistedConfig, HostError> {
     let path = config_path(app)?;
-    if !path.exists() {
-        return Ok(PersistedConfig::default());
+    let legacy = if path.exists() {
+        let raw = fs::read_to_string(&path)?;
+        serde_json::from_str::<PersistedConfig>(&raw).unwrap_or_default()
+    } else {
+        PersistedConfig::default()
+    };
+
+    // Legacy file already has clusters — use it as the source of truth.
+    // The shared file is updated as a mirror on every subsequent write.
+    if !legacy.clusters.is_empty() {
+        return Ok(legacy);
     }
-    let raw = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+
+    // Legacy file is empty/missing. Pull from the shared store if the
+    // CLI (or a previous version of this desktop) populated it.
+    if let Some(shared) = read_shared_profiles() {
+        if !shared.profiles.is_empty() {
+            return ingest_shared_into_legacy(app, shared);
+        }
+    }
+    Ok(legacy)
 }
 
 fn write_persisted_config(app: &AppHandle, cfg: &PersistedConfig) -> Result<(), HostError> {
     let path = config_path(app)?;
     let raw = serde_json::to_string_pretty(cfg)?;
     fs::write(path, raw)?;
+    // Best-effort mirror — if writing the shared file fails (e.g.
+    // unwritable home dir), the desktop's own state is still
+    // consistent; the CLI just won't see the latest set.
+    if let Err(e) = mirror_to_shared_profiles(cfg) {
+        eprintln!("warn: shared-profile mirror failed: {e}");
+    }
     Ok(())
 }
 
@@ -698,6 +912,9 @@ const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
 const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
 const DEFAULT_LOCAL_API_PORT: u16 = 3030;
 const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
+// Stable cluster id == profile name used by the CLI's `--profile`
+// flag and the shared profiles.json key.
+const LOCAL_RUNTIME_CLUSTER_ID: &str = "local-runtime";
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1181,8 +1398,16 @@ fn register_local_runtime_cluster(
             id
         }
         None => {
+            // Stable, human-friendly id so the CLI can reference the
+            // profile as `appliance --profile local-runtime` instead
+            // of a churning UUID. Safe because we already short-
+            // circuited the existing-cluster case above; if another
+            // cluster happens to use this same id (highly unlikely),
+            // both rows would point at the same NodePort window and
+            // the second's keychain write would simply replace the
+            // first's.
             let cluster = Cluster {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: LOCAL_RUNTIME_CLUSTER_ID.to_string(),
                 name: LOCAL_RUNTIME_CLUSTER_NAME.to_string(),
                 api_server_url: cfg.api_server_url.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
