@@ -1,3 +1,15 @@
+## 1.40.0 (2026-05-24)
+
+### Features
+
+- add k3 support ([#41](https://github.com/appliance-sh/appliance.sh/pull/41))
+- **bootstrap:** agnostic aws profile ([8465985](https://github.com/appliance-sh/appliance.sh/commit/8465985))
+- **bootstrap:** improved baseline ([#40](https://github.com/appliance-sh/appliance.sh/pull/40))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.39.0 (2026-05-10)
 
 ### Features
