@@ -113,6 +113,9 @@ export async function runApiServerUpdate(
         `--query 'Environment.Variables.APPLIANCE_BASE_CONFIG' --output text\`).`
     );
   }
+  if (!baseConfig.aws) {
+    throw new Error('api-server update is AWS-only — local bases have no ECR to mirror to');
+  }
   if (!baseConfig.aws.ecrRepositoryUrl) {
     throw new Error('cluster baseConfig is missing ecrRepositoryUrl — cannot mirror new image');
   }
@@ -159,6 +162,9 @@ export async function runApiServerUpdate(
   // Same env-var layout phase 2 deploys with. Recomputed each update
   // to pick up any baseConfig changes (e.g. cluster ops added a new
   // optional field that the new api-server expects).
+  if (!baseConfig.stateBackendUrl) {
+    throw new Error('cluster baseConfig is missing stateBackendUrl — cannot dispatch updated deploy');
+  }
   const sharedEnv: Record<string, string> = {
     APPLIANCE_BASE_CONFIG: JSON.stringify(baseConfig),
     PULUMI_BACKEND_URL: baseConfig.stateBackendUrl,

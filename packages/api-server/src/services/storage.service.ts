@@ -1,5 +1,6 @@
-import { applianceBaseConfig, type ObjectStore } from '@appliance.sh/sdk';
+import { applianceBaseConfig, ApplianceBaseType, type ObjectStore } from '@appliance.sh/sdk';
 import { S3ObjectStore } from './s3-object-store';
+import { FilesystemObjectStore } from './filesystem-object-store';
 
 export class StorageService {
   private readonly store: ObjectStore;
@@ -54,10 +55,16 @@ function createStorageService(): StorageService {
 
   const config = applianceBaseConfig.parse(JSON.parse(baseConfigJson));
 
-  if (!config.aws.dataBucketName) {
-    throw new Error('dataBucketName is required in APPLIANCE_BASE_CONFIG');
+  if (config.type === ApplianceBaseType.ApplianceLocal) {
+    if (!config.local?.dataDir) {
+      throw new Error('local.dataDir is required in APPLIANCE_BASE_CONFIG for local bases');
+    }
+    return new StorageService(new FilesystemObjectStore(config.local.dataDir));
   }
 
+  if (!config.aws?.dataBucketName) {
+    throw new Error('aws.dataBucketName is required in APPLIANCE_BASE_CONFIG for cloud bases');
+  }
   const store = new S3ObjectStore(config.aws.dataBucketName, config.aws.region);
   return new StorageService(store);
 }

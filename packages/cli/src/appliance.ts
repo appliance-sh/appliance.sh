@@ -24,6 +24,7 @@ program
   .command('remove <project> <environment>', 'alias for destroy')
   .command('setup', 'connect local codebase to a cloud application')
   .command('status <project>', 'show application status')
+  .command('profile', 'manage credential profiles (shared with the desktop app)')
   .command('teardown', 'destroy a bootstrap installation (reverses `appliance bootstrap`)')
   .command('test', 'run connection and signing diagnostics');
 

@@ -88,11 +88,21 @@ export class ApplianceStack extends pulumi.ComponentResource {
   constructor(name: string, args: ApplianceStackArgs, opts: ApplianceStackOpts) {
     super('appliance:aws:ApplianceStack', name, args, opts);
 
+    // `args.config.aws` was the only base shape that existed when this
+    // component was written. The base schema now also accepts
+    // `appliance-base-local` (no aws block), so the union allows
+    // `aws: undefined`. This component is AWS-only — narrow once and
+    // shadow `args.config` below so the `.aws.X` accesses keep working.
+    if (!args.config.aws) {
+      throw new Error(`ApplianceStack requires an AWS-typed base config; got type '${args.config.type}'`);
+    }
+    const awsConfig = args.config.aws;
+
     // CloudFront is the only supported ingress — the Lambda Function URL is
     // always created with AWS_IAM auth and is intended to be invoked either
     // by the CloudFront distribution (via OAC) or by the edge router role.
     // Refuse to build a stack that would expose the function URL publicly.
-    if (!args.config.aws.cloudfrontDistributionId) {
+    if (!awsConfig.cloudfrontDistributionId) {
       throw new Error(
         'ApplianceStack requires a cloudfrontDistributionId in base config — publicly accessible Lambda Function URLs are not supported.'
       );
@@ -160,11 +170,11 @@ export class ApplianceStack extends pulumi.ComponentResource {
         );
       }
 
-      if (args.codeS3Key && args.config.aws.dataBucketName) {
+      if (args.codeS3Key && awsConfig.dataBucketName) {
         policyStatements.push({
           Effect: 'Allow' as const,
           Action: 's3:GetObject',
-          Resource: `arn:aws:s3:::${args.config.aws.dataBucketName}/${args.codeS3Key}`,
+          Resource: `arn:aws:s3:::${awsConfig.dataBucketName}/${args.codeS3Key}`,
         });
       }
 
@@ -210,14 +220,14 @@ export class ApplianceStack extends pulumi.ComponentResource {
         },
         defaultOpts
       );
-    } else if (args.codeS3Key && args.config.aws.dataBucketName) {
+    } else if (args.codeS3Key && awsConfig.dataBucketName) {
       this.lambda = new aws.lambda.Function(
         `${rid}-handler`,
         {
           packageType: 'Zip',
           runtime: args.runtime ?? 'nodejs22.x',
           handler: args.handler ?? 'index.handler',
-          s3Bucket: args.config.aws.dataBucketName,
+          s3Bucket: awsConfig.dataBucketName,
           s3Key: args.codeS3Key,
           role: this.lambdaRoleArn,
           timeout: args.timeout ?? 30,
@@ -268,7 +278,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
         functionUrlAuthType: 'AWS_IAM',
         sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
           aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
-        }:distribution/${args.config.aws.cloudfrontDistributionId}`,
+        }:distribution/${awsConfig.cloudfrontDistributionId}`,
         statementId: 'FunctionURLAllowCloudFrontAccess',
       },
       defaultOpts
@@ -276,13 +286,13 @@ export class ApplianceStack extends pulumi.ComponentResource {
 
     // Grant the edge router role permission to invoke the Lambda Function URL
     // The edge router role is the execution role of the Lambda@Edge function that signs requests
-    if (args.config.aws.edgeRouterRoleArn) {
+    if (awsConfig.edgeRouterRoleArn) {
       new aws.lambda.Permission(
         `${rid}-edge-invoke-url`,
         {
           function: this.lambda.name,
           action: 'lambda:InvokeFunctionUrl',
-          principal: args.config.aws.edgeRouterRoleArn,
+          principal: awsConfig.edgeRouterRoleArn,
           functionUrlAuthType: 'AWS_IAM',
           statementId: 'FunctionURLAllowEdgeRouterRoleAccess',
         },
@@ -293,7 +303,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
         `${rid}-edge-invoke`,
         {
           action: 'lambda:InvokeFunction',
-          principal: args.config.aws.edgeRouterRoleArn,
+          principal: awsConfig.edgeRouterRoleArn,
           functionName: this.lambda.name,
           invokedViaFunctionUrl: true,
         },
@@ -301,7 +311,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
       );
     }
 
-    if (args.config.aws.cloudfrontDistributionId && args.config.aws.cloudfrontDistributionDomainName) {
+    if (awsConfig.cloudfrontDistributionId && awsConfig.cloudfrontDistributionDomainName) {
       new awsNative.lambda.Permission(
         `${rid}-cf-invoke`,
         {
@@ -309,7 +319,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
           principal: 'cloudfront.amazonaws.com',
           sourceArn: pulumi.interpolate`arn:aws:cloudfront::${
             aws.getCallerIdentityOutput({}, { provider: opts.provider }).accountId
-          }:distribution/${args.config.aws.cloudfrontDistributionId}`,
+          }:distribution/${awsConfig.cloudfrontDistributionId}`,
           functionName: this.lambda.name,
           invokedViaFunctionUrl: true,
         },
@@ -319,11 +329,11 @@ export class ApplianceStack extends pulumi.ComponentResource {
       new aws.route53.Record(
         `${rid}-cname`,
         {
-          zoneId: args.config.aws.zoneId,
+          zoneId: awsConfig.zoneId,
           name: pulumi.interpolate`${dnsLabel}.${args.config.domainName ?? ''}`,
           type: 'CNAME',
           ttl: 60,
-          records: [args.config.aws.cloudfrontDistributionDomainName],
+          records: [awsConfig.cloudfrontDistributionDomainName],
         },
         { parent: this, provider: opts.globalProvider }
       );
@@ -331,7 +341,7 @@ export class ApplianceStack extends pulumi.ComponentResource {
       new aws.route53.Record(
         `${rid}-txt`,
         {
-          zoneId: args.config.aws.zoneId,
+          zoneId: awsConfig.zoneId,
           name: pulumi.interpolate`origin.${dnsLabel}.${args.config.domainName ?? ''}`,
           type: 'TXT',
           ttl: 60,

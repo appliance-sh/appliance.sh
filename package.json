@@ -20,7 +20,7 @@
   },
   "packageManager": "pnpm@10.28.2",
   "engines": {
-    "node": "24.14.1"
+    "node": ">=24.14.1 <25"
   },
   "scripts": {
     "build": "nx run-many --target=build --all",

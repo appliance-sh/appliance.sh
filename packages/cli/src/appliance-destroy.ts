@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import type { Project, Environment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
 import chalk from 'chalk';
 
 const POLL_INTERVAL_MS = 3000;
@@ -55,6 +56,8 @@ async function pollDeployment(client: ReturnType<typeof createApplianceClient>, 
 }
 
 const program = new Command();
+
+attachProfileOption(program);
 
 program
   .description('destroy a named project/environment')

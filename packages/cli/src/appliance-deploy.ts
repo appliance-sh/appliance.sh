@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import type { Project, Environment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
 import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
 import chalk from 'chalk';
 
@@ -154,6 +155,8 @@ async function pollDeployment(client: ReturnType<typeof createApplianceClient>, 
 }
 
 const program = new Command();
+
+attachProfileOption(program);
 
 registerManifestOptions(program)
   .description('deploy a named project/environment')

@@ -2,11 +2,17 @@ import { Command } from 'commander';
 import { input, select, password } from '@inquirer/prompts';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
+import { DEFAULT_PROFILE_NAME } from './utils/profile-store.js';
 import chalk from 'chalk';
 
 const program = new Command();
 
+attachProfileOption(program);
+
 program.action(async () => {
+  const opts = program.opts<{ profile?: string }>();
+  const profileName = opts.profile ?? process.env.APPLIANCE_PROFILE ?? DEFAULT_PROFILE_NAME;
   const apiUrl = await input({
     message: 'API URL:',
     default: 'http://localhost:3000',
@@ -66,8 +72,8 @@ program.action(async () => {
     process.exit(1);
   }
 
-  saveCredentials({ apiUrl, keyId, secret });
-  console.log(chalk.green('Credentials saved. You are now logged in.'));
+  saveCredentials({ apiUrl, keyId, secret }, profileName);
+  console.log(chalk.green(`Credentials saved to profile "${profileName}". You are now logged in.`));
 });
 
 program.parse(process.argv);

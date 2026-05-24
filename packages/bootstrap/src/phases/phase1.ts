@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
-import type { ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { ApplianceBaseType, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
 import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 
@@ -37,6 +37,10 @@ const STACK_NAME = 'bootstrap';
  * appliances on this base).
  */
 export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Promise<Phase1Output> {
+  if (input.base.config.type === ApplianceBaseType.ApplianceLocal) {
+    throw new Error('Local bases skip phase 1 — there is no Pulumi-managed baseline for the k8s-backed runtime.');
+  }
+  const baseRegion = input.base.config.region;
   const workDir = path.join(opts.cacheDir, 'pulumi-workdir');
   const stateDir = path.join(opts.cacheDir, 'pulumi-state');
   const pulumiHome = path.join(opts.cacheDir, 'pulumi-home');
@@ -83,14 +87,14 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
         PULUMI_BACKEND_URL: backendUrl,
         PULUMI_HOME: pulumiHome,
         PULUMI_CONFIG_PASSPHRASE: process.env.PULUMI_CONFIG_PASSPHRASE ?? '',
-        AWS_REGION: input.base.config.region ?? 'us-east-1',
+        AWS_REGION: baseRegion ?? 'us-east-1',
         ...awsCredsFromEnv(input.aws?.profile),
         ...homeEnv(),
       },
     }
   );
 
-  await stack.setConfig('aws:region', { value: input.base.config.region ?? 'us-east-1' });
+  await stack.setConfig('aws:region', { value: baseRegion ?? 'us-east-1' });
 
   const result = await stack.up({
     onEvent: (e) => forwardPulumiEvent(e, opts.emit),

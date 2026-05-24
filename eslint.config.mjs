@@ -27,7 +27,13 @@ export default defineConfig([
   tseslint.configs.recommended,
   pluginReact.configs.flat['jsx-runtime'],
   globalIgnores([
-    'packages/*/dist/**/*', // ignore all contents in and under the `dist/` directories
+    // Build outputs. The double-glob form catches nested `dist/` dirs
+    // too (e.g. packages/desktop/sidecar/dist/), which the previous
+    // `packages/*/dist/**/*` glob missed by being one level too shallow.
+    '**/dist/**',
+    // Rust build artifacts under src-tauri/target/ include generated
+    // .js shims (e.g. __global-api-script.js) that eslint can't parse.
+    '**/target/**',
     '.nx/cache/**/*', // ignore all files cached by the Nx build system
   ]),
 ]);

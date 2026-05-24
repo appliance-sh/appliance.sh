@@ -97,6 +97,33 @@ See the [`examples/`](examples/) directory:
 - **demo-node-framework** — Node.js Express app deployed as a framework type
 - **demo-node-container** — Node.js app deployed as a container
 - **demo-python-framework** — Python app deployed as a framework type
+- **demo-python-container** — Python app deployed as a container
+- **demo-local-runtime.sh** — end-to-end deploy/destroy of both
+  container demos against the local Kubernetes runtime (k3d)
+
+## Local Kubernetes runtime
+
+For offline / single-machine development, Appliance supports a
+`appliance-base-local` base that targets a k3d cluster on the
+developer's machine instead of AWS. The desktop app manages the
+cluster lifecycle (start, stop, delete) and the api-server's
+`LocalContainerDeploymentService` maps each appliance to a
+Kubernetes Deployment + Service via `kubectl apply` / `kubectl delete`.
+
+Requirements: `docker`, `k3d`, `kubectl`.
+
+Quick start:
+
+```bash
+# from the repo root
+./examples/demo-local-runtime.sh
+```
+
+The script boots a k3d cluster, builds + imports the
+`demo-node-container` and `demo-python-container` images, launches
+the api-server with an `appliance-base-local` config, deploys both
+demos, and then destroys them. State persists under
+`~/.appliance/local-runtime`.
 
 ## Architecture
 

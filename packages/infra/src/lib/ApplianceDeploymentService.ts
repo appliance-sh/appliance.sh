@@ -66,7 +66,16 @@ export class ApplianceDeploymentService {
       (process.env.APPLIANCE_BASE_CONFIG
         ? applianceBaseConfig.parse(JSON.parse(process.env.APPLIANCE_BASE_CONFIG))
         : undefined);
-    this.region = this.baseConfig?.aws.region || 'us-east-1';
+    // AWS service: refuse non-AWS bases at construction time so the
+    // type-narrowed `.aws!` accesses below have a documented invariant.
+    // Other base types (e.g. `appliance-base-local`) route through their
+    // own service in the api-server executor.
+    if (this.baseConfig && !this.baseConfig.aws) {
+      throw new Error(
+        `ApplianceDeploymentService requires an AWS-typed base config; got type '${this.baseConfig.type}'`
+      );
+    }
+    this.region = this.baseConfig?.aws?.region || 'us-east-1';
   }
 
   private inlineProgram(stackName: string, metadata?: ApplianceStackMetadata, build?: ResolvedBuildParams) {
@@ -77,7 +86,7 @@ export class ApplianceDeploymentService {
 
       const rid = toResourceId(stackName);
       const regionalProvider = new aws.Provider(`${rid}-regional`, {
-        region: (this.baseConfig?.aws.region as aws.Region) ?? 'ap-southeast-1',
+        region: (this.baseConfig?.aws?.region as aws.Region) ?? 'ap-southeast-1',
       });
       const globalProvider = new aws.Provider(`${rid}-global`, {
         region: 'us-east-1',
@@ -100,7 +109,7 @@ export class ApplianceDeploymentService {
       const nativeRegionalProvider = new awsNative.Provider(
         `${rid}-native-regional`,
         {
-          region: (this.baseConfig?.aws.region as awsNative.Region) ?? 'ap-southeast-1',
+          region: (this.baseConfig?.aws?.region as awsNative.Region) ?? 'ap-southeast-1',
         },
         nativeProviderOpts
       );
@@ -167,6 +176,9 @@ export class ApplianceDeploymentService {
   private buildEnvVars(): Record<string, string> {
     if (!this.baseConfig) {
       throw new Error('Missing base config');
+    }
+    if (!this.baseConfig.stateBackendUrl) {
+      throw new Error('Cloud bases require a stateBackendUrl in APPLIANCE_BASE_CONFIG');
     }
     const home = this.pulumiHome();
     if (home) this.ensurePluginCache(home);
@@ -239,7 +251,7 @@ export class ApplianceDeploymentService {
    * PULUMI_CONFIG_PASSPHRASE is set to.
    */
   private secretsProvider(): string | undefined {
-    const arn = this.baseConfig?.aws.kmsKeyArn;
+    const arn = this.baseConfig?.aws?.kmsKeyArn;
     if (!arn) return undefined;
     return `awskms://${arn}?region=${this.region}`;
   }
@@ -258,7 +270,7 @@ export class ApplianceDeploymentService {
       { projectName: this.projectName, stackName, program },
       { envVars, workDir, ...(secretsProvider ? { secretsProvider } : {}) }
     );
-    await stack.setConfig('aws:region', { value: this.baseConfig!.aws.region });
+    await stack.setConfig('aws:region', { value: this.baseConfig!.aws!.region });
     await this.clearStaleProfileConfig(stack);
     return stack;
   }

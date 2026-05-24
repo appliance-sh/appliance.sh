@@ -71,6 +71,7 @@ All models are defined as Zod schemas in `packages/sdk/src/models/`.
 
 - **aws-public**: `{ type: 'appliance-base-aws-public', name, region, dns: { domainName, createZone?, attachZone? } }`
 - **aws-vpc**: `{ type: 'appliance-base-aws-vpc', name, region, dns, vpc: { vpcCidr?, numberOfAzs? } | { vpcId } }`
+- **local**: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort? } }` — k3d-backed local runtime; no DNS, no region. Persisted form carries a `local.dataDir` for the filesystem object store.
 
 ## API Reference
 
@@ -172,7 +173,29 @@ Only one deployment can be active per environment at a time. Deployments are ide
 
 ### Storage
 
-All state is stored in S3 via the `ObjectStore` interface (`get`, `set`, `delete`, `list`), implemented by `S3ObjectStore`. This includes projects, environments, deployments, API keys, and Pulumi state.
+All state is stored via the `ObjectStore` interface (`get`, `set`, `delete`, `list`). Two implementations are available:
+
+- **S3ObjectStore** (cloud bases) — backed by the cluster's data bucket; also where Pulumi state lives.
+- **FilesystemObjectStore** (local base) — backed by `local.dataDir` from the base config; no S3, no Pulumi state.
+
+The api-server picks the implementation at startup based on `APPLIANCE_BASE_CONFIG.type`.
+
+### Local Kubernetes runtime
+
+The `appliance-base-local` base swaps the cloud control plane for a k3d cluster running on the developer's machine:
+
+| Cloud component              | Local equivalent                                                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------- |
+| S3 object store              | `FilesystemObjectStore` rooted at `local.dataDir`                                         |
+| ECR image push (via `crane`) | `k3d image import` from the host Docker daemon                                            |
+| Pulumi-driven Lambda deploy  | `kubectl apply` of a Deployment + NodePort Service per appliance                          |
+| Lambda execution role        | k8s ServiceAccount (default)                                                              |
+| CloudFront / Route53         | k3d serverlb hairpins `host_port:80@loadbalancer` so services are reachable from the host |
+| Pulumi cancel / refresh      | No-op (kubectl-driven, the cluster state IS the source of truth)                          |
+
+The `LocalContainerDeploymentService` in `@appliance.sh/infra/lib/local/` provides the same `deploy / destroy / refresh` surface as `ApplianceDeploymentService`. The api-server's `deployment-executor.service.ts` selects between them at run time based on `baseConfig.type`.
+
+Cluster lifecycle (`start_local_cluster`, `stop_local_cluster`, `delete_local_cluster`, `local_cluster_status`) is exposed to the desktop UI via Tauri commands in `packages/desktop/src-tauri/src/lib.rs` and surfaced in TypeScript as the optional `ConsoleHost.local` field. On macOS, the k3d nodes run inside the Docker Desktop / Colima micro-VM — that's the "underlying micro VM" layer the desktop orchestrates.
 
 ### Installing Appliance on AWS
 

@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { input, select } from '@inquirer/prompts';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { attachProfileOption } from './utils/profile-flag.js';
 import chalk from 'chalk';
 
 function requireClient() {
@@ -17,6 +18,8 @@ function requireClient() {
 }
 
 const program = new Command();
+
+attachProfileOption(program);
 
 program.description('manage applications');
 
