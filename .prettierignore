@@ -3,6 +3,16 @@ build
 coverage
 dist
 
+# Rust build artifacts under src-tauri/target/ — generated JSON +
+# .js shims that aren't ours to format.
+target
+
+# Tauri-generated schemas (src-tauri/gen/) — written by `tauri build`.
+gen
+
 # Ignore all CDK generated output files
 cdk.*
 cdk.*/
+
+# pnpm lockfile — generator-owned.
+pnpm-lock.yaml

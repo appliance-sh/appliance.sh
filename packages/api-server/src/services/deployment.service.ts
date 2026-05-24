@@ -58,7 +58,6 @@ export class DeploymentService {
     }
 
     const now = new Date().toISOString();
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { environment: _env, ...inputWithoutEnv } = input;
     const deployment: Deployment = {
       ...inputWithoutEnv,
