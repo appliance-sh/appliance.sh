@@ -8,7 +8,9 @@ import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
 
-const ENV_IN_FLIGHT = new Set(['deploying', 'destroying', 'pending']);
+// Matches environments/detail.tsx — `pending` is the initial status
+// of a freshly-created env, not in-flight work.
+const ENV_IN_FLIGHT = new Set(['deploying', 'destroying', 'refreshing']);
 
 export function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();

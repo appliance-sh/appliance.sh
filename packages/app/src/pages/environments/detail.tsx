@@ -8,7 +8,13 @@ import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
 import type { Environment } from '@appliance.sh/sdk/models';
 
-const ENV_IN_FLIGHT = new Set(['deploying', 'destroying', 'pending']);
+// "pending" looks like in-flight but is also the initial status a
+// freshly-created environment has before any deployment runs, so we
+// must NOT lump it in here — otherwise Deploy/Destroy stay disabled
+// on a brand-new env forever. Real in-flight work always corresponds
+// to a non-terminal Deployment record; the per-deployment polling
+// surfaces that.
+const ENV_IN_FLIGHT = new Set(['deploying', 'destroying', 'refreshing']);
 
 export function EnvironmentDetailPage() {
   const { projectId, id } = useParams<{ projectId: string; id: string }>();
