@@ -1,3 +1,21 @@
+## 1.41.0 (2026-05-25)
+
+### Features
+
+- **app:** desktop deployment flow prototype ([819586e](https://github.com/appliance-sh/appliance.sh/commit/819586e))
+
+### Bug Fixes
+
+- **app:** better deploy and destroy state management ([8f9b655](https://github.com/appliance-sh/appliance.sh/commit/8f9b655))
+
+### Chores
+
+- gitignore non-example env files ([b82b50f](https://github.com/appliance-sh/appliance.sh/commit/b82b50f))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.40.1 (2026-05-25)
 
 ### Bug Fixes
