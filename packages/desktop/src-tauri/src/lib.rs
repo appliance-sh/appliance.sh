@@ -1246,6 +1246,26 @@ fn resolve_runtime_config(
 /// (or externally-running) api-server is alive on `port`. Used both
 /// for the live-handle case and to detect leftovers after a desktop
 /// restart with no managed handle.
+/// Best-effort: which PID is listening on `port`? Used when we see an
+/// api-server we didn't spawn (e.g. the user started it from the CLI
+/// during a demo) so the desktop can still display + stop it. Shells
+/// out to `lsof` because that's already on every macOS/Linux box that
+/// can run k3d; returns None on Windows or when lsof is absent.
+async fn find_pid_listening_on_port(port: u16) -> Option<u32> {
+    let (ok, stdout, _stderr) = run_status_command(&[
+        "lsof",
+        "-ti",
+        &format!("tcp:{}", port),
+        "-sTCP:LISTEN",
+    ])
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    stdout.lines().next()?.trim().parse::<u32>().ok()
+}
+
 async fn probe_api_server(port: u16) -> bool {
     // Off the tokio runtime so we don't need the `net` feature; a 200ms
     // connect_timeout is plenty against loopback.
@@ -1508,15 +1528,20 @@ async fn current_api_server_status(state: &LocalRuntimeState, cfg: &ResolvedRunt
     }
     drop(guard);
 
-    // No managed handle — check for an externally-launched (or
-    // pre-restart) api-server on the configured port. Useful when the
-    // desktop crashes but the api-server keeps running.
+    // No managed handle — check for an externally-launched api-server
+    // (e.g. the CLI demo started it, or a previous desktop session
+    // exited without stopping the sidecar). Adopt it: look up the PID
+    // via lsof so Stop still works, and report a clean Running state
+    // rather than a scary "not managed by this desktop" warning.
     if probe_api_server(cfg.api_port).await {
+        let pid = find_pid_listening_on_port(cfg.api_port).await;
         return ApiServerStatus {
             running: true,
             port: Some(cfg.api_port),
-            message: Some("api-server reachable but not managed by this desktop".to_string()),
-            ..Default::default()
+            pid,
+            started_at: None,
+            log_path: None,
+            message: None,
         };
     }
     ApiServerStatus::default()
@@ -1562,8 +1587,11 @@ async fn start_local_runtime(
     })
     .await?;
 
-    // Phase 2: api-server. Skip if a managed handle is already alive.
-    let already_alive = {
+    // Phase 2: api-server. Skip if a managed handle is already alive,
+    // OR if an externally-launched one (CLI demo, previous desktop
+    // session) is already serving on the port — adopting beats double-
+    // spawning + EADDRINUSE.
+    let managed_alive = {
         let mut guard = state.api_server.lock().await;
         if let Some(handle) = guard.as_mut() {
             matches!(handle.child.try_wait(), Ok(None))
@@ -1571,6 +1599,7 @@ async fn start_local_runtime(
             false
         }
     };
+    let already_alive = managed_alive || probe_api_server(cfg.api_port).await;
 
     if !already_alive {
         // Drop any stale exited handle before spawning.
@@ -1656,8 +1685,22 @@ async fn stop_local_runtime(
 
     // Kill the api-server first so it doesn't error-log when the
     // cluster's apiserver vanishes underneath it.
-    if let Some(mut handle) = state.api_server.lock().await.take() {
-        let _ = handle.child.kill().await;
+    let had_managed = {
+        let mut guard = state.api_server.lock().await;
+        if let Some(mut handle) = guard.take() {
+            let _ = handle.child.kill().await;
+            true
+        } else {
+            false
+        }
+    };
+    // Fallback for adopted (CLI-launched) api-servers: there's no Child
+    // handle to kill, so look up the PID listening on our port and
+    // SIGTERM it. The api-server traps SIGTERM and exits cleanly.
+    if !had_managed {
+        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
+            let _ = run_status_command(&["kill", &pid.to_string()]).await;
+        }
     }
 
     let (ok, _stdout, stderr) =
@@ -1678,8 +1721,19 @@ async fn delete_local_runtime(
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    if let Some(mut handle) = state.api_server.lock().await.take() {
-        let _ = handle.child.kill().await;
+    let had_managed = {
+        let mut guard = state.api_server.lock().await;
+        if let Some(mut handle) = guard.take() {
+            let _ = handle.child.kill().await;
+            true
+        } else {
+            false
+        }
+    };
+    if !had_managed {
+        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
+            let _ = run_status_command(&["kill", &pid.to_string()]).await;
+        }
     }
 
     let (ok, _stdout, stderr) =
