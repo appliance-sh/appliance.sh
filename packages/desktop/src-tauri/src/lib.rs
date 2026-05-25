@@ -1224,11 +1224,7 @@ fn resolve_runtime_config(
     let api_port = input.api_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
     let data_dir = match &input.data_dir {
         Some(p) => PathBuf::from(p),
-        None => app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("resolve app data dir: {e}"))?
-            .join("local-runtime"),
+        None => default_local_runtime_dir(app)?,
     };
     Ok(ResolvedRuntimeConfig {
         cluster_name,
@@ -1240,6 +1236,42 @@ fn resolve_runtime_config(
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
         node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
     })
+}
+
+/// Default data dir for the local runtime. Shared with the CLI:
+/// `~/.appliance/local-runtime/` (same convention `appliance` already
+/// uses for its credentials store + the demo script). Falling back to
+/// the Tauri-managed `app_data_dir()` when $HOME is unset keeps Linux
+/// CI / sandbox builds working — the only case where the env var
+/// might not be set.
+///
+/// Migration: if the legacy `<app-config>/local-runtime/` directory
+/// exists but the new one doesn't, surface a one-line warning to
+/// stderr so the operator can move the data over manually. Auto-
+/// migration of a multi-GB Pulumi/api-server state dir is too risky
+/// to do silently.
+fn default_local_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let preferred = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("local-runtime"));
+    let legacy = app
+        .path()
+        .app_data_dir()
+        .map(|d| d.join("local-runtime"))
+        .ok();
+
+    if let Some(preferred) = preferred {
+        if let Some(legacy) = legacy.as_ref() {
+            if legacy.exists() && !preferred.exists() {
+                eprintln!(
+                    "warn: legacy local-runtime data at {} — move it to {} to share state with the CLI",
+                    legacy.display(),
+                    preferred.display()
+                );
+            }
+        }
+        return Ok(preferred);
+    }
+
+    legacy.ok_or_else(|| "could not resolve a local-runtime data dir (no $HOME, no app data dir)".to_string())
 }
 
 /// Probe TCP + a known endpoint to decide whether a previously-spawned
@@ -1977,11 +2009,216 @@ async fn tail_local_pod_logs(
     Ok(stdout)
 }
 
+// ============================================================
+// Build + deploy from a local source folder.
+//
+// Driven by the desktop's deploy wizard: pick a folder containing an
+// appliance.json manifest, optionally override env/runtime params,
+// then build the image with docker + import into the local k3d
+// cluster. The actual api-server build + deploy calls run from the
+// frontend using the existing SDK (it already holds the cluster's
+// signed credentials, so we don't reimplement that in Rust).
+// ============================================================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplianceManifestInfo {
+    /// Manifest type / format. Mirrors the JSON manifest's `manifest`
+    /// field; informational only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<String>,
+    name: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    appliance_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+    /// Default env values from the manifest, surfaced so the wizard
+    /// can prefill the env-var editor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<serde_json::Value>,
+    /// Path to the resolved manifest file (`<dir>/appliance.json`).
+    manifest_path: String,
+}
+
+/// Probe a folder for an appliance manifest and return its parsed
+/// contents. v1 supports `appliance.json` only — programmatic .ts/.js
+/// manifests need ts-node + a trust prompt, both of which live in the
+/// CLI; surface a clear error so the wizard can suggest the workaround.
+#[tauri::command]
+async fn read_appliance_manifest(path: String) -> Result<ApplianceManifestInfo, String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
+    }
+
+    let json_path = dir.join("appliance.json");
+    if json_path.exists() {
+        let raw = fs::read_to_string(&json_path).map_err(|e| format!("read manifest: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {e}"))?;
+        let name = value
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| "manifest is missing 'name'".to_string())?
+            .to_string();
+        return Ok(ApplianceManifestInfo {
+            manifest: value
+                .get("manifest")
+                .and_then(|m| m.as_str())
+                .map(String::from),
+            name,
+            appliance_type: value.get("type").and_then(|t| t.as_str()).map(String::from),
+            port: value
+                .get("port")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok()),
+            platform: value
+                .get("platform")
+                .and_then(|p| p.as_str())
+                .map(String::from),
+            env: value.get("env").cloned(),
+            manifest_path: json_path.to_string_lossy().to_string(),
+        });
+    }
+
+    // Detect programmatic manifests so the UI can point the user at
+    // the CLI instead of silently failing.
+    for candidate in [
+        "appliance.ts",
+        "appliance.mts",
+        "appliance.cts",
+        "appliance.js",
+        "appliance.mjs",
+        "appliance.cjs",
+    ] {
+        if dir.join(candidate).exists() {
+            return Err(format!(
+                "Found {} but the desktop wizard currently only supports appliance.json. \
+                 Run `appliance deploy` from the CLI for programmatic manifests.",
+                candidate
+            ));
+        }
+    }
+
+    Err(format!(
+        "No appliance manifest found in {} (looked for appliance.json)",
+        dir.display()
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildAndImportInput {
+    /// Absolute path of the build context (the folder containing the Dockerfile).
+    path: String,
+    /// Image tag to build with, e.g. "demo-node-container:latest".
+    image_tag: String,
+    /// Optional `--platform` (e.g. "linux/amd64"). Defaults to host arch.
+    #[serde(default)]
+    platform: Option<String>,
+    /// k3d cluster to import into. Defaults to the runtime's cluster name.
+    #[serde(default)]
+    cluster_name: Option<String>,
+}
+
+/// Stream stdout+stderr from a child process onto the channel as
+/// `{type:"log", stream:"stdout"|"stderr", message: <line>}` events.
+async fn stream_child_to_channel(
+    program: &str,
+    args: &[String],
+    on_event: &Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let _ = on_event.send(serde_json::json!({
+        "type": "log",
+        "stream": "meta",
+        "message": format!("$ {} {}", program, args.join(" ")),
+    }));
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", program))?;
+
+    let stdout = child.stdout.take().ok_or("stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("stderr unavailable")?;
+
+    let ch_out = on_event.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = ch_out.send(serde_json::json!({
+                "type": "log",
+                "stream": "stdout",
+                "message": line,
+            }));
+        }
+    });
+    let ch_err = on_event.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = ch_err.send(serde_json::json!({
+                "type": "log",
+                "stream": "stderr",
+                "message": line,
+            }));
+        }
+    });
+
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    if !status.success() {
+        return Err(format!("{} exited with status {}", program, status));
+    }
+    Ok(())
+}
+
+/// Build the image with docker, then import it into k3d. Streams the
+/// raw command output to the frontend so the wizard can show a live
+/// terminal-style log pane.
+#[tauri::command]
+async fn build_and_import_image(
+    input: BuildAndImportInput,
+    on_event: Channel<serde_json::Value>,
+) -> Result<String, String> {
+    let cluster = input
+        .cluster_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string());
+
+    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), input.image_tag.clone()];
+    if let Some(p) = input.platform.as_deref() {
+        build_args.push("--platform".into());
+        build_args.push(p.into());
+    }
+    build_args.push(input.path.clone());
+    stream_child_to_channel("docker", &build_args, &on_event).await?;
+
+    let import_args: Vec<String> = vec![
+        "image".into(),
+        "import".into(),
+        "-c".into(),
+        cluster,
+        input.image_tag.clone(),
+    ];
+    stream_child_to_channel("k3d", &import_args, &on_event).await?;
+
+    Ok(input.image_tag)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(LocalRuntimeState::default()))
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -2005,7 +2242,9 @@ pub fn run() {
             stop_local_runtime,
             delete_local_runtime,
             list_local_workloads,
-            tail_local_pod_logs
+            tail_local_pod_logs,
+            read_appliance_manifest,
+            build_and_import_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -172,6 +172,39 @@ export class LocalContainerDeploymentService {
     }
   }
 
+  /**
+   * Read the current env block off the live Deployment. Used by the
+   * api-server's executor when a bare re-deploy (no buildId, no env
+   * override) lands locally: re-rendering the manifest with no env
+   * would strip the prior values, so we lift them in to keep the
+   * container's PORT (and any other deploy-time env) intact.
+   * Returns undefined if the deployment doesn't exist.
+   */
+  async getDeploymentEnv(stackName: string): Promise<Record<string, string> | undefined> {
+    try {
+      const { stdout } = await this.kubectl([
+        '-n',
+        this.cluster.namespace,
+        'get',
+        'deployment',
+        stackName,
+        '-o',
+        'jsonpath={.spec.template.spec.containers[0].env}',
+      ]);
+      const trimmed = stdout.trim();
+      if (!trimmed) return {};
+      const parsed = JSON.parse(trimmed) as Array<{ name?: string; value?: string }>;
+      const out: Record<string, string> = {};
+      for (const entry of parsed) {
+        if (entry?.name && typeof entry.value === 'string') out[entry.name] = entry.value;
+      }
+      return out;
+    } catch (err) {
+      if (isNotFoundError(err)) return undefined;
+      throw err;
+    }
+  }
+
   private async ensureNamespace(): Promise<void> {
     const exists = await this.resourceExists('namespace', this.cluster.namespace, { clusterScoped: true });
     if (exists) return;

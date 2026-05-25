@@ -274,6 +274,38 @@ export interface LocalPodLogsInput {
   namespace?: string;
 }
 
+/** Parsed contents of an appliance.json manifest in a candidate folder. */
+export interface LocalApplianceManifest {
+  manifest?: string;
+  name: string;
+  type?: string;
+  port?: number;
+  platform?: string;
+  /** Env block straight from the manifest (passed through as-is). */
+  env?: Record<string, string>;
+  /** Absolute path of the manifest file the desktop just read. */
+  manifestPath: string;
+}
+
+export interface LocalBuildAndImportInput {
+  /** Build-context folder (parent of the Dockerfile + manifest). */
+  path: string;
+  /** Image tag, e.g. "demo-node-container:latest". */
+  imageTag: string;
+  /** Optional docker --platform override (e.g. "linux/amd64"). */
+  platform?: string;
+  /** k3d cluster to import into; defaults to the active local runtime cluster. */
+  clusterName?: string;
+}
+
+/** Streaming log event emitted while a child process runs. */
+export interface LocalLogEvent {
+  type: 'log';
+  /** "stdout" / "stderr" for actual output; "meta" for command echoes. */
+  stream: 'stdout' | 'stderr' | 'meta';
+  message: string;
+}
+
 export interface LocalRuntimeHost {
   /** Legacy cluster-only status (kept for backwards compat). */
   status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
@@ -296,6 +328,16 @@ export interface LocalRuntimeHost {
   listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads>;
   /** One-shot `kubectl logs --tail` for the named pod. */
   tailPodLogs(input: LocalPodLogsInput): Promise<string>;
+
+  /** Open a native folder picker. Returns null on cancel. */
+  pickDirectory(): Promise<string | null>;
+  /** Parse an appliance.json from the given folder. Errors if the
+   *  manifest is missing or a programmatic (.ts/.js) variant is found
+   *  (those need the CLI for now). */
+  readApplianceManifest(path: string): Promise<LocalApplianceManifest>;
+  /** docker build → k3d image import, streaming each command's output
+   *  to onEvent. Resolves with the resulting image tag on success. */
+  buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
 }
 
 export type {

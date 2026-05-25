@@ -10,6 +10,7 @@ import { DeploymentsPage } from '@/pages/deployments/list';
 import { DeploymentDetailPage } from '@/pages/deployments/detail';
 import { SettingsPage } from '@/pages/settings';
 import { LocalRuntimePage } from '@/pages/local-runtime';
+import { LocalRuntimeDeployPage } from '@/pages/local-runtime/deploy';
 import { BootstrapWizardPage } from '@/pages/bootstrap/wizard';
 import { BootstrapProgressPage } from '@/pages/bootstrap/progress';
 
@@ -29,6 +30,7 @@ export const routes: RouteObject[] = [
       { path: 'deployments', element: <DeploymentsPage /> },
       { path: 'deployments/:id', element: <DeploymentDetailPage /> },
       { path: 'local-runtime', element: <LocalRuntimePage /> },
+      { path: 'local-runtime/deploy', element: <LocalRuntimeDeployPage /> },
       { path: 'settings', element: <SettingsPage /> },
     ],
   },

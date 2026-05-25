@@ -1,6 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type {
   AddClusterInput,
   ApiServerUpdateInput,
@@ -16,8 +17,11 @@ import type {
   ConsoleHost,
   HostConfig,
   LatestGhcrTagInput,
+  LocalApplianceManifest,
+  LocalBuildAndImportInput,
   LocalClusterInput,
   LocalClusterStatus,
+  LocalLogEvent,
   LocalPodLogsInput,
   LocalRuntimeInput,
   LocalRuntimeStatus,
@@ -170,6 +174,27 @@ export const tauriHost: ConsoleHost = {
     },
     async tailPodLogs(input: LocalPodLogsInput): Promise<string> {
       return invoke<string>('tail_local_pod_logs', { input });
+    },
+    async pickDirectory(): Promise<string | null> {
+      // Tauri's dialog plugin returns the chosen folder path, or null
+      // on cancel. multiple:false guarantees a single string back.
+      const picked = await openDialog({
+        directory: true,
+        multiple: false,
+        title: 'Select an appliance folder',
+      });
+      return typeof picked === 'string' ? picked : null;
+    },
+    async readApplianceManifest(path: string): Promise<LocalApplianceManifest> {
+      return invoke<LocalApplianceManifest>('read_appliance_manifest', { path });
+    },
+    async buildAndImportImage(
+      input: LocalBuildAndImportInput,
+      onEvent: (event: LocalLogEvent) => void
+    ): Promise<string> {
+      const channel = new Channel<LocalLogEvent>();
+      channel.onmessage = onEvent;
+      return invoke<string>('build_and_import_image', { input, onEvent: channel });
     },
   },
 };

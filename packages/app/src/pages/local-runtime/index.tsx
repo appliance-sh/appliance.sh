@@ -1,6 +1,7 @@
 import * as React from 'react';
+import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Play, Square, Trash2, RefreshCw, FileText, Copy } from 'lucide-react';
+import { Play, Square, Trash2, RefreshCw, FileText, Copy, Rocket } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
@@ -86,7 +87,14 @@ export function LocalRuntimePage() {
             A k3d cluster + in-process api-server running on this machine, wired into the Console as a regular cluster.
           </p>
         </div>
-        <PhaseBadge phase={phase} />
+        <div className="flex items-center gap-2">
+          <Button asChild variant="outline" disabled={phase !== 'running'}>
+            <Link to="/local-runtime/deploy">
+              <Rocket className="h-4 w-4" /> Deploy application
+            </Link>
+          </Button>
+          <PhaseBadge phase={phase} />
+        </div>
       </header>
 
       <section className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] p-4">

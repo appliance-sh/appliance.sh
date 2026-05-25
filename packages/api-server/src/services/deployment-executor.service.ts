@@ -303,13 +303,32 @@ async function executeLocalAction(
       const build: ResolvedBuild | undefined = input.buildId
         ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deploymentId}`)
         : undefined;
-      if (!build?.imageUri) {
-        throw new Error('Local deploys require a build with an imageUri (remote-image flow)');
-      }
-      const env = {
+
+      // Resolve the image and env. Symmetry with the cloud path:
+      //   * If buildId was supplied, the resolved build wins.
+      //   * If not, fall back to the live Deployment's image so the
+      //     bare "Deploy" button (Environment detail page, with no
+      //     build attached) acts as a redeploy instead of erroring.
+      //   * Likewise, when no env override is given, preserve the
+      //     existing env so a redeploy doesn't strip PORT/etc.
+      let imageUri = build?.imageUri;
+      let env: Record<string, string> = {
         ...(input.environment ?? {}),
-        ...(build.environment ?? {}),
+        ...(build?.environment ?? {}),
       };
+
+      if (!imageUri) {
+        imageUri = await local.getDeploymentImage(metadata.stackName);
+        if (!imageUri) {
+          throw new Error(
+            "No image available for this environment. First-time deploys must specify a build — use the desktop's Deploy wizard, or `appliance deploy --image-uri <image>` from the CLI."
+          );
+        }
+        if (Object.keys(env).length === 0) {
+          env = (await local.getDeploymentEnv(metadata.stackName)) ?? {};
+        }
+      }
+
       // Port precedence:
       //   1. Resolved build (set by the manifest path when the
       //      upload-zip flow lands locally — not the current
@@ -321,9 +340,9 @@ async function executeLocalAction(
       //   3. The Service falls back to 8080 inside renderManifest if
       //      nothing else is supplied.
       const envPort = env.PORT ? Number.parseInt(env.PORT, 10) : undefined;
-      const port = build.localPort ?? (Number.isFinite(envPort) ? envPort : undefined);
+      const port = build?.localPort ?? (Number.isFinite(envPort) ? envPort : undefined);
       const result = await local.deploy(metadata.stackName, metadata, {
-        imageUri: build.imageUri,
+        imageUri,
         port,
         environment: env,
       });

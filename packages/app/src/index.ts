@@ -35,4 +35,7 @@ export type {
   LocalServiceInfo,
   LocalWorkloads,
   LocalPodLogsInput,
+  LocalApplianceManifest,
+  LocalBuildAndImportInput,
+  LocalLogEvent,
 } from './lib/host';
