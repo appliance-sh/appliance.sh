@@ -1,3 +1,13 @@
+## 1.40.1 (2026-05-25)
+
+### Bug Fixes
+
+- **desktop:** adopt externally-launched local api-server ([#42](https://github.com/appliance-sh/appliance.sh/pull/42))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.40.0 (2026-05-24)
 
 ### Features
