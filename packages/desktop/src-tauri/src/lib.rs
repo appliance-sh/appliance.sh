@@ -1142,10 +1142,11 @@ struct PrereqTool {
 const LOCAL_PREREQS: &[PrereqTool] = &[
     PrereqTool {
         name: "docker",
-        purpose: "Container engine k3d runs Kubernetes nodes inside.",
+        purpose: "Container runtime Appliance shells out to for `docker build` / `docker save`.",
         version_args: &["--version"],
-        // Docker engine is an OS-level install (kernel features,
-        // privileged daemon, GUI on macOS) — guidance-only.
+        // Container runtimes are an OS-level install (kernel
+        // features, privileged daemon, GUI on macOS); we can't ship
+        // one, so guidance-only.
         auto_installable: false,
     },
     PrereqTool {
@@ -1168,21 +1169,21 @@ const LOCAL_PREREQS: &[PrereqTool] = &[
 fn install_hint(tool: &str) -> &'static str {
     if cfg!(target_os = "macos") {
         match tool {
-            "docker" => "brew install --cask docker  # or: brew install colima",
+            "docker" => "Install any container runtime (Docker Desktop, OrbStack, Colima, Rancher Desktop). https://www.docker.com/products/docker-desktop/ — https://orbstack.dev — https://github.com/abiosoft/colima",
             "k3d" => "brew install k3d",
             "kubectl" => "brew install kubectl",
             _ => "",
         }
     } else if cfg!(target_os = "linux") {
         match tool {
-            "docker" => "curl -fsSL https://get.docker.com | sh",
+            "docker" => "Install any container runtime (Docker Engine, Podman, Rancher Desktop). Docker Engine: curl -fsSL https://get.docker.com | sh",
             "k3d" => "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash",
             "kubectl" => "curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl && sudo install -m 0755 kubectl /usr/local/bin/kubectl",
             _ => "",
         }
     } else if cfg!(target_os = "windows") {
         match tool {
-            "docker" => "winget install Docker.DockerDesktop",
+            "docker" => "Install any container runtime (Docker Desktop, Rancher Desktop, Podman Desktop). https://www.docker.com/products/docker-desktop/",
             "k3d" => "choco install k3d  # or: scoop install k3d",
             "kubectl" => "winget install Kubernetes.kubectl",
             _ => "",

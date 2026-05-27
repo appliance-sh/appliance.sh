@@ -20,7 +20,7 @@ import type { CheckResult, Context, ManualInstall, Provider } from '../types.js'
 
 export const dockerProvider: Provider = {
   name: 'docker',
-  description: 'Container engine k3d runs Kubernetes nodes inside.',
+  description: 'Container runtime Appliance shells out to for `docker build` / `docker save`.',
   required: true,
   autoInstallable: false,
 
@@ -31,22 +31,36 @@ export const dockerProvider: Provider = {
   },
 
   manualInstall(ctx: Context): ManualInstall {
+    // All major container runtimes provide a Docker-compatible `docker`
+    // CLI on PATH, so we don't prescribe one. The UI lists a few common
+    // options and lets the user pick.
     if (ctx.platform === 'darwin') {
       return {
         instructions:
-          'Install Colima (recommended, open-source): https://github.com/abiosoft/colima\n' +
-          'Or Docker Desktop: https://www.docker.com/products/docker-desktop/',
-        url: 'https://github.com/abiosoft/colima#installation',
+          'Install any container runtime — Docker Desktop, OrbStack, Colima, or Rancher Desktop all work.\n' +
+          '  Docker Desktop:   https://www.docker.com/products/docker-desktop/\n' +
+          '  OrbStack:         https://orbstack.dev\n' +
+          '  Colima:           https://github.com/abiosoft/colima  (also: brew install docker)\n' +
+          '  Rancher Desktop:  https://rancherdesktop.io',
+        url: 'https://docs.docker.com/engine/install/',
       };
     }
     if (ctx.platform === 'linux') {
       return {
-        instructions: 'curl -fsSL https://get.docker.com | sh',
+        instructions:
+          'Install any container runtime — Docker Engine, Podman, or Rancher Desktop all work.\n' +
+          '  Docker Engine:    curl -fsSL https://get.docker.com | sh\n' +
+          '  Podman:           https://podman.io/docs/installation\n' +
+          '  Rancher Desktop:  https://rancherdesktop.io',
         url: 'https://docs.docker.com/engine/install/',
       };
     }
     return {
-      instructions: 'Install Docker Desktop: https://www.docker.com/products/docker-desktop/',
+      instructions:
+        'Install any container runtime — Docker Desktop, Rancher Desktop, or Podman Desktop all work.\n' +
+        '  Docker Desktop:   https://www.docker.com/products/docker-desktop/\n' +
+        '  Rancher Desktop:  https://rancherdesktop.io\n' +
+        '  Podman Desktop:   https://podman-desktop.io',
       url: 'https://docs.docker.com/desktop/install/windows-install/',
     };
   },
