@@ -1,3 +1,14 @@
+## 1.42.0 (2026-05-27)
+
+### Features
+
+- improve dx for deploy and management ([4bfd2cb](https://github.com/appliance-sh/appliance.sh/commit/4bfd2cb))
+- improve environment url handling ([7154d11](https://github.com/appliance-sh/appliance.sh/commit/7154d11))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.41.0 (2026-05-25)
 
 ### Features
