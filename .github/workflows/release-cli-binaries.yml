@@ -1,0 +1,118 @@
+name: Release CLI binaries
+on:
+  # Dispatched by .github/workflows/release.yml right after nx-release
+  # tags a new version and the api-server image build kicks off — see
+  # the `Dispatch CLI binaries build` step there. Also runnable on its
+  # own via the Actions UI for hot-fix re-uploads.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag the binaries attach to (e.g. v1.42.0). Defaults to the cli package.json version with a leading "v".
+        required: false
+        default: ''
+
+permissions:
+  contents: write # to upload assets to the release
+
+concurrency:
+  group: release-cli-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + publish CLI binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the SDK postbuild can `git describe` a tag.
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build prerequisites (SDK + helper + bootstrap) so the CLI's
+      # workspace imports resolve at compile time. We deliberately do
+      # not run `pnpm -r run build` — bringing up the full graph
+      # (api-server, infra, ...) costs minutes and isn't needed for
+      # the CLI compile alone.
+      - name: Build CLI prerequisites
+        run: |
+          pnpm --filter @appliance.sh/sdk run build
+          pnpm --filter @appliance.sh/bootstrap run build
+          pnpm --filter @appliance.sh/helper run build
+          pnpm --filter @appliance.sh/cli run build
+
+      # `bun build --compile --target=...` bundles each binary with
+      # its matching Bun runtime, so we can cross-compile every
+      # platform from a single Linux runner. Asset names match the
+      # Rust target-triple convention so the desktop's runtime
+      # downloader can derive them via std::env::consts.
+      - name: Compile per-platform binaries
+        run: pnpm --filter @appliance.sh/cli run compile:all
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            VERSION=$(node -p "require('./packages/cli/package.json').version")
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing CLI binaries for ${TAG}"
+
+      # `gh release upload` requires an existing release. nx-release
+      # creates the GitHub Release before this workflow runs; the
+      # `create --notes-file` fallback handles manual re-runs against
+      # a tag without a release.
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" --title "${TAG}" --generate-notes
+          fi
+
+      - name: Upload binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: packages/cli/dist
+        run: |
+          set -euo pipefail
+          ASSETS=(
+            appliance-aarch64-apple-darwin
+            appliance-x86_64-apple-darwin
+            appliance-x86_64-unknown-linux-gnu
+            appliance-aarch64-unknown-linux-gnu
+            appliance-x86_64-pc-windows-msvc.exe
+          )
+          # `--clobber` overwrites pre-existing assets so a re-run of
+          # this workflow (e.g. fixing a build issue) updates the
+          # release in place instead of failing on a duplicate name.
+          gh release upload "${TAG}" --clobber "${ASSETS[@]}"

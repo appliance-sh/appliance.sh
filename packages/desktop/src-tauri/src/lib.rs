@@ -8,6 +8,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_shell::process::CommandEvent;
+use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -660,7 +662,22 @@ async fn invoke_sidecar(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn node sidecar: {}", e))?;
+        .map_err(|e| {
+            // The Node sidecar drives the AWS bootstrap path (Pulumi
+            // automation), which still needs a system Node. Day-to-day
+            // local-runtime use no longer touches this code path —
+            // the helper-install flow uses the Bun-compiled CLI
+            // directly. So this error is only surfaced when an
+            // operator runs the bootstrap wizard without Node.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "Node.js is not installed or not on PATH. The AWS bootstrap flow requires Node — \
+install it from https://nodejs.org/ (or `brew install node`) and retry. The Local Runtime page \
+doesn't need Node and should work without this dependency."
+                    .to_string()
+            } else {
+                format!("failed to spawn node sidecar: {}", e)
+            }
+        })?;
 
     // Write the input JSON to stdin and close it so the sidecar's
     // `for await (const chunk of process.stdin)` loop terminates.
@@ -747,28 +764,156 @@ async fn invoke_sidecar(
     final_result.ok_or_else(|| "sidecar exited without producing a result".to_string())
 }
 
-/// Drive a helper-install via the sidecar. Frontend passes
-/// `{ tools?, force? }`; this command tags the payload with
-/// `kind: "helper-install"` so the sidecar dispatches to
-/// `@appliance.sh/helper`'s `runInstall`. Progress events stream back
-/// over the channel; the result carries per-tool outcomes the UI
-/// can render.
+/// Drive a helper-install by spawning the bundled, statically-linked
+/// `appliance` CLI binary with `local install --json`.
+///
+/// The binary is registered as a Tauri externalBin (see tauri.conf
+/// `bundle.externalBin`) and resolved here via tauri-plugin-shell's
+/// `sidecar` API. The same binary is also published as a GitHub
+/// Release asset by `.github/workflows/release-cli-binaries.yml`
+/// for standalone CLI users; the desktop ships its own copy so the
+/// first-start flow doesn't depend on a network download.
+///
+/// The CLI emits NDJSON: one JSON object per stdout line, with a
+/// final `{type: "result", result: {outcomes: [...]}}`. Progress
+/// lines flow through `on_event` so the UI can render live status.
+/// Because the CLI is a Bun-compiled binary with no runtime
+/// dependencies, this works on a fresh user's machine without Node
+/// or any other runtime — the original bootstrap deadlock is gone.
 #[tauri::command]
 async fn local_helper_install(
+    app: AppHandle,
     input: serde_json::Value,
     on_event: Channel<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let mut payload = match input {
+    let payload = match input {
         serde_json::Value::Object(map) => map,
         serde_json::Value::Null => serde_json::Map::new(),
         other => return Err(format!("local_helper_install expected an object input, got: {}", other)),
     };
-    payload.insert(
-        "kind".to_string(),
-        serde_json::Value::String("helper-install".to_string()),
-    );
-    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+
+    let force = payload.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let tools: Vec<String> = match payload.get("tools") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(other) => return Err(format!("`tools` must be an array of strings, got: {}", other)),
+    };
+
+    let mut args: Vec<String> = vec!["local".into(), "install".into()];
+    for t in &tools {
+        args.push(t.clone());
+    }
+    if force {
+        args.push("--force".into());
+    }
+    args.push("--json".into());
+
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| {
+            format!(
+                "Bundled appliance CLI is unavailable: {e}. Rebuild with `pnpm --filter @appliance.sh/desktop build` so the CLI binary lands in src-tauri/binaries/."
+            )
+        })?
+        .args(&args);
+
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+
+    let mut final_outcomes: Option<serde_json::Value> = None;
+    let mut error: Option<String> = None;
+    let mut exit_code: Option<i32> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                handle_cli_line(&bytes, &on_event, &mut final_outcomes, &mut error);
+            }
+            CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                if !line.is_empty() {
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "log",
+                        "level": "info",
+                        "message": line,
+                    }));
+                }
+            }
+            CommandEvent::Error(msg) => {
+                error = Some(msg);
+            }
+            CommandEvent::Terminated(payload) => {
+                exit_code = payload.code;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(msg) = error {
+        return Err(msg);
+    }
+    let outcomes = final_outcomes.unwrap_or_else(|| {
+        if exit_code.map(|c| c != 0).unwrap_or(true) {
+            serde_json::json!([{
+                "tool": "cli",
+                "status": "failed",
+                "message": format!(
+                    "appliance CLI exited with code {}",
+                    exit_code.map_or_else(|| "?".to_string(), |c| c.to_string()),
+                ),
+            }])
+        } else {
+            serde_json::json!([])
+        }
+    });
+
+    Ok(serde_json::json!({ "outcomes": outcomes }))
 }
+
+/// Parse one line of CLI stdout. Most lines are NDJSON; anything that
+/// fails to parse is forwarded as a log event so we don't drop output
+/// (e.g. if chalk color codes ever leak through despite --json).
+fn handle_cli_line(
+    bytes: &[u8],
+    on_event: &Channel<serde_json::Value>,
+    final_outcomes: &mut Option<serde_json::Value>,
+    error: &mut Option<String>,
+) {
+    let line = String::from_utf8_lossy(bytes);
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = on_event.send(serde_json::json!({
+                "type": "log",
+                "level": "info",
+                "message": trimmed,
+            }));
+            return;
+        }
+    };
+    let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "result" => {
+            *final_outcomes = parsed.get("result").and_then(|r| r.get("outcomes")).cloned();
+        }
+        "error" => {
+            *error = parsed.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        _ => {
+            let _ = on_event.send(parsed);
+        }
+    }
+}
+
 
 /// Drive a full bootstrap (phases 1–3) via the sidecar. The frontend
 /// passes `{bootstrapInput, options?}`; this command tags the payload

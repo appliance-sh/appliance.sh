@@ -1,12 +1,22 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities granted to the main window: invoke the backend commands, open external URLs, send notifications.",
+  "description": "Capabilities granted to the main window: invoke the backend commands, open external URLs, send notifications, drive the bundled appliance CLI.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
     "shell:allow-open",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/appliance",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
     "notification:default",
     "notification:allow-notify",
     "dialog:default",

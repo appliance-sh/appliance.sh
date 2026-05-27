@@ -137,6 +137,30 @@ dist
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# Editor swap / backup files
+*.swp
+*.swo
+*.swn
+*.bak
+
+# VS Code workspace local state (per-user; share via `.vscode/extensions.json`
+# only when the team agrees on a recommended set).
+.vscode/
+.history/
 
 # Nx
 .nx/cache
@@ -149,3 +173,20 @@ resources/*
 # Appliance builds
 **/appliance.zip
 **/*.appliance.zip
+
+# Bun build artifacts. `bun build --compile` writes a temporary
+# `.<hash>-<seq>.bun-build` file alongside its output and removes it
+# on success; interrupted runs leave 60+ MB files behind. The pattern
+# catches the litter without needing per-incident cleanup.
+*.bun-build
+.*.bun-build
+
+# Tauri externalBin staging. `packages/desktop/scripts/copy-cli.mjs`
+# populates this with the host-triple-matched CLI binary right before
+# tauri-build packages it. Also covered by the subpackage gitignore.
+packages/desktop/src-tauri/binaries/
+
+# Bun's internal lockfile if used alongside pnpm. We commit
+# pnpm-lock.yaml as the source of truth.
+bun.lockb
+bun.lock

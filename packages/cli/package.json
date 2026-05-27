@@ -15,7 +15,14 @@
     "appliance": "dist/appliance.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && pnpm run compile",
+    "compile": "bun build src/appliance.ts --compile --outfile=dist/appliance",
+    "compile:darwin-arm64": "bun build src/appliance.ts --compile --target=bun-darwin-arm64 --outfile=dist/appliance-aarch64-apple-darwin",
+    "compile:darwin-x64": "bun build src/appliance.ts --compile --target=bun-darwin-x64 --outfile=dist/appliance-x86_64-apple-darwin",
+    "compile:linux-x64": "bun build src/appliance.ts --compile --target=bun-linux-x64 --outfile=dist/appliance-x86_64-unknown-linux-gnu",
+    "compile:linux-arm64": "bun build src/appliance.ts --compile --target=bun-linux-arm64 --outfile=dist/appliance-aarch64-unknown-linux-gnu",
+    "compile:windows-x64": "bun build src/appliance.ts --compile --target=bun-windows-x64 --outfile=dist/appliance-x86_64-pc-windows-msvc.exe",
+    "compile:all": "pnpm run compile:darwin-arm64 && pnpm run compile:darwin-x64 && pnpm run compile:linux-x64 && pnpm run compile:linux-arm64 && pnpm run compile:windows-x64",
     "clean": "rm -rf ./dist/",
     "dev:setup": "pnpm link --global",
     "test": "echo \"Error: no test specified\" && exit 1"

@@ -54,12 +54,12 @@ program
       .join(', ')})`
   )
   .option('--force', 're-install even when already present', false)
-  .action(async (tools: string[], opts: { force: boolean }) => {
+  .option('--json', 'emit NDJSON progress + final result (one event per line) for tooling/IPC', false)
+  .action(async (tools: string[], opts: { force: boolean; json: boolean }) => {
     try {
-      await runWithLiveProgress(tools, { force: opts.force });
+      await runWithLiveProgress(tools, opts);
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      reportError(err, opts.json);
     }
   });
 
@@ -69,13 +69,13 @@ program
   .command('update')
   .description('re-install the latest helper-managed binaries (forces auto-installable tools)')
   .argument('[tools...]', 'tools to update (defaults to every auto-installable tool)')
-  .action(async (tools: string[]) => {
+  .option('--json', 'emit NDJSON progress + final result (one event per line) for tooling/IPC', false)
+  .action(async (tools: string[], opts: { json: boolean }) => {
     const targets = tools.length > 0 ? tools : defaultProviders.filter((p) => p.autoInstallable).map((p) => p.name);
     try {
-      await runWithLiveProgress(targets, { force: true });
+      await runWithLiveProgress(targets, { force: true, json: opts.json });
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      reportError(err, opts.json);
     }
   });
 
@@ -111,13 +111,39 @@ function printStatus(entries: StatusEntry[]): void {
   }
 }
 
-async function runWithLiveProgress(tools: string[], opts: { force: boolean }): Promise<void> {
+async function runWithLiveProgress(tools: string[], opts: { force: boolean; json: boolean }): Promise<void> {
   const targets = tools.length > 0 ? tools : undefined;
   const onProgress = (event: ProgressEvent) => {
+    if (opts.json) {
+      // Match the shape the desktop sidecar emits so the Rust-side
+      // event channel can consume CLI-driven installs and sidecar-
+      // driven installs interchangeably. `stage` carries the tool
+      // name; `message` is the human-readable progress line.
+      emitJson({ type: 'progress', stage: event.tool, message: event.message });
+      return;
+    }
     const prefix = event.type === 'error' ? chalk.red('✗') : event.type === 'done' ? chalk.green('✓') : chalk.cyan('»');
     console.log(`${prefix} ${chalk.dim(event.tool)} ${event.message}`);
   };
   const outcomes = await runInstall({ tools: targets, force: opts.force, onProgress });
+
+  if (opts.json) {
+    emitJson({
+      type: 'result',
+      result: {
+        outcomes: outcomes.map((o) => ({
+          tool: o.provider.name,
+          description: o.provider.description,
+          autoInstallable: o.provider.autoInstallable,
+          required: o.provider.required,
+          status: o.status,
+          message: o.message,
+        })),
+      },
+    });
+    if (outcomes.some((o) => o.status === 'failed')) process.exit(1);
+    return;
+  }
 
   console.log();
   let anyFailed = false;
@@ -154,4 +180,20 @@ async function runWithLiveProgress(tools: string[], opts: { force: boolean }): P
     console.log(chalk.red('One or more installs failed. See the error above.'));
     process.exit(1);
   }
+}
+
+/** NDJSON emitter: one JSON object per line on stdout. */
+function emitJson(obj: unknown): void {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+/** Report a thrown error in the form matching `--json` (or plain text). */
+function reportError(err: unknown, json: boolean): void {
+  const message = err instanceof Error ? err.message : String(err);
+  if (json) {
+    emitJson({ type: 'error', error: message });
+  } else {
+    console.error(chalk.red(message));
+  }
+  process.exit(1);
 }

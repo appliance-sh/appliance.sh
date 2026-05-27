@@ -1,3 +1,7 @@
 target
 gen
 Cargo.lock
+# Tauri externalBin staging. Populated by ../scripts/copy-cli.mjs
+# right before each desktop build; same binaries are also released as
+# GitHub Release assets by release-cli-binaries.yml.
+binaries
