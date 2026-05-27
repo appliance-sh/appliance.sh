@@ -1,3 +1,14 @@
+## 1.43.0 (2026-05-27)
+
+### Features
+
+- **cli,desktop:** improved cli bundling ([4112800](https://github.com/appliance-sh/appliance.sh/commit/4112800))
+- **helper:** setup and dependency management ([bb66bb6](https://github.com/appliance-sh/appliance.sh/commit/bb66bb6))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.42.0 (2026-05-27)
 
 ### Features

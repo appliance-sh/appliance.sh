@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/helper",
-  "version": "1.42.0",
+  "version": "1.43.0",
   "description": "Cross-platform dependency installer for the Appliance local runtime (docker / k3d / kubectl)",
   "repository": {
     "type": "git",
