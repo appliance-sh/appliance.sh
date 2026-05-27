@@ -207,7 +207,11 @@ program
       if (envsResult.data.length === 0) {
         console.log(chalk.dim('No environments.'));
       } else {
-        const urls = await getProjectUrls(client, project.id);
+        // env.url is the canonical "where is this reachable" address.
+        // For environments that predate the field, fall back to a
+        // per-project deployment scan so legacy data still surfaces.
+        const needsFallback = envsResult.data.some((e) => !e.url);
+        const fallback = needsFallback ? await getProjectUrls(client, project.id) : new Map<string, string>();
         console.log(chalk.bold('Environments'));
         for (const env of envsResult.data) {
           const statusColor =
@@ -220,7 +224,7 @@ program
             console.log(`    Last deployed:  ${env.lastDeployedAt}`);
           }
           console.log(`    Created:        ${env.createdAt}`);
-          const url = urls.get(env.id);
+          const url = env.url ?? fallback.get(env.id);
           if (url) {
             console.log(`    URL:            ${chalk.cyan(url)}`);
           }
@@ -265,7 +269,8 @@ program
         if (envsResult.data.length === 0) {
           console.log(chalk.dim('  No environments.'));
         } else {
-          const urls = await getProjectUrls(client, project.id);
+          const needsFallback = envsResult.data.some((e) => !e.url);
+          const fallback = needsFallback ? await getProjectUrls(client, project.id) : new Map<string, string>();
           for (const env of envsResult.data) {
             const deployed = env.lastDeployedAt ? `, last deployed ${env.lastDeployedAt}` : '';
             const envLinked =
@@ -273,7 +278,7 @@ program
                 ? chalk.dim(' (linked)')
                 : '';
             console.log(`  ${env.name}${envLinked} — ${env.status}${chalk.dim(deployed)}`);
-            const url = urls.get(env.id);
+            const url = env.url ?? fallback.get(env.id);
             if (url) {
               console.log(`    ${chalk.dim('URL:')} ${chalk.cyan(url)}`);
             }

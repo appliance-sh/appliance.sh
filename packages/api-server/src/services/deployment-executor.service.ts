@@ -134,7 +134,18 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
         : input.action === DeploymentAction.Destroy
           ? EnvironmentStatus.Destroyed
           : (priorEnvStatus ?? EnvironmentStatus.Deployed);
-    await environmentService.updateStatus(metadata.environmentId, finalEnvStatus);
+    // URL bookkeeping: Deploy sets it (when the executor knew one —
+    // local always, cloud not yet); Destroy clears it; Refresh leaves
+    // whatever was there.
+    const urlUpdate =
+      input.action === DeploymentAction.Deploy
+        ? result.url
+          ? { url: result.url }
+          : undefined
+        : input.action === DeploymentAction.Destroy
+          ? { url: null }
+          : undefined;
+    await environmentService.updateStatus(metadata.environmentId, finalEnvStatus, urlUpdate);
 
     logger.info('deployment succeeded', { deploymentId, action: input.action });
   } catch (error) {
@@ -222,6 +233,14 @@ function resolveSystemRoleArn(metadata: ApplianceStackMetadata): string | undefi
 interface ExecutionResult {
   message: string;
   idempotentNoop: boolean;
+  /**
+   * URL where the appliance is reachable, when known. The executor
+   * writes it onto the Environment record so consumers don't have to
+   * scrape it out of `deployment.message`. Always undefined for
+   * destroy/refresh; may be undefined for cloud deploys (no stack-
+   * outputs plumbing yet).
+   */
+  url?: string;
 }
 
 async function executeCloudAction(
@@ -275,15 +294,15 @@ async function executeCloudAction(
         onStack,
         refresh: input.refresh,
       });
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     case DeploymentAction.Destroy: {
       const result = await infraService.destroy(metadata.stackName, metadata.projectId, { onStack });
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     case DeploymentAction.Refresh: {
       const result = await infraService.refresh(metadata.stackName, metadata.projectId, { onStack });
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     default: {
       const _exhaustive: never = input.action;
@@ -346,15 +365,15 @@ async function executeLocalAction(
         port,
         environment: env,
       });
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     case DeploymentAction.Destroy: {
       const result = await local.destroy(metadata.stackName);
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     case DeploymentAction.Refresh: {
       const result = await local.refresh(metadata.stackName);
-      return { message: result.message, idempotentNoop: result.idempotentNoop };
+      return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }
     default: {
       const _exhaustive: never = input.action;

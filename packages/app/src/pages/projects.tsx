@@ -5,7 +5,7 @@ import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
-import { urlsByEnvironment } from '@/lib/deployment';
+import { urlMapForEnvironments } from '@/lib/deployment';
 import type { Project } from '@appliance.sh/sdk/models';
 
 export function ProjectsPage() {
@@ -67,9 +67,9 @@ function ConnectedProjects() {
     projectIds.forEach((projectId, idx) => {
       const deployments = deploymentsByProject[idx]?.data;
       const envs = environmentsByProject[idx]?.data;
-      if (!deployments || !envs) return;
+      if (!envs) return;
       const envNameById = new Map(envs.map((e) => [e.id, e.name]));
-      const urls = urlsByEnvironment(deployments);
+      const urls = urlMapForEnvironments(envs, deployments);
       const entries: Array<{ envName: string; url: string }> = [];
       for (const [envId, url] of urls) {
         const envName = envNameById.get(envId);

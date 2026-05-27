@@ -1,13 +1,14 @@
 import * as React from 'react';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { useQuery, useQueries, useQueryClient, useMutation } from '@tanstack/react-query';
 import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { relativeTime } from '@/lib/time';
-import { urlsByEnvironment } from '@/lib/deployment';
+import { urlMapForEnvironments } from '@/lib/deployment';
 import type { Environment, Project } from '@appliance.sh/sdk/models';
 
 export function EnvironmentsPage() {
@@ -24,6 +25,9 @@ interface EnvWithProject {
 function ConnectedEnvironments() {
   const client = useApplianceClient();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const host = useHost();
+  const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
 
   const projectsQuery = useQuery({
     queryKey: ['projects'],
@@ -66,14 +70,14 @@ function ConnectedEnvironments() {
 
   const urlByEnvId = React.useMemo(() => {
     const merged = new Map<string, string>();
-    for (const q of deploymentQueries) {
-      const partial = urlsByEnvironment(q.data);
+    envQueries.forEach((envQ, i) => {
+      const partial = urlMapForEnvironments(envQ.data, deploymentQueries[i]?.data);
       for (const [envId, url] of partial) {
         if (!merged.has(envId)) merged.set(envId, url);
       }
-    }
+    });
     return merged;
-  }, [deploymentQueries]);
+  }, [envQueries, deploymentQueries]);
 
   const projectsById = React.useMemo(() => {
     const m = new Map<string, Project>();
@@ -115,6 +119,20 @@ function ConnectedEnvironments() {
       setName('');
       setMutationError(null);
       queryClient.invalidateQueries({ queryKey: ['environments', env.projectId] });
+
+      // A brand-new env has no image yet — the first Deploy must build
+      // one. When the desktop's deploy wizard is available, route the
+      // user straight into it with the new env preselected so creating
+      // an env naturally chains into shipping it. Without the wizard
+      // (web shell), stay on the list — the existing CLI/Connect
+      // guidance still applies.
+      if (canRunDeployWizard) {
+        const project = projectsById.get(env.projectId);
+        const projectName = project?.name ?? env.projectId;
+        navigate(
+          `/local-runtime/deploy?project=${encodeURIComponent(projectName)}&environment=${encodeURIComponent(env.name)}`
+        );
+      }
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
   });
@@ -187,7 +205,7 @@ function ConnectedEnvironments() {
           </label>
           <div className="flex gap-2">
             <Button type="submit" disabled={!canCreate || createMutation.isPending}>
-              {createMutation.isPending ? 'Creating…' : 'Create'}
+              {createMutation.isPending ? 'Creating…' : canRunDeployWizard ? 'Create & deploy' : 'Create'}
             </Button>
             <Button
               type="button"

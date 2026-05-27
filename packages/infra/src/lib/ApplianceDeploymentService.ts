@@ -31,6 +31,13 @@ export interface PulumiResult {
   idempotentNoop: boolean;
   message: string;
   stackName: string;
+  /**
+   * Public URL the deployed appliance can be reached at, when known.
+   * Local deploys derive it from the assigned k3d NodePort; cloud
+   * deploys leave it undefined for now (a future change will read
+   * stack outputs to populate it). Consumers must tolerate undefined.
+   */
+  url?: string;
 }
 
 export interface ResolvedBuildParams {

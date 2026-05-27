@@ -1,12 +1,13 @@
 import * as React from 'react';
 import { Link, useNavigate, useParams, Navigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, ExternalLink, Play, Trash2 } from 'lucide-react';
+import { ChevronLeft, ExternalLink, Play, Rocket, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useHost } from '@/providers/host-provider';
 import { relativeTime } from '@/lib/time';
-import { extractDeploymentUrl, findLatestSuccessfulDeploy } from '@/lib/deployment';
+import { urlForEnvironment } from '@/lib/deployment';
 import type { Environment } from '@appliance.sh/sdk/models';
 
 // "pending" looks like in-flight but is also the initial status a
@@ -22,6 +23,8 @@ export function EnvironmentDetailPage() {
   const navigate = useNavigate();
   const client = useApplianceClient();
   const queryClient = useQueryClient();
+  const host = useHost();
+  const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
 
   const envQuery = useQuery({
     queryKey: ['environment', projectId, id],
@@ -144,10 +147,34 @@ export function EnvironmentDetailPage() {
               </div>
             </div>
             <div className="flex gap-2">
-              <Button onClick={() => deployMutation.mutate()} disabled={busy}>
-                <Play className="h-4 w-4" />
-                {deployMutation.isPending ? 'Starting…' : 'Deploy'}
-              </Button>
+              {(() => {
+                // First-time deploys have no image to redeploy from, so
+                // `client.deploy(id)` would fail with "No image available…"
+                // on the server. When the desktop's local-runtime wizard
+                // is available, route the user there with the env preset
+                // so they can build + push an image in one flow. Otherwise
+                // (web shell, cloud env) keep the existing button — the
+                // CLI is the documented escape hatch.
+                const hasImage = Boolean(env.lastDeployedAt);
+                if (!hasImage && canRunDeployWizard) {
+                  const target = `/local-runtime/deploy?project=${encodeURIComponent(
+                    projectQuery.data?.name ?? env.projectId
+                  )}&environment=${encodeURIComponent(env.name)}`;
+                  return (
+                    <Button asChild disabled={busy}>
+                      <Link to={target}>
+                        <Rocket className="h-4 w-4" /> Set up first deploy
+                      </Link>
+                    </Button>
+                  );
+                }
+                return (
+                  <Button onClick={() => deployMutation.mutate()} disabled={busy}>
+                    <Play className="h-4 w-4" />
+                    {deployMutation.isPending ? 'Starting…' : 'Deploy'}
+                  </Button>
+                );
+              })()}
               <Button variant="destructive" onClick={onDestroy} disabled={busy}>
                 <Trash2 className="h-4 w-4" />
                 {destroyMutation.isPending ? 'Starting…' : 'Destroy'}
@@ -162,8 +189,9 @@ export function EnvironmentDetailPage() {
           ) : null}
 
           {(() => {
-            const latest = findLatestSuccessfulDeploy(deploymentsQuery.data);
-            const url = extractDeploymentUrl(latest?.message);
+            // Prefer the canonical env.url; fall back to the latest
+            // deploy's message for environments that predate the field.
+            const url = urlForEnvironment(env, deploymentsQuery.data);
             if (!url) return null;
             return (
               <a

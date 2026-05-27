@@ -76,29 +76,36 @@ program
       const env = envs.data.find((e) => e.name === environmentName);
       if (!env) throw new Error(`Environment "${projectName}/${environmentName}" not found.`);
 
-      const deployments = await client.listDeployments({ environmentId: env.id, limit: 10 });
-      if (!deployments.success) throw new Error(`listDeployments: ${deployments.error.message}`);
-
-      const succeededDeploys = deployments.data.filter(
-        (d) => d.action === 'deploy' && d.status === DeploymentStatus.Succeeded
-      );
-      const latest = succeededDeploys[0];
-      if (!latest) {
-        console.error(chalk.red(`No successful deployments yet for ${projectName}/${environmentName}.`));
-        process.exit(1);
-      }
-
-      const url = extractDeploymentUrl(latest.message);
+      // env.url is the canonical address. For environments that
+      // predate the field (or where the executor never plumbed one,
+      // e.g. cloud deploys today), fall back to scanning the latest
+      // successful deployment's message.
+      let url = env.url ?? null;
       if (!url) {
-        console.error(chalk.red(`No URL recorded on the latest deployment.`));
-        console.error(
-          chalk.dim(
-            '  Cloud deployments do not yet surface their endpoint URL on the deployment record. ' +
-              'Check the Appliance Console or the upstream Pulumi outputs.'
-          )
+        const deployments = await client.listDeployments({ environmentId: env.id, limit: 10 });
+        if (!deployments.success) throw new Error(`listDeployments: ${deployments.error.message}`);
+
+        const succeededDeploys = deployments.data.filter(
+          (d) => d.action === 'deploy' && d.status === DeploymentStatus.Succeeded
         );
-        if (latest.message) console.error(chalk.dim(`  message: ${latest.message}`));
-        process.exit(1);
+        const latest = succeededDeploys[0];
+        if (!latest) {
+          console.error(chalk.red(`No successful deployments yet for ${projectName}/${environmentName}.`));
+          process.exit(1);
+        }
+
+        url = extractDeploymentUrl(latest.message);
+        if (!url) {
+          console.error(chalk.red(`No URL recorded for ${projectName}/${environmentName}.`));
+          console.error(
+            chalk.dim(
+              '  Cloud deployments do not yet surface their endpoint URL. ' +
+                'Check the Appliance Console or the upstream Pulumi outputs.'
+            )
+          );
+          if (latest.message) console.error(chalk.dim(`  message: ${latest.message}`));
+          process.exit(1);
+        }
       }
 
       if (opts.print) {

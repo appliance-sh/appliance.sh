@@ -25,6 +25,16 @@ export const environment = environmentInput.extend({
   id: z.string(),
   status: z.nativeEnum(EnvironmentStatus),
   stackName: z.string(),
+  /**
+   * Address where the environment's running application can be
+   * reached. A deployment is a *change* applied to an environment;
+   * the URL is a property of the environment itself. Populated by
+   * the deployment executor on each successful deploy and cleared
+   * on destroy. Optional and may be absent on environments that
+   * predate this field — consumers fall back to scanning the latest
+   * successful deployment message in that case.
+   */
+  url: z.string().optional(),
   lastDeployedAt: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),

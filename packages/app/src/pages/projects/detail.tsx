@@ -7,7 +7,7 @@ import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
-import { urlsByEnvironment } from '@/lib/deployment';
+import { urlMapForEnvironments } from '@/lib/deployment';
 
 // Matches environments/detail.tsx — `pending` is the initial status
 // of a freshly-created env, not in-flight work.
@@ -61,7 +61,10 @@ export function ProjectDetailPage() {
     return m;
   }, [environmentsQuery.data]);
 
-  const urlByEnvId = React.useMemo(() => urlsByEnvironment(deploymentsQuery.data), [deploymentsQuery.data]);
+  const urlByEnvId = React.useMemo(
+    () => urlMapForEnvironments(environmentsQuery.data, deploymentsQuery.data),
+    [environmentsQuery.data, deploymentsQuery.data]
+  );
 
   const [actionError, setActionError] = React.useState<string | null>(null);
 

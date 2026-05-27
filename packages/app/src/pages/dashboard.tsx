@@ -146,7 +146,10 @@ function RecentActivity({
       ) : (
         <ul className="divide-y divide-[var(--color-border)]">
           {deployments.map((d) => {
-            const url = extractDeploymentUrl(d.message);
+            // Prefer the canonical env.url; legacy envs without one
+            // still fall back to scanning this deployment's message.
+            const env = envs.get(d.environmentId);
+            const url = env?.url ?? extractDeploymentUrl(d.message);
             return (
               <li key={d.id}>
                 <Link

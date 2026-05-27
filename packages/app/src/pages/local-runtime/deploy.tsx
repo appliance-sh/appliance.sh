@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Link, useNavigate } from 'react-router';
+import { Link, useNavigate, useSearchParams } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket, X, History } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -41,6 +41,15 @@ export function LocalRuntimeDeployPage() {
   const local = host.local;
   const { recent: recentFolders, record: recordRecentFolder, forget: forgetRecentFolder } = useRecentFolders();
 
+  // Pre-selected target via query params — e.g. the Environment detail
+  // page sends `?project=foo&environment=bar` when its first-time
+  // Deploy button is clicked. Captured once on mount so navigating
+  // away (e.g. to /local-runtime) and back doesn't blow away in-flight
+  // form state.
+  const [searchParams] = useSearchParams();
+  const presetProject = React.useMemo(() => searchParams.get('project') ?? null, [searchParams]);
+  const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
+
   const [phase, setPhase] = React.useState<Phase>('pick');
 
   // Step 1 — folder + manifest
@@ -49,9 +58,11 @@ export function LocalRuntimeDeployPage() {
   const [pickError, setPickError] = React.useState<string | null>(null);
   const [pickBusy, setPickBusy] = React.useState(false);
 
-  // Step 2 — config form
-  const [projectName, setProjectName] = React.useState('');
-  const [envName, setEnvName] = React.useState('local');
+  // Step 2 — config form. Preset target wins over manifest defaults so
+  // a "Deploy to foo/bar" click from elsewhere in the app lands on bar
+  // even if the picked folder's manifest names a different project.
+  const [projectName, setProjectName] = React.useState(presetProject ?? '');
+  const [envName, setEnvName] = React.useState(presetEnvironment ?? 'local');
   const [envEntries, setEnvEntries] = React.useState<EnvEntry[]>([]);
   const [memory, setMemory] = React.useState('');
   const [timeout, setTimeoutField] = React.useState('');
@@ -77,8 +88,10 @@ export function LocalRuntimeDeployPage() {
   const applyPickedManifest = (picked: string, m: LocalApplianceManifest) => {
     setFolderPath(picked);
     setManifest(m);
-    // Reasonable defaults for step 2 form.
-    setProjectName(m.name);
+    // Reasonable defaults for step 2 form. Don't clobber a preset
+    // project/env passed via URL — those were chosen explicitly
+    // upstream (e.g. from the environment detail page).
+    if (!presetProject) setProjectName(m.name);
     const envFromManifest = Object.entries(m.env ?? {}).map(([key, value]) => ({ key, value }));
     // Prefill PORT from manifest so the container's listen port and
     // the Service / NodePort agree. Without this the executor falls
@@ -240,6 +253,17 @@ export function LocalRuntimeDeployPage() {
           local cluster.
         </p>
       </header>
+
+      {presetProject || presetEnvironment ? (
+        <div className="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-200">
+          Deploying to{' '}
+          <code className="font-mono">
+            {presetProject ?? projectName}
+            {presetEnvironment ? ` / ${presetEnvironment}` : ''}
+          </code>
+          .
+        </div>
+      ) : null}
 
       <Stepper phase={phase} />
 

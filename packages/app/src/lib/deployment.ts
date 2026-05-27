@@ -1,6 +1,15 @@
 // Shared deployment helpers used by multiple pages.
+//
+// URL bookkeeping in the platform:
+//   * The canonical "where is this thing reachable" address lives on
+//     the *Environment* — `env.url`. A deployment is a change applied
+//     to an environment; the URL is a property of the environment.
+//   * Older environments (pre-`url`-field) won't have one set yet.
+//     Helpers in this file fall back to scraping the URL out of the
+//     most recent successful deployment's `message` so UI continues
+//     to work against legacy data without requiring a manual migration.
 
-import type { Deployment } from '@appliance.sh/sdk/models';
+import type { Deployment, Environment } from '@appliance.sh/sdk/models';
 
 /**
  * Pull a URL out of a deployment's `message` string. Today only the
@@ -42,7 +51,9 @@ export function findLatestSuccessfulDeploy(deployments: Deployment[] | undefined
  *
  * Cheap: one pass, no extra fetches — callers can use a single
  * `listDeployments({ projectId })` to drive URL chips for every env
- * in a project.
+ * in a project. This is the *fallback* path for environments that
+ * predate `env.url`; new code should prefer reading `env.url` and
+ * merge the two sources via {@link urlForEnvironment} below.
  */
 export function urlsByEnvironment(deployments: Deployment[] | undefined): Map<string, string> {
   const result = new Map<string, string>();
@@ -52,6 +63,36 @@ export function urlsByEnvironment(deployments: Deployment[] | undefined): Map<st
     if (result.has(d.environmentId)) continue;
     const url = extractDeploymentUrl(d.message);
     if (url) result.set(d.environmentId, url);
+  }
+  return result;
+}
+
+/**
+ * Resolve the URL to show for an environment, preferring the canonical
+ * `env.url` and falling back to scanning the deployment list. Pass
+ * `deployments` from a query keyed by environmentId or projectId.
+ */
+export function urlForEnvironment(env: Environment | undefined, deployments?: Deployment[]): string | null {
+  if (env?.url) return env.url;
+  const latest = findLatestSuccessfulDeploy(deployments);
+  return extractDeploymentUrl(latest?.message);
+}
+
+/**
+ * Merge env.url (canonical) with the deployment-scan fallback into a
+ * single envId → url map. Pass the project's envs + a flat list of its
+ * deployments; each env's own `url` field wins, with the deployment
+ * scan filling gaps for environments that predate the field.
+ */
+export function urlMapForEnvironments(
+  envs: Environment[] | undefined,
+  deployments?: Deployment[]
+): Map<string, string> {
+  const fromDeployments = urlsByEnvironment(deployments);
+  const result = new Map<string, string>();
+  for (const env of envs ?? []) {
+    const url = env.url ?? fromDeployments.get(env.id);
+    if (url) result.set(env.id, url);
   }
   return result;
 }
