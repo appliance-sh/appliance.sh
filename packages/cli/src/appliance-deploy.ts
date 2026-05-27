@@ -1,14 +1,20 @@
 import { Command } from 'commander';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { createApplianceClient } from '@appliance.sh/sdk';
-import type { Project, Environment } from '@appliance.sh/sdk';
+import { input } from '@inquirer/prompts';
+import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
+import type { Project, Environment, Deployment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
+import { getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
+import { buildApplianceZip } from './utils/build-package.js';
+import { readLink, writeLink } from './utils/link.js';
+import { pollDeploymentUntilDone, extractDeploymentUrl } from './utils/deploy-poll.js';
+import { startProgressLine, BRAND } from './utils/progress.js';
 import chalk from 'chalk';
 
-const POLL_INTERVAL_MS = 3000;
+const DEFAULT_BUILD_OUTPUT = 'appliance.zip';
 
 function parseEnvFile(filePath: string): Record<string, string> {
   const content = fs.readFileSync(filePath, 'utf-8');
@@ -20,7 +26,6 @@ function parseEnvFile(filePath: string): Record<string, string> {
     if (eqIndex === -1) continue;
     const key = trimmed.slice(0, eqIndex).trim();
     let value = trimmed.slice(eqIndex + 1).trim();
-    // Strip surrounding quotes
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
@@ -94,12 +99,7 @@ async function renderRuntimeConfig(
     environment: environmentName,
   });
   if (!result.success) {
-    if (result.error.name === 'File Not Found') {
-      // Deploy from a location without the manifest source is
-      // legitimate (e.g. promoting a prebuilt zip). No runtime
-      // overrides, just continue.
-      return undefined;
-    }
+    if (result.error.name === 'File Not Found') return undefined;
     console.error(chalk.red(`Failed to render manifest runtime config: ${result.error.message}`));
     process.exit(1);
   }
@@ -130,28 +130,142 @@ function loadEnvFile(explicit: string | undefined, environmentName: string): Rec
   return undefined;
 }
 
-async function pollDeployment(client: ReturnType<typeof createApplianceClient>, deploymentId: string) {
-  while (true) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    const status = await client.getDeployment(deploymentId);
-    if (!status.success) {
-      console.error(chalk.red(`Failed to get deployment status: ${status.error.message}`));
-      process.exit(1);
-    }
-
-    const { status: deployStatus, message } = status.data;
-    console.log(chalk.dim(`  status: ${deployStatus}${message ? ` — ${message}` : ''}`));
-
-    if (deployStatus === 'succeeded') {
-      console.log(chalk.green('Deployment succeeded.'));
-      console.log(JSON.stringify(status.data, null, 2));
-      return;
-    }
-    if (deployStatus === 'failed') {
-      console.error(chalk.red(`Deployment failed: ${message ?? 'unknown error'}`));
-      process.exit(1);
-    }
+// Resolve which project and environment the deploy should target.
+// Cascade, in priority order:
+//   1. Explicit positional args (back-compat with `appliance deploy <p> <e>`)
+//   2. .appliance/link.json (set by a prior setup/deploy in this tree)
+//   3. Manifest `name` for project + prompt for env (TTY only)
+// Non-TTY without args or link is a hard error with a clear remediation.
+async function resolveTarget(
+  cliProject: string | undefined,
+  cliEnv: string | undefined,
+  program: Command,
+  yes: boolean
+): Promise<{ projectName: string; environmentName: string; source: string }> {
+  if (cliProject && cliEnv) {
+    return { projectName: cliProject, environmentName: cliEnv, source: 'args' };
   }
+
+  const link = readLink();
+  const manifest = await extractApplianceFile(program);
+
+  let projectName = cliProject ?? link?.projectName;
+  let environmentName = cliEnv ?? link?.environmentName;
+  let source = link ? 'link' : 'args';
+
+  // Fill project from manifest when neither args nor link supplied one.
+  if (!projectName && manifest.success && manifest.data.name) {
+    projectName = manifest.data.name;
+    source = 'manifest';
+  }
+
+  const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+  if (!projectName) {
+    if (!isTTY || yes) {
+      throw new Error(
+        'No project to deploy to. Pass `<project>` as an argument, run `appliance setup` to link this folder, or set a manifest `name`.'
+      );
+    }
+    projectName = await input({ message: 'Project name:' });
+    if (!projectName) throw new Error('Project name is required.');
+    source = 'prompt';
+  }
+
+  if (!environmentName) {
+    if (!isTTY || yes) {
+      throw new Error(
+        'No environment to deploy to. Pass `<environment>` as an argument or run `appliance setup` to link this folder.'
+      );
+    }
+    environmentName = await input({ message: 'Environment name:', default: 'production' });
+    if (!environmentName) throw new Error('Environment name is required.');
+    source = source === 'link' ? 'link' : 'prompt';
+  }
+
+  return { projectName, environmentName, source };
+}
+
+// Resolve which build to deploy. Three mutually-exclusive paths:
+//   --image-uri <uri>    : register an external image build (no upload)
+//   <existing zip path>  : upload the existing zip
+//   <no zip + default>   : auto-build the manifest into appliance.zip,
+//                          then upload it
+async function resolveBuildId(
+  client: ReturnType<typeof createApplianceClient>,
+  program: Command,
+  opts: { imageUri?: string; build: string }
+): Promise<string> {
+  if (opts.imageUri) {
+    console.log(chalk.dim(`Using image: ${opts.imageUri}`));
+    const createResult = await client.createBuild({ uploadUrl: opts.imageUri });
+    if (!createResult.success) throw new Error(`Failed to create external build: ${createResult.error.message}`);
+    console.log(chalk.dim(`External build created: ${createResult.data.buildId}`));
+    return createResult.data.buildId;
+  }
+
+  const buildPath = path.resolve(opts.build);
+  const buildExists = fs.existsSync(buildPath);
+  const isDefaultBuildPath = opts.build === DEFAULT_BUILD_OUTPUT;
+
+  if (!buildExists && !isDefaultBuildPath) {
+    // User passed an explicit --build path that doesn't exist. Bail
+    // with the file they actually wanted — no auto-build surprise.
+    throw new Error(`Build not found: ${buildPath}`);
+  }
+
+  if (!buildExists) {
+    // Default path doesn't exist — auto-build inline so `appliance
+    // deploy` works as a single command. Mirrors `vercel` building
+    // implicitly before deploy.
+    console.log(chalk.dim('No appliance.zip found — building first.'));
+    const manifest = await extractApplianceFile(program);
+    if (!manifest.success) {
+      throw new Error(
+        `Cannot auto-build: ${manifest.error.message}. Run \`appliance build\` first, or pass --image-uri / --build <path>.`
+      );
+    }
+    const built = await buildApplianceZip({ appliance: manifest.data, outputPath: buildPath });
+    const sizeMb = (built.sizeBytes / 1024 / 1024).toFixed(1);
+    console.log(chalk.green(`Built: ${built.outputPath} (${sizeMb} MB)`));
+  }
+
+  const buildData = fs.readFileSync(buildPath);
+  const sizeMb = (buildData.length / 1024 / 1024).toFixed(1);
+  console.log(chalk.dim(`Uploading build (${sizeMb} MB)...`));
+  const uploadResult = await client.uploadBuild(buildData);
+  if (!uploadResult.success) throw new Error(`Upload failed: ${uploadResult.error.message}`);
+  console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
+  return uploadResult.data.buildId;
+}
+
+function formatStatus(d: Deployment): string {
+  const base = chalk.dim(d.status);
+  return d.message ? `${base} ${chalk.dim('—')} ${d.message}` : base;
+}
+
+function printFinalBanner(deployment: Deployment, projectName: string, environmentName: string): void {
+  const url = extractDeploymentUrl(deployment.message);
+  console.log();
+  if (deployment.status === DeploymentStatus.Succeeded) {
+    if (deployment.idempotentNoop) {
+      console.log(
+        `${chalk.cyan(BRAND)} ${chalk.bold('No changes')} — ${projectName}/${environmentName} is up to date.`
+      );
+    } else {
+      console.log(`${chalk.green(BRAND)} ${chalk.bold('Deployed')} ${projectName}/${environmentName}`);
+    }
+    if (url) {
+      console.log(`  ${chalk.bold('URL:')} ${chalk.cyan(url)}`);
+    }
+  } else if (deployment.status === DeploymentStatus.Cancelled) {
+    console.log(`${chalk.yellow(BRAND)} ${chalk.bold('Cancelled')} ${projectName}/${environmentName}`);
+    if (deployment.message) console.log(`  ${deployment.message}`);
+  } else {
+    console.log(`${chalk.red(BRAND)} ${chalk.bold('Failed')} ${projectName}/${environmentName}`);
+    if (deployment.message) console.log(`  ${deployment.message}`);
+  }
+  console.log(`  ${chalk.dim('deployment')} ${deployment.id}`);
 }
 
 const program = new Command();
@@ -159,16 +273,17 @@ const program = new Command();
 attachProfileOption(program);
 
 registerManifestOptions(program)
-  .description('deploy a named project/environment')
-  .argument('<project>', 'project name')
-  .argument('<environment>', 'environment name')
-  .option('-a, --build <path>', 'appliance.zip build to deploy', 'appliance.zip')
+  .description('deploy the linked (or named) project/environment')
+  .argument('[project]', 'project name (defaults to the linked project, then to the manifest `name`)')
+  .argument('[environment]', 'environment name (defaults to the linked environment)')
+  .option('-a, --build <path>', 'appliance.zip build to deploy', DEFAULT_BUILD_OUTPUT)
   .option(
     '--image-uri <uri>',
     'reference an already-published image (e.g. ghcr.io/org/app:tag) instead of uploading a build'
   )
   .option('-e, --env-file <path>', 'env file with runtime environment variables')
-  .action(async (projectName: string, environmentName: string) => {
+  .option('-y, --yes', 'skip interactive prompts; fail when input would be needed', false)
+  .action(async (cliProject: string | undefined, cliEnvironment: string | undefined) => {
     const opts = program.opts<{
       build: string;
       imageUri?: string;
@@ -176,18 +291,17 @@ registerManifestOptions(program)
       file?: string;
       directory?: string;
       variant?: string;
+      yes: boolean;
     }>();
 
-    // --image-uri and --build are mutually exclusive; detect the
-    // explicit --build override by looking for a non-default path.
-    if (opts.imageUri && opts.build !== 'appliance.zip') {
+    if (opts.imageUri && opts.build !== DEFAULT_BUILD_OUTPUT) {
       console.error(chalk.red('Provide either --image-uri or --build, not both.'));
       process.exit(1);
     }
 
     const credentials = loadCredentials();
     if (!credentials) {
-      console.error(chalk.red('Credentials not found. Run `appliance init` first.'));
+      console.error(chalk.red('Not logged in. Run `appliance login` first.'));
       process.exit(1);
     }
 
@@ -197,52 +311,30 @@ registerManifestOptions(program)
     });
 
     try {
+      const { projectName, environmentName, source } = await resolveTarget(
+        cliProject,
+        cliEnvironment,
+        program,
+        opts.yes
+      );
+
+      if (source === 'link') {
+        console.log(
+          chalk.dim(
+            `Deploying linked target: ${chalk.bold(projectName)} → ${chalk.bold(environmentName)} ` +
+              `(unlink with \`appliance unlink\`)`
+          )
+        );
+      } else if (source === 'manifest') {
+        console.log(chalk.dim(`Deploying ${chalk.bold(projectName)} → ${chalk.bold(environmentName)} (from manifest)`));
+      }
+
       const project = await findOrCreateProject(client, projectName);
       const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
-      // Resolve the build source. Both paths end at a buildId the
-      // deploy references:
-      //   --image-uri → createBuild({ uploadUrl: <image> }) records
-      //                 an external-reference build (no upload).
-      //   default    → zip upload via uploadBuild().
-      let buildId: string;
-      if (opts.imageUri) {
-        console.log(chalk.dim(`Using image: ${opts.imageUri}`));
-        const createResult = await client.createBuild({ uploadUrl: opts.imageUri });
-        if (!createResult.success) {
-          console.error(chalk.red(`Failed to create external build: ${createResult.error.message}`));
-          process.exit(1);
-        }
-        buildId = createResult.data.buildId;
-        console.log(chalk.dim(`External build created: ${buildId}`));
-      } else {
-        const buildPath = path.resolve(opts.build);
-        if (!fs.existsSync(buildPath)) {
-          console.error(chalk.red(`Build not found: ${buildPath}`));
-          console.error(chalk.dim('Run `appliance build` first, or pass --image-uri <uri>.'));
-          process.exit(1);
-        }
-        const buildData = fs.readFileSync(buildPath);
-        const sizeMb = (buildData.length / 1024 / 1024).toFixed(1);
-        console.log(chalk.dim(`Uploading build (${sizeMb} MB)...`));
-        const uploadResult = await client.uploadBuild(buildData);
-        if (!uploadResult.success) {
-          console.error(chalk.red(`Upload failed: ${uploadResult.error.message}`));
-          process.exit(1);
-        }
-        buildId = uploadResult.data.buildId;
-        console.log(chalk.dim(`Build uploaded: ${buildId}`));
-      }
+      const buildId = await resolveBuildId(client, program, { imageUri: opts.imageUri, build: opts.build });
 
-      // Render runtime config from the manifest. The build artifact
-      // is environment-invariant — env / memory / timeout / storage
-      // are rendered fresh per-deploy with full ManifestContext so
-      // the same zip can deploy to many environments with different
-      // runtime config. Manifest source is best-effort: deploys from
-      // a checkout-less location (e.g. promoting a prebuilt zip)
-      // degrade gracefully to env-file-only.
       const manifestRuntime = await renderRuntimeConfig(program, projectName, environmentName);
-
       const envFileVars = loadEnvFile(opts.envFile, environmentName);
 
       // --env-file wins on conflict: it's the most local, ad-hoc
@@ -251,7 +343,6 @@ registerManifestOptions(program)
       const envVars: Record<string, string> | undefined =
         manifestRuntime?.env || envFileVars ? { ...(manifestRuntime?.env ?? {}), ...(envFileVars ?? {}) } : undefined;
 
-      console.log(chalk.dim(`Deploying ${projectName}/${environmentName}...`));
       const result = await client.deploy(environment.id, {
         buildId,
         environment: envVars,
@@ -264,10 +355,36 @@ registerManifestOptions(program)
         process.exit(1);
       }
 
-      console.log(chalk.dim(`Deployment started: ${result.data.id}`));
-      await pollDeployment(client, result.data.id);
+      // Persist the link so the next `appliance deploy` (no args)
+      // targets the same place. Done after the dispatch succeeds so
+      // we don't link to something that never got an id.
+      writeLink({
+        projectName,
+        environmentName,
+        apiUrl: credentials.apiUrl,
+        profile: getActiveProfileOverride() ?? process.env.APPLIANCE_PROFILE ?? undefined,
+      });
+
+      const progress = startProgressLine(`Deploying ${projectName}/${environmentName} — pending`);
+      let finalDeployment: Deployment;
+      try {
+        const { deployment } = await pollDeploymentUntilDone(client, result.data.id, {
+          onProgress: (d) => progress.update(`Deploying ${projectName}/${environmentName} — ${formatStatus(d)}`),
+        });
+        finalDeployment = deployment;
+        progress.clear();
+      } catch (err) {
+        progress.fail(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      printFinalBanner(finalDeployment, projectName, environmentName);
+
+      if (finalDeployment.status !== DeploymentStatus.Succeeded) {
+        process.exit(1);
+      }
     } catch (error) {
-      console.error(chalk.red(String(error)));
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
       process.exit(1);
     }
   });

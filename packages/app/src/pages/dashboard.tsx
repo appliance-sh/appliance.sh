@@ -9,6 +9,7 @@ import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
+import { extractDeploymentUrl } from '@/lib/deployment';
 
 export function DashboardPage() {
   const host = useHost();
@@ -18,10 +19,24 @@ export function DashboardPage() {
   if (isLoading) return null;
   if (!cluster) return <GetStarted canBootstrap={canBootstrap} />;
 
-  return <ConnectedDashboard serverUrl={cluster.apiServerUrl} clusterName={cluster.name} />;
+  return (
+    <ConnectedDashboard
+      serverUrl={cluster.apiServerUrl}
+      clusterName={cluster.name}
+      canDeployLocally={Boolean(host.local?.buildAndImportImage)}
+    />
+  );
 }
 
-function ConnectedDashboard({ serverUrl, clusterName }: { serverUrl: string; clusterName: string }) {
+function ConnectedDashboard({
+  serverUrl,
+  clusterName,
+  canDeployLocally,
+}: {
+  serverUrl: string;
+  clusterName: string;
+  canDeployLocally: boolean;
+}) {
   const client = useApplianceClient();
 
   const projectsQuery = useQuery({
@@ -64,11 +79,20 @@ function ConnectedDashboard({ serverUrl, clusterName }: { serverUrl: string; clu
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold">Dashboard</h1>
-        <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          {clusterName} · <code className="font-mono">{serverUrl}</code>
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold">Dashboard</h1>
+          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+            {clusterName} · <code className="font-mono">{serverUrl}</code>
+          </p>
+        </div>
+        {canDeployLocally ? (
+          <Button asChild>
+            <Link to="/local-runtime/deploy">
+              <Rocket className="h-4 w-4" /> Deploy
+            </Link>
+          </Button>
+        ) : null}
       </div>
 
       {error ? (
@@ -121,25 +145,30 @@ function RecentActivity({
         </div>
       ) : (
         <ul className="divide-y divide-[var(--color-border)]">
-          {deployments.map((d) => (
-            <li key={d.id}>
-              <Link
-                to={`/deployments/${d.id}`}
-                className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-4 py-2 hover:bg-[var(--color-muted)]"
-              >
-                <StatusDot status={d.status} />
-                <div className="min-w-0 text-sm">
-                  <div className="font-medium">
-                    {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
+          {deployments.map((d) => {
+            const url = extractDeploymentUrl(d.message);
+            return (
+              <li key={d.id}>
+                <Link
+                  to={`/deployments/${d.id}`}
+                  className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-4 py-2 hover:bg-[var(--color-muted)]"
+                >
+                  <StatusDot status={d.status} />
+                  <div className="min-w-0 text-sm">
+                    <div className="font-medium">
+                      {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
+                    </div>
+                    <div className="truncate text-xs text-[var(--color-muted-foreground)]">
+                      {url ? <span className="font-mono">{url}</span> : (d.message ?? '—')}
+                    </div>
                   </div>
-                  <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message ?? '—'}</div>
-                </div>
-                <div className="text-right text-xs text-[var(--color-muted-foreground)]">
-                  {relativeTime(d.startedAt)}
-                </div>
-              </Link>
-            </li>
-          ))}
+                  <div className="text-right text-xs text-[var(--color-muted-foreground)]">
+                    {relativeTime(d.startedAt)}
+                  </div>
+                </Link>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>

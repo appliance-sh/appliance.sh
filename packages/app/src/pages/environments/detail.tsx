@@ -1,11 +1,12 @@
 import * as React from 'react';
 import { Link, useNavigate, useParams, Navigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, Play, Trash2 } from 'lucide-react';
+import { ChevronLeft, ExternalLink, Play, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
+import { extractDeploymentUrl, findLatestSuccessfulDeploy } from '@/lib/deployment';
 import type { Environment } from '@appliance.sh/sdk/models';
 
 // "pending" looks like in-flight but is also the initial status a
@@ -159,6 +160,25 @@ export function EnvironmentDetailPage() {
               {actionError}
             </div>
           ) : null}
+
+          {(() => {
+            const latest = findLatestSuccessfulDeploy(deploymentsQuery.data);
+            const url = extractDeploymentUrl(latest?.message);
+            if (!url) return null;
+            return (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center justify-between gap-3 rounded-md border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-300 hover:bg-green-500/15"
+              >
+                <span>
+                  <span className="font-semibold">Live at</span> <code className="font-mono text-xs">{url}</code>
+                </span>
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            );
+          })()}
 
           <section className="grid gap-x-6 gap-y-3 rounded-md border border-[var(--color-border)] p-4 sm:grid-cols-2">
             <Row label="Status" value={env.status} />

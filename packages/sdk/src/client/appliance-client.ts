@@ -64,6 +64,16 @@ export class ApplianceClient {
         };
       }
 
+      // 204 No Content (DELETE handlers) and other empty-body
+      // responses must not be fed to JSON.parse — WebKit/WKWebView
+      // raises a confusing "String content not expected" / "Unexpected
+      // EOF" error that surfaces to the user as a delete failure.
+      // Resolve to `undefined as T` instead so `Result<void>` callers
+      // see `{ success: true }`.
+      if (response.status === 204 || response.headers.get('content-length') === '0') {
+        return { success: true, data: undefined as T };
+      }
+
       const data = await response.json();
       return { success: true, data: data as T };
     } catch (error) {

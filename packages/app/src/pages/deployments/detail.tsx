@@ -1,11 +1,12 @@
 import { Link, Navigate, useParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, ExternalLink } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { durationMs, relativeTime } from '@/lib/time';
+import { extractDeploymentUrl } from '@/lib/deployment';
 import type { Deployment } from '@appliance.sh/sdk/models';
 
 const TERMINAL = new Set(['succeeded', 'failed']);
@@ -88,6 +89,24 @@ export function DeploymentDetailPage() {
               </p>
             </div>
           </div>
+
+          {(() => {
+            const url = extractDeploymentUrl(d.message);
+            if (!url) return null;
+            return (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center justify-between gap-3 rounded-md border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-300 hover:bg-green-500/15"
+              >
+                <span>
+                  <span className="font-semibold">Deployed at</span> <code className="font-mono text-xs">{url}</code>
+                </span>
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            );
+          })()}
 
           {d.message ? (
             <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-muted)] p-3 text-xs">

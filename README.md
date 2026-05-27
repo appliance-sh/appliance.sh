@@ -52,12 +52,15 @@ Create an `appliance.json` in your project directory. You can do this interactiv
 
 ```bash
 appliance login       # Authenticate with your Appliance server
-appliance deploy      # Deploy to an environment
+appliance setup       # Link this folder to a project/environment (one-time)
+appliance deploy      # Build, upload, and deploy
 ```
 
-If your application hasn't been set up yet, `deploy` will automatically walk you through setup. You can also run `appliance setup` directly.
+`appliance setup` writes a `.appliance/link.json` recording which project and environment this folder targets. After linking, `appliance deploy` (with no arguments) builds the manifest, uploads it, and rolls the linked environment forward — re-deploys are a single command.
 
-The CLI polls until the deployment completes. Check status anytime with `appliance status <app-name>` or `appliance deployment status <deployment-id>`.
+If no `appliance.zip` exists, `appliance deploy` builds one automatically. On a first deploy without `setup`, you can still pass `appliance deploy <project> <environment>` explicitly; the CLI will create both as needed and record the link.
+
+The CLI polls until the deployment completes and prints the deployed URL when one is available. Check status anytime with `appliance status` (defaults to the linked project) or `appliance deployment status <deployment-id>`. Open the running app with `appliance open`.
 
 ## Application Types
 
@@ -76,19 +79,38 @@ Optional fields available on all types:
 
 ## CLI Commands
 
-| Command                            | Description                                                   |
-| ---------------------------------- | ------------------------------------------------------------- |
-| `appliance login`                  | Authenticate with an Appliance API server                     |
-| `appliance configure`              | Create or update `appliance.json` interactively               |
-| `appliance build`                  | Build the application locally                                 |
-| `appliance setup`                  | Connect local codebase to a cloud application                 |
-| `appliance deploy`                 | Deploy to an environment (runs setup automatically if needed) |
-| `appliance destroy`                | Destroy an environment (requires confirmation)                |
-| `appliance status <name>`          | Show application and environment status                       |
-| `appliance list`                   | List all applications and environments                        |
-| `appliance deployment status <id>` | Check a specific deployment's status                          |
+| Command                             | Description                                                                   |
+| ----------------------------------- | ----------------------------------------------------------------------------- |
+| `appliance login`                   | Authenticate with an Appliance API server                                     |
+| `appliance whoami`                  | Show the active profile, server URL, and linked project                       |
+| `appliance configure`               | Create or update `appliance.json` interactively                               |
+| `appliance build`                   | Build the application locally                                                 |
+| `appliance setup`                   | Connect local codebase to a cloud application (writes `.appliance/link.json`) |
+| `appliance link`                    | Link this folder to an existing project/environment without deploying         |
+| `appliance unlink`                  | Remove the local project/environment link                                     |
+| `appliance deploy [project] [env]`  | Build (if needed), upload, and deploy; defaults to the linked target          |
+| `appliance destroy [project] [env]` | Destroy an environment; defaults to the linked target                         |
+| `appliance open [project] [env]`    | Open the latest deployment URL in a browser                                   |
+| `appliance status [project]`        | Show application and environment status; defaults to the linked project       |
+| `appliance list`                    | List all applications and environments                                        |
+| `appliance deployment status <id>`  | Check a specific deployment's status                                          |
+| `appliance deployment cancel`       | Cancel an in-flight deployment                                                |
+| `appliance deployment refresh`      | Reconcile Pulumi state with cloud reality                                     |
 
 Top-level commands like `setup`, `status`, and `list` are shortcuts for `appliance app setup`, `appliance app status`, and `appliance app list`.
+
+### The link file
+
+`appliance setup` (and the first successful `appliance deploy`) writes `.appliance/link.json` in your project root, recording the project name, environment name, and which API server they target. Commands run from anywhere inside that tree default to the linked target, so day-to-day usage looks like:
+
+```bash
+appliance deploy   # re-deploy linked target
+appliance status   # status of linked project
+appliance open     # open latest deployment in browser
+appliance unlink   # forget the link if you want to start fresh
+```
+
+The link file is safe to commit — it contains no secrets, only names. Credentials live in `~/.appliance/profiles.json`.
 
 ## Examples
 

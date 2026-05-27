@@ -1,12 +1,14 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket } from 'lucide-react';
+import { ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket, X, History } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
 import type { LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
+import { extractDeploymentUrl } from '@/lib/deployment';
 
 // Docker Desktop-style deploy wizard for the local runtime. Three
 // steps:
@@ -37,6 +39,7 @@ export function LocalRuntimeDeployPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const local = host.local;
+  const { recent: recentFolders, record: recordRecentFolder, forget: forgetRecentFolder } = useRecentFolders();
 
   const [phase, setPhase] = React.useState<Phase>('pick');
 
@@ -71,6 +74,21 @@ export function LocalRuntimeDeployPage() {
   // ============================================================
   // Step 1 — pick a folder, read its manifest.
   // ============================================================
+  const applyPickedManifest = (picked: string, m: LocalApplianceManifest) => {
+    setFolderPath(picked);
+    setManifest(m);
+    // Reasonable defaults for step 2 form.
+    setProjectName(m.name);
+    const envFromManifest = Object.entries(m.env ?? {}).map(([key, value]) => ({ key, value }));
+    // Prefill PORT from manifest so the container's listen port and
+    // the Service / NodePort agree. Without this the executor falls
+    // back to 8080, which doesn't match e.g. demo-node-container.
+    if (m.port && !envFromManifest.some((e) => e.key === 'PORT')) {
+      envFromManifest.unshift({ key: 'PORT', value: String(m.port) });
+    }
+    setEnvEntries(envFromManifest);
+  };
+
   const onPickFolder = async () => {
     if (!local?.pickDirectory) return;
     setPickBusy(true);
@@ -79,19 +97,25 @@ export function LocalRuntimeDeployPage() {
       const picked = await local.pickDirectory();
       if (!picked) return;
       const m = await local.readApplianceManifest(picked);
-      setFolderPath(picked);
-      setManifest(m);
-      // Reasonable defaults for step 2 form.
-      setProjectName(m.name);
-      const envFromManifest = Object.entries(m.env ?? {}).map(([key, value]) => ({ key, value }));
-      // Prefill PORT from manifest so the container's listen port and
-      // the Service / NodePort agree. Without this the executor falls
-      // back to 8080, which doesn't match e.g. demo-node-container.
-      if (m.port && !envFromManifest.some((e) => e.key === 'PORT')) {
-        envFromManifest.unshift({ key: 'PORT', value: String(m.port) });
-      }
-      setEnvEntries(envFromManifest);
+      applyPickedManifest(picked, m);
     } catch (err) {
+      setPickError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPickBusy(false);
+    }
+  };
+
+  const onPickRecent = async (entry: RecentFolder) => {
+    if (!local?.readApplianceManifest) return;
+    setPickBusy(true);
+    setPickError(null);
+    try {
+      const m = await local.readApplianceManifest(entry.path);
+      applyPickedManifest(entry.path, m);
+    } catch (err) {
+      // Folder moved / manifest gone — forget the entry so it doesn't
+      // keep failing every time. Surface the error so the user knows.
+      forgetRecentFolder(entry.path);
       setPickError(err instanceof Error ? err.message : String(err));
     } finally {
       setPickBusy(false);
@@ -162,9 +186,12 @@ export function LocalRuntimeDeployPage() {
         throw new Error(finalDeploy.message ?? 'deployment failed');
       }
 
-      // Pull a URL out of the message, e.g. "Stack updated. URL: http://localhost:30039".
-      const urlMatch = finalDeploy.message?.match(/URL:\s*(\S+)/);
-      if (urlMatch) setResultUrl(urlMatch[1]);
+      const url = extractDeploymentUrl(finalDeploy.message);
+      if (url) setResultUrl(url);
+
+      // Folder + project shipped successfully — remember it so the
+      // next run of this wizard offers it as a one-click chip.
+      recordRecentFolder({ path: folderPath, projectName: manifest.name });
 
       // Nudge the workloads + deployments queries on the rest of the UI.
       queryClient.invalidateQueries({ queryKey: ['local-runtime'] });
@@ -225,6 +252,9 @@ export function LocalRuntimeDeployPage() {
           pickError={pickError}
           onNext={() => setPhase('configure')}
           canNext={canAdvanceToConfigure}
+          recent={recentFolders}
+          onPickRecent={onPickRecent}
+          onForgetRecent={forgetRecentFolder}
         />
       ) : null}
 
@@ -308,6 +338,9 @@ function PickStep({
   pickError,
   onNext,
   canNext,
+  recent,
+  onPickRecent,
+  onForgetRecent,
 }: {
   folderPath: string | null;
   manifest: LocalApplianceManifest | null;
@@ -316,6 +349,9 @@ function PickStep({
   pickError: string | null;
   onNext: () => void;
   canNext: boolean;
+  recent: RecentFolder[];
+  onPickRecent: (entry: RecentFolder) => void;
+  onForgetRecent: (path: string) => void;
 }) {
   return (
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
@@ -332,6 +368,39 @@ function PickStep({
         </Button>
         {folderPath ? <code className="truncate font-mono text-xs">{folderPath}</code> : null}
       </div>
+
+      {recent.length > 0 && !folderPath ? (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">
+            <History className="h-3 w-3" /> Recent
+          </div>
+          <ul className="flex flex-wrap gap-1.5">
+            {recent.map((entry) => (
+              <li key={entry.path}>
+                <span className="inline-flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 pl-2 pr-0.5 py-0.5 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => onPickRecent(entry)}
+                    disabled={pickBusy}
+                    className="font-mono text-[11px] hover:text-[var(--color-accent)] disabled:opacity-50"
+                    title={entry.path}
+                  >
+                    {entry.projectName ?? basename(entry.path)}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Forget ${entry.path}`}
+                    onClick={() => onForgetRecent(entry.path)}
+                    className="rounded p-0.5 text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {pickError ? (
         <div className="rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">{pickError}</div>
@@ -609,6 +678,12 @@ function TextInput({
       )}
     />
   );
+}
+
+function basename(p: string): string {
+  const trimmed = p.replace(/[\\/]+$/, '');
+  const idx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
 }
 
 // ----- SDK helpers (small replicas of CLI deploy) --------------------

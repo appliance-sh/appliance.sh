@@ -1,9 +1,25 @@
 import { Command } from 'commander';
 import { input, select } from '@inquirer/prompts';
 import { createApplianceClient } from '@appliance.sh/sdk';
-import { loadCredentials } from './utils/credentials.js';
+import { loadCredentials, getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
+import { readLink, writeLink } from './utils/link.js';
+import { urlsByEnvironment } from './utils/deploy-poll.js';
 import chalk from 'chalk';
+
+// Fetch the URL map for a single project — one round-trip via
+// listDeployments({ projectId }), then a newest-first scan for the
+// most recent successful deploy per env. Returns an empty map on
+// failure so listing still works when the deployments endpoint is
+// transiently degraded.
+async function getProjectUrls(
+  client: ReturnType<typeof createApplianceClient>,
+  projectId: string
+): Promise<Map<string, string>> {
+  const r = await client.listDeployments({ projectId, limit: 50 });
+  if (!r.success) return new Map();
+  return urlsByEnvironment(r.data);
+}
 
 function requireClient() {
   const credentials = loadCredentials();
@@ -11,10 +27,13 @@ function requireClient() {
     console.error(chalk.red('Not logged in. Run `appliance login` first.'));
     process.exit(1);
   }
-  return createApplianceClient({
-    baseUrl: credentials.apiUrl,
-    credentials: { keyId: credentials.keyId, secret: credentials.secret },
-  });
+  return {
+    client: createApplianceClient({
+      baseUrl: credentials.apiUrl,
+      credentials: { keyId: credentials.keyId, secret: credentials.secret },
+    }),
+    apiUrl: credentials.apiUrl,
+  };
 }
 
 const program = new Command();
@@ -28,7 +47,7 @@ program
   .command('setup')
   .description('connect local codebase to a cloud application')
   .action(async () => {
-    const client = requireClient();
+    const { client, apiUrl } = requireClient();
 
     try {
       // Step 1: Select or create an application
@@ -119,9 +138,20 @@ program
         console.log(chalk.dim(`Using environment: ${environmentName}`));
       }
 
+      // Persist the link so `appliance deploy` / `status` / etc. can
+      // run with no args. We always overwrite — re-running setup is
+      // the intended way to retarget this folder.
+      const linkPath = writeLink({
+        projectName,
+        environmentName,
+        apiUrl,
+        profile: getActiveProfileOverride() ?? process.env.APPLIANCE_PROFILE ?? undefined,
+      });
+
       console.log();
       console.log(chalk.green('Setup complete.'));
-      console.log(chalk.dim(`Run ${chalk.bold(`appliance deploy ${projectName} ${environmentName}`)} to deploy.`));
+      console.log(chalk.dim(`Linked ${projectName} → ${environmentName} (${linkPath})`));
+      console.log(chalk.dim(`Run ${chalk.bold('appliance deploy')} to deploy.`));
     } catch (error) {
       console.error(chalk.red(String(error)));
       process.exit(1);
@@ -132,9 +162,22 @@ program
 program
   .command('status')
   .description('show application status')
-  .argument('<project>', 'application name')
-  .action(async (projectName: string) => {
-    const client = requireClient();
+  .argument('[project]', 'application name (defaults to the linked project)')
+  .action(async (projectArg: string | undefined) => {
+    const { client } = requireClient();
+
+    // No arg → fall back to the cwd link, so `appliance status` works
+    // out of the box from a linked project directory.
+    const link = readLink();
+    const projectName = projectArg ?? link?.projectName;
+    if (!projectName) {
+      console.error(
+        chalk.red(
+          'No project to inspect. Pass `<project>` or run `appliance setup` / `appliance link` to link this folder.'
+        )
+      );
+      process.exit(1);
+    }
 
     try {
       const projectsResult = await client.listProjects();
@@ -164,17 +207,23 @@ program
       if (envsResult.data.length === 0) {
         console.log(chalk.dim('No environments.'));
       } else {
+        const urls = await getProjectUrls(client, project.id);
         console.log(chalk.bold('Environments'));
         for (const env of envsResult.data) {
           const statusColor =
             env.status === 'deployed' ? chalk.green : env.status === 'failed' ? chalk.red : chalk.yellow;
-          console.log(`  ${chalk.bold(env.name)}`);
+          const linkedMarker = link && link.environmentName === env.name ? chalk.dim(' (linked)') : '';
+          console.log(`  ${chalk.bold(env.name)}${linkedMarker}`);
           console.log(`    Status:         ${statusColor(env.status)}`);
           console.log(`    Stack:          ${env.stackName}`);
           if (env.lastDeployedAt) {
             console.log(`    Last deployed:  ${env.lastDeployedAt}`);
           }
           console.log(`    Created:        ${env.createdAt}`);
+          const url = urls.get(env.id);
+          if (url) {
+            console.log(`    URL:            ${chalk.cyan(url)}`);
+          }
         }
       }
     } catch (error) {
@@ -188,7 +237,7 @@ program
   .command('list')
   .description('list applications and environments')
   .action(async () => {
-    const client = requireClient();
+    const { client } = requireClient();
 
     try {
       const projectsResult = await client.listProjects();
@@ -202,8 +251,10 @@ program
         return;
       }
 
+      const link = readLink();
       for (const project of projectsResult.data) {
-        console.log(chalk.bold(project.name) + chalk.dim(` (${project.id}) — ${project.status}`));
+        const linkedMarker = link && link.projectName === project.name ? chalk.dim(' (linked)') : '';
+        console.log(chalk.bold(project.name) + linkedMarker + chalk.dim(` (${project.id}) — ${project.status}`));
 
         const envsResult = await client.listEnvironments(project.id);
         if (!envsResult.success) {
@@ -214,9 +265,18 @@ program
         if (envsResult.data.length === 0) {
           console.log(chalk.dim('  No environments.'));
         } else {
+          const urls = await getProjectUrls(client, project.id);
           for (const env of envsResult.data) {
             const deployed = env.lastDeployedAt ? `, last deployed ${env.lastDeployedAt}` : '';
-            console.log(`  ${env.name} — ${env.status}${chalk.dim(deployed)}`);
+            const envLinked =
+              link && link.projectName === project.name && link.environmentName === env.name
+                ? chalk.dim(' (linked)')
+                : '';
+            console.log(`  ${env.name}${envLinked} — ${env.status}${chalk.dim(deployed)}`);
+            const url = urls.get(env.id);
+            if (url) {
+              console.log(`    ${chalk.dim('URL:')} ${chalk.cyan(url)}`);
+            }
           }
         }
 

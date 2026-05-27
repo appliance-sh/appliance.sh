@@ -1,12 +1,13 @@
 import * as React from 'react';
 import { Link, Navigate, useNavigate, useParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, Trash2 } from 'lucide-react';
+import { ChevronLeft, ExternalLink, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
+import { urlsByEnvironment } from '@/lib/deployment';
 
 // Matches environments/detail.tsx — `pending` is the initial status
 // of a freshly-created env, not in-flight work.
@@ -59,6 +60,8 @@ export function ProjectDetailPage() {
     (environmentsQuery.data ?? []).forEach((e) => m.set(e.id, e.name));
     return m;
   }, [environmentsQuery.data]);
+
+  const urlByEnvId = React.useMemo(() => urlsByEnvironment(deploymentsQuery.data), [deploymentsQuery.data]);
 
   const [actionError, setActionError] = React.useState<string | null>(null);
 
@@ -152,21 +155,43 @@ export function ProjectDetailPage() {
               <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">No environments yet.</div>
             ) : (
               <ul className="divide-y divide-[var(--color-border)]">
-                {environmentsQuery.data.map((env) => (
-                  <li key={env.id}>
-                    <Link
-                      to={`/environments/${env.projectId}/${env.id}`}
+                {environmentsQuery.data.map((env) => {
+                  const url = urlByEnvId.get(env.id);
+                  return (
+                    <li
+                      key={env.id}
                       className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-2 hover:bg-[var(--color-muted)]"
                     >
-                      <StatusDot status={env.status} />
-                      <div className="min-w-0 text-sm font-medium">{env.name}</div>
+                      <Link to={`/environments/${env.projectId}/${env.id}`} aria-label={`Open ${env.name}`}>
+                        <StatusDot status={env.status} />
+                      </Link>
+                      <div className="min-w-0">
+                        <Link
+                          to={`/environments/${env.projectId}/${env.id}`}
+                          className="block text-sm font-medium hover:underline"
+                        >
+                          {env.name}
+                        </Link>
+                        {url ? (
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 font-mono text-[11px] text-green-300 hover:underline"
+                            title="Open deployed URL"
+                          >
+                            {url}
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        ) : null}
+                      </div>
                       <div className="text-xs text-[var(--color-muted-foreground)]">{env.status}</div>
                       <div className="text-xs text-[var(--color-muted-foreground)]">
                         {env.lastDeployedAt ? relativeTime(env.lastDeployedAt) : '—'}
                       </div>
-                    </Link>
-                  </li>
-                ))}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>

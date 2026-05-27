@@ -1,12 +1,13 @@
 import * as React from 'react';
 import { Link } from 'react-router';
 import { useQuery, useQueries, useQueryClient, useMutation } from '@tanstack/react-query';
-import { Plus, Trash2 } from 'lucide-react';
+import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { relativeTime } from '@/lib/time';
+import { urlsByEnvironment } from '@/lib/deployment';
 import type { Environment, Project } from '@appliance.sh/sdk/models';
 
 export function EnvironmentsPage() {
@@ -46,6 +47,33 @@ function ConnectedEnvironments() {
       refetchInterval: 10_000,
     })),
   });
+
+  // One deployments query per project — the SDK returns them newest
+  // first, so a per-project pass is enough to find each env's live URL
+  // without spinning up O(envs) extra queries.
+  const deploymentQueries = useQueries({
+    queries: (projectsQuery.data ?? []).map((p) => ({
+      queryKey: ['deployments', 'by-project', p.id],
+      enabled: !!client,
+      queryFn: async () => {
+        const r = await client!.listDeployments({ projectId: p.id, limit: 50 });
+        if (!r.success) throw r.error;
+        return r.data;
+      },
+      refetchInterval: 10_000,
+    })),
+  });
+
+  const urlByEnvId = React.useMemo(() => {
+    const merged = new Map<string, string>();
+    for (const q of deploymentQueries) {
+      const partial = urlsByEnvironment(q.data);
+      for (const [envId, url] of partial) {
+        if (!merged.has(envId)) merged.set(envId, url);
+      }
+    }
+    return merged;
+  }, [deploymentQueries]);
 
   const projectsById = React.useMemo(() => {
     const m = new Map<string, Project>();
@@ -194,36 +222,55 @@ function ConnectedEnvironments() {
         </div>
       ) : (
         <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
-          {rows.map(({ env, project }) => (
-            <li key={env.id} className="flex items-center">
-              <Link
-                to={`/environments/${env.projectId}/${env.id}`}
-                className="grid flex-1 grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 hover:bg-[var(--color-muted)]"
+          {rows.map(({ env, project }) => {
+            const url = urlByEnvId.get(env.id);
+            return (
+              <li
+                key={env.id}
+                className="grid flex-1 grid-cols-[auto_1fr_auto_auto_auto] items-center gap-4 px-4 py-3 hover:bg-[var(--color-muted)]"
               >
-                <StatusDot status={env.status} />
+                <Link to={`/environments/${env.projectId}/${env.id}`} aria-label={`Open ${env.name}`}>
+                  <StatusDot status={env.status} />
+                </Link>
                 <div className="min-w-0">
-                  <div className="text-sm font-medium">{env.name}</div>
+                  <Link
+                    to={`/environments/${env.projectId}/${env.id}`}
+                    className="block text-sm font-medium hover:underline"
+                  >
+                    {env.name}
+                  </Link>
                   <div className="text-xs text-[var(--color-muted-foreground)]">
                     {projectsById.get(env.projectId)?.name ?? project.name}
                   </div>
+                  {url ? (
+                    <a
+                      href={url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-0.5 inline-flex items-center gap-1 font-mono text-[11px] text-green-300 hover:underline"
+                      title="Open deployed URL"
+                    >
+                      {url}
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  ) : null}
                 </div>
                 <div className="text-xs text-[var(--color-muted-foreground)]">{env.status}</div>
                 <div className="text-xs text-[var(--color-muted-foreground)]">
                   {env.lastDeployedAt ? relativeTime(env.lastDeployedAt) : '—'}
                 </div>
-              </Link>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => onDelete(env)}
-                disabled={deleteMutation.isPending}
-                aria-label={`Delete ${env.name}`}
-                className="mr-2"
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </li>
-          ))}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => onDelete(env)}
+                  disabled={deleteMutation.isPending}
+                  aria-label={`Delete ${env.name}`}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

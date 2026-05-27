@@ -1,10 +1,11 @@
 import * as React from 'react';
 import { Link } from 'react-router';
-import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
-import { Plus, Trash2 } from 'lucide-react';
+import { useQueries, useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
+import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import { urlsByEnvironment } from '@/lib/deployment';
 import type { Project } from '@appliance.sh/sdk/models';
 
 export function ProjectsPage() {
@@ -30,6 +31,55 @@ function ConnectedProjects() {
       return r.data;
     },
   });
+
+  // Per-project deployments + environments queries so each row can
+  // surface the live URL of every env that has been deployed
+  // successfully. Same pattern used by the environments + dashboard
+  // pages — N+1 only kicks in for large project counts, and the page
+  // is already iterating per project for the listing.
+  const projectIds = (projectsQuery.data ?? []).map((p) => p.id);
+  const deploymentsByProject = useQueries({
+    queries: projectIds.map((projectId) => ({
+      queryKey: ['deployments', 'by-project', projectId],
+      enabled: !!client,
+      queryFn: async () => {
+        const r = await client!.listDeployments({ projectId, limit: 50 });
+        if (!r.success) throw r.error;
+        return r.data;
+      },
+      refetchInterval: 15_000,
+    })),
+  });
+  const environmentsByProject = useQueries({
+    queries: projectIds.map((projectId) => ({
+      queryKey: ['environments', projectId],
+      enabled: !!client,
+      queryFn: async () => {
+        const r = await client!.listEnvironments(projectId);
+        if (!r.success) throw r.error;
+        return r.data;
+      },
+    })),
+  });
+
+  const liveUrlsByProject = React.useMemo(() => {
+    const out = new Map<string, Array<{ envName: string; url: string }>>();
+    projectIds.forEach((projectId, idx) => {
+      const deployments = deploymentsByProject[idx]?.data;
+      const envs = environmentsByProject[idx]?.data;
+      if (!deployments || !envs) return;
+      const envNameById = new Map(envs.map((e) => [e.id, e.name]));
+      const urls = urlsByEnvironment(deployments);
+      const entries: Array<{ envName: string; url: string }> = [];
+      for (const [envId, url] of urls) {
+        const envName = envNameById.get(envId);
+        if (!envName) continue;
+        entries.push({ envName, url });
+      }
+      if (entries.length > 0) out.set(projectId, entries);
+    });
+    return out;
+  }, [projectsQuery.data, deploymentsByProject, environmentsByProject]);
 
   const [creating, setCreating] = React.useState(false);
   const [name, setName] = React.useState('');
@@ -152,32 +202,54 @@ function ConnectedProjects() {
         </div>
       ) : (
         <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
-          {projectsQuery.data.map((p) => (
-            <li key={p.id} className="flex items-center">
-              <Link
-                to={`/projects/${p.id}`}
-                className="grid flex-1 grid-cols-[1fr_auto] items-center gap-4 px-4 py-3 hover:bg-[var(--color-muted)]"
+          {projectsQuery.data.map((p) => {
+            const urls = liveUrlsByProject.get(p.id) ?? [];
+            return (
+              <li
+                key={p.id}
+                className="grid flex-1 grid-cols-[1fr_auto_auto] items-center gap-4 px-4 py-3 hover:bg-[var(--color-muted)]"
               >
-                <div>
-                  <div className="text-sm font-medium">{p.name}</div>
+                <div className="min-w-0">
+                  <Link to={`/projects/${p.id}`} className="block text-sm font-medium hover:underline">
+                    {p.name}
+                  </Link>
                   {p.description ? (
                     <div className="text-xs text-[var(--color-muted-foreground)]">{p.description}</div>
                   ) : null}
+                  {urls.length > 0 ? (
+                    <ul className="mt-1 space-y-0.5">
+                      {urls.map(({ envName, url }) => (
+                        <li key={envName + url}>
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 font-mono text-[11px] text-green-300 hover:underline"
+                            title={`${envName} — open deployed URL`}
+                          >
+                            <span className="text-[var(--color-muted-foreground)]">{envName}</span>
+                            <span aria-hidden>→</span>
+                            <span>{url}</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </div>
                 <div className="text-xs text-[var(--color-muted-foreground)]">{p.status}</div>
-              </Link>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => onDelete(p)}
-                disabled={deleteMutation.isPending}
-                aria-label={`Delete ${p.name}`}
-                className="mr-2"
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </li>
-          ))}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => onDelete(p)}
+                  disabled={deleteMutation.isPending}
+                  aria-label={`Delete ${p.name}`}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

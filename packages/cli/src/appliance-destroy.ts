@@ -1,11 +1,13 @@
 import { Command } from 'commander';
-import { createApplianceClient } from '@appliance.sh/sdk';
-import type { Project, Environment } from '@appliance.sh/sdk';
+import { confirm } from '@inquirer/prompts';
+import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
+import type { Project, Environment, Deployment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
+import { readLink } from './utils/link.js';
+import { pollDeploymentUntilDone } from './utils/deploy-poll.js';
+import { startProgressLine, BRAND } from './utils/progress.js';
 import chalk from 'chalk';
-
-const POLL_INTERVAL_MS = 3000;
 
 async function findProject(client: ReturnType<typeof createApplianceClient>, name: string): Promise<Project> {
   const listResult = await client.listProjects();
@@ -31,28 +33,23 @@ async function findEnvironment(
   return existing;
 }
 
-async function pollDeployment(client: ReturnType<typeof createApplianceClient>, deploymentId: string) {
-  while (true) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    const status = await client.getDeployment(deploymentId);
-    if (!status.success) {
-      console.error(chalk.red(`Failed to get deployment status: ${status.error.message}`));
-      process.exit(1);
-    }
+function formatStatus(d: Deployment): string {
+  const base = chalk.dim(d.status);
+  return d.message ? `${base} ${chalk.dim('—')} ${d.message}` : base;
+}
 
-    const { status: deployStatus, message } = status.data;
-    console.log(chalk.dim(`  status: ${deployStatus}${message ? ` — ${message}` : ''}`));
-
-    if (deployStatus === 'succeeded') {
-      console.log(chalk.green('Destroy succeeded.'));
-      console.log(JSON.stringify(status.data, null, 2));
-      return;
-    }
-    if (deployStatus === 'failed') {
-      console.error(chalk.red(`Destroy failed: ${message ?? 'unknown error'}`));
-      process.exit(1);
-    }
+function printFinalBanner(deployment: Deployment, projectName: string, environmentName: string): void {
+  console.log();
+  if (deployment.status === DeploymentStatus.Succeeded) {
+    console.log(`${chalk.green(BRAND)} ${chalk.bold('Destroyed')} ${projectName}/${environmentName}`);
+  } else if (deployment.status === DeploymentStatus.Cancelled) {
+    console.log(`${chalk.yellow(BRAND)} ${chalk.bold('Cancelled')} ${projectName}/${environmentName}`);
+    if (deployment.message) console.log(`  ${deployment.message}`);
+  } else {
+    console.log(`${chalk.red(BRAND)} ${chalk.bold('Failed')} ${projectName}/${environmentName}`);
+    if (deployment.message) console.log(`  ${deployment.message}`);
   }
+  console.log(`  ${chalk.dim('deployment')} ${deployment.id}`);
 }
 
 const program = new Command();
@@ -60,14 +57,41 @@ const program = new Command();
 attachProfileOption(program);
 
 program
-  .description('destroy a named project/environment')
-  .argument('<project>', 'project name')
-  .argument('<environment>', 'environment name')
-  .action(async (projectName: string, environmentName: string) => {
+  .description('destroy the linked (or named) project/environment')
+  .argument('[project]', 'project name (defaults to the linked project)')
+  .argument('[environment]', 'environment name (defaults to the linked environment)')
+  .option('-y, --yes', 'skip confirmation prompt', false)
+  .action(async (cliProject: string | undefined, cliEnvironment: string | undefined) => {
+    const opts = program.opts<{ yes: boolean }>();
+
     const credentials = loadCredentials();
     if (!credentials) {
-      console.error(chalk.red('Credentials not found. Run `appliance init` first.'));
+      console.error(chalk.red('Not logged in. Run `appliance login` first.'));
       process.exit(1);
+    }
+
+    const link = readLink();
+    const projectName = cliProject ?? link?.projectName;
+    const environmentName = cliEnvironment ?? link?.environmentName;
+    if (!projectName || !environmentName) {
+      console.error(
+        chalk.red(
+          'No target to destroy. Pass `<project> <environment>` or run `appliance setup` / `appliance link` to link this folder.'
+        )
+      );
+      process.exit(1);
+    }
+
+    const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (!opts.yes && isTTY) {
+      const ok = await confirm({
+        message: `Destroy ${chalk.bold(projectName)}/${chalk.bold(environmentName)}? This tears down its stack.`,
+        default: false,
+      });
+      if (!ok) {
+        console.log(chalk.dim('Cancelled.'));
+        return;
+      }
     }
 
     const client = createApplianceClient({
@@ -79,17 +103,32 @@ program
       const project = await findProject(client, projectName);
       const environment = await findEnvironment(client, project.id, environmentName);
 
-      console.log(chalk.dim(`Destroying ${projectName}/${environmentName}...`));
       const result = await client.destroy(environment.id);
       if (!result.success) {
         console.error(chalk.red(`Destroy failed: ${result.error.message}`));
         process.exit(1);
       }
 
-      console.log(chalk.dim(`Destroy deployment started: ${result.data.id}`));
-      await pollDeployment(client, result.data.id);
+      const progress = startProgressLine(`Destroying ${projectName}/${environmentName} — pending`);
+      let finalDeployment: Deployment;
+      try {
+        const { deployment } = await pollDeploymentUntilDone(client, result.data.id, {
+          onProgress: (d) => progress.update(`Destroying ${projectName}/${environmentName} — ${formatStatus(d)}`),
+        });
+        finalDeployment = deployment;
+        progress.clear();
+      } catch (err) {
+        progress.fail(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      printFinalBanner(finalDeployment, projectName, environmentName);
+
+      if (finalDeployment.status !== DeploymentStatus.Succeeded) {
+        process.exit(1);
+      }
     } catch (error) {
-      console.error(chalk.red(String(error)));
+      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
       process.exit(1);
     }
   });

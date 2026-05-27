@@ -3,5 +3,5 @@
   "name": "demo-python-container",
   "type": "container",
   "port": 8080,
-  "platform": "linux/amd64"
+  "platform": "linux/arm64"
 }
