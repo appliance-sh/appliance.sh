@@ -1,3 +1,13 @@
+## 1.44.0 (2026-05-27)
+
+### Features
+
+- **cli:** binary distribution ([c92d140](https://github.com/appliance-sh/appliance.sh/commit/c92d140))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.43.0 (2026-05-27)
 
 ### Features
