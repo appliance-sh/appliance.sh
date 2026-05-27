@@ -46,14 +46,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build prerequisites (SDK + helper + bootstrap) so the CLI's
-      # workspace imports resolve at compile time. We deliberately do
-      # not run `pnpm -r run build` — bringing up the full graph
-      # (api-server, infra, ...) costs minutes and isn't needed for
-      # the CLI compile alone.
+      # Build prerequisites in topological order so each package's
+      # workspace imports resolve at compile time. Bootstrap depends
+      # on infra (Pulumi types live there), so infra must build
+      # before bootstrap even though the CLI doesn't import infra
+      # directly. The `...` ellipsis filter would pull these in
+      # automatically via the dep graph, but the explicit list is
+      # easier to grep when something breaks.
       - name: Build CLI prerequisites
         run: |
           pnpm --filter @appliance.sh/sdk run build
+          pnpm --filter @appliance.sh/infra run build
           pnpm --filter @appliance.sh/bootstrap run build
           pnpm --filter @appliance.sh/helper run build
           pnpm --filter @appliance.sh/cli run build
