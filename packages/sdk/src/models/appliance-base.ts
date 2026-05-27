@@ -138,6 +138,19 @@ export const applianceBaseConfig = z.object({
           clusterName: z.string().optional(),
           namespace: z.string().optional(),
           hostPort: z.number().int().min(1).max(65535).optional(),
+          // DNS suffix appended to each deploy's hostname to form
+          // `<stackName>.<suffix>` Ingress routes. Defaults to
+          // `appliance.localhost` — `.localhost` is RFC 6761
+          // reserved and auto-resolves to 127.0.0.1 in every modern
+          // browser + OS resolver, so no /etc/hosts setup is needed.
+          // Override to `appliance.local` or your own domain for
+          // setups that route via custom DNS.
+          hostnameSuffix: z.string().optional(),
+          // Ingress class the per-appliance Ingress declares.
+          // Defaults to k3s/k3d's built-in `traefik` controller.
+          // Override for clusters that swapped in nginx-ingress or
+          // similar.
+          ingressClassName: z.string().optional(),
         })
         .optional(),
     })

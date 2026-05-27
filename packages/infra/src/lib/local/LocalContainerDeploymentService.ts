@@ -50,7 +50,25 @@ interface ClusterConfig {
   clusterName: string;
   namespace: string;
   hostPort: number;
+  /** DNS suffix appended to each deploy's stack name to form the
+   *  hostname-based Ingress route, e.g. `appliance.localhost` ->
+   *  `<stackName>.appliance.localhost`. Mirrors the cloud router's
+   *  `<stackName>.<domain>` shape so local + remote URLs share a
+   *  structure. */
+  hostnameSuffix: string;
+  /** Ingress class the per-appliance Ingress declares — defaults to
+   *  k3s/k3d's built-in `traefik` controller. */
+  ingressClassName: string;
 }
+
+// `.localhost` is reserved by RFC 6761 and resolves to 127.0.0.1
+// client-side in every modern browser plus macOS / systemd-resolved /
+// Windows 10+. That makes `<project>-<env>.appliance.localhost` Just
+// Work in a browser the moment the cluster is up — no /etc/hosts,
+// no dnsmasq, no `.local` mDNS collisions. Override via
+// `base.local.cluster.hostnameSuffix` if you want a different TLD.
+const DEFAULT_LOCAL_HOSTNAME_SUFFIX = 'appliance.localhost';
+const DEFAULT_LOCAL_INGRESS_CLASS = 'traefik';
 
 /**
  * Local-runtime counterpart to ApplianceDeploymentService. Maps each
@@ -88,6 +106,7 @@ export class LocalContainerDeploymentService {
     await this.maybeImportImage(build.imageUri);
 
     const nodePort = deterministicNodePort(stackName);
+    const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
     const manifest = renderManifest({
       name: stackName,
       namespace: this.cluster.namespace,
@@ -96,6 +115,8 @@ export class LocalContainerDeploymentService {
       nodePort,
       env: build.environment ?? {},
       metadata,
+      hostname,
+      ingressClassName: this.cluster.ingressClassName,
     });
 
     const before = await this.getDeploymentImage(stackName);
@@ -106,16 +127,21 @@ export class LocalContainerDeploymentService {
     // and we report whatever the cluster recorded.
     const liveNodePort = (await this.getServiceNodePort(stackName)) ?? nodePort;
 
-    const idempotentNoop = before === build.imageUri;
-    const url = liveNodePort ? `http://localhost:${liveNodePort}` : undefined;
+    // Primary URL goes through the cluster's Ingress (Traefik), so it
+    // shares the cloud router's hostname-routing model. NodePort URL
+    // is reported alongside as a direct-access fallback for setups
+    // where the browser/host doesn't resolve `*.localhost`.
+    const hostnameUrl = applianceHostnameUrl(hostname, this.cluster.hostPort);
+    const nodePortUrl = liveNodePort ? `http://localhost:${liveNodePort}` : undefined;
+    const messageBody = idempotentMessage(before === build.imageUri, hostnameUrl, nodePortUrl);
 
     return {
       action: 'deploy',
       ok: true,
-      idempotentNoop,
-      message: idempotentNoop ? 'No changes (idempotent)' : `Stack updated. URL: ${url ?? 'pending'}`,
+      idempotentNoop: before === build.imageUri,
+      message: messageBody,
       stackName,
-      url,
+      url: hostnameUrl,
     };
   }
 
@@ -123,9 +149,10 @@ export class LocalContainerDeploymentService {
     const ns = this.cluster.namespace;
     const existed = await this.resourceExists('deployment', stackName);
 
-    // Delete both halves; ignoring `not found` is the idempotent path
-    // because either resource may already be missing from a previous
-    // partial destroy.
+    // Delete all three resources; ignoring `not found` is the
+    // idempotent path because any of them may already be missing from
+    // a previous partial destroy.
+    await this.kubectlDeleteIfExists('ingress', stackName);
     await this.kubectlDeleteIfExists('service', stackName);
     await this.kubectlDeleteIfExists('deployment', stackName);
 
@@ -316,12 +343,50 @@ function resolveClusterConfig(baseConfig: ApplianceBaseConfig): ClusterConfig {
     clusterName: cluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
     namespace: cluster.namespace ?? DEFAULT_LOCAL_NAMESPACE,
     hostPort: cluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT,
+    hostnameSuffix: cluster.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
+    ingressClassName: cluster.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
   };
+}
+
+/**
+ * Build the public hostname for an appliance. Mirrors the cloud
+ * router's `<stackName>.<domain>` shape — same structure, just a
+ * different domain. Stack names come straight from project-environment
+ * which already match RFC 1123 (lowercase, alphanumeric, hyphens)
+ * because both names are validated by the api-server, so no
+ * additional sanitization is needed.
+ */
+export function applianceHostname(stackName: string, hostnameSuffix: string): string {
+  return `${stackName}.${hostnameSuffix}`;
+}
+
+/**
+ * Compose a host-reachable URL for an appliance. Omits the port when
+ * it's the default 80, matching how browsers render URLs.
+ */
+export function applianceHostnameUrl(hostname: string, hostPort: number): string {
+  if (hostPort === 80) return `http://${hostname}`;
+  return `http://${hostname}:${hostPort}`;
 }
 
 function isNotFoundError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /not\s*found/i.test(err.message) || /Error from server \(NotFound\)/i.test(err.message);
+}
+
+/**
+ * Build the user-visible deploy message. Surfaces both the
+ * hostname-based URL (the canonical "live URL" via the cluster's
+ * Ingress) and the NodePort URL (direct-access fallback). When the
+ * deploy is a no-op we keep the message short — the URLs haven't
+ * changed.
+ */
+function idempotentMessage(noop: boolean, hostnameUrl: string, nodePortUrl: string | undefined): string {
+  if (noop) return 'No changes (idempotent)';
+  if (nodePortUrl) {
+    return `Stack updated. URL: ${hostnameUrl} (direct: ${nodePortUrl})`;
+  }
+  return `Stack updated. URL: ${hostnameUrl}`;
 }
 
 function isRegistryReference(image: string): boolean {
@@ -341,6 +406,11 @@ export interface ManifestParams {
   nodePort?: number;
   env: Record<string, string>;
   metadata: LocalDeploymentMetadata;
+  /** Public hostname Traefik routes to this appliance via the
+   *  generated Ingress. Typically `<stackName>.appliance.localhost`. */
+  hostname: string;
+  /** IngressClass the Ingress declares (k3s/k3d ships `traefik`). */
+  ingressClassName: string;
 }
 
 /**
@@ -360,7 +430,7 @@ export function deterministicNodePort(stackName: string): number {
 }
 
 export function renderManifest(params: ManifestParams): string {
-  const { name, namespace, image, port, nodePort, env, metadata } = params;
+  const { name, namespace, image, port, nodePort, env, metadata, hostname, ingressClassName } = params;
   // Cluster-IP for in-cluster reachability would be ideal, but the
   // dev story is "hit the appliance from a browser on the host", so
   // we publish via NodePort. k3d's built-in loadbalancer hairpins
@@ -423,6 +493,31 @@ spec:
   - port: ${port}
     targetPort: ${port}
     protocol: TCP${nodePort ? `\n    nodePort: ${nodePort}` : ''}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${yamlString(name)}
+  namespace: ${yamlString(namespace)}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+    appliance.sh/project: ${yamlString(metadata.projectName)}
+    appliance.sh/environment: ${yamlString(metadata.environmentName)}
+  annotations:
+    appliance.sh/deployment-id: ${yamlString(metadata.deploymentId)}
+spec:
+  ingressClassName: ${yamlString(ingressClassName)}
+  rules:
+  - host: ${yamlString(hostname)}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ${yamlString(name)}
+            port:
+              number: ${port}
 `;
 }
 

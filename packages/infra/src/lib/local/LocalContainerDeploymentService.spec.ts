@@ -7,6 +7,8 @@ import {
   DEFAULT_LOCAL_NODEPORT_MAX,
   DEFAULT_LOCAL_NODEPORT_MIN,
   LocalContainerDeploymentService,
+  applianceHostname,
+  applianceHostnameUrl,
   deterministicNodePort,
   renderManifest,
 } from './LocalContainerDeploymentService';
@@ -58,13 +60,30 @@ describe('renderManifest', () => {
       deploymentId: 'deployment_1',
       stackName: 'demo-prod',
     },
+    hostname: 'demo-prod.appliance.localhost',
+    ingressClassName: 'traefik',
   };
 
-  it('renders a Deployment + Service pair under one document stream', () => {
+  it('renders a Deployment + Service + Ingress trio under one document stream', () => {
     const yaml = renderManifest(baseParams);
     expect(yaml).toContain('kind: Deployment');
     expect(yaml).toContain('kind: Service');
-    expect(yaml.indexOf('---')).toBeGreaterThan(0);
+    expect(yaml).toContain('kind: Ingress');
+    // Two document separators between the three resources.
+    expect(yaml.split('---').length).toBe(3);
+  });
+
+  it('routes the Ingress to the appliance hostname via the configured ingress class', () => {
+    const yaml = renderManifest({
+      ...baseParams,
+      hostname: 'my-app-prod.appliance.localhost',
+      ingressClassName: 'traefik',
+    });
+    expect(yaml).toContain('ingressClassName: "traefik"');
+    expect(yaml).toContain('- host: "my-app-prod.appliance.localhost"');
+    // Ingress backend points at the same Service we just rendered.
+    expect(yaml).toContain('name: "demo-prod"');
+    expect(yaml).toContain('number: 3000');
   });
 
   it('annotates the Deployment with appliance ids', () => {
@@ -106,6 +125,22 @@ describe('renderManifest', () => {
   it('omits the nodePort line when none is supplied (k8s picks one)', () => {
     const yaml = renderManifest({ ...baseParams });
     expect(yaml).not.toContain('nodePort:');
+  });
+});
+
+describe('applianceHostname / applianceHostnameUrl', () => {
+  it('combines stack name + suffix into a `<stack>.<suffix>` hostname', () => {
+    expect(applianceHostname('demo-prod', 'appliance.localhost')).toBe('demo-prod.appliance.localhost');
+  });
+
+  it('omits the port from the URL when the host port is 80', () => {
+    expect(applianceHostnameUrl('demo-prod.appliance.localhost', 80)).toBe('http://demo-prod.appliance.localhost');
+  });
+
+  it('includes the port for non-default ports', () => {
+    expect(applianceHostnameUrl('demo-prod.appliance.localhost', 8081)).toBe(
+      'http://demo-prod.appliance.localhost:8081'
+    );
   });
 });
 
