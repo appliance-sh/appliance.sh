@@ -1,3 +1,13 @@
+## 1.44.1 (2026-05-27)
+
+### Bug Fixes
+
+- **ci:** cli release ([7d2b102](https://github.com/appliance-sh/appliance.sh/commit/7d2b102))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.44.0 (2026-05-27)
 
 ### Features
