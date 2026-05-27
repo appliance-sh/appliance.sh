@@ -1253,29 +1253,88 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let (hint, error) =
+                resolve_missing_hint(tool.name, if stderr.is_empty() { None } else { Some(stderr) }).await;
             PreflightCheck {
                 tool: tool.name.to_string(),
                 installed: false,
                 version: None,
                 purpose: tool.purpose.to_string(),
-                install_hint: install_hint(tool.name).to_string(),
+                install_hint: hint,
                 auto_installable: tool.auto_installable,
-                error: if stderr.is_empty() { None } else { Some(stderr) },
+                error,
             }
         }
-        Err(err) => PreflightCheck {
-            tool: tool.name.to_string(),
-            installed: false,
-            version: None,
-            purpose: tool.purpose.to_string(),
-            install_hint: install_hint(tool.name).to_string(),
-            auto_installable: tool.auto_installable,
-            error: Some(if err.kind() == std::io::ErrorKind::NotFound {
+        Err(err) => {
+            let raw = if err.kind() == std::io::ErrorKind::NotFound {
                 "not on PATH".to_string()
             } else {
                 err.to_string()
-            }),
-        },
+            };
+            let (hint, error) = resolve_missing_hint(tool.name, Some(raw)).await;
+            PreflightCheck {
+                tool: tool.name.to_string(),
+                installed: false,
+                version: None,
+                purpose: tool.purpose.to_string(),
+                install_hint: hint,
+                auto_installable: tool.auto_installable,
+                error,
+            }
+        }
+    }
+}
+
+/// Customise the install hint for a missing tool when an adjacent
+/// runtime is already on PATH. Appliance shells out to the `docker`
+/// CLI specifically, so a Colima- or Podman-only setup looks like
+/// "I have a runtime" to the user but trips us up. Detect those and
+/// turn the generic "install a runtime" hint into one targeted line:
+///
+///   * Colima present  → `brew install docker`  (Colima is the daemon,
+///                        the user just needs the matching CLI client)
+///   * Podman present  → suggest podman-mac-helper / aliasing (Podman
+///                        ships its own CLI; bridging it to `docker`
+///                        gives Appliance what it needs)
+///
+/// Returns `(install_hint, error_message)`.
+async fn resolve_missing_hint(tool: &str, raw_error: Option<String>) -> (String, Option<String>) {
+    if tool != "docker" {
+        return (install_hint(tool).to_string(), raw_error);
+    }
+    if which_succeeds("colima").await {
+        let hint =
+            "brew install docker  # Colima is already on PATH; this adds the matching `docker` CLI client.".to_string();
+        let note = "Colima is installed but Appliance needs the `docker` CLI (it shells out to `docker build` / `docker save`). Install the client alongside the runtime."
+            .to_string();
+        return (hint, merge_note(raw_error, note));
+    }
+    if which_succeeds("podman").await {
+        let hint = if cfg!(target_os = "macos") {
+            "brew install podman-mac-helper && sudo podman-mac-helper install  # exposes Podman as a `docker`-compatible socket+CLI".to_string()
+        } else {
+            "Install the `podman-docker` package, or alias `docker` to `podman`".to_string()
+        };
+        let note = "Podman is installed but Appliance shells out to the `docker` CLI. Bridge them via podman-docker / an alias and retry."
+            .to_string();
+        return (hint, merge_note(raw_error, note));
+    }
+    (install_hint(tool).to_string(), raw_error)
+}
+
+async fn which_succeeds(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn merge_note(raw: Option<String>, note: String) -> Option<String> {
+    match raw {
+        Some(prev) if !prev.is_empty() => Some(format!("{note} ({prev})")),
+        _ => Some(note),
     }
 }
 
@@ -2580,19 +2639,94 @@ fn ensure_helper_bin_on_path() {
     let Some(dir) = helper_bin_dir() else {
         return;
     };
-    let dir_str = match dir.to_str() {
-        Some(s) => s.to_string(),
-        None => return,
-    };
+    prepend_to_path(&[dir]);
+}
+
+/// macOS GUI apps (anything launched from Finder, the Dock, or
+/// Spotlight) inherit a stripped-down PATH like
+/// `/usr/bin:/bin:/usr/sbin:/sbin`. Tools the user installed via
+/// Homebrew (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin`
+/// on Intel) or pip/cargo's `~/.local/bin` are nowhere to be found,
+/// so `Command::new("docker")` returns ENOENT even when `which docker`
+/// works fine in Terminal. The user's shell rc files (.zshrc /
+/// .bashrc) are NOT sourced for GUI launches.
+///
+/// We pre-populate PATH with the canonical user-bin dirs so
+/// downstream spawns of docker / kubectl / k3d / git / etc. resolve
+/// the same binaries the user runs from their shell. Existence
+/// filtering avoids littering PATH with non-existent entries.
+fn ensure_user_paths_on_path() {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        candidates.extend([
+            // Homebrew on Apple Silicon.
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/sbin"),
+            // Homebrew on Intel + common manual installs.
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/local/sbin"),
+            // MacPorts.
+            PathBuf::from("/opt/local/bin"),
+            PathBuf::from("/opt/local/sbin"),
+        ]);
+    } else if cfg!(target_os = "linux") {
+        candidates.extend([
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/local/sbin"),
+            PathBuf::from("/snap/bin"),
+            PathBuf::from("/var/lib/flatpak/exports/bin"),
+        ]);
+    }
+
+    if !cfg!(target_os = "windows") {
+        if let Ok(home) = std::env::var("HOME") {
+            let home = PathBuf::from(home);
+            candidates.push(home.join(".local").join("bin"));
+            // cargo, mise, asdf shims; cheap to include since
+            // prepend_to_path filters missing entries.
+            candidates.push(home.join(".cargo").join("bin"));
+            candidates.push(home.join(".local").join("share").join("mise").join("shims"));
+            candidates.push(home.join(".asdf").join("shims"));
+        }
+    }
+
+    let existing: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .collect();
+    prepend_to_path(&existing);
+}
+
+/// Prepend any dirs not already on PATH, preserving order. Skips
+/// empty / unresolvable paths and dirs that are already present so
+/// repeat calls are no-ops.
+fn prepend_to_path(dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
     let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
     let current = std::env::var("PATH").unwrap_or_default();
-    if current.split(sep).any(|p| p == dir_str) {
+    let existing: std::collections::HashSet<&str> = current.split(sep).collect();
+
+    let mut prefix = String::new();
+    for dir in dirs {
+        let Some(dir_str) = dir.to_str() else { continue };
+        if existing.contains(dir_str) || prefix.split(sep).any(|p| p == dir_str) {
+            continue;
+        }
+        if !prefix.is_empty() {
+            prefix.push(sep);
+        }
+        prefix.push_str(dir_str);
+    }
+    if prefix.is_empty() {
         return;
     }
     let next = if current.is_empty() {
-        dir_str
+        prefix
     } else {
-        format!("{dir_str}{sep}{current}")
+        format!("{prefix}{sep}{current}")
     };
     // Safety: set_var is unsafe in newer Rust because env mutation
     // races other threads. We call it once at startup before any
@@ -2602,6 +2736,11 @@ fn ensure_helper_bin_on_path() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Order matters: user paths first so Homebrew etc. resolve before
+    // any helper-installed fallback. The helper dir is then prepended
+    // on top — its binaries win when both system + helper have a
+    // copy, which keeps versioning predictable.
+    ensure_user_paths_on_path();
     ensure_helper_bin_on_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
