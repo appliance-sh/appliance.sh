@@ -1,3 +1,13 @@
+## 1.45.0 (2026-05-27)
+
+### Features
+
+- **helper:** check for container runtime ([ab8839f](https://github.com/appliance-sh/appliance.sh/commit/ab8839f))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.44.1 (2026-05-27)
 
 ### Bug Fixes
