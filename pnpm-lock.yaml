@@ -226,7 +226,7 @@ importers:
         version: 5.9.3
 
   packages/cli:
-    dependencies:
+    devDependencies:
       '@appliance.sh/bootstrap':
         specifier: workspace:*
         version: link:../bootstrap
@@ -242,6 +242,12 @@ importers:
       '@types/archiver':
         specifier: ^7.0.0
         version: 7.0.0
+      '@types/json-diff':
+        specifier: ^1.0.3
+        version: 1.0.3
+      '@types/node':
+        specifier: 24.12.2
+        version: 24.12.2
       archiver:
         specifier: ^7.0.1
         version: 7.0.1
@@ -257,13 +263,6 @@ importers:
       random-word-slugs:
         specifier: ^0.1.7
         version: 0.1.7
-    devDependencies:
-      '@types/json-diff':
-        specifier: ^1.0.3
-        version: 1.0.3
-      '@types/node':
-        specifier: 24.12.2
-        version: 24.12.2
       typescript:
         specifier: 5.9.3
         version: 5.9.3

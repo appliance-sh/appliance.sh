@@ -10,10 +10,15 @@
   "license": "MIT",
   "author": "Eliot Lim",
   "type": "module",
-  "main": "index.js",
   "bin": {
-    "appliance": "dist/appliance.js"
+    "appliance": "bin/appliance.js"
   },
+  "files": [
+    "bin",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc && pnpm run compile",
     "compile": "bun build src/appliance.ts --compile --outfile=dist/appliance",
@@ -23,25 +28,25 @@
     "compile:linux-arm64": "bun build src/appliance.ts --compile --target=bun-linux-arm64 --outfile=dist/appliance-aarch64-unknown-linux-gnu",
     "compile:windows-x64": "bun build src/appliance.ts --compile --target=bun-windows-x64 --outfile=dist/appliance-x86_64-pc-windows-msvc.exe",
     "compile:all": "pnpm run compile:darwin-arm64 && pnpm run compile:darwin-x64 && pnpm run compile:linux-x64 && pnpm run compile:linux-arm64 && pnpm run compile:windows-x64",
+    "postinstall": "node scripts/install-binary.mjs",
     "clean": "rm -rf ./dist/",
     "dev:setup": "pnpm link --global",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
     "@appliance.sh/bootstrap": "workspace:*",
     "@appliance.sh/helper": "workspace:*",
     "@appliance.sh/sdk": "workspace:*",
     "@inquirer/prompts": "^7.10.1",
     "@types/archiver": "^7.0.0",
+    "@types/json-diff": "^1.0.3",
+    "@types/node": "24.12.2",
     "archiver": "^7.0.1",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
     "json-diff": "^1.0.6",
-    "random-word-slugs": "^0.1.7"
-  },
-  "devDependencies": {
-    "@types/json-diff": "^1.0.3",
-    "@types/node": "24.12.2",
+    "random-word-slugs": "^0.1.7",
     "typescript": "5.9.3"
   }
 }
