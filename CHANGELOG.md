@@ -1,3 +1,13 @@
+## 1.45.1 (2026-05-27)
+
+### Bug Fixes
+
+- **desktop:** ensure user binary paths load ([cd0a7d4](https://github.com/appliance-sh/appliance.sh/commit/cd0a7d4))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.45.0 (2026-05-27)
 
 ### Features
