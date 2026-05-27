@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 
 import * as sdk from '@appliance.sh/sdk';
+
+// Prepend ~/.appliance/bin to PATH so subcommands spawned by
+// commander (and any tools they invoke — docker, k3d, kubectl)
+// resolve helper-installed binaries when the system PATH lacks them.
+// Idempotent; safe to also call from a subcommand entry directly.
+ensureHelperBinOnPath();
 
 const program = new Command();
 
@@ -21,6 +28,7 @@ program
   .command('install [project] [environment]', 'alias for deploy')
   .command('link', 'link this folder to a project/environment')
   .command('list', 'list applications and environments')
+  .command('local', 'manage the local k3d-backed runtime (doctor, …)')
   .command('login', 'authenticate with the appliance API')
   .command('open', 'open the latest deployment URL in a browser')
   .command('remove [project] [environment]', 'alias for destroy')

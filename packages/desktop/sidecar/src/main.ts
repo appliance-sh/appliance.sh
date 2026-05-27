@@ -18,6 +18,7 @@ import {
   type StatePromotionInput,
   type StatePromotionOptions,
 } from '@appliance.sh/bootstrap';
+import { runInstall as runHelperInstall, runStatus as runHelperStatus } from '@appliance.sh/helper';
 
 // The Tauri side spawns this sidecar for any operation that needs the
 // bootstrap package's local-machine capabilities (Pulumi automation,
@@ -59,6 +60,14 @@ type SidecarInput =
   | {
       kind: 'latest-version';
       input?: LatestGhcrTagInput;
+    }
+  | {
+      kind: 'helper-install';
+      tools?: string[];
+      force?: boolean;
+    }
+  | {
+      kind: 'helper-status';
     };
 
 async function readStdin(): Promise<string> {
@@ -71,6 +80,24 @@ async function readStdin(): Promise<string> {
 
 function emit(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+// Drop the Provider object reference from each install outcome before
+// emitting — it's not serializable cleanly across the IPC boundary
+// and the consumer only needs the static metadata anyway.
+function serializeOutcome(o: {
+  provider: { name: string; description: string; autoInstallable: boolean; required: boolean };
+  status: string;
+  message: string;
+}) {
+  return {
+    tool: o.provider.name,
+    description: o.provider.description,
+    autoInstallable: o.provider.autoInstallable,
+    required: o.provider.required,
+    status: o.status,
+    message: o.message,
+  };
 }
 
 async function main(): Promise<void> {
@@ -134,6 +161,35 @@ async function main(): Promise<void> {
       case 'latest-version': {
         const version = await latestGhcrTag(parsed.input ?? {});
         emit({ type: 'result', result: { version } });
+        break;
+      }
+      case 'helper-install': {
+        // Map helper ProgressEvent → sidecar progress lines so the
+        // Tauri channel sees the same shape it does for bootstrap.
+        const outcomes = await runHelperInstall({
+          tools: parsed.tools,
+          force: parsed.force,
+          onProgress: (e) => emit({ type: 'progress', stage: e.tool, message: e.message }),
+        });
+        emit({ type: 'result', result: { outcomes: outcomes.map(serializeOutcome) } });
+        break;
+      }
+      case 'helper-status': {
+        const entries = await runHelperStatus();
+        emit({
+          type: 'result',
+          result: {
+            checks: entries.map(({ provider, check }) => ({
+              tool: provider.name,
+              installed: check.installed,
+              version: check.version,
+              purpose: provider.description,
+              required: provider.required,
+              autoInstallable: provider.autoInstallable,
+              error: check.error,
+            })),
+          },
+        });
         break;
       }
       default: {

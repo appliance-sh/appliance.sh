@@ -747,6 +747,29 @@ async fn invoke_sidecar(
     final_result.ok_or_else(|| "sidecar exited without producing a result".to_string())
 }
 
+/// Drive a helper-install via the sidecar. Frontend passes
+/// `{ tools?, force? }`; this command tags the payload with
+/// `kind: "helper-install"` so the sidecar dispatches to
+/// `@appliance.sh/helper`'s `runInstall`. Progress events stream back
+/// over the channel; the result carries per-tool outcomes the UI
+/// can render.
+#[tauri::command]
+async fn local_helper_install(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => return Err(format!("local_helper_install expected an object input, got: {}", other)),
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("helper-install".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 /// Drive a full bootstrap (phases 1–3) via the sidecar. The frontend
 /// passes `{bootstrapInput, options?}`; this command tags the payload
 /// with `kind: "bootstrap"` so the sidecar dispatches to runBootstrap.
@@ -954,12 +977,186 @@ fn cluster_name_or_default(input: &LocalClusterInput) -> String {
         .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string())
 }
 
+// Tools the local-runtime path shells out to. Centralised so preflight
+// + spawn error mapping stay in sync — if one of these is renamed or a
+// new one is added (e.g. `crane`), everything downstream picks it up.
+//
+// `auto_installable` mirrors the `Provider.autoInstallable` flag in
+// `@appliance.sh/helper`. The UI uses it to decide whether to render
+// an Install button vs. fall back to copy-paste guidance. Stays in
+// lockstep with the helper's provider definitions.
+struct PrereqTool {
+    name: &'static str,
+    purpose: &'static str,
+    // Argv to print a version banner. Tool-specific: kubectl predates
+    // `--version` and only accepts `version --client`.
+    version_args: &'static [&'static str],
+    auto_installable: bool,
+}
+
+const LOCAL_PREREQS: &[PrereqTool] = &[
+    PrereqTool {
+        name: "docker",
+        purpose: "Container engine k3d runs Kubernetes nodes inside.",
+        version_args: &["--version"],
+        // Docker engine is an OS-level install (kernel features,
+        // privileged daemon, GUI on macOS) — guidance-only.
+        auto_installable: false,
+    },
+    PrereqTool {
+        name: "k3d",
+        purpose: "Lightweight Kubernetes-in-Docker cluster used as the local runtime.",
+        version_args: &["--version"],
+        auto_installable: true,
+    },
+    PrereqTool {
+        name: "kubectl",
+        purpose: "Used to apply Deployments / Services onto the local cluster.",
+        version_args: &["version", "--client"],
+        auto_installable: true,
+    },
+];
+
+/// Per-OS install command for a prerequisite. Surfaced to the UI so
+/// the user can copy-paste a working install line for their platform
+/// instead of hunting through docs after seeing a spawn error.
+fn install_hint(tool: &str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        match tool {
+            "docker" => "brew install --cask docker  # or: brew install colima",
+            "k3d" => "brew install k3d",
+            "kubectl" => "brew install kubectl",
+            _ => "",
+        }
+    } else if cfg!(target_os = "linux") {
+        match tool {
+            "docker" => "curl -fsSL https://get.docker.com | sh",
+            "k3d" => "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash",
+            "kubectl" => "curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl && sudo install -m 0755 kubectl /usr/local/bin/kubectl",
+            _ => "",
+        }
+    } else if cfg!(target_os = "windows") {
+        match tool {
+            "docker" => "winget install Docker.DockerDesktop",
+            "k3d" => "choco install k3d  # or: scoop install k3d",
+            "kubectl" => "winget install Kubernetes.kubectl",
+            _ => "",
+        }
+    } else {
+        ""
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PreflightCheck {
+    /// Tool name as invoked on the command line (`docker`, `k3d`, …).
+    tool: String,
+    /// True when the tool resolved on PATH and `<tool> --version` exited 0.
+    installed: bool,
+    /// First non-empty line of stdout from `<tool> --version`. Useful for
+    /// confirming compatibility (e.g. older k3d versions miss flags).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// One-line human description of what this tool is used for.
+    purpose: String,
+    /// Platform-appropriate install command. Empty on unsupported OSes.
+    install_hint: String,
+    /// True when `appliance local install <tool>` can ship a working
+    /// binary without manual steps. Drives whether the UI shows an
+    /// Install button vs. only the copy-paste hint.
+    auto_installable: bool,
+    /// stderr captured when the version check itself failed (e.g. docker
+    /// daemon not running for `docker version`). Lets the UI distinguish
+    /// "not installed" from "installed but broken".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Probe each required CLI tool with `--version`. Designed to never
+/// fail the call itself — every tool returns a structured record the UI
+/// can render even when nothing is installed, so users can copy the
+/// install commands without first hitting a cryptic spawn error.
+#[tauri::command]
+async fn local_preflight() -> Vec<PreflightCheck> {
+    let mut out = Vec::with_capacity(LOCAL_PREREQS.len());
+    for tool in LOCAL_PREREQS {
+        out.push(probe_tool(tool).await);
+    }
+    out
+}
+
+async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
+    let probe = Command::new(tool.name).args(tool.version_args).output().await;
+    match probe {
+        Ok(output) if output.status.success() => {
+            let line = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            PreflightCheck {
+                tool: tool.name.to_string(),
+                installed: true,
+                version: line,
+                purpose: tool.purpose.to_string(),
+                install_hint: install_hint(tool.name).to_string(),
+                auto_installable: tool.auto_installable,
+                error: None,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            PreflightCheck {
+                tool: tool.name.to_string(),
+                installed: false,
+                version: None,
+                purpose: tool.purpose.to_string(),
+                install_hint: install_hint(tool.name).to_string(),
+                auto_installable: tool.auto_installable,
+                error: if stderr.is_empty() { None } else { Some(stderr) },
+            }
+        }
+        Err(err) => PreflightCheck {
+            tool: tool.name.to_string(),
+            installed: false,
+            version: None,
+            purpose: tool.purpose.to_string(),
+            install_hint: install_hint(tool.name).to_string(),
+            auto_installable: tool.auto_installable,
+            error: Some(if err.kind() == std::io::ErrorKind::NotFound {
+                "not on PATH".to_string()
+            } else {
+                err.to_string()
+            }),
+        },
+    }
+}
+
+/// Wrap a spawn error in an actionable, installer-aware message when the
+/// underlying OS error is "command not found". Other errors pass through
+/// unchanged so debugging info isn't lost.
+fn map_spawn_error(tool: &str, err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        let hint = install_hint(tool);
+        if hint.is_empty() {
+            format!("`{tool}` is not installed or not on PATH.")
+        } else {
+            format!(
+                "`{tool}` is not installed or not on PATH. Install it with:\n  {hint}\nThen retry."
+            )
+        }
+    } else {
+        format!("failed to spawn {tool}: {err}")
+    }
+}
+
 async fn run_status_command(args: &[&str]) -> Result<(bool, String, String), String> {
     let output = Command::new(args[0])
         .args(&args[1..])
         .output()
         .await
-        .map_err(|e| format!("failed to spawn {}: {}", args[0], e))?;
+        .map_err(|e| map_spawn_error(args[0], e))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     Ok((output.status.success(), stdout, stderr))
@@ -2213,8 +2410,53 @@ async fn build_and_import_image(
     Ok(input.image_tag)
 }
 
+/// Resolve the helper-managed bin dir (`~/.appliance/bin` on POSIX,
+/// `%LOCALAPPDATA%\Appliance\bin` on Windows) so we can prepend it to
+/// PATH before spawning child processes. Mirrors `helperBinDir()` in
+/// `@appliance.sh/helper` — both sides must agree on the location for
+/// `appliance local install` (Node) to land binaries the desktop's
+/// `Command::new("k3d")` calls then pick up.
+fn helper_bin_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return Some(PathBuf::from(local).join("Appliance").join("bin"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".appliance").join("bin"))
+}
+
+/// Prepend the helper bin dir to this process's PATH so every
+/// downstream `Command::new(...)` sees `~/.appliance/bin/k3d` etc.
+/// without each call site having to manage env vars. Idempotent.
+fn ensure_helper_bin_on_path() {
+    let Some(dir) = helper_bin_dir() else {
+        return;
+    };
+    let dir_str = match dir.to_str() {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let current = std::env::var("PATH").unwrap_or_default();
+    if current.split(sep).any(|p| p == dir_str) {
+        return;
+    }
+    let next = if current.is_empty() {
+        dir_str
+    } else {
+        format!("{dir_str}{sep}{current}")
+    };
+    // Safety: set_var is unsafe in newer Rust because env mutation
+    // races other threads. We call it once at startup before any
+    // tokio runtime is up.
+    unsafe { std::env::set_var("PATH", next) };
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ensure_helper_bin_on_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
@@ -2234,6 +2476,8 @@ pub fn run() {
             update_baseline,
             latest_api_server_version,
             local_cluster_status,
+            local_helper_install,
+            local_preflight,
             start_local_cluster,
             stop_local_cluster,
             delete_local_cluster,

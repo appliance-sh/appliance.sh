@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@appliance.sh/bootstrap": "workspace:*",
+    "@appliance.sh/helper": "workspace:*",
     "@appliance.sh/sdk": "workspace:*",
     "@inquirer/prompts": "^7.10.1",
     "@types/archiver": "^7.0.0",

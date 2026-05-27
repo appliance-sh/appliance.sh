@@ -1,11 +1,29 @@
 import * as React from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Play, Square, Trash2, RefreshCw, FileText, Copy, Rocket } from 'lucide-react';
+import {
+  AlertTriangle,
+  Check,
+  Copy,
+  Download,
+  FileText,
+  Play,
+  RefreshCw,
+  Rocket,
+  Square,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
-import type { LocalDeploymentInfo, LocalPodInfo, LocalRuntimeStatus, LocalServiceInfo } from '@/lib/host';
+import type {
+  LocalDeploymentInfo,
+  LocalPodInfo,
+  LocalPreflightCheck,
+  LocalRuntimeStatus,
+  LocalServiceInfo,
+} from '@/lib/host';
 
 // Docker Desktop-style overview page for the local k3d-backed
 // container runtime. Drives three things in one place:
@@ -35,6 +53,26 @@ export function LocalRuntimePage() {
       return running ? 5_000 : 2_000;
     },
   });
+
+  // Preflight: ask the host which of docker/k3d/kubectl are installed.
+  // The runtime itself shells out to all three; if any are missing the
+  // first Start click would surface a cryptic "failed to spawn" error.
+  // We render an actionable install panel instead and disable Start
+  // until everything checks out. Polled lazily so installing a tool in
+  // a separate terminal is reflected within a few seconds without
+  // requiring a page reload.
+  const preflightQuery = useQuery({
+    queryKey: ['local-runtime', 'preflight'],
+    enabled: supported && Boolean(local?.preflight),
+    queryFn: () => local!.preflight(),
+    refetchInterval: (q) => {
+      const data = q.state.data;
+      if (!data) return 5_000;
+      return data.every((c) => c.installed) ? false : 5_000;
+    },
+  });
+  const preflightChecks = preflightQuery.data ?? [];
+  const preflightReady = preflightChecks.length === 0 || preflightChecks.every((c) => c.installed);
 
   const startMutation = useMutation({
     mutationFn: () => local!.startRuntime(),
@@ -97,10 +135,23 @@ export function LocalRuntimePage() {
         </div>
       </header>
 
+      <PreflightPanel
+        checks={preflightChecks}
+        loading={preflightQuery.isLoading}
+        onRefresh={() => preflightQuery.refetch()}
+        canInstall={Boolean(local?.installPrereq)}
+        onInstall={async (tool) => {
+          if (!local?.installPrereq) return;
+          await local.installPrereq([tool], () => {});
+          preflightQuery.refetch();
+        }}
+      />
+
       <section className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] p-4">
         <Button
           onClick={() => startMutation.mutate()}
-          disabled={phase === 'running' || phase === 'starting' || startMutation.isPending}
+          disabled={!preflightReady || phase === 'running' || phase === 'starting' || startMutation.isPending}
+          title={!preflightReady ? 'Install the prerequisites listed above to enable Start' : undefined}
         >
           <Play className="h-4 w-4" /> {phase === 'running' ? 'Running' : phase === 'starting' ? 'Starting…' : 'Start'}
         </Button>
@@ -135,6 +186,170 @@ export function LocalRuntimePage() {
 }
 
 type Phase = 'unknown' | 'starting' | 'running' | 'stopping' | 'stopped' | 'error' | 'partial';
+
+function PreflightPanel({
+  checks,
+  loading,
+  onRefresh,
+  canInstall,
+  onInstall,
+}: {
+  checks: LocalPreflightCheck[];
+  loading: boolean;
+  onRefresh: () => void;
+  canInstall: boolean;
+  onInstall: (tool: string) => Promise<void>;
+}) {
+  // While preflight is in flight (and we have no cached result), keep
+  // the panel out of the layout — the controls below already render a
+  // disabled Start button, and a flicker of "Checking…" before the
+  // first result tends to be more noisy than informative.
+  if (loading && checks.length === 0) return null;
+  if (checks.length === 0) return null;
+  const missing = checks.filter((c) => !c.installed);
+  if (missing.length === 0) {
+    return (
+      <section className="flex items-center justify-between gap-3 rounded-md border border-green-500/40 bg-green-500/10 px-3 py-2 text-xs text-green-300">
+        <span className="inline-flex items-center gap-2">
+          <Check className="h-3.5 w-3.5" />
+          Prerequisites ready: {checks.map((c) => c.tool).join(', ')}
+        </span>
+        <Button variant="ghost" size="icon" aria-label="Re-check prerequisites" onClick={onRefresh}>
+          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+        </Button>
+      </section>
+    );
+  }
+  return (
+    <section className="space-y-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-4">
+      <header className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-2">
+          <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-300" />
+          <div>
+            <h2 className="text-sm font-semibold text-amber-200">Install required tools</h2>
+            <p className="mt-0.5 text-xs text-amber-200/80">
+              The local runtime drives a real Docker + k3d + kubectl stack. Install the missing tools below, then
+              re-check.
+            </p>
+          </div>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onRefresh}>
+          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /> Re-check
+        </Button>
+      </header>
+      <ul className="space-y-2">
+        {checks.map((c) => (
+          <PreflightRow key={c.tool} check={c} canInstall={canInstall && c.autoInstallable} onInstall={onInstall} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function PreflightRow({
+  check,
+  canInstall,
+  onInstall,
+}: {
+  check: LocalPreflightCheck;
+  canInstall: boolean;
+  onInstall: (tool: string) => Promise<void>;
+}) {
+  const [copied, setCopied] = React.useState(false);
+  const [installing, setInstalling] = React.useState(false);
+  const [installError, setInstallError] = React.useState<string | null>(null);
+
+  const onCopy = async () => {
+    if (!check.installHint || typeof navigator === 'undefined' || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(check.installHint);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // clipboard permission denied or unavailable — leave the hint
+      // visible and let the user copy it manually.
+    }
+  };
+
+  const onClickInstall = async () => {
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      await onInstall(check.tool);
+    } catch (err) {
+      setInstallError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <li
+      className={cn(
+        'rounded-md border px-3 py-2 text-xs',
+        check.installed ? 'border-green-500/30 bg-green-500/5' : 'border-amber-500/30 bg-amber-500/10'
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 font-medium">
+            {check.installed ? (
+              <Check className="h-3.5 w-3.5 text-green-300" />
+            ) : (
+              <X className="h-3.5 w-3.5 text-amber-300" />
+            )}
+            <code className="font-mono">{check.tool}</code>
+            {check.version ? <span className="text-[var(--color-muted-foreground)]">— {check.version}</span> : null}
+          </div>
+          <p className="mt-1 text-[var(--color-muted-foreground)]">{check.purpose}</p>
+          {!check.installed ? (
+            <div className="mt-2 space-y-2">
+              {canInstall ? (
+                <div>
+                  <Button onClick={onClickInstall} disabled={installing} size="sm">
+                    <Download className={cn('h-3.5 w-3.5', installing && 'animate-pulse')} />
+                    {installing ? 'Installing…' : `Install ${check.tool}`}
+                  </Button>
+                  <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
+                    Downloads from the upstream release into <code>~/.appliance/bin/</code>. No admin password needed.
+                  </p>
+                </div>
+              ) : null}
+              {check.installHint ? (
+                <div>
+                  {canInstall ? (
+                    <p className="text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">
+                      Or install manually:
+                    </p>
+                  ) : null}
+                  <div className="mt-1 flex items-center gap-2">
+                    <code className="block flex-1 overflow-x-auto rounded bg-black/40 px-2 py-1 font-mono text-[11px]">
+                      {check.installHint}
+                    </code>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={onCopy}
+                      aria-label={`Copy install command for ${check.tool}`}
+                    >
+                      <Copy className="h-3 w-3" />
+                      {copied ? 'Copied' : 'Copy'}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+              {installError ? (
+                <p className="font-mono text-[10px] text-red-300">{installError}</p>
+              ) : check.error ? (
+                <p className="font-mono text-[10px] text-amber-200/80">{check.error}</p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </li>
+  );
+}
 
 function derivePhase(
   status: LocalRuntimeStatus | undefined,

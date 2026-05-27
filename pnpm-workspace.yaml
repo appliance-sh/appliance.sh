@@ -1,6 +1,7 @@
 packages:
   - packages/sdk
   - packages/cli
+  - packages/helper
   - packages/infra
   - packages/api-server
   - packages/install-aws

@@ -1,0 +1,30 @@
+{
+  "name": "@appliance.sh/helper",
+  "version": "1.42.0",
+  "description": "Cross-platform dependency installer for the Appliance local runtime (docker / k3d / kubectl)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/appliance-sh/appliance.sh.git",
+    "directory": "packages/helper"
+  },
+  "license": "MIT",
+  "author": "Eliot Lim",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf ./dist/"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "typescript": "5.9.3"
+  }
+}

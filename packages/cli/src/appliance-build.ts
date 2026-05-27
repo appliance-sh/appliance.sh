@@ -1,8 +1,13 @@
 import { Command } from 'commander';
 import * as path from 'node:path';
+import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
 import { buildApplianceZip } from './utils/build-package.js';
 import chalk from 'chalk';
+
+// When invoked directly (commander dispatch covers this too), make
+// sure helper-installed docker / k3d / kubectl resolve on PATH.
+ensureHelperBinOnPath();
 
 const DEFAULT_OUTPUT = 'appliance.zip';
 

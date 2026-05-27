@@ -23,6 +23,7 @@ import type {
   LocalClusterStatus,
   LocalLogEvent,
   LocalPodLogsInput,
+  LocalPreflightCheck,
   LocalRuntimeInput,
   LocalRuntimeStatus,
   LocalWorkloads,
@@ -145,6 +146,21 @@ export const tauriHost: ConsoleHost = {
   },
 
   local: {
+    async preflight(): Promise<LocalPreflightCheck[]> {
+      return invoke<LocalPreflightCheck[]>('local_preflight');
+    },
+    async installPrereq(
+      tools: string[] | undefined,
+      onEvent: (event: { type: string; stage?: string; message?: string }) => void,
+      opts?: { force?: boolean }
+    ): Promise<{ outcomes: Array<{ tool: string; status: string; message: string }> }> {
+      const channel = new Channel<{ type: string; stage?: string; message?: string }>();
+      channel.onmessage = onEvent;
+      return invoke<{ outcomes: Array<{ tool: string; status: string; message: string }> }>('local_helper_install', {
+        input: { tools, force: opts?.force ?? false },
+        onEvent: channel,
+      });
+    },
     async status(input?: LocalClusterInput): Promise<LocalClusterStatus> {
       return invoke<LocalClusterStatus>('local_cluster_status', { input: input ?? {} });
     },

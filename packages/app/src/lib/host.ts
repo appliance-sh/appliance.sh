@@ -306,7 +306,73 @@ export interface LocalLogEvent {
   message: string;
 }
 
+/**
+ * One row in the prerequisite report rendered before the user can start
+ * the local runtime. The desktop probes each tool with `<tool> --version`
+ * and reports installed/version/install-hint so the UI can show a
+ * copy-paste install command instead of an opaque "spawn failed".
+ */
+export interface LocalPreflightCheck {
+  /** Tool name as invoked on the command line (`docker`, `k3d`, …). */
+  tool: string;
+  /** True iff `<tool> --version` exited 0. */
+  installed: boolean;
+  /** First line of stdout from `<tool> --version`, when installed. */
+  version?: string;
+  /** One-line human description of what this tool is for. */
+  purpose: string;
+  /** Platform-appropriate install command (empty on unsupported OS). */
+  installHint: string;
+  /**
+   * True when `host.local.installPrereq(tool)` can drive an automatic
+   * install (docker engine is guidance-only).
+   */
+  autoInstallable: boolean;
+  /** stderr or io::Error captured when the version check failed. */
+  error?: string;
+}
+
+/**
+ * Outcome of a helper-driven install for a single tool. The sidecar
+ * surfaces these so the UI can render per-tool success/failure rather
+ * than collapsing the batch into a single boolean.
+ */
+export interface LocalHelperInstallOutcome {
+  tool: string;
+  status: 'installed' | 'already' | 'guidance' | 'failed';
+  message: string;
+}
+
+export interface LocalHelperInstallResult {
+  outcomes: LocalHelperInstallOutcome[];
+}
+
+/**
+ * Streamed progress event from a helper-install run. Mirrors the
+ * bootstrap channel shape so callers can use the same Tauri Channel
+ * plumbing.
+ */
+export interface LocalHelperProgressEvent {
+  type: string;
+  stage?: string;
+  message?: string;
+}
+
 export interface LocalRuntimeHost {
+  /** Probe the local-runtime prerequisites (docker, k3d, kubectl). */
+  preflight(): Promise<LocalPreflightCheck[]>;
+  /**
+   * Drive the helper to install missing prerequisites. `tools` is
+   * either explicit names or `undefined` to install everything
+   * required. Progress events stream onto `onEvent`; the returned
+   * promise resolves with per-tool outcomes once the run completes.
+   * Optional on hosts (web shell) that can't drive a Node sidecar.
+   */
+  installPrereq?(
+    tools: string[] | undefined,
+    onEvent: (event: LocalHelperProgressEvent) => void,
+    opts?: { force?: boolean }
+  ): Promise<LocalHelperInstallResult>;
   /** Legacy cluster-only status (kept for backwards compat). */
   status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
   start(input?: LocalClusterInput): Promise<LocalClusterStatus>;
