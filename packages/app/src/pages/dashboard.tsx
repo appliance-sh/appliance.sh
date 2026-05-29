@@ -1,6 +1,6 @@
 import { Link } from 'react-router';
 import { useQuery, useQueries } from '@tanstack/react-query';
-import { Rocket, Folder, Box, Plug, Wand } from 'lucide-react';
+import { Rocket, Folder, Box, Plug, Wand, Laptop } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -14,10 +14,11 @@ import { extractDeploymentUrl } from '@/lib/deployment';
 export function DashboardPage() {
   const host = useHost();
   const canBootstrap = Boolean(host.bootstrap);
+  const canBootstrapLocal = Boolean(host.local?.startRuntime);
   const { cluster, isLoading } = useSelectedCluster();
 
   if (isLoading) return null;
-  if (!cluster) return <GetStarted canBootstrap={canBootstrap} />;
+  if (!cluster) return <GetStarted canBootstrap={canBootstrap} canBootstrapLocal={canBootstrapLocal} />;
 
   return (
     <ConnectedDashboard
@@ -178,34 +179,49 @@ function RecentActivity({
   );
 }
 
-function GetStarted({ canBootstrap }: { canBootstrap: boolean }) {
+function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean; canBootstrapLocal: boolean }) {
+  // Local is the recommended starting point — zero cloud cost, no
+  // AWS credentials needed, runs on the operator's own machine. When
+  // available we promote it to primary and let AWS / Connect sit
+  // alongside as alternatives.
   return (
-    <div className="mx-auto max-w-2xl space-y-6 pt-8">
+    <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div>
         <h1 className="text-2xl font-semibold">Welcome to Appliance</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Install and run applications on the cloud. Pick a starting point below.
+          Install and run applications on a cluster. Start with a local k3d runtime on this device, provision an AWS
+          cluster, or connect to one you already have.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-3">
+        {canBootstrapLocal ? (
+          <ActionCard
+            icon={Laptop}
+            title="Start a local runtime"
+            body="Spin up a k3d cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
+            cta="Start"
+            to="/bootstrap?mode=local"
+            primary
+          />
+        ) : null}
         {canBootstrap ? (
           <ActionCard
             icon={Wand}
-            title="Bootstrap a new installation"
+            title="Bootstrap on AWS"
             body="Provision the base AWS infrastructure from this machine using your current credentials."
             cta="Start wizard"
-            to="/bootstrap"
-            primary
+            to="/bootstrap?mode=aws"
+            primary={!canBootstrapLocal}
           />
         ) : null}
         <ActionCard
           icon={Plug}
-          title="Connect to an existing cluster"
+          title="Connect to existing"
           body="Point this shell at an api-server you already have by entering its URL and an API key."
           cta="Connect"
           to="/connect"
-          primary={!canBootstrap}
+          primary={!canBootstrap && !canBootstrapLocal}
         />
       </div>
     </div>

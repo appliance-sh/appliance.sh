@@ -79,6 +79,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'authenticate with the appliance API',
     load: () => import('./appliance-login.js'),
   },
+  manifest: {
+    description: 'evaluate a programmatic appliance manifest in a sandbox',
+    load: () => import('./appliance-manifest.js'),
+  },
   open: {
     description: 'open the latest deployment URL in a browser',
     load: () => import('./appliance-open.js'),

@@ -2445,11 +2445,18 @@ struct ApplianceManifestInfo {
 }
 
 /// Probe a folder for an appliance manifest and return its parsed
-/// contents. v1 supports `appliance.json` only — programmatic .ts/.js
-/// manifests need ts-node + a trust prompt, both of which live in the
-/// CLI; surface a clear error so the wizard can suggest the workaround.
+/// contents. `appliance.json` is read directly. Programmatic .ts/.js
+/// manifests are evaluated by spawning the bundled CLI sidecar with
+/// `appliance manifest read --json`, which runs the manifest in its
+/// QuickJS sandbox (see packages/cli/src/sandbox) and prints the
+/// resolved object as a single JSON line on stdout. The CLI binary
+/// is the same one shipped to end users, so the desktop and CLI
+/// always see the manifest through the same sandbox.
 #[tauri::command]
-async fn read_appliance_manifest(path: String) -> Result<ApplianceManifestInfo, String> {
+async fn read_appliance_manifest(
+    app: AppHandle,
+    path: String,
+) -> Result<ApplianceManifestInfo, String> {
     let dir = PathBuf::from(&path);
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -2460,54 +2467,150 @@ async fn read_appliance_manifest(path: String) -> Result<ApplianceManifestInfo, 
         let raw = fs::read_to_string(&json_path).map_err(|e| format!("read manifest: {e}"))?;
         let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("parse manifest: {e}"))?;
-        let name = value
-            .get("name")
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| "manifest is missing 'name'".to_string())?
-            .to_string();
-        return Ok(ApplianceManifestInfo {
-            manifest: value
-                .get("manifest")
-                .and_then(|m| m.as_str())
-                .map(String::from),
-            name,
-            appliance_type: value.get("type").and_then(|t| t.as_str()).map(String::from),
-            port: value
-                .get("port")
-                .and_then(|p| p.as_u64())
-                .and_then(|p| u16::try_from(p).ok()),
-            platform: value
-                .get("platform")
-                .and_then(|p| p.as_str())
-                .map(String::from),
-            env: value.get("env").cloned(),
-            manifest_path: json_path.to_string_lossy().to_string(),
-        });
+        return manifest_info_from_value(&value, &json_path);
     }
 
-    // Detect programmatic manifests so the UI can point the user at
-    // the CLI instead of silently failing.
-    for candidate in [
-        "appliance.ts",
-        "appliance.mts",
-        "appliance.cts",
-        "appliance.js",
-        "appliance.mjs",
-        "appliance.cjs",
-    ] {
-        if dir.join(candidate).exists() {
-            return Err(format!(
-                "Found {} but the desktop wizard currently only supports appliance.json. \
-                 Run `appliance deploy` from the CLI for programmatic manifests.",
-                candidate
-            ));
+    // Probe for a programmatic manifest. First hit wins, matching the
+    // CLI's resolution order so both surfaces pick the same file.
+    let code_manifest = ["appliance.ts", "appliance.mts", "appliance.cts",
+                        "appliance.js", "appliance.mjs", "appliance.cjs"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists());
+
+    let Some(code_path) = code_manifest else {
+        return Err(format!(
+            "No appliance manifest found in {} (looked for appliance.json plus .ts/.mts/.cts/.js/.mjs/.cjs)",
+            dir.display()
+        ));
+    };
+
+    let value = evaluate_manifest_via_sidecar(&app, &code_path).await?;
+    manifest_info_from_value(&value, &code_path)
+}
+
+/// Shape one manifest field-set into the wizard-facing struct. Shared
+/// between the JSON fast path and the sandbox-evaluated path.
+fn manifest_info_from_value(
+    value: &serde_json::Value,
+    file_path: &std::path::Path,
+) -> Result<ApplianceManifestInfo, String> {
+    let name = value
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "manifest is missing 'name'".to_string())?
+        .to_string();
+    Ok(ApplianceManifestInfo {
+        manifest: value
+            .get("manifest")
+            .and_then(|m| m.as_str())
+            .map(String::from),
+        name,
+        appliance_type: value.get("type").and_then(|t| t.as_str()).map(String::from),
+        port: value
+            .get("port")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u16::try_from(p).ok()),
+        platform: value
+            .get("platform")
+            .and_then(|p| p.as_str())
+            .map(String::from),
+        env: value.get("env").cloned(),
+        manifest_path: file_path.to_string_lossy().to_string(),
+    })
+}
+
+/// Spawn the bundled `appliance` CLI sidecar with the `manifest read`
+/// subcommand. The CLI emits exactly one JSON line on stdout:
+///
+///     {ok: true, path, manifest}                       (success)
+///     {ok: false, kind: 'runtime' | 'validation', error, path?}  (failure)
+///
+/// We surface the failure as a plain string so the wizard can display
+/// it next to the folder picker without any further unwrapping.
+async fn evaluate_manifest_via_sidecar(
+    app: &AppHandle,
+    manifest_path: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| format!(
+            "Bundled appliance CLI is unavailable: {e}. Rebuild with `pnpm --filter @appliance.sh/desktop build` so the CLI binary lands in src-tauri/binaries/."
+        ))?
+        .args([
+            "manifest".to_string(),
+            "read".to_string(),
+            manifest_path.to_string_lossy().to_string(),
+        ]);
+
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut spawn_error: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                stdout_buf.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            CommandEvent::Stderr(bytes) => {
+                stderr_buf.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            CommandEvent::Error(msg) => {
+                spawn_error = Some(msg);
+            }
+            CommandEvent::Terminated(payload) => {
+                exit_code = payload.code;
+            }
+            _ => {}
         }
     }
 
-    Err(format!(
-        "No appliance manifest found in {} (looked for appliance.json)",
-        dir.display()
-    ))
+    if let Some(msg) = spawn_error {
+        return Err(format!("appliance CLI error: {msg}"));
+    }
+
+    // The CLI prints exactly one JSON object. Take the last non-empty
+    // line so any incidental warnings on stdout don't break parsing.
+    let last_json_line = stdout_buf
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()
+        .ok_or_else(|| {
+            let stderr_tail = stderr_buf.trim();
+            if stderr_tail.is_empty() {
+                format!(
+                    "appliance CLI produced no output (exit code {:?})",
+                    exit_code
+                )
+            } else {
+                format!("appliance CLI produced no output (stderr: {stderr_tail})")
+            }
+        })?;
+
+    let parsed: serde_json::Value = serde_json::from_str(last_json_line)
+        .map_err(|e| format!("appliance CLI output was not JSON: {e}: {last_json_line}"))?;
+
+    let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error in manifest sandbox")
+            .to_string();
+        return Err(err);
+    }
+
+    parsed
+        .get("manifest")
+        .cloned()
+        .ok_or_else(|| "appliance CLI did not return a manifest object".to_string())
 }
 
 #[derive(Deserialize)]

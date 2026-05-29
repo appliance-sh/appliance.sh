@@ -274,7 +274,7 @@ export interface LocalPodLogsInput {
   namespace?: string;
 }
 
-/** Parsed contents of an appliance.json manifest in a candidate folder. */
+/** Parsed contents of an appliance manifest (json or sandbox-evaluated ts/js). */
 export interface LocalApplianceManifest {
   manifest?: string;
   name: string;
@@ -397,9 +397,10 @@ export interface LocalRuntimeHost {
 
   /** Open a native folder picker. Returns null on cancel. */
   pickDirectory(): Promise<string | null>;
-  /** Parse an appliance.json from the given folder. Errors if the
-   *  manifest is missing or a programmatic (.ts/.js) variant is found
-   *  (those need the CLI for now). */
+  /** Resolve an appliance manifest in the given folder. `.json` is
+   *  read directly; `.ts` / `.js` (and `.mts` / `.cts` / `.mjs` /
+   *  `.cjs`) are evaluated through the CLI's QuickJS sandbox via the
+   *  sidecar. Errors if no manifest is found or the sandbox rejects. */
   readApplianceManifest(path: string): Promise<LocalApplianceManifest>;
   /** docker build → k3d image import, streaming each command's output
    *  to onEvent. Resolves with the resulting image tag on success. */

@@ -31,9 +31,9 @@
     "postinstall": "node scripts/install-binary.mjs",
     "clean": "rm -rf ./dist/",
     "dev:setup": "pnpm link --global",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
-  "dependencies": {},
   "devDependencies": {
     "@appliance.sh/bootstrap": "workspace:*",
     "@appliance.sh/helper": "workspace:*",
@@ -42,11 +42,15 @@
     "@types/archiver": "^7.0.0",
     "@types/json-diff": "^1.0.3",
     "@types/node": "24.12.2",
+    "@vitest/coverage-v8": "^3.2.4",
     "archiver": "^7.0.1",
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
     "json-diff": "^1.0.6",
+    "quickjs-emscripten": "^0.32.0",
     "random-word-slugs": "^0.1.7",
-    "typescript": "5.9.3"
+    "sucrase": "^3.35.1",
+    "typescript": "5.9.3",
+    "vitest": "^3.2.4"
   }
 }

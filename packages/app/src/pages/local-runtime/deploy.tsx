@@ -12,7 +12,9 @@ import { extractDeploymentUrl } from '@/lib/deployment';
 
 // Docker Desktop-style deploy wizard for the local runtime. Three
 // steps:
-//   1. Pick a folder containing appliance.json + a Dockerfile.
+//   1. Pick a folder containing an appliance.{json,ts,js} manifest
+//      + a Dockerfile. Programmatic .ts/.js manifests run in the
+//      CLI's QuickJS sandbox (sidecar invocation).
 //   2. Configure the deploy — project / environment names, env vars,
 //      optional runtime overrides (memory / timeout / storage).
 //   3. Run — streams docker build + k3d image import logs from the
@@ -249,8 +251,8 @@ export function LocalRuntimeDeployPage() {
       <header>
         <h1 className="text-xl font-semibold">Deploy Application</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Pick a folder with an <code>appliance.json</code>, configure overrides, then build and deploy directly to the
-          local cluster.
+          Pick a folder with an <code>appliance.json</code>, <code>.ts</code>, or <code>.js</code> manifest, configure
+          overrides, then build and deploy directly to the local cluster.
         </p>
       </header>
 
@@ -381,9 +383,9 @@ function PickStep({
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
       <h2 className="text-sm font-semibold">Source folder</h2>
       <p className="text-xs text-[var(--color-muted-foreground)]">
-        The folder must contain a <code>Dockerfile</code> and an <code>appliance.json</code> manifest. Programmatic
-        manifests (<code>appliance.ts</code> / <code>.js</code>) aren&rsquo;t supported here yet — use the CLI for
-        those.
+        The folder must contain a <code>Dockerfile</code> plus an <code>appliance.json</code>, <code>appliance.ts</code>
+        , or <code>appliance.js</code> manifest. Programmatic manifests run inside a QuickJS sandbox — no host
+        filesystem, process, or network access; only <code>@appliance.sh/sdk</code> imports resolve.
       </p>
       <div className="flex items-center gap-2">
         <Button onClick={onPick} disabled={pickBusy}>

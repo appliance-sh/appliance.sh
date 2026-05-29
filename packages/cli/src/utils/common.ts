@@ -1,11 +1,11 @@
 import { Command } from 'commander';
 import path from 'path';
 import * as fs from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { confirm } from '@inquirer/prompts';
 import { Appliance, applianceFullInput, ApplianceFullInput, ManifestContext, Result } from '@appliance.sh/sdk';
 import chalk from 'chalk';
 import { addTrustedProject, isTrustedProject, settingsFilePath } from './settings.js';
+import { evaluateManifest } from '../sandbox/index.js';
 
 // Ordered by precedence. First hit wins when the user passes neither
 // --file nor --directory (or --directory without --file).
@@ -260,36 +260,12 @@ async function loadManifest(filePath: string, ext: string, ctx: ManifestContext)
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   }
   if (CODE_EXTENSIONS.has(ext)) {
-    const mod = await importManifestModule(filePath);
-    let raw: unknown = (mod as { default?: unknown }).default ?? mod;
-    if (typeof raw === 'function') raw = await (raw as (ctx: ManifestContext) => unknown)(ctx);
-    return raw;
+    // Programmatic manifests run inside a QuickJS sandbox (see
+    // src/sandbox/). Only `@appliance.sh/sdk` is resolvable; fs,
+    // process, fetch, and arbitrary npm modules are not.
+    return evaluateManifest(filePath, ctx);
   }
   throw new Error(`Unsupported manifest extension: ${ext}`);
-}
-
-async function importManifestModule(filePath: string): Promise<unknown> {
-  const url = pathToFileURL(filePath).href;
-  const isTs = /\.[cm]?ts$/i.test(filePath);
-  if (!isTs) return import(url);
-
-  // Node 22.18+ strips types natively via --experimental-strip-types
-  // (on by default). `process.features.typescript` is the canonical
-  // capability flag — when it's truthy, plain `import()` handles TS.
-  if ((process.features as unknown as { typescript?: boolean }).typescript) {
-    return import(url);
-  }
-
-  try {
-    const { register } = await import('node:module');
-    register('tsx/esm', pathToFileURL('./').href);
-    return import(url);
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    throw new Error(
-      `Cannot load TypeScript manifest ${filePath}: install tsx in the CLI's runtime dependencies, or run Node 22.18+ with native strip-types. (${reason})`
-    );
-  }
 }
 
 export function saveApplianceFile(filePath: string, appliance: Appliance): Result<void> {
