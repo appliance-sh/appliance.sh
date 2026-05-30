@@ -1079,6 +1079,14 @@ const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
 const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
 const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
 const DEFAULT_LOCAL_API_PORT: u16 = 3030;
+// Host-side port the k3d-attached registry publishes on. Picked
+// out of the way of common dev tools (5000 is occupied by macOS
+// AirPlay Receiver on Sequoia+, 5001 by some VPN clients). Users
+// can override via `LocalRuntimeInput.registry_port` when 5050
+// conflicts. The api-server's KubernetesDeploymentService doesn't
+// touch this port — image push is a desktop/CLI build-side concern,
+// so api-server can stay running in-cluster without docker access.
+const DEFAULT_LOCAL_REGISTRY_PORT: u16 = 5050;
 const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
 // Stable cluster id == profile name used by the CLI's `--profile`
 // flag and the shared profiles.json key.
@@ -1120,6 +1128,16 @@ fn cluster_name_or_default(input: &LocalClusterInput) -> String {
         .cluster_name
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string())
+}
+
+/// k3d registry name attached to a given cluster. The k3d CLI prefixes
+/// every registry name with `k3d-` once created (so a registry named
+/// `appliance-local-registry` shows up as `k3d-appliance-local-registry`
+/// in `k3d registry list` and as a container of that name). We pass
+/// the unprefixed form to `k3d registry create / delete` and accept
+/// either form when matching against `k3d registry list -o json`.
+fn registry_name_for_cluster(cluster: &str) -> String {
+    format!("{cluster}-registry")
 }
 
 // Tools the local-runtime path shells out to. Centralised so preflight
@@ -1469,6 +1487,16 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             DEFAULT_LOCAL_NODEPORT_MAX,
         );
         let agents_arg = "1";
+        // Ensure a registry exists alongside the cluster. The cluster
+        // is then created with `--registry-use`, which wires up
+        // containerd config so k3s pulls from the registry as a
+        // mirror. This is the build-side push target: the api-server,
+        // once we move it in-cluster, has no docker daemon and can't
+        // `k3d image import` — but it can read images that the
+        // desktop/CLI pushed to this registry.
+        let registry_name = registry_name_for_cluster(&name);
+        ensure_registry(&registry_name, DEFAULT_LOCAL_REGISTRY_PORT).await?;
+        let registry_use_arg = format!("{}:{}", registry_name, DEFAULT_LOCAL_REGISTRY_PORT);
         let (ok, _stdout, stderr) = run_status_command(&[
             "k3d",
             "cluster",
@@ -1480,6 +1508,8 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             &port_arg,
             "-p",
             &nodeport_arg,
+            "--registry-use",
+            &registry_use_arg,
             "--wait",
         ])
         .await?;
@@ -1520,12 +1550,50 @@ async fn delete_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSt
     if !ok && !stderr.contains("not found") {
         return Err(format!("k3d cluster delete failed: {}", stderr));
     }
+    // Best-effort: tear down the matching registry. Detached from
+    // the cluster lifecycle (deleting a registry while another
+    // cluster still uses it would break that cluster), but our
+    // naming convention is 1:1 with cluster name, so it's safe to
+    // remove here. Ignored on "not found" so a re-delete is a no-op.
+    let registry_name = registry_name_for_cluster(&name);
+    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
     Ok(LocalClusterStatus {
         exists: false,
         running: false,
         cluster_name: name,
         message: None,
     })
+}
+
+/// Idempotent registry create: probe `k3d registry list`, create if
+/// missing. The k3d CLI surfaces registries under their `k3d-`-prefixed
+/// container names, so we match both forms. Errors that look like
+/// "already exists" / "port in use" are surfaced verbatim to the
+/// caller — those need user action (rename or free the port), not a
+/// silent retry.
+async fn ensure_registry(name: &str, port: u16) -> Result<(), String> {
+    if let Ok((ok, stdout, _stderr)) = run_status_command(&["k3d", "registry", "list", "-o", "json"]).await {
+        if ok {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                let prefixed = format!("k3d-{}", name);
+                if let Some(list) = parsed.as_array() {
+                    for entry in list {
+                        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        if entry_name == name || entry_name == prefixed.as_str() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let port_arg = format!("0.0.0.0:{}", port);
+    let (ok, _stdout, stderr) =
+        run_status_command(&["k3d", "registry", "create", name, "--port", &port_arg]).await?;
+    if !ok {
+        return Err(format!("k3d registry create failed: {}", stderr));
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -1551,6 +1619,10 @@ struct LocalRuntimeInput {
     host_port: Option<u16>,
     api_port: Option<u16>,
     data_dir: Option<String>,
+    /// Host-side port the k3d-attached registry publishes on. Falls
+    /// back to DEFAULT_LOCAL_REGISTRY_PORT when omitted. Override when
+    /// 5050 collides with another local service.
+    registry_port: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1564,6 +1636,18 @@ struct ResolvedRuntimeConfig {
     api_server_url: String,
     node_port_min: u16,
     node_port_max: u16,
+    /// Host-side URL of the k3d-attached registry (e.g.
+    /// `localhost:5050`). Build-side code (the desktop's
+    /// build_and_import_image, future CLI push paths) tags + pushes
+    /// against this address; the cluster pulls through the
+    /// `--registry-use` mirror configured at create time. None when
+    /// the runtime was created before Phase 3 (the import-via-k3d
+    /// fallback path still works in that case).
+    registry_url: String,
+    /// Bare host-side port the registry listens on. Surfaced
+    /// separately so the frontend can construct image refs without
+    /// re-parsing `registry_url`.
+    registry_port: u16,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -1624,6 +1708,7 @@ fn resolve_runtime_config(
         .unwrap_or_else(|| DEFAULT_LOCAL_NAMESPACE.to_string());
     let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
     let api_port = input.api_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
     let data_dir = match &input.data_dir {
         Some(p) => PathBuf::from(p),
         None => default_local_runtime_dir(app)?,
@@ -1637,6 +1722,8 @@ fn resolve_runtime_config(
         api_server_url: format!("http://localhost:{}", api_port),
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
         node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
+        registry_url: format!("localhost:{}", registry_port),
+        registry_port,
     })
 }
 
@@ -2626,6 +2713,15 @@ struct BuildAndImportInput {
     /// k3d cluster to import into. Defaults to the runtime's cluster name.
     #[serde(default)]
     cluster_name: Option<String>,
+    /// Host-side registry URL to push to (e.g. `localhost:5050`).
+    /// When set, the image is tagged `<registry_url>/<image_tag>` and
+    /// pushed via `docker push` instead of being imported with
+    /// `k3d image import`. The returned image URI then references the
+    /// registry path so the cluster can pull through the mirror —
+    /// works whether api-server runs on the host or in-cluster.
+    /// Omit (or pass null) to keep the legacy import-only flow.
+    #[serde(default)]
+    registry_url: Option<String>,
 }
 
 /// Stream stdout+stderr from a child process onto the channel as
@@ -2685,9 +2781,16 @@ async fn stream_child_to_channel(
     Ok(())
 }
 
-/// Build the image with docker, then import it into k3d. Streams the
-/// raw command output to the frontend so the wizard can show a live
-/// terminal-style log pane.
+/// Build the image with docker, then either push it to a host-side
+/// registry (when one is configured for the cluster) or import it
+/// into k3d. Streams raw command output to the frontend so the
+/// wizard can show a live terminal-style log pane.
+///
+/// Returns the image reference the cluster should use to pull. For
+/// the registry path that's `<registry_url>/<image_tag>`; for the
+/// import path it's the original `image_tag`. Either way, the caller
+/// (the deploy wizard) hands this URI straight to api-server's
+/// build resolver.
 #[tauri::command]
 async fn build_and_import_image(
     input: BuildAndImportInput,
@@ -2698,7 +2801,17 @@ async fn build_and_import_image(
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string());
 
-    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), input.image_tag.clone()];
+    // When a registry is configured, tag the build with the
+    // registry-qualified ref up front so the single `docker build`
+    // produces an image already named the way we'll push it. Avoids
+    // a separate `docker tag` step.
+    let pushable_tag = input
+        .registry_url
+        .as_deref()
+        .map(|reg| format!("{}/{}", reg, input.image_tag));
+    let build_tag = pushable_tag.clone().unwrap_or_else(|| input.image_tag.clone());
+
+    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), build_tag.clone()];
     if let Some(p) = input.platform.as_deref() {
         build_args.push("--platform".into());
         build_args.push(p.into());
@@ -2706,6 +2819,18 @@ async fn build_and_import_image(
     build_args.push(input.path.clone());
     stream_child_to_channel("docker", &build_args, &on_event).await?;
 
+    if let Some(pushable) = pushable_tag {
+        // Registry path: push, then return the registry-qualified
+        // reference so the cluster pulls via the `--registry-use`
+        // mirror configured at cluster create.
+        let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
+        stream_child_to_channel("docker", &push_args, &on_event).await?;
+        return Ok(pushable);
+    }
+
+    // Legacy path: no registry available — fall back to importing
+    // the image directly into the k3d cluster. Compatible with
+    // clusters that pre-date Phase 3 (no registry attached).
     let import_args: Vec<String> = vec![
         "image".into(),
         "import".into(),

@@ -201,6 +201,9 @@ export interface LocalRuntimeInput {
   hostPort?: number;
   apiPort?: number;
   dataDir?: string;
+  /** Host-side port the k3d-attached registry publishes on. Falls
+   *  back to the Tauri-side default (5050) when omitted. */
+  registryPort?: number;
 }
 
 export interface ResolvedRuntimeConfig {
@@ -212,6 +215,11 @@ export interface ResolvedRuntimeConfig {
   apiServerUrl: string;
   nodePortMin: number;
   nodePortMax: number;
+  /** Host-side URL of the k3d-attached registry (e.g.
+   *  `localhost:5050`). Build-side code pushes here; the cluster
+   *  pulls through the `--registry-use` mirror. */
+  registryUrl: string;
+  registryPort: number;
 }
 
 export interface ApiServerStatus {
@@ -296,6 +304,13 @@ export interface LocalBuildAndImportInput {
   platform?: string;
   /** k3d cluster to import into; defaults to the active local runtime cluster. */
   clusterName?: string;
+  /** Host-side registry URL the cluster pulls through (e.g.
+   *  `localhost:5050`). When set, the image is tagged
+   *  `<registryUrl>/<imageTag>` and pushed via `docker push` instead
+   *  of `k3d image import`. The resolved Promise then resolves with
+   *  the registry-qualified ref so callers can hand it straight to
+   *  api-server. Read from `LocalRuntimeStatus.config.registryUrl`. */
+  registryUrl?: string;
 }
 
 /** Streaming log event emitted while a child process runs. */
