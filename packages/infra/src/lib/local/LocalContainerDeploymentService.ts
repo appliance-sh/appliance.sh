@@ -453,17 +453,21 @@ function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
 
 function resolveClusterConfig(baseConfig: ApplianceBaseConfig): ClusterConfig {
   // Common k8s params (namespace, hostnameSuffix, ingressClassName)
-  // come from whichever subobject the variant uses. Local-only
-  // fields (k3d cluster name, host port) only have meaning for
-  // `appliance-base-local`; for generic Kubernetes bases they fall
-  // back to schema defaults that aren't actually used (the k3d
-  // host-port routing is replaced by external Ingress).
+  // come from whichever subobject the variant uses. hostPort is
+  // local-specific (the k3d serverlb publishes :80 on `hostPort` so
+  // the host can hit the Ingress); for `appliance-base-kubernetes`
+  // the cluster fronts Ingress on the canonical 80/443 and we render
+  // it port-less (applianceHostnameUrl elides :80). Stamping the
+  // k3d default (8081) onto a generic Kubernetes URL produced a
+  // bogus `:8081` suffix on every reported deploy URL.
   const k8sParams = getKubernetesParams(baseConfig);
   const localCluster = baseConfig.local?.cluster ?? {};
+  const hostPort =
+    baseConfig.type === ApplianceBaseType.ApplianceLocal ? (localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT) : 80;
   return {
     clusterName: localCluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
     namespace: k8sParams?.namespace ?? DEFAULT_LOCAL_NAMESPACE,
-    hostPort: localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT,
+    hostPort,
     hostnameSuffix: k8sParams?.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
     ingressClassName: k8sParams?.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
   };

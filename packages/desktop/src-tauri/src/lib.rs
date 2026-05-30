@@ -1119,6 +1119,21 @@ struct LocalClusterInput {
     /// and common 8080.
     #[serde(default)]
     host_port: Option<u16>,
+    /// Host-side port the k3d-attached registry publishes on. Falls
+    /// back to DEFAULT_LOCAL_REGISTRY_PORT (5050). Plumbed through
+    /// to `ensure_registry` and `--registry-use` at cluster-create
+    /// time so a user-supplied `LocalRuntimeInput.registryPort` is
+    /// actually honored end-to-end.
+    #[serde(default)]
+    registry_port: Option<u16>,
+    /// Host-side directory bind-mounted into the k3d node container
+    /// so the in-cluster api-server's PersistentVolume (hostPath
+    /// inside the node) actually maps onto durable host storage.
+    /// Without this, `k3d cluster delete` wipes everything the
+    /// FilesystemObjectStore wrote (projects, environments, keys).
+    /// Must be a path the host's Docker daemon can mount.
+    #[serde(default)]
+    data_dir: Option<String>,
 }
 
 fn cluster_name_or_default(input: &LocalClusterInput) -> String {
@@ -1452,9 +1467,22 @@ async fn local_cluster_status(input: LocalClusterInput) -> Result<LocalClusterSt
 #[tauri::command]
 async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
     let name = cluster_name_or_default(&input);
+    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
+    let registry_name = registry_name_for_cluster(&name);
+
+    // Ensure the registry exists regardless of whether we're about to
+    // create or restart the cluster. It's a sibling container, not a
+    // cluster-owned one, so a Docker restart / `docker rm` between
+    // sessions can leave the cluster up but the registry gone — in
+    // which case `ensure_registry` brings it back, idempotently.
+    // (--registry-use only takes effect at cluster create; for
+    // clusters that pre-date Phase 3 the wizard's fallback path
+    // handles the no-mirror case — see bug_012 fix in next commit.)
+    ensure_registry(&registry_name, registry_port).await?;
+
     let status = local_cluster_status(LocalClusterInput {
         cluster_name: Some(name.clone()),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await?;
     if status.exists {
@@ -1485,39 +1513,50 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             DEFAULT_LOCAL_NODEPORT_MAX,
         );
         let agents_arg = "1";
-        // Ensure a registry exists alongside the cluster. The cluster
-        // is then created with `--registry-use`, which wires up
-        // containerd config so k3s pulls from the registry as a
-        // mirror. This is the build-side push target: the api-server,
-        // once we move it in-cluster, has no docker daemon and can't
-        // `k3d image import` — but it can read images that the
-        // desktop/CLI pushed to this registry.
-        let registry_name = registry_name_for_cluster(&name);
-        ensure_registry(&registry_name, DEFAULT_LOCAL_REGISTRY_PORT).await?;
-        let registry_use_arg = format!("{}:{}", registry_name, DEFAULT_LOCAL_REGISTRY_PORT);
-        let (ok, _stdout, stderr) = run_status_command(&[
-            "k3d",
-            "cluster",
-            "create",
-            &name,
-            "--agents",
-            agents_arg,
-            "-p",
-            &port_arg,
-            "-p",
-            &nodeport_arg,
-            "--registry-use",
-            &registry_use_arg,
-            "--wait",
-        ])
-        .await?;
+        let registry_use_arg = format!("{}:{}", registry_name, registry_port);
+        // Bind-mount the host-side data_dir into the k3d node so the
+        // in-cluster api-server's PersistentVolume (`hostPath` inside
+        // the agent container) actually resolves to durable storage
+        // on the operator's host. Without this, k3d's agent overlay
+        // becomes the backing store and `k3d cluster delete` wipes
+        // every project/environment/api-key the FilesystemObjectStore
+        // wrote. Same path on both sides of the colon so manifests
+        // can use one absolute path everywhere.
+        let mut create_args: Vec<String> = vec![
+            "cluster".into(),
+            "create".into(),
+            name.clone(),
+            "--agents".into(),
+            agents_arg.into(),
+            "-p".into(),
+            port_arg,
+            "-p".into(),
+            nodeport_arg,
+            "--registry-use".into(),
+            registry_use_arg,
+        ];
+        let volume_arg;
+        if let Some(data_dir) = input.data_dir.as_deref() {
+            // Ensure the source exists before docker mounts it —
+            // docker auto-creates missing host paths as root-owned
+            // dirs, which then can't be written by the user later.
+            fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
+            volume_arg = format!("{}:{}", data_dir, data_dir);
+            create_args.push("--volume".into());
+            create_args.push(volume_arg.clone());
+        }
+        create_args.push("--wait".into());
+        let create_argv: Vec<&str> = std::iter::once("k3d")
+            .chain(create_args.iter().map(String::as_str))
+            .collect();
+        let (ok, _stdout, stderr) = run_status_command(&create_argv).await?;
         if !ok {
             return Err(format!("k3d cluster create failed: {}", stderr));
         }
     }
     local_cluster_status(LocalClusterInput {
         cluster_name: Some(name),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await
 }
@@ -1533,7 +1572,7 @@ async fn stop_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStat
     }
     local_cluster_status(LocalClusterInput {
         cluster_name: Some(name),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await
 }
@@ -1585,7 +1624,15 @@ async fn ensure_registry(name: &str, port: u16) -> Result<(), String> {
             }
         }
     }
-    let port_arg = format!("0.0.0.0:{}", port);
+    // Bind only on loopback. The cluster reaches the registry through
+    // Docker's internal bridge network via the registry container's
+    // DNS name (wired by `--registry-use`), not through the host-
+    // published port — so loopback-only binding doesn't break pulls.
+    // It DOES keep the unauthenticated registry off any LAN interface,
+    // which matters on shared networks (cafes, conferences) where a
+    // predictable `localhost:5050/<image>:latest` tag would otherwise
+    // be pre-positionable by anyone on the subnet.
+    let port_arg = format!("127.0.0.1:{}", port);
     let (ok, _stdout, stderr) =
         run_status_command(&["k3d", "registry", "create", name, "--port", &port_arg]).await?;
     if !ok {
@@ -1888,6 +1935,7 @@ async fn local_runtime_status(
     let cluster = local_cluster_status(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
+        ..Default::default()
     })
     .await?;
     let api_server = current_api_server_status(&cfg).await;
@@ -1909,10 +1957,12 @@ async fn start_local_runtime(
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    // Phase 1: cluster (k3d + attached registry)
+    // Phase 1: cluster (k3d + attached registry + data_dir bind-mount)
     let _ = start_local_cluster(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
+        registry_port: Some(cfg.registry_port),
+        data_dir: Some(cfg.data_dir.clone()),
     })
     .await?;
 
@@ -2053,12 +2103,22 @@ struct BootstrapInClusterResult {
 /// in-cluster api-server authenticates via its mounted ServiceAccount
 /// (loadFromCluster()), so we don't ship server/token here.
 fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
+    // namespace must track cfg.namespace (which honors user
+    // input.namespace override). Hardcoding to DEFAULT_LOCAL_NAMESPACE
+    // would silently diverge from the namespace the desktop's
+    // list_local_workloads queries against. hostnameSuffix +
+    // ingressClassName are currently not user-overridable so the
+    // defaults match LocalContainerDeploymentService's defaults; lift
+    // them onto ResolvedRuntimeConfig if/when an override surface
+    // appears. registry.url stays as-is for now — no in-cluster
+    // consumer reads it, but if one is added it'll need the cluster-
+    // internal registry hostname, not the host's localhost.
     serde_json::json!({
         "type": "appliance-base-kubernetes",
         "name": "local-runtime",
         "kubernetes": {
             "dataDir": "/data",
-            "namespace": DEFAULT_LOCAL_NAMESPACE,
+            "namespace": cfg.namespace,
             "hostnameSuffix": "appliance.localhost",
             "ingressClassName": "traefik",
             "registry": {
@@ -2068,6 +2128,16 @@ fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
         }
     })
     .to_string()
+}
+
+/// Minimal-escape transform for values interpolated into YAML
+/// double-quoted scalars. Covers the three characters that can
+/// break a double-quoted scalar: `\` (escape lead-in), `\n` (closes
+/// the scalar mid-string), `"` (terminates the scalar). Quoting at
+/// the call sites is unconditional, so we don't need to handle the
+/// plain-scalar reserved characters here.
+fn yaml_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"")
 }
 
 /// Compose the multi-document YAML manifest deployed via kubectl apply.
@@ -2090,8 +2160,16 @@ fn render_in_cluster_api_server_manifest(
     bootstrap_token: &str,
 ) -> String {
     let base_config = build_in_cluster_base_config(cfg);
-    let escaped_base_config = base_config.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"");
-    let host_data_dir = &cfg.data_dir;
+    let escaped_base_config = yaml_double_quoted(&base_config);
+    // Windows resolves data_dir through Tauri's app_data_dir() into
+    // a backslash-laden path (`C:\Users\..`). YAML 1.2 only accepts
+    // a fixed set of escapes inside double-quoted scalars (`\n`, `\t`,
+    // `\\`, `\"`, `\uNNNN`, `\UNNNNNNNN`, …); a bare `\U` followed
+    // by anything other than 8 hex digits parses as an invalid
+    // escape and kubectl rejects the whole apply. Same escape pass
+    // as base_config keeps both safe for Windows + arbitrary
+    // user-supplied overrides.
+    let host_data_dir = yaml_double_quoted(&cfg.data_dir);
     format!(
         r#"apiVersion: v1
 kind: Namespace
