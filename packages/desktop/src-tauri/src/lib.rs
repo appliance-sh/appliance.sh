@@ -380,12 +380,21 @@ fn delete_api_key(account: &str) {
 // no-op. Returns true if the persisted file was rewritten so the
 // caller can persist + clean up the old keychain slot.
 fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, HostError> {
+    let mut migrated = migrate_legacy_top_level_url(cfg)?;
+    migrated |= migrate_legacy_local_runtime_urls(cfg);
+    if migrated {
+        write_persisted_config(app, cfg)?;
+    }
+    Ok(migrated)
+}
+
+/// Original field-shape migration: top-level `api_server_url` →
+/// `clusters[]` entry. Runs once per upgrade from the pre-clusters
+/// era.
+fn migrate_legacy_top_level_url(cfg: &mut PersistedConfig) -> Result<bool, HostError> {
     if !cfg.clusters.is_empty() {
         // Already migrated. Drop the legacy field if it lingered.
-        if cfg.api_server_url.take().is_some() {
-            return Ok(true);
-        }
-        return Ok(false);
+        return Ok(cfg.api_server_url.take().is_some());
     }
     let Some(legacy_url) = cfg.api_server_url.take() else {
         return Ok(false);
@@ -409,8 +418,44 @@ fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, Ho
     delete_api_key(LEGACY_KEYCHAIN_ACCOUNT);
     cfg.clusters.push(cluster);
     cfg.selected_cluster_id = Some(id);
-    write_persisted_config(app, cfg)?;
     Ok(true)
+}
+
+/// Phase-4 URL-shape migration. Pre-Phase-4 desktops registered the
+/// Local Runtime cluster with `http://localhost:<api_port>` because
+/// api-server ran as a host-side child process. Phase 4 moves
+/// api-server in-cluster and re-derives the URL as
+/// `http://api.appliance.localhost:<host_port>`. Without this fixup
+/// the post-upgrade `start_local_runtime` would find
+/// `find_local_runtime_cluster` empty against the new URL, mint a
+/// second `local-runtime` cluster id (duplicate-id collision), and
+/// stomp the existing keychain entry. Rewriting in place keeps the
+/// cluster id (so the keychain entry survives) and lets the freshly
+/// in-cluster api-server pick up the existing API key the moment
+/// it's reachable.
+fn migrate_legacy_local_runtime_urls(cfg: &mut PersistedConfig) -> bool {
+    let new_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, DEFAULT_LOCAL_HOST_PORT);
+    let mut migrated = false;
+    for cluster in &mut cfg.clusters {
+        if cluster.id != LOCAL_RUNTIME_CLUSTER_ID {
+            continue;
+        }
+        if is_pre_phase4_local_runtime_url(&cluster.api_server_url) {
+            cluster.api_server_url = new_url.clone();
+            migrated = true;
+        }
+    }
+    migrated
+}
+
+fn is_pre_phase4_local_runtime_url(url: &str) -> bool {
+    // Pre-Phase-4 default port was DEFAULT_LOCAL_API_PORT (3030) but
+    // users could override via LocalRuntimeInput.api_port to anything;
+    // matching the host (localhost / 127.0.0.1) is the discriminator
+    // that catches the legacy shape without false-positiving on the
+    // new `api.appliance.localhost` form.
+    let stripped = url.strip_prefix("http://").unwrap_or(url);
+    stripped.starts_with("localhost:") || stripped.starts_with("127.0.0.1:")
 }
 
 fn derive_name_from_url(url: &str) -> String {
@@ -1076,7 +1121,6 @@ const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
 // the same range so each deployment's NodePort is reachable here.
 const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
 const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
-const DEFAULT_LOCAL_API_PORT: u16 = 3030;
 // Host-side port the k3d-attached registry publishes on. Picked
 // out of the way of common dev tools (5000 is occupied by macOS
 // AirPlay Receiver on Sequoia+, 5001 by some VPN clients). Users
@@ -1662,7 +1706,6 @@ struct LocalRuntimeInput {
     cluster_name: Option<String>,
     namespace: Option<String>,
     host_port: Option<u16>,
-    api_port: Option<u16>,
     data_dir: Option<String>,
     /// Host-side port the k3d-attached registry publishes on. Falls
     /// back to DEFAULT_LOCAL_REGISTRY_PORT when omitted. Override when
@@ -1676,7 +1719,6 @@ struct ResolvedRuntimeConfig {
     cluster_name: String,
     namespace: String,
     host_port: u16,
-    api_port: u16,
     data_dir: String,
     api_server_url: String,
     node_port_min: u16,
@@ -1743,7 +1785,6 @@ fn resolve_runtime_config(
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_NAMESPACE.to_string());
     let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
-    let api_port = input.api_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
     let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
     let data_dir = match &input.data_dir {
         Some(p) => PathBuf::from(p),
@@ -1760,7 +1801,6 @@ fn resolve_runtime_config(
         cluster_name,
         namespace,
         host_port,
-        api_port,
         data_dir: data_dir.to_string_lossy().to_string(),
         api_server_url,
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
@@ -2126,12 +2166,13 @@ struct BootstrapInClusterInput {
     /// dir, registry port, etc. Defaults to the same resolution
     /// `local_runtime_status` uses.
     runtime: Option<LocalRuntimeInput>,
-    /// Override the api-server image reference. When omitted, the
-    /// image is assumed to live at
-    /// `<registry_url>/appliance-api-server:latest` in the
-    /// cluster-attached registry. Set this to point at a different
-    /// tag, or to a pre-pulled remote image (`ghcr.io/...`) for
-    /// production-style installs.
+    /// Override the api-server image reference. Defaults to
+    /// `ghcr.io/appliance-sh/api-server:latest` (cluster pulls from
+    /// ghcr on first deploy, caches thereafter). For local dev
+    /// iteration build the image and push to
+    /// `<registry_url>/appliance-api-server:<tag>`, then pass that
+    /// ref through here so the cluster pulls from the local
+    /// registry mirror instead.
     image: Option<String>,
 }
 
@@ -2404,6 +2445,44 @@ spec:
     )
 }
 
+/// Read the existing BOOTSTRAP_TOKEN out of the api-server Secret in
+/// the appliance-system namespace. Returns None when the Secret
+/// doesn't exist yet (first bootstrap), when kubectl fails (cluster
+/// down), or when the field is absent. Used so re-bootstrap reuses
+/// the token the already-running pod's env was seeded with — see
+/// bug_004 reasoning in bootstrap_in_cluster_api_server.
+async fn read_existing_bootstrap_token() -> Option<String> {
+    let (ok, stdout, _stderr) = run_status_command(&[
+        "kubectl",
+        "-n",
+        IN_CLUSTER_API_SERVER_NAMESPACE,
+        "get",
+        "secret",
+        &format!("{}-config", IN_CLUSTER_API_SERVER_NAME),
+        "-o",
+        "jsonpath={.data.BOOTSTRAP_TOKEN}",
+    ])
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let encoded = stdout.trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    // Secret values are base64-encoded on read. Decode and validate
+    // it's a non-empty UTF-8 string before reusing.
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let token = String::from_utf8(decoded).ok()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 /// Pipe a manifest string into `kubectl apply -f -` so we don't have
 /// to materialize a temp file on disk. Surfaces stderr verbatim — the
 /// kubectl error messages are usually self-explanatory and the caller
@@ -2502,7 +2581,16 @@ async fn bootstrap_in_cluster_api_server(
     let image = input
         .image
         .unwrap_or_else(|| IN_CLUSTER_API_SERVER_DEFAULT_IMAGE.to_string());
-    let bootstrap_token = random_bootstrap_token();
+    // Reuse the existing Secret's BOOTSTRAP_TOKEN when one is
+    // present — the running api-server pod's env was populated via
+    // envFrom at container start, which is a one-shot snapshot;
+    // updating the Secret does NOT re-inject env vars or restart
+    // the pod, so minting a fresh token here would mean the pod's
+    // env (old token) and the curl we POST below (new token) never
+    // match — 401 forever, until manual pod restart. Reading the
+    // existing token sidesteps this and keeps re-bootstrap clean
+    // when the pod is already up.
+    let bootstrap_token = read_existing_bootstrap_token().await.unwrap_or_else(random_bootstrap_token);
     let manifest = render_in_cluster_api_server_manifest(&cfg, &image, &bootstrap_token);
     kubectl_apply_manifest(&manifest).await?;
 

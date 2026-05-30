@@ -199,7 +199,6 @@ export interface LocalRuntimeInput {
   clusterName?: string;
   namespace?: string;
   hostPort?: number;
-  apiPort?: number;
   dataDir?: string;
   /** Host-side port the k3d-attached registry publishes on. Falls
    *  back to the Tauri-side default (5050) when omitted. */
@@ -210,7 +209,6 @@ export interface ResolvedRuntimeConfig {
   clusterName: string;
   namespace: string;
   hostPort: number;
-  apiPort: number;
   dataDir: string;
   apiServerUrl: string;
   nodePortMin: number;
@@ -441,8 +439,10 @@ export interface BootstrapInClusterInput {
    *  `runtimeStatus()` uses. */
   runtime?: LocalRuntimeInput;
   /** Override the api-server image reference. Defaults to
-   *  `<registryUrl>/appliance-api-server:latest`. Set to a remote
-   *  registry image for production-style installs. */
+   *  `ghcr.io/appliance-sh/api-server:latest` (pulled from ghcr on
+   *  first deploy). For local dev iteration, push a built image to
+   *  `<registryUrl>/appliance-api-server:<tag>` and pass that ref
+   *  through here. */
   image?: string;
 }
 
