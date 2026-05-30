@@ -1,7 +1,7 @@
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 import { lookup } from './controller';
-import { applianceBaseConfigInput, ApplianceBaseConfigInput, ApplianceBaseType } from '@appliance.sh/sdk';
+import { applianceBaseConfigInput, ApplianceBaseConfigInput, isKubernetesBase } from '@appliance.sh/sdk';
 import { ApplianceBaseAwsPublic } from './aws/ApplianceBaseAwsPublic';
 import { ApplianceBaseAwsVpc } from './aws/ApplianceBaseAwsVpc';
 
@@ -32,11 +32,12 @@ export async function applianceInfra(input: ApplianceInfraInput): Promise<Applia
     }
 
     const baseConfig = parsed.data;
-    // Local bases are managed by the desktop / api-server (kubectl
-    // against k3d) and not by this Pulumi program — skip them here
-    // so the declarative `applianceInfra({ bases })` interface can
+    // Kubernetes-driven bases (local k3d + generic external
+    // clusters) are managed by the api-server's KubernetesDeploymentService
+    // directly and not by this Pulumi program — skip them here so
+    // the declarative `applianceInfra({ bases })` interface can
     // still accept mixed base lists.
-    if (baseConfig.type === ApplianceBaseType.ApplianceLocal) {
+    if (isKubernetesBase(baseConfig)) {
       continue;
     }
     const baseController = lookup(baseConfig);

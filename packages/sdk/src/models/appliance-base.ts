@@ -9,6 +9,26 @@ export enum ApplianceBaseType {
   // Deployment + Service rather than a Lambda. Used by the desktop
   // for offline / single-machine development.
   ApplianceLocal = 'appliance-base-local',
+  // Generic Kubernetes base: api-server drives an arbitrary k8s
+  // cluster identified by URL + credentials. Same machinery as
+  // ApplianceLocal under the hood, but without the desktop-managed
+  // k3d lifecycle assumptions — connection details are explicit
+  // rather than discovered from the host's default kubeconfig.
+  ApplianceKubernetes = 'appliance-base-kubernetes',
+}
+
+// True for any base whose deploys go through the Kubernetes API
+// client (KubernetesDeploymentService), rather than Pulumi. Use
+// this to gate branches that are about "is this a k8s-driven base"
+// rather than "is this specifically the k3d-on-developer-laptop
+// base." Doubles as a TypeScript type guard: callers that pass a
+// discriminated-union value get the union narrowed to the k8s
+// variants on the truthy branch and the non-k8s variants on the
+// falsy branch.
+export function isKubernetesBase<T extends { type: ApplianceBaseType }>(
+  config: T
+): config is T & { type: ApplianceBaseType.ApplianceLocal | ApplianceBaseType.ApplianceKubernetes } {
+  return config.type === ApplianceBaseType.ApplianceLocal || config.type === ApplianceBaseType.ApplianceKubernetes;
 }
 
 export const applianceBaseInput = z.object({
@@ -70,10 +90,56 @@ export const applianceLocalInput = applianceBaseInput.omit({ dns: true }).extend
 
 export type ApplianceLocalInput = z.infer<typeof applianceLocalInput>;
 
+// Generic Kubernetes base. The caller supplies enough to construct a
+// `@kubernetes/client-node` KubeConfig and the api-server takes it
+// from there. Exactly one of `token` (with optional `ca` + required
+// `server`) or `kubeconfig` (inline YAML) must be supplied — when
+// running in-cluster, both can be omitted and the api-server will
+// fall back to `kc.loadFromCluster()`.
+export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).extend({
+  type: z.literal(ApplianceBaseType.ApplianceKubernetes),
+  kubernetes: z.object({
+    // https://kube.example.com:6443. Required when authenticating
+    // with a bearer token. Omit when supplying `kubeconfig` or
+    // relying on in-cluster discovery.
+    server: z.string().optional(),
+    // base64-encoded CA bundle for the apiserver's TLS cert.
+    ca: z.string().optional(),
+    // ServiceAccount bearer token. Mutex with `kubeconfig`.
+    token: z.string().optional(),
+    // Inline kubeconfig YAML. Mutex with `server`/`token`.
+    kubeconfig: z.string().optional(),
+    // Namespace appliances deploy into. Defaults to `appliance`.
+    namespace: z.string().optional(),
+    // DNS suffix appended to per-appliance Ingress hostnames
+    // (`<stackName>.<suffix>`). No default — operators must supply
+    // a routable suffix for the cluster (e.g. `apps.example.com`).
+    hostnameSuffix: z.string().optional(),
+    // Ingress controller class. Cluster-dependent; common values
+    // are `nginx`, `traefik`, `alb`.
+    ingressClassName: z.string().optional(),
+    // Path mounted into the api-server pod that backs the
+    // FilesystemObjectStore. Typically a PVC mount such as `/data`.
+    dataDir: z.string(),
+    // Optional registry hint. When set, builds may tag/push images
+    // here before triggering a deploy — leaves the deploy itself
+    // pointing at the resulting `<registry.url>/<image>` reference.
+    registry: z
+      .object({
+        url: z.string(),
+        insecure: z.boolean().optional(),
+      })
+      .optional(),
+  }),
+});
+
+export type ApplianceKubernetesInput = z.infer<typeof applianceKubernetesInput>;
+
 export const applianceBaseConfigInput = z.discriminatedUnion('type', [
   applianceAwsPublicInput,
   applianceAwsVpcInput,
   applianceLocalInput,
+  applianceKubernetesInput,
 ]);
 
 export type ApplianceBaseConfigInput = z.infer<typeof applianceBaseConfigInput>;
@@ -155,6 +221,65 @@ export const applianceBaseConfig = z.object({
         .optional(),
     })
     .optional(),
+  // Generic Kubernetes runtime config. Present for
+  // `appliance-base-kubernetes` bases. Same role as `local` but the
+  // cluster connection is explicit (server URL + credentials or an
+  // inline kubeconfig) rather than discovered from the host's
+  // default kubeconfig. Omit all of `server`, `kubeconfig`, and
+  // `token` to fall back to `kc.loadFromCluster()` when running
+  // inside a pod with a mounted ServiceAccount.
+  kubernetes: z
+    .object({
+      server: z.string().optional(),
+      ca: z.string().optional(),
+      token: z.string().optional(),
+      kubeconfig: z.string().optional(),
+      namespace: z.string().optional(),
+      hostnameSuffix: z.string().optional(),
+      ingressClassName: z.string().optional(),
+      dataDir: z.string(),
+      registry: z
+        .object({
+          url: z.string(),
+          insecure: z.boolean().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
+
+/**
+ * Common Kubernetes deploy parameters extracted from either an
+ * `appliance-base-local` or `appliance-base-kubernetes` config.
+ * Returns null for non-Kubernetes bases (AWS). `dataDir` is required
+ * for both variants; the other fields fall back to consumer-side
+ * defaults when undefined.
+ */
+export function getKubernetesParams(config: ApplianceBaseConfig): {
+  dataDir: string;
+  namespace?: string;
+  hostnameSuffix?: string;
+  ingressClassName?: string;
+} | null {
+  if (config.type === ApplianceBaseType.ApplianceLocal) {
+    if (!config.local) return null;
+    return {
+      dataDir: config.local.dataDir,
+      namespace: config.local.cluster?.namespace,
+      hostnameSuffix: config.local.cluster?.hostnameSuffix,
+      ingressClassName: config.local.cluster?.ingressClassName,
+    };
+  }
+  if (config.type === ApplianceBaseType.ApplianceKubernetes) {
+    if (!config.kubernetes) return null;
+    return {
+      dataDir: config.kubernetes.dataDir,
+      namespace: config.kubernetes.namespace,
+      hostnameSuffix: config.kubernetes.hostnameSuffix,
+      ingressClassName: config.kubernetes.ingressClassName,
+    };
+  }
+  return null;
+}

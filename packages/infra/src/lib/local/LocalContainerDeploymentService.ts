@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { ApplianceBaseConfig, ApplianceBaseType } from '@appliance.sh/sdk';
+import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
 
 const execFileAsync = promisify(execFile);
 
@@ -86,9 +86,10 @@ export class LocalContainerDeploymentService {
   private readonly cluster: ClusterConfig;
 
   constructor(private readonly baseConfig: ApplianceBaseConfig) {
-    if (baseConfig.type !== ApplianceBaseType.ApplianceLocal) {
+    if (!isKubernetesBase(baseConfig)) {
       throw new Error(
-        `LocalContainerDeploymentService requires a base of type '${ApplianceBaseType.ApplianceLocal}', got '${baseConfig.type}'`
+        `LocalContainerDeploymentService requires a Kubernetes-driven base ` +
+          `('${ApplianceBaseType.ApplianceLocal}' or '${ApplianceBaseType.ApplianceKubernetes}'), got '${baseConfig.type}'`
       );
     }
     this.cluster = resolveClusterConfig(baseConfig);
@@ -338,13 +339,20 @@ export class LocalContainerDeploymentService {
 }
 
 function resolveClusterConfig(baseConfig: ApplianceBaseConfig): ClusterConfig {
-  const cluster = baseConfig.local?.cluster ?? {};
+  // Common k8s params (namespace, hostnameSuffix, ingressClassName)
+  // come from whichever subobject the variant uses. Local-only
+  // fields (k3d cluster name, host port) only have meaning for
+  // `appliance-base-local`; for generic Kubernetes bases they fall
+  // back to schema defaults that aren't actually used (the k3d
+  // host-port routing is replaced by external Ingress).
+  const k8s = getKubernetesParams(baseConfig);
+  const localCluster = baseConfig.local?.cluster ?? {};
   return {
-    clusterName: cluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
-    namespace: cluster.namespace ?? DEFAULT_LOCAL_NAMESPACE,
-    hostPort: cluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT,
-    hostnameSuffix: cluster.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
-    ingressClassName: cluster.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
+    clusterName: localCluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
+    namespace: k8s?.namespace ?? DEFAULT_LOCAL_NAMESPACE,
+    hostPort: localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT,
+    hostnameSuffix: k8s?.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
+    ingressClassName: k8s?.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
   };
 }
 

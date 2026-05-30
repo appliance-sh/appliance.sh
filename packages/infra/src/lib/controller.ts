@@ -9,12 +9,13 @@ export function lookup(baseConfig: ApplianceBaseConfigInput) {
     case ApplianceBaseType.ApplianceAwsVpc:
       return ApplianceBaseAwsVpc;
     case ApplianceBaseType.ApplianceLocal:
-      // Local bases don't have a Pulumi-managed baseline — the
-      // api-server's LocalContainerDeploymentService handles the
-      // whole deploy/destroy cycle directly via kubectl. The
+    case ApplianceBaseType.ApplianceKubernetes:
+      // Kubernetes-driven bases don't have a Pulumi-managed baseline —
+      // the api-server's KubernetesDeploymentService handles the
+      // whole deploy/destroy cycle directly via the k8s API. The
       // declarative `applianceInfra()` entrypoint is AWS-only.
       throw new Error(
-        'Local bases do not have a Pulumi-managed baseline; use the desktop to manage cluster lifecycle.'
+        `${baseConfig.type} bases do not have a Pulumi-managed baseline; use the desktop or apply the api-server manifest directly to manage cluster lifecycle.`
       );
   }
 }

@@ -1,6 +1,6 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
-import { applianceBaseConfig, ApplianceBaseType, applianceInput, BuildType } from '@appliance.sh/sdk';
+import { applianceBaseConfig, applianceInput, BuildType, isKubernetesBase } from '@appliance.sh/sdk';
 import type { ApplianceBaseConfig, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -65,14 +65,16 @@ export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
     const config = getBaseConfig();
 
-    // Local-base shortcut: only `remote-image` builds are supported
-    // (uploads have no S3 path). Pass the stored source through as
-    // imageUri verbatim — the local executor handles k3d import.
-    if (config.type === ApplianceBaseType.ApplianceLocal) {
+    // Kubernetes-base shortcut (local + generic k8s): only
+    // `remote-image` builds are supported (uploads have no S3 path).
+    // Pass the stored source through as imageUri verbatim — the
+    // KubernetesDeploymentService consumes the image reference
+    // directly (local k3d additionally handles k3d import host-side).
+    if (isKubernetesBase(config)) {
       const stored = await buildUploadService.get(buildId);
       if (!stored) throw new Error(`Build not found: ${buildId}`);
       if (stored.type !== BuildType.RemoteImage) {
-        throw new Error('Local bases only support remote-image builds');
+        throw new Error(`${config.type} bases only support remote-image builds`);
       }
       return { imageUri: stored.source };
     }

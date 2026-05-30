@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
-import { ApplianceBaseType, type ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { isKubernetesBase, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
 import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 
@@ -37,8 +37,10 @@ const STACK_NAME = 'bootstrap';
  * appliances on this base).
  */
 export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Promise<Phase1Output> {
-  if (input.base.config.type === ApplianceBaseType.ApplianceLocal) {
-    throw new Error('Local bases skip phase 1 — there is no Pulumi-managed baseline for the k8s-backed runtime.');
+  if (isKubernetesBase(input.base.config)) {
+    throw new Error(
+      `${input.base.config.type} bases skip phase 1 — there is no Pulumi-managed baseline for the k8s-backed runtime.`
+    );
   }
   const baseRegion = input.base.config.region;
   const workDir = path.join(opts.cacheDir, 'pulumi-workdir');

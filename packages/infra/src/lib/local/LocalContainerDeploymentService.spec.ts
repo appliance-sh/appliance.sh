@@ -14,7 +14,7 @@ import {
 } from './LocalContainerDeploymentService';
 
 describe('LocalContainerDeploymentService', () => {
-  it('refuses non-local base configs', () => {
+  it('refuses non-Kubernetes base configs', () => {
     expect(
       () =>
         new LocalContainerDeploymentService({
@@ -23,7 +23,23 @@ describe('LocalContainerDeploymentService', () => {
           stateBackendUrl: 's3://x',
           aws: { region: 'us-east-1', zoneId: 'Z1' },
         })
-    ).toThrow(/requires a base of type/);
+    ).toThrow(/requires a Kubernetes-driven base/);
+  });
+
+  it('accepts appliance-base-kubernetes configs', () => {
+    const service = new LocalContainerDeploymentService({
+      type: ApplianceBaseType.ApplianceKubernetes,
+      name: 'remote',
+      kubernetes: {
+        server: 'https://kube.example.com:6443',
+        token: 'sha256~abc',
+        dataDir: '/data',
+        namespace: 'apps',
+        hostnameSuffix: 'apps.example.com',
+        ingressClassName: 'nginx',
+      },
+    });
+    expect(service).toBeInstanceOf(LocalContainerDeploymentService);
   });
 
   it('applies defaults when cluster fields are omitted', () => {

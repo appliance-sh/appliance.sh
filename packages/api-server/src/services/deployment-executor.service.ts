@@ -1,11 +1,11 @@
 import {
   applianceBaseConfig,
-  ApplianceBaseType,
   Deployment,
   DeploymentStatus,
   DeploymentAction,
   EnvironmentStatus,
   deploymentInput,
+  isKubernetesBase,
   z,
 } from '@appliance.sh/sdk';
 import {
@@ -104,11 +104,12 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
     };
 
     let result;
-    if (baseConfig?.type === ApplianceBaseType.ApplianceLocal) {
-      // Local k8s runtime — no Pulumi, no cancel-aware stack handle.
-      // Build resolution still flows through buildService so the
-      // upstream upload/remote-image distinction is preserved, but
-      // the executor maps the resolved bits into LocalResolvedBuild
+    if (baseConfig && isKubernetesBase(baseConfig)) {
+      // Kubernetes-driven runtime (local k3d + generic external
+      // cluster) — no Pulumi, no cancel-aware stack handle. Build
+      // resolution still flows through buildService so the upstream
+      // upload/remote-image distinction is preserved, but the
+      // executor maps the resolved bits into LocalResolvedBuild
       // instead of the AWS-shaped ResolvedBuild.
       const local = new LocalContainerDeploymentService(baseConfig);
       result = await executeLocalAction(local, input, metadata, deployment.id);
