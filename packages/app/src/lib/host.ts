@@ -217,8 +217,12 @@ export interface ResolvedRuntimeConfig {
   nodePortMax: number;
   /** Host-side URL of the k3d-attached registry (e.g.
    *  `localhost:5050`). Build-side code pushes here; the cluster
-   *  pulls through the `--registry-use` mirror. */
-  registryUrl: string;
+   *  pulls through the `--registry-use` mirror. Optional —
+   *  undefined when no matching registry container exists for the
+   *  cluster (pre-Phase-3 runtimes, or after a manual registry
+   *  delete). Wizard checks for undefined and falls back to
+   *  `k3d image import`. */
+  registryUrl?: string;
   registryPort: number;
 }
 

@@ -1685,13 +1685,18 @@ struct ResolvedRuntimeConfig {
     /// `localhost:5050`). Build-side code (the desktop's
     /// build_and_import_image, future CLI push paths) tags + pushes
     /// against this address; the cluster pulls through the
-    /// `--registry-use` mirror configured at create time. None when
-    /// the runtime was created before Phase 3 (the import-via-k3d
-    /// fallback path still works in that case).
-    registry_url: String,
-    /// Bare host-side port the registry listens on. Surfaced
-    /// separately so the frontend can construct image refs without
-    /// re-parsing `registry_url`.
+    /// `--registry-use` mirror configured at create time. **None**
+    /// when no matching registry container exists for the cluster
+    /// (pre-Phase-3 runtimes, or after a manual `k3d registry delete`)
+    /// — the deploy wizard checks for None and falls back to
+    /// `k3d image import`. Populated by local_runtime_status after
+    /// it probes `k3d registry list`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_url: Option<String>,
+    /// Candidate host-side port the registry will be created on
+    /// (or matches an existing one on). Surfaced separately so the
+    /// frontend can show the planned port even when `registry_url`
+    /// is None pre-create.
     registry_port: u16,
 }
 
@@ -1760,9 +1765,40 @@ fn resolve_runtime_config(
         api_server_url,
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
         node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
-        registry_url: format!("localhost:{}", registry_port),
+        // resolve_runtime_config is sync and doesn't probe Docker;
+        // local_runtime_status fills this in after probing
+        // `k3d registry list` for the matching container. callers
+        // that bypass local_runtime_status (start_local_runtime uses
+        // registry_port directly) won't observe None during the
+        // create-then-probe window.
+        registry_url: None,
         registry_port,
     })
+}
+
+/// Probe `k3d registry list` for a registry attached to the named
+/// cluster. Returns `Some(localhost:<port>)` when one exists at the
+/// expected default port. Returns None on probe failure or absence —
+/// callers treat None as "no registry available, fall back to
+/// k3d image import".
+async fn probe_registry_url(cluster_name: &str, candidate_port: u16) -> Option<String> {
+    let (ok, stdout, _stderr) = run_status_command(&["k3d", "registry", "list", "-o", "json"])
+        .await
+        .ok()?;
+    if !ok {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let list = parsed.as_array()?;
+    let registry_name = registry_name_for_cluster(cluster_name);
+    let prefixed = format!("k3d-{}", registry_name);
+    for entry in list {
+        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if entry_name == registry_name || entry_name == prefixed {
+            return Some(format!("localhost:{}", candidate_port));
+        }
+    }
+    None
 }
 
 /// Default data dir for the local runtime. Shared with the CLI:
@@ -1931,13 +1967,18 @@ async fn local_runtime_status(
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
+    let mut cfg = resolve_runtime_config(&app, &input)?;
     let cluster = local_cluster_status(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
         ..Default::default()
     })
     .await?;
+    // Reflect registry presence in cfg.registry_url so the deploy
+    // wizard can fall back to `k3d image import` on pre-Phase-3
+    // clusters (no registry attached) instead of pushing to a port
+    // nobody's listening on.
+    cfg.registry_url = probe_registry_url(&cfg.cluster_name, cfg.registry_port).await;
     let api_server = current_api_server_status(&cfg).await;
     let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
     let cluster_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
@@ -2030,6 +2071,15 @@ async fn delete_local_runtime(
         return Err(format!("k3d cluster delete failed: {}", stderr));
     }
 
+    // Tear down the sibling registry too — `k3d cluster delete`
+    // doesn't touch standalone registries, so without this the
+    // registry container survives "Delete Runtime" and keeps
+    // holding the host port for the next start. Mirrors what
+    // delete_local_cluster already does. Best-effort: ignored on
+    // "not found" so a re-delete is a no-op.
+    let registry_name = registry_name_for_cluster(&cfg.cluster_name);
+    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
+
     // Forget the registered cluster + keychain entry; the data dir is
     // left alone (the user can wipe it manually if they want to start
     // fully fresh — we treat it as their data, like Docker volumes).
@@ -2110,22 +2160,25 @@ fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
     // ingressClassName are currently not user-overridable so the
     // defaults match LocalContainerDeploymentService's defaults; lift
     // them onto ResolvedRuntimeConfig if/when an override surface
-    // appears. registry.url stays as-is for now — no in-cluster
-    // consumer reads it, but if one is added it'll need the cluster-
-    // internal registry hostname, not the host's localhost.
+    // appears. The registry block is included only when a registry
+    // is actually present — no in-cluster consumer reads it today,
+    // but emitting `null` would be a future footgun.
+    let mut kubernetes = serde_json::json!({
+        "dataDir": "/data",
+        "namespace": cfg.namespace,
+        "hostnameSuffix": "appliance.localhost",
+        "ingressClassName": "traefik",
+    });
+    if let Some(registry_url) = cfg.registry_url.as_deref() {
+        kubernetes["registry"] = serde_json::json!({
+            "url": registry_url,
+            "insecure": true,
+        });
+    }
     serde_json::json!({
         "type": "appliance-base-kubernetes",
         "name": "local-runtime",
-        "kubernetes": {
-            "dataDir": "/data",
-            "namespace": cfg.namespace,
-            "hostnameSuffix": "appliance.localhost",
-            "ingressClassName": "traefik",
-            "registry": {
-                "url": cfg.registry_url,
-                "insecure": true,
-            }
-        }
+        "kubernetes": kubernetes,
     })
     .to_string()
 }
