@@ -2271,6 +2271,407 @@ async fn delete_local_runtime(
     local_runtime_status(app, state, Some(input)).await
 }
 
+// ============================================================
+// In-cluster api-server bootstrap
+//
+// Generates and applies the manifests that run api-server *inside*
+// the k3d cluster — Deployment + Service + Ingress, plus a
+// ServiceAccount/Role bound to the appliance namespace so the
+// in-cluster api-server can drive deploys against itself via
+// loadFromCluster(). The same image works against any kubernetes
+// cluster; here it's pulled from the cluster-attached registry.
+//
+// This path is the new model for `appliance-base-kubernetes` and
+// the eventual destination for `appliance-base-local` (Phase 5
+// rewires start_local_runtime to call into here instead of spawning
+// api-server as a host-side child process). Phase 4 lands the
+// machinery as an additive Tauri command so it can be exercised
+// independently before the cutover.
+// ============================================================
+
+const IN_CLUSTER_API_SERVER_NAMESPACE: &str = "appliance-system";
+const IN_CLUSTER_API_SERVER_NAME: &str = "api-server";
+const IN_CLUSTER_API_SERVER_HOSTNAME: &str = "api.appliance.localhost";
+const IN_CLUSTER_API_SERVER_PORT: u16 = 3000;
+const IN_CLUSTER_API_SERVER_IMAGE_NAME: &str = "appliance-api-server";
+const IN_CLUSTER_API_SERVER_IMAGE_TAG: &str = "latest";
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct BootstrapInClusterInput {
+    /// Override the runtime input that resolves cluster name, data
+    /// dir, registry port, etc. Defaults to the same resolution
+    /// `local_runtime_status` uses.
+    runtime: Option<LocalRuntimeInput>,
+    /// Override the api-server image reference. When omitted, the
+    /// image is assumed to live at
+    /// `<registry_url>/appliance-api-server:latest` in the
+    /// cluster-attached registry. Set this to point at a different
+    /// tag, or to a pre-pulled remote image (`ghcr.io/...`) for
+    /// production-style installs.
+    image: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapInClusterResult {
+    /// Hostname the in-cluster api-server is reachable at. Always
+    /// goes through the cluster's Ingress so the URL is identical
+    /// across local + remote deploys of the same image.
+    api_server_url: String,
+    /// API key minted via the bootstrap token. Caller persists this
+    /// alongside the cluster registration so the SDK can sign
+    /// subsequent requests.
+    api_key: ApiKey,
+}
+
+/// Build the JSON `APPLIANCE_BASE_CONFIG` env value for the in-cluster
+/// api-server. Uses the new `appliance-base-kubernetes` variant — the
+/// in-cluster api-server authenticates via its mounted ServiceAccount
+/// (loadFromCluster()), so we don't ship server/token here.
+fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
+    serde_json::json!({
+        "type": "appliance-base-kubernetes",
+        "name": "local-runtime",
+        "kubernetes": {
+            "dataDir": "/data",
+            "namespace": DEFAULT_LOCAL_NAMESPACE,
+            "hostnameSuffix": "appliance.localhost",
+            "ingressClassName": "traefik",
+            "registry": {
+                "url": cfg.registry_url,
+                "insecure": true,
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Compose the multi-document YAML manifest deployed via kubectl apply.
+/// Resource breakdown:
+///   * Namespace `appliance-system` — keeps system components separate
+///     from user appliances (which land in `appliance`).
+///   * ServiceAccount + ClusterRole + ClusterRoleBinding — grants the
+///     in-cluster api-server CRUD on the resources it manages
+///     (deployments, services, ingresses, pods, namespaces, secrets).
+///   * Secret — carries APPLIANCE_BASE_CONFIG + BOOTSTRAP_TOKEN so the
+///     deployment env doesn't expose them in `kubectl describe`.
+///   * PersistentVolume + PersistentVolumeClaim — hostPath-backed PV
+///     mounted into the api-server pod as /data, mirroring the
+///     filesystem object store path the cloud path stores in S3.
+///   * Deployment + Service + Ingress — the api-server itself, fronted
+///     by the cluster's Traefik at `api.appliance.localhost`.
+fn render_in_cluster_api_server_manifest(
+    cfg: &ResolvedRuntimeConfig,
+    image: &str,
+    bootstrap_token: &str,
+) -> String {
+    let base_config = build_in_cluster_base_config(cfg);
+    let escaped_base_config = base_config.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"");
+    let host_data_dir = &cfg.data_dir;
+    format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {name}
+  namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: appliance-api-server
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "services", "pods", "secrets", "configmaps", "persistentvolumeclaims", "events"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: appliance-api-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: appliance-api-server
+subjects:
+- kind: ServiceAccount
+  name: {name}
+  namespace: {ns}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {name}-config
+  namespace: {ns}
+type: Opaque
+stringData:
+  APPLIANCE_BASE_CONFIG: "{base_config}"
+  BOOTSTRAP_TOKEN: "{token}"
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: appliance-data
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  hostPath:
+    path: "{data_dir}"
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: appliance-data
+  namespace: {ns}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+  volumeName: appliance-data
+  storageClassName: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/name: {name}
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {name}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {name}
+        app.kubernetes.io/managed-by: appliance.sh
+    spec:
+      serviceAccountName: {name}
+      containers:
+      - name: api-server
+        image: "{image}"
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: {port}
+          name: http
+        envFrom:
+        - secretRef:
+            name: {name}-config
+        env:
+        - name: APPLIANCE_MODE
+          value: "server"
+        - name: PORT
+          value: "{port}"
+        - name: HOST
+          value: "0.0.0.0"
+        readinessProbe:
+          httpGet:
+            path: /bootstrap/status
+            port: {port}
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: appliance-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  selector:
+    app.kubernetes.io/name: {name}
+  ports:
+  - port: 80
+    targetPort: {port}
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: {hostname}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {name}
+            port:
+              number: 80
+"#,
+        ns = IN_CLUSTER_API_SERVER_NAMESPACE,
+        name = IN_CLUSTER_API_SERVER_NAME,
+        hostname = IN_CLUSTER_API_SERVER_HOSTNAME,
+        port = IN_CLUSTER_API_SERVER_PORT,
+        image = image,
+        data_dir = host_data_dir,
+        base_config = escaped_base_config,
+        token = bootstrap_token,
+    )
+}
+
+/// Pipe a manifest string into `kubectl apply -f -` so we don't have
+/// to materialize a temp file on disk. Surfaces stderr verbatim — the
+/// kubectl error messages are usually self-explanatory and the caller
+/// just bubbles them up to the UI.
+async fn kubectl_apply_manifest(manifest: &str) -> Result<(), String> {
+    let mut child = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn kubectl: {e}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "kubectl stdin unavailable".to_string())?;
+        stdin
+            .write_all(manifest.as_bytes())
+            .await
+            .map_err(|e| format!("write kubectl stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("kubectl wait: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl apply failed: {}", stderr));
+    }
+    Ok(())
+}
+
+/// Poll an arbitrary URL until /bootstrap/status returns 2xx, or the
+/// timeout elapses. Used to detect when the in-cluster api-server is
+/// past its readiness probe and reachable via the cluster's Ingress.
+async fn wait_for_api_server_url(url: &str, max_wait: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let target = format!("{}/bootstrap/status", url.trim_end_matches('/'));
+    loop {
+        let (ok, _stdout, _stderr) =
+            run_status_command(&["curl", "-fsS", "-o", "/dev/null", &target]).await?;
+        if ok {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "in-cluster api-server did not become reachable at {url} within {}s",
+                max_wait.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Mint an initial api key against the in-cluster api-server. Mirrors
+/// the host-side `mint_api_key` but takes the full URL instead of a
+/// loopback port — same `/bootstrap/create-key` route, same payload.
+async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, String> {
+    let url = format!("{}/bootstrap/create-key", api_server_url.trim_end_matches('/'));
+    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
+    let (ok, stdout, stderr) = run_status_command(&[
+        "curl",
+        "-fsS",
+        "-X",
+        "POST",
+        &url,
+        "-H",
+        &format!("X-Bootstrap-Token: {}", token),
+        "-H",
+        "content-type: application/json",
+        "-d",
+        &body,
+    ])
+    .await?;
+    if !ok {
+        return Err(format!("mint api key failed: {}", stderr));
+    }
+    serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
+}
+
+/// Apply the in-cluster api-server manifests to the running k3d
+/// cluster, wait for the deployment to become reachable, and mint
+/// the first API key. The api-server image must already be present
+/// in the cluster-attached registry (push via the desktop's
+/// build_and_import_image with `image_tag: appliance-api-server:latest`,
+/// or pre-pull from a remote registry). Idempotent: applying twice
+/// reconciles the manifest in place and mints a fresh key.
+#[tauri::command]
+async fn bootstrap_in_cluster_api_server(
+    app: AppHandle,
+    input: BootstrapInClusterInput,
+) -> Result<BootstrapInClusterResult, String> {
+    let runtime_input = input.runtime.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &runtime_input)?;
+    let image = input.image.unwrap_or_else(|| {
+        format!(
+            "{}/{}:{}",
+            cfg.registry_url, IN_CLUSTER_API_SERVER_IMAGE_NAME, IN_CLUSTER_API_SERVER_IMAGE_TAG
+        )
+    });
+    let bootstrap_token = random_bootstrap_token();
+    let manifest = render_in_cluster_api_server_manifest(&cfg, &image, &bootstrap_token);
+    kubectl_apply_manifest(&manifest).await?;
+
+    // The Ingress goes through the cluster's serverlb host port. URL
+    // shape mirrors what user appliances get (`<name>.appliance.localhost`)
+    // so the desktop's cluster registry can treat the in-cluster
+    // api-server as just-another-reachable-URL.
+    let api_server_url = if cfg.host_port == 80 {
+        format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
+    } else {
+        format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, cfg.host_port)
+    };
+    wait_for_api_server_url(&api_server_url, Duration::from_secs(60)).await?;
+    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token).await?;
+    Ok(BootstrapInClusterResult {
+        api_server_url,
+        api_key,
+    })
+}
+
 // --- kubectl-driven workloads & logs --------------------------------
 
 #[derive(Serialize, Default)]
@@ -3001,7 +3402,8 @@ pub fn run() {
             list_local_workloads,
             tail_local_pod_logs,
             read_appliance_manifest,
-            build_and_import_image
+            build_and_import_image,
+            bootstrap_in_cluster_api_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
