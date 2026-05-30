@@ -71,7 +71,10 @@ All models are defined as Zod schemas in `packages/sdk/src/models/`.
 
 - **aws-public**: `{ type: 'appliance-base-aws-public', name, region, dns: { domainName, createZone?, attachZone? } }`
 - **aws-vpc**: `{ type: 'appliance-base-aws-vpc', name, region, dns, vpc: { vpcCidr?, numberOfAzs? } | { vpcId } }`
-- **local**: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort? } }` — k3d-backed local runtime; no DNS, no region. Persisted form carries a `local.dataDir` for the filesystem object store.
+- **local**: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort?, hostnameSuffix?, ingressClassName? } }` — desktop-managed k3d runtime; no DNS, no region. Persisted form carries a `local.dataDir` for the filesystem object store.
+- **kubernetes**: `{ type: 'appliance-base-kubernetes', name, kubernetes: { server?, ca?, token?, kubeconfig?, namespace?, hostnameSuffix?, ingressClassName?, dataDir, registry? } }` — generic BYO Kubernetes cluster reachable via URL + credentials (or an inline kubeconfig, or in-cluster ServiceAccount when api-server is itself in the cluster).
+
+Both `local` and `kubernetes` are handled by the same `KubernetesDeploymentService` under the hood. Use the helper `isKubernetesBase(config)` (exported from `@appliance.sh/sdk`) to branch on "is this a k8s-driven base" rather than enumerating the two variants explicitly.
 
 ## API Reference
 
@@ -180,22 +183,49 @@ All state is stored via the `ObjectStore` interface (`get`, `set`, `delete`, `li
 
 The api-server picks the implementation at startup based on `APPLIANCE_BASE_CONFIG.type`.
 
-### Local Kubernetes runtime
+### Kubernetes runtime
 
-The `appliance-base-local` base swaps the cloud control plane for a k3d cluster running on the developer's machine:
+Two base variants drive deploys against a Kubernetes cluster instead of AWS:
 
-| Cloud component              | Local equivalent                                                                          |
-| ---------------------------- | ----------------------------------------------------------------------------------------- |
-| S3 object store              | `FilesystemObjectStore` rooted at `local.dataDir`                                         |
-| ECR image push (via `crane`) | `k3d image import` from the host Docker daemon                                            |
-| Pulumi-driven Lambda deploy  | `kubectl apply` of a Deployment + NodePort Service per appliance                          |
-| Lambda execution role        | k8s ServiceAccount (default)                                                              |
-| CloudFront / Route53         | k3d serverlb hairpins `host_port:80@loadbalancer` so services are reachable from the host |
-| Pulumi cancel / refresh      | No-op (kubectl-driven, the cluster state IS the source of truth)                          |
+- **`appliance-base-local`** — desktop-managed k3d cluster on the developer's machine. The desktop owns cluster lifecycle (start/stop/delete) and pre-flight (Docker, k3d, kubectl).
+- **`appliance-base-kubernetes`** — generic BYO cluster reachable via URL + credentials. The same machinery, but cluster lifecycle and credential provisioning are out of band.
 
-The `LocalContainerDeploymentService` in `@appliance.sh/infra/lib/local/` provides the same `deploy / destroy / refresh` surface as `ApplianceDeploymentService`. The api-server's `deployment-executor.service.ts` selects between them at run time based on `baseConfig.type`.
+Both variants flow through `KubernetesDeploymentService` (`@appliance.sh/infra/lib/local/`), which talks to the cluster via `@kubernetes/client-node` rather than shelling out to `kubectl`. Each appliance maps to a Deployment + Service (NodePort) + Ingress in the configured namespace; destroy tears the same trio down.
 
-Cluster lifecycle (`start_local_cluster`, `stop_local_cluster`, `delete_local_cluster`, `local_cluster_status`) is exposed to the desktop UI via Tauri commands in `packages/desktop/src-tauri/src/lib.rs` and surfaced in TypeScript as the optional `ConsoleHost.local` field. On macOS, the k3d nodes run inside the Docker Desktop / Colima micro-VM — that's the "underlying micro VM" layer the desktop orchestrates.
+| Cloud component              | Kubernetes equivalent                                                                                             |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| S3 object store              | `FilesystemObjectStore` rooted at `kubernetes.dataDir` (PVC-mounted in-cluster, host-path on local k3d)           |
+| ECR image push (via `crane`) | `docker push` to a cluster-attached registry (k3d local) or to any reachable registry (generic kubernetes)        |
+| Pulumi-driven Lambda deploy  | k8s API `apply` (read → create-or-replace) of a Deployment + Service + Ingress per appliance                      |
+| Lambda execution role        | k8s ServiceAccount (default)                                                                                      |
+| CloudFront / Route53         | Cluster Ingress (Traefik on k3d) at `<stack>.<hostnameSuffix>` — defaults to `*.appliance.localhost` on local k3d |
+| Pulumi cancel / refresh      | No-op — the k8s API state IS the source of truth                                                                  |
+
+#### Cluster connection
+
+`KubernetesDeploymentService` resolves a `KubeConfig` in this priority order:
+
+1. `appliance-base-kubernetes` with inline `kubernetes.kubeconfig` (YAML).
+2. `appliance-base-kubernetes` with `kubernetes.server` + `kubernetes.token` (+ optional `ca`).
+3. `appliance-base-kubernetes` with nothing set — `kc.loadFromCluster()` reads the mounted ServiceAccount (the path taken when api-server itself runs in-cluster).
+4. `appliance-base-local` — falls back to the host's default kubeconfig (preserves prior k3d-on-laptop behavior).
+
+#### In-cluster api-server
+
+api-server runs as a Kubernetes Deployment inside the cluster it manages — mirroring the AWS path where api-server is itself a deployed appliance. The desktop's `bootstrap_in_cluster_api_server` Tauri command applies the manifests (Deployment + Service + Ingress + ServiceAccount + ClusterRole(Binding) + Secret + PVC) into the `appliance-system` namespace, waits for the Ingress at `api.appliance.localhost` to be reachable, and mints the first API key via the bootstrap token.
+
+The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:latest`. For local iteration, build the image and push it to the cluster registry (`localhost:5050/appliance-api-server:<tag>`), then pass that ref through `BootstrapInClusterInput.image`.
+
+#### Local cluster lifecycle (k3d)
+
+Tauri commands in `packages/desktop/src-tauri/src/lib.rs` orchestrate the k3d cluster + sibling registry — both are host-OS concerns that don't fit in api-server:
+
+- `start_local_cluster` — creates the k3d cluster, ensures a sibling registry (`<cluster>-registry` on host port 5050) exists, attaches it via `--registry-use`, and publishes the cluster's serverlb on the desktop-configured host port.
+- `stop_local_cluster` / `delete_local_cluster` — symmetric teardown; delete also removes the matching registry.
+- `local_cluster_status` — exposes existence + running state for the UI's Start/Stop affordances.
+- `start_local_runtime` — composes the above with `bootstrap_in_cluster_api_server` and registers the resulting cluster (`http://api.appliance.localhost[:port]`) in the desktop's persisted config.
+
+On macOS, the k3d nodes and the registry both run inside the Docker Desktop / Colima micro-VM — that's the "underlying micro VM" layer the desktop orchestrates.
 
 ### Installing Appliance on AWS
 
