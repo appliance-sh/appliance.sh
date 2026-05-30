@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,8 +10,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::process::Command;
 
 // Keychain service is shared across all Appliance Desktop installs on
 // the machine. Each cluster's API key lives at account
@@ -1680,20 +1678,6 @@ struct LocalRuntimeStatus {
     cluster_id: Option<String>,
 }
 
-/// Held in Tauri's managed state. Wraps the spawned api-server
-/// child + metadata; `None` means no live api-server.
-struct ApiServerHandle {
-    child: Child,
-    port: u16,
-    log_path: PathBuf,
-    started_at: String,
-}
-
-#[derive(Default)]
-struct LocalRuntimeState {
-    api_server: Mutex<Option<ApiServerHandle>>,
-}
-
 fn resolve_runtime_config(
     app: &AppHandle,
     input: &LocalRuntimeInput,
@@ -1713,13 +1697,20 @@ fn resolve_runtime_config(
         Some(p) => PathBuf::from(p),
         None => default_local_runtime_dir(app)?,
     };
+    // api-server lives in-cluster behind the Ingress, reached via the
+    // k3d serverlb at `host_port`. URL omits the port when it's 80.
+    let api_server_url = if host_port == 80 {
+        format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
+    } else {
+        format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, host_port)
+    };
     Ok(ResolvedRuntimeConfig {
         cluster_name,
         namespace,
         host_port,
         api_port,
         data_dir: data_dir.to_string_lossy().to_string(),
-        api_server_url: format!("http://localhost:{}", api_port),
+        api_server_url,
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
         node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
         registry_url: format!("localhost:{}", registry_port),
@@ -1763,145 +1754,11 @@ fn default_local_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     legacy.ok_or_else(|| "could not resolve a local-runtime data dir (no $HOME, no app data dir)".to_string())
 }
 
-/// Probe TCP + a known endpoint to decide whether a previously-spawned
-/// (or externally-running) api-server is alive on `port`. Used both
-/// for the live-handle case and to detect leftovers after a desktop
-/// restart with no managed handle.
-/// Best-effort: which PID is listening on `port`? Used when we see an
-/// api-server we didn't spawn (e.g. the user started it from the CLI
-/// during a demo) so the desktop can still display + stop it. Shells
-/// out to `lsof` because that's already on every macOS/Linux box that
-/// can run k3d; returns None on Windows or when lsof is absent.
-async fn find_pid_listening_on_port(port: u16) -> Option<u32> {
-    let (ok, stdout, _stderr) = run_status_command(&[
-        "lsof",
-        "-ti",
-        &format!("tcp:{}", port),
-        "-sTCP:LISTEN",
-    ])
-    .await
-    .ok()?;
-    if !ok {
-        return None;
-    }
-    stdout.lines().next()?.trim().parse::<u32>().ok()
-}
-
-async fn probe_api_server(port: u16) -> bool {
-    // Off the tokio runtime so we don't need the `net` feature; a 200ms
-    // connect_timeout is plenty against loopback.
-    tokio::task::spawn_blocking(move || {
-        let addr = format!("127.0.0.1:{}", port);
-        let sock_addr: std::net::SocketAddr = match addr.parse() {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(200)).is_ok()
-    })
-    .await
-    .unwrap_or(false)
-}
-
-fn api_server_entry() -> Result<(PathBuf, Vec<String>), String> {
-    // Prefer the compiled dist; fall back to `tsx src/main.ts` for dev
-    // builds where the user runs `pnpm tauri dev` without first
-    // running `pnpm --filter @appliance.sh/api-server build`.
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("api-server");
-    let dist = base.join("dist").join("src").join("main.js");
-    if dist.exists() {
-        return Ok((PathBuf::from("node"), vec![dist.to_string_lossy().to_string()]));
-    }
-    let src = base.join("src").join("main.ts");
-    if !src.exists() {
-        return Err(format!(
-            "api-server entry point not found (looked at {} and {})",
-            dist.display(),
-            src.display()
-        ));
-    }
-    let tsx = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("node_modules")
-        .join(".bin")
-        .join("tsx");
-    if !tsx.exists() {
-        return Err(format!(
-            "api-server dist not built and tsx fallback missing at {}",
-            tsx.display()
-        ));
-    }
-    Ok((tsx, vec![src.to_string_lossy().to_string()]))
-}
-
-/// Build the JSON `APPLIANCE_BASE_CONFIG` env value the api-server
-/// expects. The local-base schema is defined in
-/// packages/sdk/src/models/appliance-base.ts.
-fn build_base_config(cfg: &ResolvedRuntimeConfig) -> String {
-    serde_json::json!({
-        "type": "appliance-base-local",
-        "name": "local-runtime",
-        "local": {
-            "dataDir": cfg.data_dir,
-            "cluster": {
-                "clusterName": cfg.cluster_name,
-                "namespace": cfg.namespace,
-                "hostPort": cfg.host_port,
-            }
-        }
-    })
-    .to_string()
-}
-
 /// Generate a short opaque token used as BOOTSTRAP_TOKEN for the
-/// spawned api-server. It's only valid for the lifetime of this
-/// process — once we mint an api key, the token is forgotten.
+/// in-cluster api-server. Valid only for the lifetime of this
+/// bootstrap call — once we mint an api key, the token is forgotten.
 fn random_bootstrap_token() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")
-}
-
-/// Mint an initial api key via the api-server's bootstrap route.
-/// Idempotent at the SERVER level (`/bootstrap/status` reports whether
-/// any key already exists), but creates a fresh "Local Runtime" named
-/// key each time it's called.
-async fn mint_api_key(api_port: u16, token: &str) -> Result<ApiKey, String> {
-    let url = format!("http://localhost:{}/bootstrap/create-key", api_port);
-    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
-    let (ok, stdout, stderr) = run_status_command(&[
-        "curl",
-        "-fsS",
-        "-X",
-        "POST",
-        &url,
-        "-H",
-        &format!("X-Bootstrap-Token: {}", token),
-        "-H",
-        "content-type: application/json",
-        "-d",
-        &body,
-    ])
-    .await?;
-    if !ok {
-        return Err(format!("mint api key failed: {}", stderr));
-    }
-    serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
-}
-
-async fn wait_for_api_server(port: u16, max_wait: Duration) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + max_wait;
-    loop {
-        if probe_api_server(port).await {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("api-server did not come up on :{} in time", port));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
 }
 
 /// Find the persisted "Local Runtime" cluster (if any). Identified by
@@ -2000,78 +1857,30 @@ fn unregister_local_runtime_cluster(app: &AppHandle, api_server_url: &str) -> Re
     write_persisted_config(app, &persisted)
 }
 
-fn tail_log(path: &Path, lines: usize) -> String {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return String::new();
+/// Probe the in-cluster api-server's `/bootstrap/status` endpoint
+/// through the cluster's Ingress. No PID, no log file — the
+/// in-cluster api-server is a k8s Pod, its liveness is the apiserver's
+/// concern. The UI gets `running: true/false` and uses the URL for
+/// any "see logs" link.
+async fn current_api_server_status(cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
+    let target = format!("{}/bootstrap/status", cfg.api_server_url.trim_end_matches('/'));
+    let running = match run_status_command(&["curl", "-fsS", "-o", "/dev/null", &target]).await {
+        Ok((ok, _, _)) => ok,
+        Err(_) => false,
     };
-    let collected: Vec<&str> = raw.lines().rev().take(lines).collect();
-    collected.into_iter().rev().collect::<Vec<_>>().join("\n")
-}
-
-async fn current_api_server_status(state: &LocalRuntimeState, cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
-    let mut guard = state.api_server.lock().await;
-    if let Some(handle) = guard.as_mut() {
-        // try_wait drains the exit status without blocking. If the
-        // child has exited, drop the handle so subsequent calls see
-        // a clean Stopped state.
-        match handle.child.try_wait() {
-            Ok(Some(_status)) => {
-                let stale = guard.take().expect("guard checked above");
-                let msg = format!(
-                    "api-server exited unexpectedly. Tail of {}:\n{}",
-                    stale.log_path.display(),
-                    tail_log(&stale.log_path, 40)
-                );
-                return ApiServerStatus {
-                    running: false,
-                    message: Some(msg),
-                    ..Default::default()
-                };
-            }
-            Ok(None) => {
-                return ApiServerStatus {
-                    running: true,
-                    pid: handle.child.id(),
-                    port: Some(handle.port),
-                    started_at: Some(handle.started_at.clone()),
-                    log_path: Some(handle.log_path.to_string_lossy().to_string()),
-                    message: None,
-                };
-            }
-            Err(e) => {
-                return ApiServerStatus {
-                    running: false,
-                    message: Some(format!("try_wait: {e}")),
-                    ..Default::default()
-                };
-            }
-        }
+    ApiServerStatus {
+        running,
+        port: None,
+        pid: None,
+        started_at: None,
+        log_path: None,
+        message: None,
     }
-    drop(guard);
-
-    // No managed handle — check for an externally-launched api-server
-    // (e.g. the CLI demo started it, or a previous desktop session
-    // exited without stopping the sidecar). Adopt it: look up the PID
-    // via lsof so Stop still works, and report a clean Running state
-    // rather than a scary "not managed by this desktop" warning.
-    if probe_api_server(cfg.api_port).await {
-        let pid = find_pid_listening_on_port(cfg.api_port).await;
-        return ApiServerStatus {
-            running: true,
-            port: Some(cfg.api_port),
-            pid,
-            started_at: None,
-            log_path: None,
-            message: None,
-        };
-    }
-    ApiServerStatus::default()
 }
 
 #[tauri::command]
 async fn local_runtime_status(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
@@ -2081,7 +1890,7 @@ async fn local_runtime_status(
         host_port: Some(cfg.host_port),
     })
     .await?;
-    let api_server = current_api_server_status(state.inner(), &cfg).await;
+    let api_server = current_api_server_status(&cfg).await;
     let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
     let cluster_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
     Ok(LocalRuntimeStatus {
@@ -2095,167 +1904,75 @@ async fn local_runtime_status(
 #[tauri::command]
 async fn start_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    // Phase 1: cluster
+    // Phase 1: cluster (k3d + attached registry)
     let _ = start_local_cluster(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
     })
     .await?;
 
-    // Phase 2: api-server. Skip if a managed handle is already alive,
-    // OR if an externally-launched one (CLI demo, previous desktop
-    // session) is already serving on the port — adopting beats double-
-    // spawning + EADDRINUSE.
-    let managed_alive = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(handle) = guard.as_mut() {
-            matches!(handle.child.try_wait(), Ok(None))
-        } else {
-            false
-        }
+    // Phase 2: api-server in-cluster. Idempotent at the cluster level
+    // (kubectl apply reconciles in place) — but each call mints a
+    // fresh bootstrap key, which we then write over any prior
+    // registration. Skip if the in-cluster api-server is already
+    // reachable AND we have a registered cluster + working key on
+    // file; the existing key keeps working across desktop restarts.
+    let already_running = current_api_server_status(&cfg).await.running;
+    let already_registered = {
+        let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
+        find_local_runtime_cluster(&persisted, &cfg.api_server_url).is_some()
     };
-    let already_alive = managed_alive || probe_api_server(cfg.api_port).await;
 
-    if !already_alive {
-        // Drop any stale exited handle before spawning.
-        {
-            let mut guard = state.api_server.lock().await;
-            *guard = None;
-        }
-        let token = random_bootstrap_token();
-        let (program, base_args) = api_server_entry()?;
+    if !already_running || !already_registered {
         let data_dir = PathBuf::from(&cfg.data_dir);
         fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-        let log_dir = app
-            .path()
-            .app_log_dir()
-            .map_err(|e| format!("resolve log dir: {e}"))?;
-        fs::create_dir_all(&log_dir).map_err(|e| format!("create log dir: {e}"))?;
-        let log_path = log_dir.join("local-api-server.log");
-        // Truncate on each start so the log shows only the current
-        // run — keeps the "tail of log" error path useful instead of
-        // showing stale failures from a prior session.
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .map_err(|e| format!("open log file: {e}"))?;
-        let log_file_err = log_file.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
 
-        let mut cmd = Command::new(&program);
-        cmd.args(&base_args)
-            .env("APPLIANCE_MODE", "server")
-            .env("APPLIANCE_BASE_CONFIG", build_base_config(&cfg))
-            .env("BOOTSTRAP_TOKEN", &token)
-            .env("PORT", cfg.api_port.to_string())
-            .env("HOST", "127.0.0.1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
-            .kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn api-server: {e}"))?;
-        let started_at = chrono::Utc::now().to_rfc3339();
-        {
-            let mut guard = state.api_server.lock().await;
-            *guard = Some(ApiServerHandle {
-                child,
-                port: cfg.api_port,
-                log_path: log_path.clone(),
-                started_at,
-            });
-        }
+        let result = bootstrap_in_cluster_api_server(
+            app.clone(),
+            BootstrapInClusterInput {
+                runtime: Some(input.clone()),
+                image: None,
+            },
+        )
+        .await?;
 
-        if let Err(e) = wait_for_api_server(cfg.api_port, Duration::from_secs(25)).await {
-            // Reap the handle so the next start retries cleanly.
-            if let Some(mut handle) = state.api_server.lock().await.take() {
-                let _ = handle.child.start_kill();
-            }
-            return Err(format!(
-                "{e}. Tail of {}:\n{}",
-                log_path.display(),
-                tail_log(&log_path, 40)
-            ));
-        }
-
-        // Phase 3: mint key + register cluster (idempotent — if a
-        // matching cluster already exists, we just refresh its key).
-        let api_key = mint_api_key(cfg.api_port, &token).await?;
-        register_local_runtime_cluster(&app, &cfg, &api_key).map_err(|e| e.to_string())?;
+        register_local_runtime_cluster(&app, &cfg, &result.api_key).map_err(|e| e.to_string())?;
     }
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
 }
 
 #[tauri::command]
 async fn stop_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    // Kill the api-server first so it doesn't error-log when the
-    // cluster's apiserver vanishes underneath it.
-    let had_managed = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(mut handle) = guard.take() {
-            let _ = handle.child.kill().await;
-            true
-        } else {
-            false
-        }
-    };
-    // Fallback for adopted (CLI-launched) api-servers: there's no Child
-    // handle to kill, so look up the PID listening on our port and
-    // SIGTERM it. The api-server traps SIGTERM and exits cleanly.
-    if !had_managed {
-        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
-            let _ = run_status_command(&["kill", &pid.to_string()]).await;
-        }
-    }
-
+    // Stopping the cluster takes the in-cluster api-server pod with
+    // it — no host-side process to kill anymore.
     let (ok, _stdout, stderr) =
         run_status_command(&["k3d", "cluster", "stop", &cfg.cluster_name]).await?;
     if !ok && !stderr.contains("not found") {
         return Err(format!("k3d cluster stop failed: {}", stderr));
     }
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
 }
 
 #[tauri::command]
 async fn delete_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
-
-    let had_managed = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(mut handle) = guard.take() {
-            let _ = handle.child.kill().await;
-            true
-        } else {
-            false
-        }
-    };
-    if !had_managed {
-        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
-            let _ = run_status_command(&["kill", &pid.to_string()]).await;
-        }
-    }
 
     let (ok, _stdout, stderr) =
         run_status_command(&["k3d", "cluster", "delete", &cfg.cluster_name]).await?;
@@ -2268,7 +1985,7 @@ async fn delete_local_runtime(
     // fully fresh — we treat it as their data, like Docker volumes).
     unregister_local_runtime_cluster(&app, &cfg.api_server_url).map_err(|e| e.to_string())?;
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
 }
 
 // ============================================================
@@ -2293,8 +2010,14 @@ const IN_CLUSTER_API_SERVER_NAMESPACE: &str = "appliance-system";
 const IN_CLUSTER_API_SERVER_NAME: &str = "api-server";
 const IN_CLUSTER_API_SERVER_HOSTNAME: &str = "api.appliance.localhost";
 const IN_CLUSTER_API_SERVER_PORT: u16 = 3000;
-const IN_CLUSTER_API_SERVER_IMAGE_NAME: &str = "appliance-api-server";
-const IN_CLUSTER_API_SERVER_IMAGE_TAG: &str = "latest";
+// Default api-server image. Cluster pulls this directly from ghcr
+// on first deploy; subsequent pod restarts reuse the cached image
+// thanks to `imagePullPolicy: IfNotPresent`. Override via the
+// `image` field on `BootstrapInClusterInput` for local dev iteration
+// (build → push to <registry_url>/appliance-api-server:<tag>, pass
+// that ref through). The tag tracks the SDK release stream — bump
+// in lockstep with packages/sdk's published version.
+const IN_CLUSTER_API_SERVER_DEFAULT_IMAGE: &str = "ghcr.io/appliance-sh/api-server:latest";
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -2645,12 +2368,9 @@ async fn bootstrap_in_cluster_api_server(
 ) -> Result<BootstrapInClusterResult, String> {
     let runtime_input = input.runtime.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &runtime_input)?;
-    let image = input.image.unwrap_or_else(|| {
-        format!(
-            "{}/{}:{}",
-            cfg.registry_url, IN_CLUSTER_API_SERVER_IMAGE_NAME, IN_CLUSTER_API_SERVER_IMAGE_TAG
-        )
-    });
+    let image = input
+        .image
+        .unwrap_or_else(|| IN_CLUSTER_API_SERVER_DEFAULT_IMAGE.to_string());
     let bootstrap_token = random_bootstrap_token();
     let manifest = render_in_cluster_api_server_manifest(&cfg, &image, &bootstrap_token);
     kubectl_apply_manifest(&manifest).await?;
@@ -3375,7 +3095,6 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(Arc::new(LocalRuntimeState::default()))
         .invoke_handler(tauri::generate_handler![
             get_config,
             add_cluster,
