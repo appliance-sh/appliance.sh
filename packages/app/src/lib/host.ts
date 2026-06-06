@@ -199,19 +199,29 @@ export interface LocalRuntimeInput {
   clusterName?: string;
   namespace?: string;
   hostPort?: number;
-  apiPort?: number;
   dataDir?: string;
+  /** Host-side port the k3d-attached registry publishes on. Falls
+   *  back to the Tauri-side default (5050) when omitted. */
+  registryPort?: number;
 }
 
 export interface ResolvedRuntimeConfig {
   clusterName: string;
   namespace: string;
   hostPort: number;
-  apiPort: number;
   dataDir: string;
   apiServerUrl: string;
   nodePortMin: number;
   nodePortMax: number;
+  /** Host-side URL of the k3d-attached registry (e.g.
+   *  `localhost:5050`). Build-side code pushes here; the cluster
+   *  pulls through the `--registry-use` mirror. Optional —
+   *  undefined when no matching registry container exists for the
+   *  cluster (pre-Phase-3 runtimes, or after a manual registry
+   *  delete). Wizard checks for undefined and falls back to
+   *  `k3d image import`. */
+  registryUrl?: string;
+  registryPort: number;
 }
 
 export interface ApiServerStatus {
@@ -296,6 +306,13 @@ export interface LocalBuildAndImportInput {
   platform?: string;
   /** k3d cluster to import into; defaults to the active local runtime cluster. */
   clusterName?: string;
+  /** Host-side registry URL the cluster pulls through (e.g.
+   *  `localhost:5050`). When set, the image is tagged
+   *  `<registryUrl>/<imageTag>` and pushed via `docker push` instead
+   *  of `k3d image import`. The resolved Promise then resolves with
+   *  the registry-qualified ref so callers can hand it straight to
+   *  api-server. Read from `LocalRuntimeStatus.config.registryUrl`. */
+  registryUrl?: string;
 }
 
 /** Streaming log event emitted while a child process runs. */
@@ -405,6 +422,38 @@ export interface LocalRuntimeHost {
   /** docker build → k3d image import, streaming each command's output
    *  to onEvent. Resolves with the resulting image tag on success. */
   buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
+  /** Apply the in-cluster api-server manifest to the local cluster
+   *  (Deployment + Service + Ingress + RBAC + PVC), wait for it to
+   *  become reachable at `api.appliance.localhost`, mint a first
+   *  API key via the bootstrap token. The api-server image must
+   *  already live in the cluster-attached registry (pushed via
+   *  `buildAndImportImage` with the appliance-api-server context).
+   *  Returns the resulting URL + key. Idempotent — safe to call
+   *  again to reconcile drift. */
+  bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult>;
+}
+
+export interface BootstrapInClusterInput {
+  /** Override the runtime input used to resolve cluster name / data
+   *  dir / registry. Defaults to the same resolution
+   *  `runtimeStatus()` uses. */
+  runtime?: LocalRuntimeInput;
+  /** Override the api-server image reference. Defaults to
+   *  `ghcr.io/appliance-sh/api-server:latest` (pulled from ghcr on
+   *  first deploy). For local dev iteration, push a built image to
+   *  `<registryUrl>/appliance-api-server:<tag>` and pass that ref
+   *  through here. */
+  image?: string;
+}
+
+export interface BootstrapInClusterResult {
+  /** URL at which the in-cluster api-server is reachable
+   *  (`http://api.appliance.localhost[:port]`). */
+  apiServerUrl: string;
+  /** API key minted via the bootstrap token — caller persists it
+   *  alongside the cluster registration. Shape matches what
+   *  api-server's POST /bootstrap/create-key returns. */
+  apiKey: { id: string; secret: string };
 }
 
 export type {

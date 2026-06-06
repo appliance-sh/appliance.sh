@@ -1,3 +1,4 @@
+import * as k8s from '@kubernetes/client-node';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
@@ -70,29 +71,49 @@ interface ClusterConfig {
 const DEFAULT_LOCAL_HOSTNAME_SUFFIX = 'appliance.localhost';
 const DEFAULT_LOCAL_INGRESS_CLASS = 'traefik';
 
+// Rollout-wait budget. Matches the previous kubectl-shell timeout
+// (`--timeout=120s`) so behaviour at the deploy boundary is
+// unchanged. Polled every ROLLOUT_POLL_INTERVAL_MS until the
+// Deployment's observedGeneration catches up and all replicas report
+// Ready, or this budget elapses.
+const ROLLOUT_TIMEOUT_MS = 120_000;
+const ROLLOUT_POLL_INTERVAL_MS = 1_000;
+
 /**
- * Local-runtime counterpart to ApplianceDeploymentService. Maps each
- * deploy to a single Kubernetes Deployment + Service inside a
- * developer-side k3d cluster. Destroy tears the same pair down.
+ * Drives appliance deploys against an arbitrary Kubernetes cluster
+ * (`appliance-base-local` k3d, or `appliance-base-kubernetes` for any
+ * cluster reachable via URL + credentials). Maps each deploy to a
+ * Deployment + Service + Ingress trio in the configured namespace;
+ * destroy tears the same trio down.
  *
- * Cluster lifecycle (create/start/stop) is the desktop's
- * responsibility — see Tauri's `start_local_cluster` etc. This
- * service assumes `kubectl` already has access to the running
- * cluster and that the named image is importable (either built on
- * the host Docker daemon and pre-imported via `k3d image import`,
- * or pullable by the cluster directly).
+ * Talks to the cluster via `@kubernetes/client-node` rather than
+ * shelling out to `kubectl`, so the same code path works whether
+ * api-server runs on the host pointing at k3d, in-cluster via a
+ * ServiceAccount, or against a remote control plane.
+ *
+ * Cluster lifecycle (create/start/stop of the underlying k3d cluster)
+ * remains the desktop's responsibility — see Tauri's
+ * `start_local_cluster` etc.
  */
-export class LocalContainerDeploymentService {
+export class KubernetesDeploymentService {
   private readonly cluster: ClusterConfig;
+  private readonly kc: k8s.KubeConfig;
+  private readonly objects: k8s.KubernetesObjectApi;
+  private readonly core: k8s.CoreV1Api;
+  private readonly apps: k8s.AppsV1Api;
 
   constructor(private readonly baseConfig: ApplianceBaseConfig) {
     if (!isKubernetesBase(baseConfig)) {
       throw new Error(
-        `LocalContainerDeploymentService requires a Kubernetes-driven base ` +
+        `KubernetesDeploymentService requires a Kubernetes-driven base ` +
           `('${ApplianceBaseType.ApplianceLocal}' or '${ApplianceBaseType.ApplianceKubernetes}'), got '${baseConfig.type}'`
       );
     }
     this.cluster = resolveClusterConfig(baseConfig);
+    this.kc = createKubeConfig(baseConfig);
+    this.objects = k8s.KubernetesObjectApi.makeApiClient(this.kc);
+    this.core = this.kc.makeApiClient(k8s.CoreV1Api);
+    this.apps = this.kc.makeApiClient(k8s.AppsV1Api);
   }
 
   async deploy(
@@ -102,8 +123,9 @@ export class LocalContainerDeploymentService {
   ): Promise<LocalDeploymentResult> {
     await this.ensureNamespace();
     // Best-effort import: silently skips when the image is not in the
-    // host Docker daemon — k3s will then try a registry pull, which
-    // is the desired behaviour for remote images (ghcr.io/...).
+    // host Docker daemon, the k3d CLI is missing, or the base is a
+    // generic (non-k3d) Kubernetes cluster. For those cases k8s falls
+    // back to a registry pull, which is the desired behaviour.
     await this.maybeImportImage(build.imageUri);
 
     const nodePort = deterministicNodePort(stackName);
@@ -121,7 +143,10 @@ export class LocalContainerDeploymentService {
     });
 
     const before = await this.getDeploymentImage(stackName);
-    await this.kubectlApply(manifest);
+    const objects = k8s.loadAllYaml(manifest) as k8s.KubernetesObject[];
+    for (const obj of objects) {
+      await this.applyObject(obj);
+    }
     await this.waitForRollout(stackName);
     // Read back the live NodePort — if k8s accepted our pinned value
     // it'll match `nodePort`; if not (e.g. collision), it picks one
@@ -148,14 +173,14 @@ export class LocalContainerDeploymentService {
 
   async destroy(stackName: string): Promise<LocalDeploymentResult> {
     const ns = this.cluster.namespace;
-    const existed = await this.resourceExists('deployment', stackName);
+    const existed = await this.resourceExists('Deployment', 'apps/v1', stackName);
 
     // Delete all three resources; ignoring `not found` is the
     // idempotent path because any of them may already be missing from
     // a previous partial destroy.
-    await this.kubectlDeleteIfExists('ingress', stackName);
-    await this.kubectlDeleteIfExists('service', stackName);
-    await this.kubectlDeleteIfExists('deployment', stackName);
+    await this.deleteIfExists('Ingress', 'networking.k8s.io/v1', stackName);
+    await this.deleteIfExists('Service', 'v1', stackName);
+    await this.deleteIfExists('Deployment', 'apps/v1', stackName);
 
     return {
       action: 'destroy',
@@ -171,7 +196,7 @@ export class LocalContainerDeploymentService {
     // deploy — the live state of the cluster IS the source of truth.
     // We report a no-op so the api-server's executor can settle the
     // deployment record without surfacing a misleading error.
-    const exists = await this.resourceExists('deployment', stackName);
+    const exists = await this.resourceExists('Deployment', 'apps/v1', stackName);
     return {
       action: 'refresh',
       ok: true,
@@ -183,17 +208,8 @@ export class LocalContainerDeploymentService {
 
   async getDeploymentImage(stackName: string): Promise<string | undefined> {
     try {
-      const { stdout } = await this.kubectl([
-        '-n',
-        this.cluster.namespace,
-        'get',
-        'deployment',
-        stackName,
-        '-o',
-        'jsonpath={.spec.template.spec.containers[0].image}',
-      ]);
-      const trimmed = stdout.trim();
-      return trimmed || undefined;
+      const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
+      return dep.spec?.template?.spec?.containers?.[0]?.image ?? undefined;
     } catch (err) {
       if (isNotFoundError(err)) return undefined;
       throw err;
@@ -210,20 +226,10 @@ export class LocalContainerDeploymentService {
    */
   async getDeploymentEnv(stackName: string): Promise<Record<string, string> | undefined> {
     try {
-      const { stdout } = await this.kubectl([
-        '-n',
-        this.cluster.namespace,
-        'get',
-        'deployment',
-        stackName,
-        '-o',
-        'jsonpath={.spec.template.spec.containers[0].env}',
-      ]);
-      const trimmed = stdout.trim();
-      if (!trimmed) return {};
-      const parsed = JSON.parse(trimmed) as Array<{ name?: string; value?: string }>;
+      const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
+      const envList = dep.spec?.template?.spec?.containers?.[0]?.env ?? [];
       const out: Record<string, string> = {};
-      for (const entry of parsed) {
+      for (const entry of envList) {
         if (entry?.name && typeof entry.value === 'string') out[entry.name] = entry.value;
       }
       return out;
@@ -234,12 +240,22 @@ export class LocalContainerDeploymentService {
   }
 
   private async ensureNamespace(): Promise<void> {
-    const exists = await this.resourceExists('namespace', this.cluster.namespace, { clusterScoped: true });
-    if (exists) return;
-    await this.kubectl(['create', 'namespace', this.cluster.namespace]);
+    try {
+      await this.core.readNamespace({ name: this.cluster.namespace });
+      return;
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
+    }
+    await this.core.createNamespace({
+      body: { apiVersion: 'v1', kind: 'Namespace', metadata: { name: this.cluster.namespace } },
+    });
   }
 
   private async maybeImportImage(image: string): Promise<void> {
+    // Image-import is only meaningful for the k3d-on-laptop runtime.
+    // Generic Kubernetes bases must have the image already pushed to
+    // a registry the cluster can reach.
+    if (this.baseConfig.type !== ApplianceBaseType.ApplianceLocal) return;
     // Only push host-built images into k3d. Anything with a registry
     // host (a `.` or `:port` before the first slash) is treated as
     // remote-pull territory and skipped.
@@ -260,54 +276,101 @@ export class LocalContainerDeploymentService {
     }
   }
 
-  private async kubectlApply(manifest: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const child = execFile(
-        'kubectl',
-        ['apply', '-f', '-'],
-        { maxBuffer: 16 * 1024 * 1024 },
-        (err, stdout, stderr) => {
-          if (err) {
-            const message = stderr || stdout || (err as Error).message;
-            reject(new Error(`kubectl apply failed: ${message}`));
-            return;
-          }
-          resolve();
-        }
-      );
-      child.stdin?.end(manifest);
-    });
-  }
-
-  private async waitForRollout(stackName: string): Promise<void> {
+  /**
+   * `kubectl apply` equivalent for a single object: read existing,
+   * replace on hit (preserving immutable fields like Service.clusterIP),
+   * create on miss. Strategic-merge would be more accurate for partial
+   * field updates, but the manifest we send is the complete intended
+   * state for these resources, so a full replace is semantically
+   * equivalent and avoids the per-resource patch-type plumbing.
+   */
+  private async applyObject(desired: k8s.KubernetesObject): Promise<void> {
+    if (!desired.metadata?.name) {
+      throw new Error(`KubernetesObject of kind '${desired.kind}' is missing metadata.name`);
+    }
+    // KubernetesObjectApi.read() takes a header-shaped object (the
+    // `KubernetesObjectHeader` alias the library doesn't re-export);
+    // construct it inline so we don't depend on the alias name.
+    const header = {
+      apiVersion: desired.apiVersion ?? '',
+      kind: desired.kind ?? '',
+      metadata: { name: desired.metadata.name, namespace: desired.metadata.namespace },
+    };
     try {
-      await this.kubectl([
-        '-n',
-        this.cluster.namespace,
-        'rollout',
-        'status',
-        `deployment/${stackName}`,
-        '--timeout=120s',
-      ]);
+      const existing = await this.objects.read(header);
+      const merged: k8s.KubernetesObject = {
+        ...desired,
+        metadata: { ...desired.metadata, resourceVersion: existing.metadata?.resourceVersion },
+      };
+      // Service.spec.{clusterIP,clusterIPs} are immutable post-create;
+      // a replace that omits them gets rejected. Lift the live values
+      // back into the desired spec so the round-trip is a no-op for
+      // those fields.
+      if (desired.kind === 'Service') {
+        const existingSpec = (existing as { spec?: Record<string, unknown> }).spec ?? {};
+        const desiredSpec = (desired as { spec?: Record<string, unknown> }).spec ?? {};
+        (merged as { spec: Record<string, unknown> }).spec = {
+          ...desiredSpec,
+          clusterIP: existingSpec.clusterIP,
+          clusterIPs: existingSpec.clusterIPs,
+        };
+      }
+      await this.objects.replace(merged);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Rollout did not complete: ${message}`);
+      if (isNotFoundError(err)) {
+        await this.objects.create(desired);
+        return;
+      }
+      throw err;
     }
   }
 
-  private async kubectlDeleteIfExists(kind: string, name: string): Promise<void> {
+  private async deleteIfExists(kind: string, apiVersion: string, name: string): Promise<void> {
     try {
-      await this.kubectl(['-n', this.cluster.namespace, 'delete', kind, name, '--ignore-not-found=true']);
+      await this.objects.delete({ apiVersion, kind, metadata: { name, namespace: this.cluster.namespace } });
     } catch (err) {
       if (isNotFoundError(err)) return;
       throw err;
     }
   }
 
-  private async resourceExists(kind: string, name: string, opts?: { clusterScoped?: boolean }): Promise<boolean> {
-    const args = opts?.clusterScoped ? [] : ['-n', this.cluster.namespace];
+  /**
+   * Poll the Deployment until the controller has observed our latest
+   * generation and all desired replicas report Ready, or the rollout
+   * budget elapses. Mirrors `kubectl rollout status` semantics: an
+   * error from the API surfaces as the rollout failure, a stable but
+   * un-ready state surfaces as a timeout.
+   */
+  private async waitForRollout(stackName: string): Promise<void> {
+    const deadline = Date.now() + ROLLOUT_TIMEOUT_MS;
+    let lastErr: unknown;
+    while (Date.now() < deadline) {
+      try {
+        const dep = await this.apps.readNamespacedDeployment({
+          name: stackName,
+          namespace: this.cluster.namespace,
+        });
+        const desiredReplicas = dep.spec?.replicas ?? 1;
+        const status = dep.status ?? {};
+        const observed = status.observedGeneration ?? -1;
+        const generation = dep.metadata?.generation ?? 0;
+        const ready = status.readyReplicas ?? 0;
+        const updated = status.updatedReplicas ?? 0;
+        if (observed >= generation && updated >= desiredReplicas && ready >= desiredReplicas) {
+          return;
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+      await sleep(ROLLOUT_POLL_INTERVAL_MS);
+    }
+    const tail = lastErr instanceof Error ? `: ${lastErr.message}` : '';
+    throw new Error(`Rollout did not complete within ${Math.floor(ROLLOUT_TIMEOUT_MS / 1000)}s${tail}`);
+  }
+
+  private async resourceExists(kind: string, apiVersion: string, name: string): Promise<boolean> {
     try {
-      await this.kubectl([...args, 'get', kind, name]);
+      await this.objects.read({ apiVersion, kind, metadata: { name, namespace: this.cluster.namespace } });
       return true;
     } catch (err) {
       if (isNotFoundError(err)) return false;
@@ -317,42 +380,96 @@ export class LocalContainerDeploymentService {
 
   private async getServiceNodePort(stackName: string): Promise<number | undefined> {
     try {
-      const { stdout } = await this.kubectl([
-        '-n',
-        this.cluster.namespace,
-        'get',
-        'service',
-        stackName,
-        '-o',
-        'jsonpath={.spec.ports[0].nodePort}',
-      ]);
-      const port = Number.parseInt(stdout.trim(), 10);
-      return Number.isFinite(port) && port > 0 ? port : undefined;
+      const svc = await this.core.readNamespacedService({ name: stackName, namespace: this.cluster.namespace });
+      const port = svc.spec?.ports?.[0]?.nodePort;
+      return typeof port === 'number' && port > 0 ? port : undefined;
     } catch {
       return undefined;
     }
   }
+}
 
-  private async kubectl(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    return execFileAsync('kubectl', args, { maxBuffer: 16 * 1024 * 1024 });
+// Backwards-compat alias — the executor and any direct consumers
+// still import `LocalContainerDeploymentService`. Aliased rather than
+// subclassed so the class identity (typeof instances) matches the
+// new name. Drop in a follow-up once consumers migrate.
+export const LocalContainerDeploymentService = KubernetesDeploymentService;
+export type LocalContainerDeploymentService = KubernetesDeploymentService;
+
+/**
+ * Build a KubeConfig from the base config. Four supported modes,
+ * in priority order:
+ *   1. `appliance-base-kubernetes` with inline `kubeconfig` — parsed
+ *      verbatim. Covers BYO clusters where the operator already has
+ *      a working kubeconfig.
+ *   2. `appliance-base-kubernetes` with `server` + `token` — built
+ *      programmatically. The common path for in-cluster API tokens
+ *      and ServiceAccount-issued credentials supplied out of band.
+ *   3. `appliance-base-kubernetes` with none of the above — falls
+ *      back to `loadFromCluster()`, which reads the pod's mounted
+ *      ServiceAccount token + CA. The expected path when api-server
+ *      itself runs inside the cluster it manages.
+ *   4. `appliance-base-local` — loads the host's default kubeconfig
+ *      (preserves prior behaviour for k3d-on-laptop dev).
+ */
+function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
+  const kc = new k8s.KubeConfig();
+  if (baseConfig.type === ApplianceBaseType.ApplianceKubernetes) {
+    const cfg = baseConfig.kubernetes;
+    if (!cfg) {
+      throw new Error(`'kubernetes' block is required for ${ApplianceBaseType.ApplianceKubernetes} bases`);
+    }
+    if (cfg.kubeconfig) {
+      kc.loadFromString(cfg.kubeconfig);
+      return kc;
+    }
+    if (cfg.server && cfg.token) {
+      kc.addCluster({
+        name: 'appliance',
+        server: cfg.server,
+        caData: cfg.ca,
+        skipTLSVerify: !cfg.ca,
+      });
+      kc.addUser({ name: 'appliance', token: cfg.token });
+      kc.addContext({
+        name: 'appliance',
+        cluster: 'appliance',
+        user: 'appliance',
+        namespace: cfg.namespace,
+      });
+      kc.setCurrentContext('appliance');
+      return kc;
+    }
+    // No explicit credentials → assume in-cluster ServiceAccount.
+    kc.loadFromCluster();
+    return kc;
   }
+  // appliance-base-local: trust whatever the host kubeconfig points
+  // at. The desktop's cluster lifecycle keeps that pointed at the
+  // managed k3d cluster.
+  kc.loadFromDefault();
+  return kc;
 }
 
 function resolveClusterConfig(baseConfig: ApplianceBaseConfig): ClusterConfig {
   // Common k8s params (namespace, hostnameSuffix, ingressClassName)
-  // come from whichever subobject the variant uses. Local-only
-  // fields (k3d cluster name, host port) only have meaning for
-  // `appliance-base-local`; for generic Kubernetes bases they fall
-  // back to schema defaults that aren't actually used (the k3d
-  // host-port routing is replaced by external Ingress).
-  const k8s = getKubernetesParams(baseConfig);
+  // come from whichever subobject the variant uses. hostPort is
+  // local-specific (the k3d serverlb publishes :80 on `hostPort` so
+  // the host can hit the Ingress); for `appliance-base-kubernetes`
+  // the cluster fronts Ingress on the canonical 80/443 and we render
+  // it port-less (applianceHostnameUrl elides :80). Stamping the
+  // k3d default (8081) onto a generic Kubernetes URL produced a
+  // bogus `:8081` suffix on every reported deploy URL.
+  const k8sParams = getKubernetesParams(baseConfig);
   const localCluster = baseConfig.local?.cluster ?? {};
+  const hostPort =
+    baseConfig.type === ApplianceBaseType.ApplianceLocal ? (localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT) : 80;
   return {
     clusterName: localCluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
-    namespace: k8s?.namespace ?? DEFAULT_LOCAL_NAMESPACE,
-    hostPort: localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT,
-    hostnameSuffix: k8s?.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
-    ingressClassName: k8s?.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
+    namespace: k8sParams?.namespace ?? DEFAULT_LOCAL_NAMESPACE,
+    hostPort,
+    hostnameSuffix: k8sParams?.hostnameSuffix ?? DEFAULT_LOCAL_HOSTNAME_SUFFIX,
+    ingressClassName: k8sParams?.ingressClassName ?? DEFAULT_LOCAL_INGRESS_CLASS,
   };
 }
 
@@ -378,8 +495,18 @@ export function applianceHostnameUrl(hostname: string, hostPort: number): string
 }
 
 function isNotFoundError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  return /not\s*found/i.test(err.message) || /Error from server \(NotFound\)/i.test(err.message);
+  if (!err || typeof err !== 'object') return false;
+  // @kubernetes/client-node v1 surfaces apiserver errors as ApiException
+  // with a `.code` (HTTP status). Older shapes used `.statusCode` or
+  // `.response.statusCode`; check all three plus the legacy string
+  // match for kubectl-shaped errors so the wrapper stays compatible
+  // with mocked tests.
+  const e = err as { code?: number; statusCode?: number; response?: { statusCode?: number }; message?: string };
+  if (e.code === 404 || e.statusCode === 404 || e.response?.statusCode === 404) return true;
+  if (typeof e.message === 'string') {
+    return /not\s*found/i.test(e.message) || /Error from server \(NotFound\)/i.test(e.message);
+  }
+  return false;
 }
 
 /**
@@ -400,6 +527,10 @@ function idempotentMessage(noop: boolean, hostnameUrl: string, nodePortUrl: stri
 function isRegistryReference(image: string): boolean {
   const firstSegment = image.split('/')[0];
   return firstSegment.includes('.') || firstSegment.includes(':');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export interface ManifestParams {

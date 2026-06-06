@@ -150,27 +150,38 @@ export function LocalRuntimeDeployPage() {
     const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
 
     try {
-      // 1. docker build + k3d import — streams onto our log box.
+      // 1. Resolve the cluster's registry URL (if one is attached)
+      //    so build_and_import_image pushes to it instead of falling
+      //    back to k3d image import. Registry path is required once
+      //    api-server moves in-cluster (no docker daemon available),
+      //    and works equally well when api-server is still on the
+      //    host — k3s pulls through the `--registry-use` mirror
+      //    either way.
+      const runtime = await local.runtimeStatus();
+      const registryUrl = runtime.config.registryUrl;
+
+      // 2. docker build + push (or import fallback) — streams onto our log box.
       const imageTag = `${manifest.name}:latest`;
       append({ stream: 'meta', message: `==> building image ${imageTag} from ${folderPath}` });
-      await local.buildAndImportImage(
+      const resolvedImageRef = await local.buildAndImportImage(
         {
           path: folderPath,
           imageTag,
           platform: manifest.platform,
+          registryUrl,
         },
         (event: LocalLogEvent) => append({ stream: event.stream, message: event.message })
       );
 
-      // 2. SDK path: find-or-create project + environment, register
+      // 3. SDK path: find-or-create project + environment, register
       //    the external-image build, dispatch the deploy, poll until
       //    a terminal state arrives.
       append({ stream: 'meta', message: `==> registering project "${projectName}" / env "${envName}"` });
       const project = await findOrCreateProject(client, projectName);
       const env = await findOrCreateEnvironment(client, project.id, projectName, envName);
 
-      append({ stream: 'meta', message: `==> creating external build for ${imageTag}` });
-      const build = await client.createBuild({ uploadUrl: imageTag });
+      append({ stream: 'meta', message: `==> creating external build for ${resolvedImageRef}` });
+      const build = await client.createBuild({ uploadUrl: resolvedImageRef });
       if (!build.success) throw new Error(`createBuild: ${build.error.message}`);
 
       const envVars: Record<string, string> = {};

@@ -31,6 +31,7 @@
   },
   "dependencies": {
     "@appliance.sh/sdk": "workspace:*",
+    "@kubernetes/client-node": "^1.4.0",
     "@pulumi/aws": "^7.16.0",
     "@pulumi/aws-native": "^1.48.0",
     "@pulumi/awsx": "^3.1.0",

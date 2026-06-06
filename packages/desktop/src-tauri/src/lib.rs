@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,8 +10,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::process::Command;
 
 // Keychain service is shared across all Appliance Desktop installs on
 // the machine. Each cluster's API key lives at account
@@ -382,12 +380,21 @@ fn delete_api_key(account: &str) {
 // no-op. Returns true if the persisted file was rewritten so the
 // caller can persist + clean up the old keychain slot.
 fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, HostError> {
+    let mut migrated = migrate_legacy_top_level_url(cfg)?;
+    migrated |= migrate_legacy_local_runtime_urls(cfg);
+    if migrated {
+        write_persisted_config(app, cfg)?;
+    }
+    Ok(migrated)
+}
+
+/// Original field-shape migration: top-level `api_server_url` →
+/// `clusters[]` entry. Runs once per upgrade from the pre-clusters
+/// era.
+fn migrate_legacy_top_level_url(cfg: &mut PersistedConfig) -> Result<bool, HostError> {
     if !cfg.clusters.is_empty() {
         // Already migrated. Drop the legacy field if it lingered.
-        if cfg.api_server_url.take().is_some() {
-            return Ok(true);
-        }
-        return Ok(false);
+        return Ok(cfg.api_server_url.take().is_some());
     }
     let Some(legacy_url) = cfg.api_server_url.take() else {
         return Ok(false);
@@ -411,8 +418,44 @@ fn migrate_legacy(app: &AppHandle, cfg: &mut PersistedConfig) -> Result<bool, Ho
     delete_api_key(LEGACY_KEYCHAIN_ACCOUNT);
     cfg.clusters.push(cluster);
     cfg.selected_cluster_id = Some(id);
-    write_persisted_config(app, cfg)?;
     Ok(true)
+}
+
+/// Phase-4 URL-shape migration. Pre-Phase-4 desktops registered the
+/// Local Runtime cluster with `http://localhost:<api_port>` because
+/// api-server ran as a host-side child process. Phase 4 moves
+/// api-server in-cluster and re-derives the URL as
+/// `http://api.appliance.localhost:<host_port>`. Without this fixup
+/// the post-upgrade `start_local_runtime` would find
+/// `find_local_runtime_cluster` empty against the new URL, mint a
+/// second `local-runtime` cluster id (duplicate-id collision), and
+/// stomp the existing keychain entry. Rewriting in place keeps the
+/// cluster id (so the keychain entry survives) and lets the freshly
+/// in-cluster api-server pick up the existing API key the moment
+/// it's reachable.
+fn migrate_legacy_local_runtime_urls(cfg: &mut PersistedConfig) -> bool {
+    let new_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, DEFAULT_LOCAL_HOST_PORT);
+    let mut migrated = false;
+    for cluster in &mut cfg.clusters {
+        if cluster.id != LOCAL_RUNTIME_CLUSTER_ID {
+            continue;
+        }
+        if is_pre_phase4_local_runtime_url(&cluster.api_server_url) {
+            cluster.api_server_url = new_url.clone();
+            migrated = true;
+        }
+    }
+    migrated
+}
+
+fn is_pre_phase4_local_runtime_url(url: &str) -> bool {
+    // Pre-Phase-4 default port was DEFAULT_LOCAL_API_PORT (3030) but
+    // users could override via LocalRuntimeInput.api_port to anything;
+    // matching the host (localhost / 127.0.0.1) is the discriminator
+    // that catches the legacy shape without false-positiving on the
+    // new `api.appliance.localhost` form.
+    let stripped = url.strip_prefix("http://").unwrap_or(url);
+    stripped.starts_with("localhost:") || stripped.starts_with("127.0.0.1:")
 }
 
 fn derive_name_from_url(url: &str) -> String {
@@ -1078,7 +1121,14 @@ const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
 // the same range so each deployment's NodePort is reachable here.
 const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
 const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
-const DEFAULT_LOCAL_API_PORT: u16 = 3030;
+// Host-side port the k3d-attached registry publishes on. Picked
+// out of the way of common dev tools (5000 is occupied by macOS
+// AirPlay Receiver on Sequoia+, 5001 by some VPN clients). Users
+// can override via `LocalRuntimeInput.registry_port` when 5050
+// conflicts. The api-server's KubernetesDeploymentService doesn't
+// touch this port — image push is a desktop/CLI build-side concern,
+// so api-server can stay running in-cluster without docker access.
+const DEFAULT_LOCAL_REGISTRY_PORT: u16 = 5050;
 const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
 // Stable cluster id == profile name used by the CLI's `--profile`
 // flag and the shared profiles.json key.
@@ -1113,6 +1163,21 @@ struct LocalClusterInput {
     /// and common 8080.
     #[serde(default)]
     host_port: Option<u16>,
+    /// Host-side port the k3d-attached registry publishes on. Falls
+    /// back to DEFAULT_LOCAL_REGISTRY_PORT (5050). Plumbed through
+    /// to `ensure_registry` and `--registry-use` at cluster-create
+    /// time so a user-supplied `LocalRuntimeInput.registryPort` is
+    /// actually honored end-to-end.
+    #[serde(default)]
+    registry_port: Option<u16>,
+    /// Host-side directory bind-mounted into the k3d node container
+    /// so the in-cluster api-server's PersistentVolume (hostPath
+    /// inside the node) actually maps onto durable host storage.
+    /// Without this, `k3d cluster delete` wipes everything the
+    /// FilesystemObjectStore wrote (projects, environments, keys).
+    /// Must be a path the host's Docker daemon can mount.
+    #[serde(default)]
+    data_dir: Option<String>,
 }
 
 fn cluster_name_or_default(input: &LocalClusterInput) -> String {
@@ -1120,6 +1185,16 @@ fn cluster_name_or_default(input: &LocalClusterInput) -> String {
         .cluster_name
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string())
+}
+
+/// k3d registry name attached to a given cluster. The k3d CLI prefixes
+/// every registry name with `k3d-` once created (so a registry named
+/// `appliance-local-registry` shows up as `k3d-appliance-local-registry`
+/// in `k3d registry list` and as a container of that name). We pass
+/// the unprefixed form to `k3d registry create / delete` and accept
+/// either form when matching against `k3d registry list -o json`.
+fn registry_name_for_cluster(cluster: &str) -> String {
+    format!("{cluster}-registry")
 }
 
 // Tools the local-runtime path shells out to. Centralised so preflight
@@ -1436,9 +1511,22 @@ async fn local_cluster_status(input: LocalClusterInput) -> Result<LocalClusterSt
 #[tauri::command]
 async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
     let name = cluster_name_or_default(&input);
+    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
+    let registry_name = registry_name_for_cluster(&name);
+
+    // Ensure the registry exists regardless of whether we're about to
+    // create or restart the cluster. It's a sibling container, not a
+    // cluster-owned one, so a Docker restart / `docker rm` between
+    // sessions can leave the cluster up but the registry gone — in
+    // which case `ensure_registry` brings it back, idempotently.
+    // (--registry-use only takes effect at cluster create; for
+    // clusters that pre-date Phase 3 the wizard's fallback path
+    // handles the no-mirror case — see bug_012 fix in next commit.)
+    ensure_registry(&registry_name, registry_port).await?;
+
     let status = local_cluster_status(LocalClusterInput {
         cluster_name: Some(name.clone()),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await?;
     if status.exists {
@@ -1469,27 +1557,50 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
             DEFAULT_LOCAL_NODEPORT_MAX,
         );
         let agents_arg = "1";
-        let (ok, _stdout, stderr) = run_status_command(&[
-            "k3d",
-            "cluster",
-            "create",
-            &name,
-            "--agents",
-            agents_arg,
-            "-p",
-            &port_arg,
-            "-p",
-            &nodeport_arg,
-            "--wait",
-        ])
-        .await?;
+        let registry_use_arg = format!("{}:{}", registry_name, registry_port);
+        // Bind-mount the host-side data_dir into the k3d node so the
+        // in-cluster api-server's PersistentVolume (`hostPath` inside
+        // the agent container) actually resolves to durable storage
+        // on the operator's host. Without this, k3d's agent overlay
+        // becomes the backing store and `k3d cluster delete` wipes
+        // every project/environment/api-key the FilesystemObjectStore
+        // wrote. Same path on both sides of the colon so manifests
+        // can use one absolute path everywhere.
+        let mut create_args: Vec<String> = vec![
+            "cluster".into(),
+            "create".into(),
+            name.clone(),
+            "--agents".into(),
+            agents_arg.into(),
+            "-p".into(),
+            port_arg,
+            "-p".into(),
+            nodeport_arg,
+            "--registry-use".into(),
+            registry_use_arg,
+        ];
+        let volume_arg;
+        if let Some(data_dir) = input.data_dir.as_deref() {
+            // Ensure the source exists before docker mounts it —
+            // docker auto-creates missing host paths as root-owned
+            // dirs, which then can't be written by the user later.
+            fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
+            volume_arg = format!("{}:{}", data_dir, data_dir);
+            create_args.push("--volume".into());
+            create_args.push(volume_arg.clone());
+        }
+        create_args.push("--wait".into());
+        let create_argv: Vec<&str> = std::iter::once("k3d")
+            .chain(create_args.iter().map(String::as_str))
+            .collect();
+        let (ok, _stdout, stderr) = run_status_command(&create_argv).await?;
         if !ok {
             return Err(format!("k3d cluster create failed: {}", stderr));
         }
     }
     local_cluster_status(LocalClusterInput {
         cluster_name: Some(name),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await
 }
@@ -1505,7 +1616,7 @@ async fn stop_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStat
     }
     local_cluster_status(LocalClusterInput {
         cluster_name: Some(name),
-        host_port: input.host_port,
+        ..Default::default()
     })
     .await
 }
@@ -1520,12 +1631,58 @@ async fn delete_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSt
     if !ok && !stderr.contains("not found") {
         return Err(format!("k3d cluster delete failed: {}", stderr));
     }
+    // Best-effort: tear down the matching registry. Detached from
+    // the cluster lifecycle (deleting a registry while another
+    // cluster still uses it would break that cluster), but our
+    // naming convention is 1:1 with cluster name, so it's safe to
+    // remove here. Ignored on "not found" so a re-delete is a no-op.
+    let registry_name = registry_name_for_cluster(&name);
+    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
     Ok(LocalClusterStatus {
         exists: false,
         running: false,
         cluster_name: name,
         message: None,
     })
+}
+
+/// Idempotent registry create: probe `k3d registry list`, create if
+/// missing. The k3d CLI surfaces registries under their `k3d-`-prefixed
+/// container names, so we match both forms. Errors that look like
+/// "already exists" / "port in use" are surfaced verbatim to the
+/// caller — those need user action (rename or free the port), not a
+/// silent retry.
+async fn ensure_registry(name: &str, port: u16) -> Result<(), String> {
+    if let Ok((ok, stdout, _stderr)) = run_status_command(&["k3d", "registry", "list", "-o", "json"]).await {
+        if ok {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                let prefixed = format!("k3d-{}", name);
+                if let Some(list) = parsed.as_array() {
+                    for entry in list {
+                        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        if entry_name == name || entry_name == prefixed.as_str() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Bind only on loopback. The cluster reaches the registry through
+    // Docker's internal bridge network via the registry container's
+    // DNS name (wired by `--registry-use`), not through the host-
+    // published port — so loopback-only binding doesn't break pulls.
+    // It DOES keep the unauthenticated registry off any LAN interface,
+    // which matters on shared networks (cafes, conferences) where a
+    // predictable `localhost:5050/<image>:latest` tag would otherwise
+    // be pre-positionable by anyone on the subnet.
+    let port_arg = format!("127.0.0.1:{}", port);
+    let (ok, _stdout, stderr) =
+        run_status_command(&["k3d", "registry", "create", name, "--port", &port_arg]).await?;
+    if !ok {
+        return Err(format!("k3d registry create failed: {}", stderr));
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -1549,8 +1706,11 @@ struct LocalRuntimeInput {
     cluster_name: Option<String>,
     namespace: Option<String>,
     host_port: Option<u16>,
-    api_port: Option<u16>,
     data_dir: Option<String>,
+    /// Host-side port the k3d-attached registry publishes on. Falls
+    /// back to DEFAULT_LOCAL_REGISTRY_PORT when omitted. Override when
+    /// 5050 collides with another local service.
+    registry_port: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1559,11 +1719,27 @@ struct ResolvedRuntimeConfig {
     cluster_name: String,
     namespace: String,
     host_port: u16,
-    api_port: u16,
     data_dir: String,
     api_server_url: String,
     node_port_min: u16,
     node_port_max: u16,
+    /// Host-side URL of the k3d-attached registry (e.g.
+    /// `localhost:5050`). Build-side code (the desktop's
+    /// build_and_import_image, future CLI push paths) tags + pushes
+    /// against this address; the cluster pulls through the
+    /// `--registry-use` mirror configured at create time. **None**
+    /// when no matching registry container exists for the cluster
+    /// (pre-Phase-3 runtimes, or after a manual `k3d registry delete`)
+    /// — the deploy wizard checks for None and falls back to
+    /// `k3d image import`. Populated by local_runtime_status after
+    /// it probes `k3d registry list`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_url: Option<String>,
+    /// Candidate host-side port the registry will be created on
+    /// (or matches an existing one on). Surfaced separately so the
+    /// frontend can show the planned port even when `registry_url`
+    /// is None pre-create.
+    registry_port: u16,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -1596,20 +1772,6 @@ struct LocalRuntimeStatus {
     cluster_id: Option<String>,
 }
 
-/// Held in Tauri's managed state. Wraps the spawned api-server
-/// child + metadata; `None` means no live api-server.
-struct ApiServerHandle {
-    child: Child,
-    port: u16,
-    log_path: PathBuf,
-    started_at: String,
-}
-
-#[derive(Default)]
-struct LocalRuntimeState {
-    api_server: Mutex<Option<ApiServerHandle>>,
-}
-
 fn resolve_runtime_config(
     app: &AppHandle,
     input: &LocalRuntimeInput,
@@ -1623,21 +1785,60 @@ fn resolve_runtime_config(
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_NAMESPACE.to_string());
     let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
-    let api_port = input.api_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
     let data_dir = match &input.data_dir {
         Some(p) => PathBuf::from(p),
         None => default_local_runtime_dir(app)?,
+    };
+    // api-server lives in-cluster behind the Ingress, reached via the
+    // k3d serverlb at `host_port`. URL omits the port when it's 80.
+    let api_server_url = if host_port == 80 {
+        format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
+    } else {
+        format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, host_port)
     };
     Ok(ResolvedRuntimeConfig {
         cluster_name,
         namespace,
         host_port,
-        api_port,
         data_dir: data_dir.to_string_lossy().to_string(),
-        api_server_url: format!("http://localhost:{}", api_port),
+        api_server_url,
         node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
         node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
+        // resolve_runtime_config is sync and doesn't probe Docker;
+        // local_runtime_status fills this in after probing
+        // `k3d registry list` for the matching container. callers
+        // that bypass local_runtime_status (start_local_runtime uses
+        // registry_port directly) won't observe None during the
+        // create-then-probe window.
+        registry_url: None,
+        registry_port,
     })
+}
+
+/// Probe `k3d registry list` for a registry attached to the named
+/// cluster. Returns `Some(localhost:<port>)` when one exists at the
+/// expected default port. Returns None on probe failure or absence —
+/// callers treat None as "no registry available, fall back to
+/// k3d image import".
+async fn probe_registry_url(cluster_name: &str, candidate_port: u16) -> Option<String> {
+    let (ok, stdout, _stderr) = run_status_command(&["k3d", "registry", "list", "-o", "json"])
+        .await
+        .ok()?;
+    if !ok {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let list = parsed.as_array()?;
+    let registry_name = registry_name_for_cluster(cluster_name);
+    let prefixed = format!("k3d-{}", registry_name);
+    for entry in list {
+        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if entry_name == registry_name || entry_name == prefixed {
+            return Some(format!("localhost:{}", candidate_port));
+        }
+    }
+    None
 }
 
 /// Default data dir for the local runtime. Shared with the CLI:
@@ -1676,145 +1877,11 @@ fn default_local_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     legacy.ok_or_else(|| "could not resolve a local-runtime data dir (no $HOME, no app data dir)".to_string())
 }
 
-/// Probe TCP + a known endpoint to decide whether a previously-spawned
-/// (or externally-running) api-server is alive on `port`. Used both
-/// for the live-handle case and to detect leftovers after a desktop
-/// restart with no managed handle.
-/// Best-effort: which PID is listening on `port`? Used when we see an
-/// api-server we didn't spawn (e.g. the user started it from the CLI
-/// during a demo) so the desktop can still display + stop it. Shells
-/// out to `lsof` because that's already on every macOS/Linux box that
-/// can run k3d; returns None on Windows or when lsof is absent.
-async fn find_pid_listening_on_port(port: u16) -> Option<u32> {
-    let (ok, stdout, _stderr) = run_status_command(&[
-        "lsof",
-        "-ti",
-        &format!("tcp:{}", port),
-        "-sTCP:LISTEN",
-    ])
-    .await
-    .ok()?;
-    if !ok {
-        return None;
-    }
-    stdout.lines().next()?.trim().parse::<u32>().ok()
-}
-
-async fn probe_api_server(port: u16) -> bool {
-    // Off the tokio runtime so we don't need the `net` feature; a 200ms
-    // connect_timeout is plenty against loopback.
-    tokio::task::spawn_blocking(move || {
-        let addr = format!("127.0.0.1:{}", port);
-        let sock_addr: std::net::SocketAddr = match addr.parse() {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(200)).is_ok()
-    })
-    .await
-    .unwrap_or(false)
-}
-
-fn api_server_entry() -> Result<(PathBuf, Vec<String>), String> {
-    // Prefer the compiled dist; fall back to `tsx src/main.ts` for dev
-    // builds where the user runs `pnpm tauri dev` without first
-    // running `pnpm --filter @appliance.sh/api-server build`.
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("api-server");
-    let dist = base.join("dist").join("src").join("main.js");
-    if dist.exists() {
-        return Ok((PathBuf::from("node"), vec![dist.to_string_lossy().to_string()]));
-    }
-    let src = base.join("src").join("main.ts");
-    if !src.exists() {
-        return Err(format!(
-            "api-server entry point not found (looked at {} and {})",
-            dist.display(),
-            src.display()
-        ));
-    }
-    let tsx = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("node_modules")
-        .join(".bin")
-        .join("tsx");
-    if !tsx.exists() {
-        return Err(format!(
-            "api-server dist not built and tsx fallback missing at {}",
-            tsx.display()
-        ));
-    }
-    Ok((tsx, vec![src.to_string_lossy().to_string()]))
-}
-
-/// Build the JSON `APPLIANCE_BASE_CONFIG` env value the api-server
-/// expects. The local-base schema is defined in
-/// packages/sdk/src/models/appliance-base.ts.
-fn build_base_config(cfg: &ResolvedRuntimeConfig) -> String {
-    serde_json::json!({
-        "type": "appliance-base-local",
-        "name": "local-runtime",
-        "local": {
-            "dataDir": cfg.data_dir,
-            "cluster": {
-                "clusterName": cfg.cluster_name,
-                "namespace": cfg.namespace,
-                "hostPort": cfg.host_port,
-            }
-        }
-    })
-    .to_string()
-}
-
 /// Generate a short opaque token used as BOOTSTRAP_TOKEN for the
-/// spawned api-server. It's only valid for the lifetime of this
-/// process — once we mint an api key, the token is forgotten.
+/// in-cluster api-server. Valid only for the lifetime of this
+/// bootstrap call — once we mint an api key, the token is forgotten.
 fn random_bootstrap_token() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")
-}
-
-/// Mint an initial api key via the api-server's bootstrap route.
-/// Idempotent at the SERVER level (`/bootstrap/status` reports whether
-/// any key already exists), but creates a fresh "Local Runtime" named
-/// key each time it's called.
-async fn mint_api_key(api_port: u16, token: &str) -> Result<ApiKey, String> {
-    let url = format!("http://localhost:{}/bootstrap/create-key", api_port);
-    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
-    let (ok, stdout, stderr) = run_status_command(&[
-        "curl",
-        "-fsS",
-        "-X",
-        "POST",
-        &url,
-        "-H",
-        &format!("X-Bootstrap-Token: {}", token),
-        "-H",
-        "content-type: application/json",
-        "-d",
-        &body,
-    ])
-    .await?;
-    if !ok {
-        return Err(format!("mint api key failed: {}", stderr));
-    }
-    serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
-}
-
-async fn wait_for_api_server(port: u16, max_wait: Duration) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + max_wait;
-    loop {
-        if probe_api_server(port).await {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("api-server did not come up on :{} in time", port));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
 }
 
 /// Find the persisted "Local Runtime" cluster (if any). Identified by
@@ -1913,88 +1980,46 @@ fn unregister_local_runtime_cluster(app: &AppHandle, api_server_url: &str) -> Re
     write_persisted_config(app, &persisted)
 }
 
-fn tail_log(path: &Path, lines: usize) -> String {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return String::new();
+/// Probe the in-cluster api-server's `/bootstrap/status` endpoint
+/// through the cluster's Ingress. No PID, no log file — the
+/// in-cluster api-server is a k8s Pod, its liveness is the apiserver's
+/// concern. The UI gets `running: true/false` and uses the URL for
+/// any "see logs" link.
+async fn current_api_server_status(cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
+    let target = format!("{}/bootstrap/status", cfg.api_server_url.trim_end_matches('/'));
+    let running = match run_status_command(&["curl", "-fsS", "-o", "/dev/null", &target]).await {
+        Ok((ok, _, _)) => ok,
+        Err(_) => false,
     };
-    let collected: Vec<&str> = raw.lines().rev().take(lines).collect();
-    collected.into_iter().rev().collect::<Vec<_>>().join("\n")
-}
-
-async fn current_api_server_status(state: &LocalRuntimeState, cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
-    let mut guard = state.api_server.lock().await;
-    if let Some(handle) = guard.as_mut() {
-        // try_wait drains the exit status without blocking. If the
-        // child has exited, drop the handle so subsequent calls see
-        // a clean Stopped state.
-        match handle.child.try_wait() {
-            Ok(Some(_status)) => {
-                let stale = guard.take().expect("guard checked above");
-                let msg = format!(
-                    "api-server exited unexpectedly. Tail of {}:\n{}",
-                    stale.log_path.display(),
-                    tail_log(&stale.log_path, 40)
-                );
-                return ApiServerStatus {
-                    running: false,
-                    message: Some(msg),
-                    ..Default::default()
-                };
-            }
-            Ok(None) => {
-                return ApiServerStatus {
-                    running: true,
-                    pid: handle.child.id(),
-                    port: Some(handle.port),
-                    started_at: Some(handle.started_at.clone()),
-                    log_path: Some(handle.log_path.to_string_lossy().to_string()),
-                    message: None,
-                };
-            }
-            Err(e) => {
-                return ApiServerStatus {
-                    running: false,
-                    message: Some(format!("try_wait: {e}")),
-                    ..Default::default()
-                };
-            }
-        }
+    ApiServerStatus {
+        running,
+        port: None,
+        pid: None,
+        started_at: None,
+        log_path: None,
+        message: None,
     }
-    drop(guard);
-
-    // No managed handle — check for an externally-launched api-server
-    // (e.g. the CLI demo started it, or a previous desktop session
-    // exited without stopping the sidecar). Adopt it: look up the PID
-    // via lsof so Stop still works, and report a clean Running state
-    // rather than a scary "not managed by this desktop" warning.
-    if probe_api_server(cfg.api_port).await {
-        let pid = find_pid_listening_on_port(cfg.api_port).await;
-        return ApiServerStatus {
-            running: true,
-            port: Some(cfg.api_port),
-            pid,
-            started_at: None,
-            log_path: None,
-            message: None,
-        };
-    }
-    ApiServerStatus::default()
 }
 
 #[tauri::command]
 async fn local_runtime_status(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
+    let mut cfg = resolve_runtime_config(&app, &input)?;
     let cluster = local_cluster_status(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
+        ..Default::default()
     })
     .await?;
-    let api_server = current_api_server_status(state.inner(), &cfg).await;
+    // Reflect registry presence in cfg.registry_url so the deploy
+    // wizard can fall back to `k3d image import` on pre-Phase-3
+    // clusters (no registry attached) instead of pushing to a port
+    // nobody's listening on.
+    cfg.registry_url = probe_registry_url(&cfg.cluster_name, cfg.registry_port).await;
+    let api_server = current_api_server_status(&cfg).await;
     let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
     let cluster_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
     Ok(LocalRuntimeStatus {
@@ -2008,167 +2033,77 @@ async fn local_runtime_status(
 #[tauri::command]
 async fn start_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    // Phase 1: cluster
+    // Phase 1: cluster (k3d + attached registry + data_dir bind-mount)
     let _ = start_local_cluster(LocalClusterInput {
         cluster_name: Some(cfg.cluster_name.clone()),
         host_port: Some(cfg.host_port),
+        registry_port: Some(cfg.registry_port),
+        data_dir: Some(cfg.data_dir.clone()),
     })
     .await?;
 
-    // Phase 2: api-server. Skip if a managed handle is already alive,
-    // OR if an externally-launched one (CLI demo, previous desktop
-    // session) is already serving on the port — adopting beats double-
-    // spawning + EADDRINUSE.
-    let managed_alive = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(handle) = guard.as_mut() {
-            matches!(handle.child.try_wait(), Ok(None))
-        } else {
-            false
-        }
+    // Phase 2: api-server in-cluster. Idempotent at the cluster level
+    // (kubectl apply reconciles in place) — but each call mints a
+    // fresh bootstrap key, which we then write over any prior
+    // registration. Skip if the in-cluster api-server is already
+    // reachable AND we have a registered cluster + working key on
+    // file; the existing key keeps working across desktop restarts.
+    let already_running = current_api_server_status(&cfg).await.running;
+    let already_registered = {
+        let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
+        find_local_runtime_cluster(&persisted, &cfg.api_server_url).is_some()
     };
-    let already_alive = managed_alive || probe_api_server(cfg.api_port).await;
 
-    if !already_alive {
-        // Drop any stale exited handle before spawning.
-        {
-            let mut guard = state.api_server.lock().await;
-            *guard = None;
-        }
-        let token = random_bootstrap_token();
-        let (program, base_args) = api_server_entry()?;
+    if !already_running || !already_registered {
         let data_dir = PathBuf::from(&cfg.data_dir);
         fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-        let log_dir = app
-            .path()
-            .app_log_dir()
-            .map_err(|e| format!("resolve log dir: {e}"))?;
-        fs::create_dir_all(&log_dir).map_err(|e| format!("create log dir: {e}"))?;
-        let log_path = log_dir.join("local-api-server.log");
-        // Truncate on each start so the log shows only the current
-        // run — keeps the "tail of log" error path useful instead of
-        // showing stale failures from a prior session.
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .map_err(|e| format!("open log file: {e}"))?;
-        let log_file_err = log_file.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
 
-        let mut cmd = Command::new(&program);
-        cmd.args(&base_args)
-            .env("APPLIANCE_MODE", "server")
-            .env("APPLIANCE_BASE_CONFIG", build_base_config(&cfg))
-            .env("BOOTSTRAP_TOKEN", &token)
-            .env("PORT", cfg.api_port.to_string())
-            .env("HOST", "127.0.0.1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
-            .kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn api-server: {e}"))?;
-        let started_at = chrono::Utc::now().to_rfc3339();
-        {
-            let mut guard = state.api_server.lock().await;
-            *guard = Some(ApiServerHandle {
-                child,
-                port: cfg.api_port,
-                log_path: log_path.clone(),
-                started_at,
-            });
-        }
+        let result = bootstrap_in_cluster_api_server(
+            app.clone(),
+            BootstrapInClusterInput {
+                runtime: Some(input.clone()),
+                image: None,
+            },
+        )
+        .await?;
 
-        if let Err(e) = wait_for_api_server(cfg.api_port, Duration::from_secs(25)).await {
-            // Reap the handle so the next start retries cleanly.
-            if let Some(mut handle) = state.api_server.lock().await.take() {
-                let _ = handle.child.start_kill();
-            }
-            return Err(format!(
-                "{e}. Tail of {}:\n{}",
-                log_path.display(),
-                tail_log(&log_path, 40)
-            ));
-        }
-
-        // Phase 3: mint key + register cluster (idempotent — if a
-        // matching cluster already exists, we just refresh its key).
-        let api_key = mint_api_key(cfg.api_port, &token).await?;
-        register_local_runtime_cluster(&app, &cfg, &api_key).map_err(|e| e.to_string())?;
+        register_local_runtime_cluster(&app, &cfg, &result.api_key).map_err(|e| e.to_string())?;
     }
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
 }
 
 #[tauri::command]
 async fn stop_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
 
-    // Kill the api-server first so it doesn't error-log when the
-    // cluster's apiserver vanishes underneath it.
-    let had_managed = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(mut handle) = guard.take() {
-            let _ = handle.child.kill().await;
-            true
-        } else {
-            false
-        }
-    };
-    // Fallback for adopted (CLI-launched) api-servers: there's no Child
-    // handle to kill, so look up the PID listening on our port and
-    // SIGTERM it. The api-server traps SIGTERM and exits cleanly.
-    if !had_managed {
-        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
-            let _ = run_status_command(&["kill", &pid.to_string()]).await;
-        }
-    }
-
+    // Stopping the cluster takes the in-cluster api-server pod with
+    // it — no host-side process to kill anymore.
     let (ok, _stdout, stderr) =
         run_status_command(&["k3d", "cluster", "stop", &cfg.cluster_name]).await?;
     if !ok && !stderr.contains("not found") {
         return Err(format!("k3d cluster stop failed: {}", stderr));
     }
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
 }
 
 #[tauri::command]
 async fn delete_local_runtime(
     app: AppHandle,
-    state: tauri::State<'_, Arc<LocalRuntimeState>>,
     input: Option<LocalRuntimeInput>,
 ) -> Result<LocalRuntimeStatus, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
-
-    let had_managed = {
-        let mut guard = state.api_server.lock().await;
-        if let Some(mut handle) = guard.take() {
-            let _ = handle.child.kill().await;
-            true
-        } else {
-            false
-        }
-    };
-    if !had_managed {
-        if let Some(pid) = find_pid_listening_on_port(cfg.api_port).await {
-            let _ = run_status_command(&["kill", &pid.to_string()]).await;
-        }
-    }
 
     let (ok, _stdout, stderr) =
         run_status_command(&["k3d", "cluster", "delete", &cfg.cluster_name]).await?;
@@ -2176,12 +2111,504 @@ async fn delete_local_runtime(
         return Err(format!("k3d cluster delete failed: {}", stderr));
     }
 
+    // Tear down the sibling registry too — `k3d cluster delete`
+    // doesn't touch standalone registries, so without this the
+    // registry container survives "Delete Runtime" and keeps
+    // holding the host port for the next start. Mirrors what
+    // delete_local_cluster already does. Best-effort: ignored on
+    // "not found" so a re-delete is a no-op.
+    let registry_name = registry_name_for_cluster(&cfg.cluster_name);
+    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
+
     // Forget the registered cluster + keychain entry; the data dir is
     // left alone (the user can wipe it manually if they want to start
     // fully fresh — we treat it as their data, like Docker volumes).
     unregister_local_runtime_cluster(&app, &cfg.api_server_url).map_err(|e| e.to_string())?;
 
-    local_runtime_status(app, state, Some(input)).await
+    local_runtime_status(app, Some(input)).await
+}
+
+// ============================================================
+// In-cluster api-server bootstrap
+//
+// Generates and applies the manifests that run api-server *inside*
+// the k3d cluster — Deployment + Service + Ingress, plus a
+// ServiceAccount/Role bound to the appliance namespace so the
+// in-cluster api-server can drive deploys against itself via
+// loadFromCluster(). The same image works against any kubernetes
+// cluster; here it's pulled from the cluster-attached registry.
+//
+// This path is the new model for `appliance-base-kubernetes` and
+// the eventual destination for `appliance-base-local` (Phase 5
+// rewires start_local_runtime to call into here instead of spawning
+// api-server as a host-side child process). Phase 4 lands the
+// machinery as an additive Tauri command so it can be exercised
+// independently before the cutover.
+// ============================================================
+
+const IN_CLUSTER_API_SERVER_NAMESPACE: &str = "appliance-system";
+const IN_CLUSTER_API_SERVER_NAME: &str = "api-server";
+const IN_CLUSTER_API_SERVER_HOSTNAME: &str = "api.appliance.localhost";
+const IN_CLUSTER_API_SERVER_PORT: u16 = 3000;
+// Default api-server image. Cluster pulls this directly from ghcr
+// on first deploy; subsequent pod restarts reuse the cached image
+// thanks to `imagePullPolicy: IfNotPresent`. Override via the
+// `image` field on `BootstrapInClusterInput` for local dev iteration
+// (build → push to <registry_url>/appliance-api-server:<tag>, pass
+// that ref through). The tag tracks the SDK release stream — bump
+// in lockstep with packages/sdk's published version.
+const IN_CLUSTER_API_SERVER_DEFAULT_IMAGE: &str = "ghcr.io/appliance-sh/api-server:latest";
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct BootstrapInClusterInput {
+    /// Override the runtime input that resolves cluster name, data
+    /// dir, registry port, etc. Defaults to the same resolution
+    /// `local_runtime_status` uses.
+    runtime: Option<LocalRuntimeInput>,
+    /// Override the api-server image reference. Defaults to
+    /// `ghcr.io/appliance-sh/api-server:latest` (cluster pulls from
+    /// ghcr on first deploy, caches thereafter). For local dev
+    /// iteration build the image and push to
+    /// `<registry_url>/appliance-api-server:<tag>`, then pass that
+    /// ref through here so the cluster pulls from the local
+    /// registry mirror instead.
+    image: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapInClusterResult {
+    /// Hostname the in-cluster api-server is reachable at. Always
+    /// goes through the cluster's Ingress so the URL is identical
+    /// across local + remote deploys of the same image.
+    api_server_url: String,
+    /// API key minted via the bootstrap token. Caller persists this
+    /// alongside the cluster registration so the SDK can sign
+    /// subsequent requests.
+    api_key: ApiKey,
+}
+
+/// Build the JSON `APPLIANCE_BASE_CONFIG` env value for the in-cluster
+/// api-server. Uses the new `appliance-base-kubernetes` variant — the
+/// in-cluster api-server authenticates via its mounted ServiceAccount
+/// (loadFromCluster()), so we don't ship server/token here.
+fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
+    // namespace must track cfg.namespace (which honors user
+    // input.namespace override). Hardcoding to DEFAULT_LOCAL_NAMESPACE
+    // would silently diverge from the namespace the desktop's
+    // list_local_workloads queries against. hostnameSuffix +
+    // ingressClassName are currently not user-overridable so the
+    // defaults match LocalContainerDeploymentService's defaults; lift
+    // them onto ResolvedRuntimeConfig if/when an override surface
+    // appears. The registry block is included only when a registry
+    // is actually present — no in-cluster consumer reads it today,
+    // but emitting `null` would be a future footgun.
+    let mut kubernetes = serde_json::json!({
+        "dataDir": "/data",
+        "namespace": cfg.namespace,
+        "hostnameSuffix": "appliance.localhost",
+        "ingressClassName": "traefik",
+    });
+    if let Some(registry_url) = cfg.registry_url.as_deref() {
+        kubernetes["registry"] = serde_json::json!({
+            "url": registry_url,
+            "insecure": true,
+        });
+    }
+    serde_json::json!({
+        "type": "appliance-base-kubernetes",
+        "name": "local-runtime",
+        "kubernetes": kubernetes,
+    })
+    .to_string()
+}
+
+/// Minimal-escape transform for values interpolated into YAML
+/// double-quoted scalars. Covers the three characters that can
+/// break a double-quoted scalar: `\` (escape lead-in), `\n` (closes
+/// the scalar mid-string), `"` (terminates the scalar). Quoting at
+/// the call sites is unconditional, so we don't need to handle the
+/// plain-scalar reserved characters here.
+fn yaml_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"")
+}
+
+/// Compose the multi-document YAML manifest deployed via kubectl apply.
+/// Resource breakdown:
+///   * Namespace `appliance-system` — keeps system components separate
+///     from user appliances (which land in `appliance`).
+///   * ServiceAccount + ClusterRole + ClusterRoleBinding — grants the
+///     in-cluster api-server CRUD on the resources it manages
+///     (deployments, services, ingresses, pods, namespaces, secrets).
+///   * Secret — carries APPLIANCE_BASE_CONFIG + BOOTSTRAP_TOKEN so the
+///     deployment env doesn't expose them in `kubectl describe`.
+///   * PersistentVolume + PersistentVolumeClaim — hostPath-backed PV
+///     mounted into the api-server pod as /data, mirroring the
+///     filesystem object store path the cloud path stores in S3.
+///   * Deployment + Service + Ingress — the api-server itself, fronted
+///     by the cluster's Traefik at `api.appliance.localhost`.
+fn render_in_cluster_api_server_manifest(
+    cfg: &ResolvedRuntimeConfig,
+    image: &str,
+    bootstrap_token: &str,
+) -> String {
+    let base_config = build_in_cluster_base_config(cfg);
+    let escaped_base_config = yaml_double_quoted(&base_config);
+    // Windows resolves data_dir through Tauri's app_data_dir() into
+    // a backslash-laden path (`C:\Users\..`). YAML 1.2 only accepts
+    // a fixed set of escapes inside double-quoted scalars (`\n`, `\t`,
+    // `\\`, `\"`, `\uNNNN`, `\UNNNNNNNN`, …); a bare `\U` followed
+    // by anything other than 8 hex digits parses as an invalid
+    // escape and kubectl rejects the whole apply. Same escape pass
+    // as base_config keeps both safe for Windows + arbitrary
+    // user-supplied overrides.
+    let host_data_dir = yaml_double_quoted(&cfg.data_dir);
+    format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {name}
+  namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: appliance-api-server
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "services", "pods", "secrets", "configmaps", "persistentvolumeclaims", "events"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: appliance-api-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: appliance-api-server
+subjects:
+- kind: ServiceAccount
+  name: {name}
+  namespace: {ns}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {name}-config
+  namespace: {ns}
+type: Opaque
+stringData:
+  APPLIANCE_BASE_CONFIG: "{base_config}"
+  BOOTSTRAP_TOKEN: "{token}"
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: appliance-data
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  hostPath:
+    path: "{data_dir}"
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: appliance-data
+  namespace: {ns}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+  volumeName: appliance-data
+  storageClassName: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/name: {name}
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {name}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {name}
+        app.kubernetes.io/managed-by: appliance.sh
+    spec:
+      serviceAccountName: {name}
+      containers:
+      - name: api-server
+        image: "{image}"
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: {port}
+          name: http
+        envFrom:
+        - secretRef:
+            name: {name}-config
+        env:
+        - name: APPLIANCE_MODE
+          value: "server"
+        - name: PORT
+          value: "{port}"
+        - name: HOST
+          value: "0.0.0.0"
+        readinessProbe:
+          httpGet:
+            path: /bootstrap/status
+            port: {port}
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: appliance-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  selector:
+    app.kubernetes.io/name: {name}
+  ports:
+  - port: 80
+    targetPort: {port}
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {name}
+  namespace: {ns}
+  labels:
+    app.kubernetes.io/managed-by: appliance.sh
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: {hostname}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {name}
+            port:
+              number: 80
+"#,
+        ns = IN_CLUSTER_API_SERVER_NAMESPACE,
+        name = IN_CLUSTER_API_SERVER_NAME,
+        hostname = IN_CLUSTER_API_SERVER_HOSTNAME,
+        port = IN_CLUSTER_API_SERVER_PORT,
+        image = image,
+        data_dir = host_data_dir,
+        base_config = escaped_base_config,
+        token = bootstrap_token,
+    )
+}
+
+/// Read the existing BOOTSTRAP_TOKEN out of the api-server Secret in
+/// the appliance-system namespace. Returns None when the Secret
+/// doesn't exist yet (first bootstrap), when kubectl fails (cluster
+/// down), or when the field is absent. Used so re-bootstrap reuses
+/// the token the already-running pod's env was seeded with — see
+/// bug_004 reasoning in bootstrap_in_cluster_api_server.
+async fn read_existing_bootstrap_token() -> Option<String> {
+    let (ok, stdout, _stderr) = run_status_command(&[
+        "kubectl",
+        "-n",
+        IN_CLUSTER_API_SERVER_NAMESPACE,
+        "get",
+        "secret",
+        &format!("{}-config", IN_CLUSTER_API_SERVER_NAME),
+        "-o",
+        "jsonpath={.data.BOOTSTRAP_TOKEN}",
+    ])
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let encoded = stdout.trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    // Secret values are base64-encoded on read. Decode and validate
+    // it's a non-empty UTF-8 string before reusing.
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let token = String::from_utf8(decoded).ok()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Pipe a manifest string into `kubectl apply -f -` so we don't have
+/// to materialize a temp file on disk. Surfaces stderr verbatim — the
+/// kubectl error messages are usually self-explanatory and the caller
+/// just bubbles them up to the UI.
+async fn kubectl_apply_manifest(manifest: &str) -> Result<(), String> {
+    let mut child = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn kubectl: {e}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "kubectl stdin unavailable".to_string())?;
+        stdin
+            .write_all(manifest.as_bytes())
+            .await
+            .map_err(|e| format!("write kubectl stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("kubectl wait: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl apply failed: {}", stderr));
+    }
+    Ok(())
+}
+
+/// Poll an arbitrary URL until /bootstrap/status returns 2xx, or the
+/// timeout elapses. Used to detect when the in-cluster api-server is
+/// past its readiness probe and reachable via the cluster's Ingress.
+async fn wait_for_api_server_url(url: &str, max_wait: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let target = format!("{}/bootstrap/status", url.trim_end_matches('/'));
+    loop {
+        let (ok, _stdout, _stderr) =
+            run_status_command(&["curl", "-fsS", "-o", "/dev/null", &target]).await?;
+        if ok {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "in-cluster api-server did not become reachable at {url} within {}s",
+                max_wait.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Mint an initial api key against the in-cluster api-server. Mirrors
+/// the host-side `mint_api_key` but takes the full URL instead of a
+/// loopback port — same `/bootstrap/create-key` route, same payload.
+async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, String> {
+    let url = format!("{}/bootstrap/create-key", api_server_url.trim_end_matches('/'));
+    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
+    let (ok, stdout, stderr) = run_status_command(&[
+        "curl",
+        "-fsS",
+        "-X",
+        "POST",
+        &url,
+        "-H",
+        &format!("X-Bootstrap-Token: {}", token),
+        "-H",
+        "content-type: application/json",
+        "-d",
+        &body,
+    ])
+    .await?;
+    if !ok {
+        return Err(format!("mint api key failed: {}", stderr));
+    }
+    serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
+}
+
+/// Apply the in-cluster api-server manifests to the running k3d
+/// cluster, wait for the deployment to become reachable, and mint
+/// the first API key. The api-server image must already be present
+/// in the cluster-attached registry (push via the desktop's
+/// build_and_import_image with `image_tag: appliance-api-server:latest`,
+/// or pre-pull from a remote registry). Idempotent: applying twice
+/// reconciles the manifest in place and mints a fresh key.
+#[tauri::command]
+async fn bootstrap_in_cluster_api_server(
+    app: AppHandle,
+    input: BootstrapInClusterInput,
+) -> Result<BootstrapInClusterResult, String> {
+    let runtime_input = input.runtime.unwrap_or_default();
+    let cfg = resolve_runtime_config(&app, &runtime_input)?;
+    let image = input
+        .image
+        .unwrap_or_else(|| IN_CLUSTER_API_SERVER_DEFAULT_IMAGE.to_string());
+    // Reuse the existing Secret's BOOTSTRAP_TOKEN when one is
+    // present — the running api-server pod's env was populated via
+    // envFrom at container start, which is a one-shot snapshot;
+    // updating the Secret does NOT re-inject env vars or restart
+    // the pod, so minting a fresh token here would mean the pod's
+    // env (old token) and the curl we POST below (new token) never
+    // match — 401 forever, until manual pod restart. Reading the
+    // existing token sidesteps this and keeps re-bootstrap clean
+    // when the pod is already up.
+    let bootstrap_token = read_existing_bootstrap_token().await.unwrap_or_else(random_bootstrap_token);
+    let manifest = render_in_cluster_api_server_manifest(&cfg, &image, &bootstrap_token);
+    kubectl_apply_manifest(&manifest).await?;
+
+    // The Ingress goes through the cluster's serverlb host port. URL
+    // shape mirrors what user appliances get (`<name>.appliance.localhost`)
+    // so the desktop's cluster registry can treat the in-cluster
+    // api-server as just-another-reachable-URL.
+    let api_server_url = if cfg.host_port == 80 {
+        format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
+    } else {
+        format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, cfg.host_port)
+    };
+    wait_for_api_server_url(&api_server_url, Duration::from_secs(60)).await?;
+    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token).await?;
+    Ok(BootstrapInClusterResult {
+        api_server_url,
+        api_key,
+    })
 }
 
 // --- kubectl-driven workloads & logs --------------------------------
@@ -2626,6 +3053,15 @@ struct BuildAndImportInput {
     /// k3d cluster to import into. Defaults to the runtime's cluster name.
     #[serde(default)]
     cluster_name: Option<String>,
+    /// Host-side registry URL to push to (e.g. `localhost:5050`).
+    /// When set, the image is tagged `<registry_url>/<image_tag>` and
+    /// pushed via `docker push` instead of being imported with
+    /// `k3d image import`. The returned image URI then references the
+    /// registry path so the cluster can pull through the mirror —
+    /// works whether api-server runs on the host or in-cluster.
+    /// Omit (or pass null) to keep the legacy import-only flow.
+    #[serde(default)]
+    registry_url: Option<String>,
 }
 
 /// Stream stdout+stderr from a child process onto the channel as
@@ -2685,9 +3121,16 @@ async fn stream_child_to_channel(
     Ok(())
 }
 
-/// Build the image with docker, then import it into k3d. Streams the
-/// raw command output to the frontend so the wizard can show a live
-/// terminal-style log pane.
+/// Build the image with docker, then either push it to a host-side
+/// registry (when one is configured for the cluster) or import it
+/// into k3d. Streams raw command output to the frontend so the
+/// wizard can show a live terminal-style log pane.
+///
+/// Returns the image reference the cluster should use to pull. For
+/// the registry path that's `<registry_url>/<image_tag>`; for the
+/// import path it's the original `image_tag`. Either way, the caller
+/// (the deploy wizard) hands this URI straight to api-server's
+/// build resolver.
 #[tauri::command]
 async fn build_and_import_image(
     input: BuildAndImportInput,
@@ -2698,7 +3141,17 @@ async fn build_and_import_image(
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string());
 
-    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), input.image_tag.clone()];
+    // When a registry is configured, tag the build with the
+    // registry-qualified ref up front so the single `docker build`
+    // produces an image already named the way we'll push it. Avoids
+    // a separate `docker tag` step.
+    let pushable_tag = input
+        .registry_url
+        .as_deref()
+        .map(|reg| format!("{}/{}", reg, input.image_tag));
+    let build_tag = pushable_tag.clone().unwrap_or_else(|| input.image_tag.clone());
+
+    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), build_tag.clone()];
     if let Some(p) = input.platform.as_deref() {
         build_args.push("--platform".into());
         build_args.push(p.into());
@@ -2706,6 +3159,18 @@ async fn build_and_import_image(
     build_args.push(input.path.clone());
     stream_child_to_channel("docker", &build_args, &on_event).await?;
 
+    if let Some(pushable) = pushable_tag {
+        // Registry path: push, then return the registry-qualified
+        // reference so the cluster pulls via the `--registry-use`
+        // mirror configured at cluster create.
+        let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
+        stream_child_to_channel("docker", &push_args, &on_event).await?;
+        return Ok(pushable);
+    }
+
+    // Legacy path: no registry available — fall back to importing
+    // the image directly into the k3d cluster. Compatible with
+    // clusters that pre-date Phase 3 (no registry attached).
     let import_args: Vec<String> = vec![
         "image".into(),
         "import".into(),
@@ -2849,7 +3314,6 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(Arc::new(LocalRuntimeState::default()))
         .invoke_handler(tauri::generate_handler![
             get_config,
             add_cluster,
@@ -2876,7 +3340,8 @@ pub fn run() {
             list_local_workloads,
             tail_local_pod_logs,
             read_appliance_manifest,
-            build_and_import_image
+            build_and_import_image,
+            bootstrap_in_cluster_api_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
