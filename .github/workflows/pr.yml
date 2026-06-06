@@ -30,6 +30,14 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
+      # The CLI build compiles a standalone binary with `bun build
+      # --compile`, and the desktop build copies that binary in via
+      # copy-cli.mjs — so the PR build needs Bun on PATH just like
+      # release-cli-binaries.yml does.
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build
