@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
-import { useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket, X, History } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { AlertTriangle, ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket, X, History } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
@@ -51,6 +51,22 @@ export function LocalRuntimeDeployPage() {
   const [searchParams] = useSearchParams();
   const presetProject = React.useMemo(() => searchParams.get('project') ?? null, [searchParams]);
   const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
+
+  // The run step needs a running cluster + api-server (the build is
+  // pushed/imported into the cluster, the deploy goes through the
+  // api-server) and a selected cluster for SDK credentials. Surface
+  // both up front — the wizard is reachable while the runtime is down
+  // (deep links, or the user stopped it mid-session), and finding out
+  // at the end of step 3 is the worst place. Shares the Local Runtime
+  // page's query key so the two views never disagree.
+  const runtimeQuery = useQuery({
+    queryKey: ['local-runtime', 'status'],
+    enabled: Boolean(local?.runtimeStatus),
+    queryFn: () => local!.runtimeStatus(),
+    refetchInterval: 5_000,
+  });
+  const runtimeUp = Boolean(runtimeQuery.data?.cluster.running && runtimeQuery.data?.apiServer.running);
+  const readyToDeploy = runtimeUp && Boolean(client);
 
   const [phase, setPhase] = React.useState<Phase>('pick');
 
@@ -141,7 +157,21 @@ export function LocalRuntimeDeployPage() {
   // Step 3 — build + import + deploy + poll.
   // ============================================================
   const runDeploy = async () => {
-    if (!folderPath || !manifest || !local?.buildAndImportImage || !client) return;
+    if (!folderPath || !manifest || !local?.buildAndImportImage) return;
+    // Defense in depth behind the banner/disabled button: a silent
+    // return here used to leave step 3 stuck on "Starting…" forever.
+    if (!client) {
+      setRunStatus('failed');
+      setRunError(
+        'No cluster is selected, so there are no credentials to deploy with. Start the local runtime (it registers its cluster automatically), then retry.'
+      );
+      return;
+    }
+    if (!runtimeUp) {
+      setRunStatus('failed');
+      setRunError('The local runtime is not running. Start it from the Local Runtime page, then retry.');
+      return;
+    }
     setRunStatus('running');
     setLogs([]);
     setRunError(null);
@@ -270,6 +300,25 @@ export function LocalRuntimeDeployPage() {
         </p>
       </header>
 
+      {!readyToDeploy && !runtimeQuery.isLoading ? (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {!runtimeUp ? (
+              <>
+                The local runtime isn&apos;t running — builds deploy into its cluster, so the final step needs it up.{' '}
+                <Link to="/local-runtime" className="underline">
+                  Start it from the Local Runtime page
+                </Link>{' '}
+                first. You can still pick a folder and configure in the meantime.
+              </>
+            ) : (
+              <>No cluster is selected. Starting the local runtime registers its cluster automatically.</>
+            )}
+          </span>
+        </div>
+      ) : null}
+
       {presetProject || presetEnvironment ? (
         <div className="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-200">
           Deploying to{' '}
@@ -318,7 +367,7 @@ export function LocalRuntimeDeployPage() {
             setPhase('run');
             void runDeploy();
           }}
-          canNext={canRun}
+          canNext={canRun && readyToDeploy}
         />
       ) : null}
 

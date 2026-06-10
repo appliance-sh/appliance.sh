@@ -129,11 +129,20 @@ export function LocalRuntimePage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button asChild variant="outline" disabled={phase !== 'running'}>
-            <Link to="/local-runtime/deploy">
+          {phase === 'running' ? (
+            <Button asChild variant="outline">
+              <Link to="/local-runtime/deploy">
+                <Rocket className="h-4 w-4" /> Deploy application
+              </Link>
+            </Button>
+          ) : (
+            // `disabled` on an asChild Button renders an anchor, and
+            // anchors ignore it — the wizard stayed reachable with the
+            // runtime down. A real <button> actually gates.
+            <Button variant="outline" disabled title="Start the runtime to deploy applications">
               <Rocket className="h-4 w-4" /> Deploy application
-            </Link>
-          </Button>
+            </Button>
+          )}
           <PhaseBadge phase={phase} />
         </div>
       </header>

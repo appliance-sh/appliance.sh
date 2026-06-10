@@ -268,6 +268,17 @@ pnpm run dev          # API server in watch mode + SDK/infra rebuilds
 pnpm run build        # Build all packages
 ```
 
+### Desktop UI in a browser (mock host)
+
+The desktop-only pages (Local Runtime, deploy wizard, bootstrap) normally need a Tauri build. For UI iteration, a dev-only mock of the Tauri IPC layer lets them run in any browser:
+
+```bash
+pnpm --filter @appliance.sh/desktop dev
+# then open http://localhost:1420/?mock-host&scenario=<name>
+```
+
+Scenarios (`packages/desktop/src/mock-host.ts`): `ready` (default), `running` (workloads populated), `daemon-down` (colima stopped, auto-startable), `daemon-manual`, `missing` (tools not installed). Lifecycle transitions are simulated with realistic delays; SDK-driven pages can talk to a real api-server by patching the mock cluster's key in sessionStorage. The mock is loaded via dynamic import behind `import.meta.env.DEV` — it never ships in production bundles.
+
 ### Testing
 
 Tests use Vitest (`packages/api-server/src/**/*.spec.ts`):
