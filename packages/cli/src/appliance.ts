@@ -75,6 +75,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'manage the local k3d-backed runtime',
     load: () => import('./appliance-local.js'),
   },
+  vm: {
+    description: 'manage the microVM runtime (isolated VM engine)',
+    load: () => import('./appliance-vm.js'),
+  },
   login: {
     description: 'authenticate with the appliance API',
     load: () => import('./appliance-login.js'),

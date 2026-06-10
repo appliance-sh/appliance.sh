@@ -16,11 +16,15 @@ export interface ExecResult {
   stderr: string;
 }
 
-export async function runCommand(argv: string[], opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
+export async function runCommand(
+  argv: string[],
+  opts: { timeoutMs?: number; env?: Record<string, string> } = {}
+): Promise<ExecResult> {
   const [cmd, ...args] = argv;
   try {
     const { stdout, stderr } = await execFileAsync(cmd, args, {
       timeout: opts.timeoutMs,
+      env: opts.env ? { ...process.env, ...opts.env } : undefined,
       // A wedged tool dumping logs must not OOM the caller; 16 MiB is
       // far beyond any output we parse (k3d list JSON, kubectl apply).
       maxBuffer: 16 * 1024 * 1024,

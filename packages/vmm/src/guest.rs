@@ -32,6 +32,10 @@ const ALPINE_NETBOOT: &str = "netboot-3.21.3";
 /// http://<guest-ip>:9991/k3s.yaml once k3s is up).
 pub const KUBECONFIG_PORT: u16 = 9991;
 
+/// NodePort the in-VM registry service binds (inside the NodePort
+/// range k3s allows by default).
+pub const REGISTRY_NODEPORT: u16 = 30500;
+
 pub struct BootMedia {
     pub image: PathBuf,
 }
@@ -92,10 +96,14 @@ set -x
 # alpine virt kernel; e2fsprogs comes from the apkovl world file.
 PERSIST=/persist
 mkdir -p "$PERSIST"
-if ! blkid /dev/vda >/dev/null 2>&1; then
+# busybox blkid exits 0 even when it finds no signature — gate on its
+# *output* instead of its status.
+if [ -z "$(blkid /dev/vda 2>/dev/null)" ]; then
   mkfs.ext4 -q -L appliance-data /dev/vda
 fi
-mount -t ext4 /dev/vda "$PERSIST" || true
+if ! mount -t ext4 /dev/vda "$PERSIST"; then
+  echo "WARNING: data disk mount failed — falling back to tmpfs (no persistence, limited space)"
+fi
 
 # --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
@@ -109,6 +117,68 @@ cp "$MEDIA/k3s" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
 
 mkdir -p "$PERSIST/k3s" /etc/rancher/k3s
+
+# containerd pull-through: image refs pushed from the host as
+# localhost:__REGISTRY_HOST_PORT__/<name> resolve to the in-VM registry's
+# NodePort. Read by k3s at startup.
+cat > /etc/rancher/k3s/registries.yaml <<RYAML
+mirrors:
+  "localhost:__REGISTRY_HOST_PORT__":
+    endpoint:
+      - "http://127.0.0.1:__REGISTRY_NODEPORT__"
+RYAML
+
+# In-VM image registry, installed via k3s's auto-applying manifests
+# dir. Plain registry:2 on a NodePort; the host forwards
+# 127.0.0.1:__REGISTRY_HOST_PORT__ here so `docker push` from the host
+# lands inside the VM.
+mkdir -p "$PERSIST/k3s/server/manifests"
+cat > "$PERSIST/k3s/server/manifests/appliance-registry.yaml" <<RMANIFEST
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: appliance-registry
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: appliance-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: appliance-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: appliance-registry
+    spec:
+      containers:
+      - name: registry
+        image: registry:2
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/registry
+      volumes:
+      - name: data
+        hostPath:
+          path: /persist/registry
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: appliance-registry
+  namespace: kube-system
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: appliance-registry
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: __REGISTRY_NODEPORT__
+RMANIFEST
 
 # Single-node dev cluster. Traefik (bundled) terminates ingress on
 # node port 80 via servicelb — the host forwards 127.0.0.1:<hostPort>
@@ -134,7 +204,7 @@ mkdir -p /srv/handoff
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
-fn build_apkovl() -> Result<Vec<u8>> {
+fn build_apkovl(registry_host_port: u16) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -182,6 +252,8 @@ fn build_apkovl() -> Result<Vec<u8>> {
         0o755,
         APPLIANCE_START
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
+            .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
+            .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
             .as_bytes(),
     )?;
 
@@ -220,9 +292,9 @@ fn build_apkovl() -> Result<Vec<u8>> {
 /// change is overkill for now — we rebuild on every `up`/`run`; it
 /// takes well under a second and guarantees the media matches the
 /// code that produced it.
-pub fn build_boot_media(vm_dir: &Path) -> Result<BootMedia> {
+pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
-    let apkovl = build_apkovl()?;
+    let apkovl = build_apkovl(registry_host_port)?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
@@ -296,10 +368,17 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
 
     crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))?;
     crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))?;
+    crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))?;
     eprintln!(
-        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80",
-        spec.api_port, spec.host_port
+        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
+        spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT
     );
+    // The deterministic-NodePort window KubernetesDeploymentService
+    // assigns from — forwarded so the "direct" URLs in deploy results
+    // work exactly as they do on k3d.
+    for port in 30000..=30050u16 {
+        let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
+    }
 
     // The guest serves its kubeconfig only after k3s has written it —
     // first boot includes apk installs + image pulls, so be generous.

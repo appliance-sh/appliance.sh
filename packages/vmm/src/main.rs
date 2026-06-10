@@ -158,6 +158,11 @@ fn run() -> Result<()> {
             let spec = ensure_spec(&name)?;
             let paths = VmPaths::for_name(&name);
             if store::read_live_pid(&name).is_none() {
+                // Clear stale readiness markers from a previous boot
+                // *before* spawning — the poll below must only ever
+                // observe files written by this boot.
+                let _ = std::fs::remove_file(paths.kubeconfig());
+                let _ = std::fs::remove_file(paths.guest_ip());
                 let exe = std::env::current_exe().context("resolve current executable")?;
                 let child = Command::new(exe)
                     .args(["run", &name])

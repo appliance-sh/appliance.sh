@@ -37,6 +37,10 @@ export interface LocalRuntimeOptions {
   hostPort?: number;
   registryPort?: number;
   dataDir?: string;
+  /** Host-side registry URL to advertise in the base config. When
+   *  set, the k3d registry probe is skipped entirely — used by the
+   *  microVM engine, whose registry isn't a k3d container. */
+  registryUrl?: string;
 }
 
 export interface ResolvedRuntimeConfig {
@@ -77,7 +81,7 @@ export async function resolveRuntimeConfig(input: LocalRuntimeOptions = {}): Pro
     dataDir: input.dataDir ?? defaultLocalRuntimeDir(),
     apiServerUrl: apiServerUrlForHostPort(hostPort),
     registryPort,
-    registryUrl: await probeRegistryUrl(clusterName, registryPort),
+    registryUrl: input.registryUrl ?? (await probeRegistryUrl(clusterName, registryPort)),
   };
 }
 
@@ -312,18 +316,21 @@ spec:
  * create-key call (new token) permanently mismatched — 401 until a
  * manual pod restart.
  */
-export async function readExistingBootstrapToken(): Promise<string | null> {
+export async function readExistingBootstrapToken(opts: { kubeconfigPath?: string } = {}): Promise<string | null> {
   try {
-    const r = await runCommand([
-      'kubectl',
-      '-n',
-      IN_CLUSTER_API_SERVER_NAMESPACE,
-      'get',
-      'secret',
-      `${IN_CLUSTER_API_SERVER_NAME}-config`,
-      '-o',
-      'jsonpath={.data.BOOTSTRAP_TOKEN}',
-    ]);
+    const r = await runCommand(
+      [
+        'kubectl',
+        '-n',
+        IN_CLUSTER_API_SERVER_NAMESPACE,
+        'get',
+        'secret',
+        `${IN_CLUSTER_API_SERVER_NAME}-config`,
+        '-o',
+        'jsonpath={.data.BOOTSTRAP_TOKEN}',
+      ],
+      opts.kubeconfigPath ? { env: { KUBECONFIG: opts.kubeconfigPath } } : {}
+    );
     if (!r.ok) return null;
     const encoded = r.stdout.trim();
     if (!encoded) return null;
@@ -339,9 +346,12 @@ export async function readExistingBootstrapToken(): Promise<string | null> {
  * materialize a temp file on disk. Surfaces stderr verbatim — kubectl
  * error messages are usually self-explanatory.
  */
-export async function kubectlApplyManifest(manifest: string): Promise<void> {
+export async function kubectlApplyManifest(manifest: string, opts: { kubeconfigPath?: string } = {}): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('kubectl', ['apply', '-f', '-'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('kubectl', ['apply', '-f', '-'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: opts.kubeconfigPath ? { ...process.env, KUBECONFIG: opts.kubeconfigPath } : process.env,
+    });
     let stderr = '';
     child.stderr.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf8');
@@ -412,6 +422,14 @@ export async function mintApiKey(apiServerUrl: string, token: string, name = 'Lo
 
 export interface BootstrapInClusterOptions {
   runtime?: LocalRuntimeOptions;
+  /** Milliseconds to wait for the api-server to come up after the
+   *  apply. First boots include a full image pull + extraction, so
+   *  the default is generous. */
+  readyTimeoutMs?: number;
+  /** Kubeconfig the kubectl calls should use. Defaults to the
+   *  ambient kubeconfig (the k3d path); the microVM engine passes
+   *  the per-VM file appliance-vmm fetched. */
+  kubeconfigPath?: string;
   /** Override the api-server image reference (see
    *  IN_CLUSTER_API_SERVER_DEFAULT_IMAGE for the default + rationale). */
   image?: string;
@@ -443,22 +461,27 @@ export async function bootstrapInClusterApiServer(
 
   // Reuse the existing Secret's BOOTSTRAP_TOKEN when one is present —
   // see readExistingBootstrapToken for why minting fresh would 401.
-  const bootstrapToken = (await readExistingBootstrapToken()) ?? crypto.randomUUID().replaceAll('-', '');
+  const bootstrapToken =
+    (await readExistingBootstrapToken({ kubeconfigPath: opts.kubeconfigPath })) ??
+    crypto.randomUUID().replaceAll('-', '');
 
   // When the image is sitting in the local docker daemon (the
   // build-locally iteration path), import it straight into the
-  // cluster's containerd store. Covers clusters whose registries.yaml
-  // doesn't mirror the sibling registry, and skips the pull entirely
-  // for everyone else.
-  if (await importImageToCluster(image, cfg.clusterName)) {
+  // cluster's containerd store. k3d-only: covers clusters whose
+  // registries.yaml doesn't mirror the sibling registry. The microVM
+  // path (kubeconfigPath set) delivers images via its in-VM registry
+  // instead — there is no k3d cluster to import into.
+  if (!opts.kubeconfigPath && (await importImageToCluster(image, cfg.clusterName))) {
     emit(`imported ${image} into cluster ${cfg.clusterName}`);
   }
 
   emit(`applying api-server manifests (image ${image})`);
-  await kubectlApplyManifest(renderInClusterApiServerManifest(cfg, image, bootstrapToken));
+  await kubectlApplyManifest(renderInClusterApiServerManifest(cfg, image, bootstrapToken), {
+    kubeconfigPath: opts.kubeconfigPath,
+  });
 
   emit(`waiting for ${cfg.apiServerUrl} to become reachable`);
-  await waitForApiServerUrl(cfg.apiServerUrl, 60_000);
+  await waitForApiServerUrl(cfg.apiServerUrl, opts.readyTimeoutMs ?? 240_000);
 
   emit('minting initial API key');
   const apiKey = await mintApiKey(cfg.apiServerUrl, bootstrapToken, opts.keyName);

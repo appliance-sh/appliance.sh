@@ -27,6 +27,11 @@ pub struct VmSpec {
     pub host_port: u16,
     /// Host loopback port forwarded to the Kubernetes API (:6443).
     pub api_port: u16,
+    /// Host loopback port forwarded to the in-VM image registry.
+    /// 5052 by default — deliberately clear of the k3d runtime's 5050
+    /// so both engines can coexist on one machine.
+    #[serde(default = "default_registry_port")]
+    pub registry_port: u16,
 }
 
 impl VmSpec {
@@ -44,6 +49,7 @@ impl VmSpec {
             mac: random_mac(),
             host_port: 8081,
             api_port: 6443,
+            registry_port: 5052,
         }
     }
 }
@@ -112,4 +118,8 @@ pub struct VmStatus {
     pub backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+fn default_registry_port() -> u16 {
+    5052
 }

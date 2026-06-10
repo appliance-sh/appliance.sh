@@ -1,3 +1,4 @@
+import { craneProvider } from './providers/crane.js';
 import { dockerProvider } from './providers/docker.js';
 import { k3dProvider } from './providers/k3d.js';
 import { kubectlProvider } from './providers/kubectl.js';
@@ -7,7 +8,7 @@ import type { Provider } from './types.js';
 // tools that run on top of it (k3d, kubectl). New providers append
 // here; consumers iterate `defaultProviders` rather than referencing
 // individual exports so additions Just Work.
-export const defaultProviders: Provider[] = [dockerProvider, k3dProvider, kubectlProvider];
+export const defaultProviders: Provider[] = [dockerProvider, k3dProvider, kubectlProvider, craneProvider];
 
 export function findProvider(name: string): Provider | undefined {
   return defaultProviders.find((p) => p.name === name);

@@ -9,9 +9,12 @@
 // registries.yaml doesn't mirror the registry (`--registry-use` only
 // takes effect at cluster create time).
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import chalk from 'chalk';
-import { DEFAULT_LOCAL_CLUSTER_NAME, importImageToCluster } from '@appliance.sh/helper';
+import { DEFAULT_LOCAL_CLUSTER_NAME, helperBinDir, importImageToCluster, runInstall } from '@appliance.sh/helper';
 
 export interface PublishLocalImageOptions {
   /** Appliance name — becomes the image repository name. */
@@ -56,13 +59,27 @@ export async function publishLocalApplianceImage(opts: PublishLocalImageOptions)
   }
 
   let pushed = false;
+  let publishedRef = imageRef;
   if (opts.registryUrl) {
     console.log(chalk.dim(`Pushing ${imageRef}`));
     try {
       execFileSync('docker', ['push', imageRef], { stdio: 'inherit' });
       pushed = true;
     } catch {
-      console.log(chalk.yellow(`Push to ${opts.registryUrl} failed — falling back to k3d image import.`));
+      // `docker push` executes inside the docker VM (colima/Desktop),
+      // where the host's 127.0.0.1 registries (the microVM engine's
+      // forwarded registry) don't exist. Retry host-side with crane —
+      // which also returns a digest ref, making redeploys roll even
+      // under a reused tag.
+      console.log(chalk.dim('docker push failed — retrying host-side with crane'));
+      try {
+        publishedRef = await cranePush(imageRef);
+        pushed = true;
+        console.log(chalk.dim(`pushed ${publishedRef}`));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(chalk.yellow(`Registry push failed (${message}) — falling back to k3d image import.`));
+      }
     }
   }
 
@@ -86,5 +103,37 @@ export async function publishLocalApplianceImage(opts: PublishLocalImageOptions)
         'Check that the cluster is running (`appliance local status`).'
     );
   }
-  return imageRef;
+  return publishedRef;
+}
+
+/** Push a daemon-held image to its registry from the host process via
+ *  `docker save` + `crane push`. Returns the digest-qualified ref. */
+async function cranePush(imageRef: string): Promise<string> {
+  const outcomes = await runInstall({ tools: ['crane'] });
+  const failed = outcomes.find((o) => o.status === 'failed');
+  if (failed) throw new Error(`crane install failed: ${failed.message}`);
+  const managed = path.join(helperBinDir(), 'crane');
+  const crane = fs.existsSync(managed) ? managed : 'crane';
+
+  const tarPath = path.join(os.tmpdir(), `appliance-image-${process.pid}.tar`);
+  try {
+    execFileSync('docker', ['save', '-o', tarPath, imageRef], { stdio: 'inherit' });
+    const r = spawnSync(crane, ['push', '--insecure', tarPath, imageRef], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (r.status !== 0) throw new Error('crane push failed');
+    const lines = r.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const digestRef = lines[lines.length - 1];
+    if (!digestRef || !digestRef.includes('@sha256:')) {
+      throw new Error('could not parse digest from crane output');
+    }
+    return digestRef;
+  } finally {
+    fs.rmSync(tarPath, { force: true });
+  }
 }
