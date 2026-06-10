@@ -28,9 +28,7 @@ export function AppShell() {
   // first click — better to hide it than disable it.
   const nav: NavItem[] = [
     ...baseNav,
-    ...(host.local?.runtimeStatus
-      ? ([{ to: '/local-runtime', label: 'Local Runtime', icon: Server }] as NavItem[])
-      : []),
+    ...(host.local?.runtimeStatus ? ([{ to: '/local-runtime', label: 'Runtimes', icon: Server }] as NavItem[]) : []),
     ...tailNav,
   ];
 

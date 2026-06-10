@@ -303,6 +303,19 @@ program
   });
 
 program
+  .command('kubeconfig')
+  .description("print the microVM's kubeconfig path (use: export KUBECONFIG=$(appliance vm kubeconfig))")
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    const p = path.join(vmDir(opts.name), 'kubeconfig.yaml');
+    if (!fs.existsSync(p)) {
+      console.error(chalk.red(`no kubeconfig at ${p} — is the VM up? (appliance vm up)`));
+      process.exit(1);
+    }
+    console.log(p);
+  });
+
+program
   .command('doctor')
   .description('probe whether this machine can run microVMs')
   .action(() => {

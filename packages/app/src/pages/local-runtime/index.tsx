@@ -124,9 +124,10 @@ export function LocalRuntimePage() {
     <div className="max-w-4xl space-y-6">
       <header className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold">Local Runtime</h1>
+          <h1 className="text-xl font-semibold">Runtimes</h1>
           <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            A k3d cluster + in-process api-server running on this machine, wired into the Console as a regular cluster.
+            Local engines for running appliances on this machine — the k3d cluster and the isolated microVM. Both wire
+            into the console as regular clusters.
           </p>
         </div>
         <div className="flex items-center gap-2">

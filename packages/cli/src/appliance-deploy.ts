@@ -274,7 +274,21 @@ async function resolveKubernetesBuildId(
     );
   }
 
+  // Loopback registries mean the cluster runs on this machine — and
+  // the microVM has no binfmt emulation, so a cross-arch image
+  // crashloops with `exec format error` after an opaque rollout
+  // timeout. Warn up front while the build platform is still cheap to
+  // change.
   const registryUrl = baseConfig.kubernetes?.registry?.url ?? null;
+  const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  if (registryUrl?.startsWith('localhost') && appliance.platform && !appliance.platform.endsWith(hostArch)) {
+    console.log(
+      chalk.yellow(
+        `Warning: manifest platform "${appliance.platform}" does not match this machine (linux/${hostArch}). ` +
+          'The local cluster may not be able to run the image — consider removing "platform" from appliance.json for local deploys.'
+      )
+    );
+  }
   const clusterName = baseConfig.local?.cluster?.clusterName;
   const imageRef = await publishLocalApplianceImage({
     name: appliance.name,
