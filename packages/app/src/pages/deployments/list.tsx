@@ -2,6 +2,8 @@ import { Link } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ListSkeleton } from '@/components/ui/skeleton';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
@@ -56,11 +58,9 @@ export function DeploymentsPage() {
       ) : null}
 
       {deploymentsQuery.isLoading && !deploymentsQuery.data ? (
-        <div className="text-sm text-[var(--color-muted-foreground)]">Loading…</div>
+        <ListSkeleton />
       ) : !deploymentsQuery.data || deploymentsQuery.data.length === 0 ? (
-        <div className="rounded-md border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
-          No deployments yet.
-        </div>
+        <EmptyState title="No deployments yet" description="Deploy an environment and its runs will show up here." />
       ) : (
         <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)]">
           {deploymentsQuery.data.map((d) => (

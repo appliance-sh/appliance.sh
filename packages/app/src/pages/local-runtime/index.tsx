@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
 import type {
@@ -39,6 +40,7 @@ import type {
 export function LocalRuntimePage() {
   const host = useHost();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
   const local = host.local;
   const supported = Boolean(local?.runtimeStatus);
 
@@ -109,13 +111,13 @@ export function LocalRuntimePage() {
     );
   }
 
-  const onDelete = () => {
-    const ok =
-      typeof window !== 'undefined'
-        ? window.confirm(
-            'Delete the local runtime? This stops the api-server, deletes the k3d cluster, and forgets the registered Console cluster + API key. The data dir is left on disk.'
-          )
-        : true;
+  const onDelete = async () => {
+    const ok = await confirm({
+      title: 'Delete the local runtime?',
+      description:
+        'This stops the api-server, deletes the k3d cluster, and forgets the registered Console cluster + API key. The data dir is left on disk.',
+      confirmLabel: 'Delete runtime',
+    });
     if (!ok) return;
     deleteMutation.mutate();
   };
@@ -217,6 +219,7 @@ export function LocalRuntimePage() {
 function MicroVmPanel() {
   const host = useHost();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
   const vm = host.vm!;
 
   const statusQuery = useQuery({
@@ -254,10 +257,12 @@ function MicroVmPanel() {
     }
   };
 
-  const onDelete = () => {
-    const ok =
-      typeof window === 'undefined' ||
-      window.confirm('Delete the microVM? In-VM state (projects, images, deployments) is destroyed.');
+  const onDelete = async () => {
+    const ok = await confirm({
+      title: 'Delete the microVM?',
+      description: 'In-VM state (projects, images, deployments) is destroyed.',
+      confirmLabel: 'Delete microVM',
+    });
     if (!ok) return;
     void run('delete', () => vm.remove());
   };

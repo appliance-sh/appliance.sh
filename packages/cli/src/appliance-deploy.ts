@@ -13,6 +13,7 @@ import { publishLocalApplianceImage } from './utils/local-image.js';
 import { readLink, writeLink } from './utils/link.js';
 import { pollDeploymentUntilDone, extractDeploymentUrl } from './utils/deploy-poll.js';
 import { startProgressLine, BRAND } from './utils/progress.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 const DEFAULT_BUILD_OUTPUT = 'appliance.zip';
@@ -462,8 +463,8 @@ registerManifestOptions(program)
         process.exit(1);
       }
     } catch (error) {
-      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl: credentials.apiUrl });
+      process.exit(process.exitCode ?? 1);
     }
   });
 

@@ -7,6 +7,7 @@ import { attachProfileOption } from './utils/profile-flag.js';
 import { readLink } from './utils/link.js';
 import { pollDeploymentUntilDone } from './utils/deploy-poll.js';
 import { startProgressLine, BRAND } from './utils/progress.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 async function findProject(client: ReturnType<typeof createApplianceClient>, name: string): Promise<Project> {
@@ -83,7 +84,14 @@ program
     }
 
     const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-    if (!opts.yes && isTTY) {
+    if (!opts.yes) {
+      if (!isTTY) {
+        // Destroy is the one irreversible command — never let a piped
+        // or CI invocation tear a stack down without an explicit opt-in.
+        console.error(chalk.red('Refusing to destroy without confirmation in a non-interactive session.'));
+        console.error(chalk.dim('Pass --yes to confirm.'));
+        process.exit(1);
+      }
       const ok = await confirm({
         message: `Destroy ${chalk.bold(projectName)}/${chalk.bold(environmentName)}? This tears down its stack.`,
         default: false,
@@ -128,8 +136,8 @@ program
         process.exit(1);
       }
     } catch (error) {
-      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl: credentials.apiUrl });
+      process.exit(process.exitCode ?? 1);
     }
   });
 

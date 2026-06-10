@@ -1,5 +1,7 @@
 import { Command } from 'commander';
+import chalk from 'chalk';
 import { extractApplianceFile, registerManifestOptions, saveApplianceFile } from './utils/common.js';
+import { printCliError } from './utils/errors.js';
 import {
   promptForApplianceFramework,
   promptForApplianceName,
@@ -14,7 +16,7 @@ import { ApplianceInput, ApplianceType } from '@appliance.sh/sdk';
 
 const program = new Command();
 
-registerManifestOptions(program);
+registerManifestOptions(program).description('interactively configure the appliance manifest in this folder');
 
 const cmd = program.parse(process.argv);
 
@@ -26,13 +28,19 @@ if (
     cmd.getOptionValue('directory')) &&
   !applianceFileResult.success
 ) {
-  console.log('The specified file was not found.');
+  console.error(chalk.red('The specified file was not found.'));
   process.exit(1);
 }
 
 if (!applianceFileResult.success) {
-  console.log(`An error occurred while reading the specified file.`);
-  console.log(applianceFileResult.error);
+  if (applianceFileResult.error.name === 'File Not Found') {
+    console.log(chalk.dim('No existing manifest found — starting from scratch.'));
+  } else {
+    // Anything else (parse error, untrusted programmatic manifest) is
+    // not safe to silently overwrite with wizard output.
+    console.error(chalk.red(`Could not read the existing manifest: ${applianceFileResult.error.message}`));
+    process.exit(1);
+  }
 }
 
 let updatedApplianceFile = {
@@ -91,5 +99,5 @@ try {
 
   saveApplianceFile(cmd.getOptionValue('file') || 'appliance.json', updatedApplianceFile);
 } catch (error) {
-  console.error(error);
+  printCliError(error);
 }

@@ -150,6 +150,20 @@ program
           console.log(`  API key id:     ${result.apiKey.id}`);
           console.log(chalk.yellow(`  API key secret: ${result.apiKey.secret}  (shown once; save it now)`));
         }
+        console.log();
+        console.log(chalk.bold('Next steps'));
+        if (result.apiServerUrl) {
+          console.log(
+            `  Run ${chalk.cyan('appliance login')} with the API server URL${result.apiKey ? ' and the key above' : ''} to save a profile,`
+          );
+          console.log(
+            `  then ${chalk.cyan('appliance setup')} in your app folder and ${chalk.cyan('appliance deploy')}.`
+          );
+        } else {
+          console.log(
+            '  Phase 2 (hoist api-server) has not run yet — re-run with `--phases all` to finish the installation.'
+          );
+        }
       } catch (e) {
         console.error();
         const msg = e instanceof Error ? e.message : String(e);

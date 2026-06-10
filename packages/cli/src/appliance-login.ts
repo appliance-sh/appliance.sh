@@ -23,8 +23,16 @@ program.action(async () => {
   const method = await select({
     message: 'Authentication method:',
     choices: [
-      { name: 'Bootstrap (create new API key)', value: 'bootstrap' },
-      { name: 'Existing API key', value: 'existing' },
+      {
+        name: 'Bootstrap (create new API key)',
+        value: 'bootstrap',
+        description: 'First-time setup: exchange the server’s one-time bootstrap token for a new API key.',
+      },
+      {
+        name: 'Existing API key',
+        value: 'existing',
+        description: 'Paste a key you already have (ak_… id and sk_… secret).',
+      },
     ],
   });
 

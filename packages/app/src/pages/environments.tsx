@@ -4,6 +4,10 @@ import { useQuery, useQueries, useQueryClient, useMutation } from '@tanstack/rea
 import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ListSkeleton } from '@/components/ui/skeleton';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -27,6 +31,8 @@ function ConnectedEnvironments() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const host = useHost();
+  const confirm = useConfirm();
+  const { toast } = useToast();
   const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
 
   const projectsQuery = useQuery({
@@ -143,9 +149,10 @@ function ConnectedEnvironments() {
       if (!r.success) throw r.error;
       return env.projectId;
     },
-    onSuccess: (projectId) => {
+    onSuccess: (projectId, env) => {
       setMutationError(null);
       queryClient.invalidateQueries({ queryKey: ['environments', projectId] });
+      toast(`Environment "${env.name}" deleted`);
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
   });
@@ -158,8 +165,12 @@ function ConnectedEnvironments() {
     createMutation.mutate({ name, projectId });
   };
 
-  const onDelete = (env: Environment) => {
-    const ok = typeof window !== 'undefined' ? window.confirm(`Delete environment "${env.name}"?`) : true;
+  const onDelete = async (env: Environment) => {
+    const ok = await confirm({
+      title: `Delete environment "${env.name}"?`,
+      description: 'This removes the environment record. A deployed stack must be destroyed first.',
+      confirmLabel: 'Delete',
+    });
     if (!ok) return;
     deleteMutation.mutate(env);
   };
@@ -229,15 +240,22 @@ function ConnectedEnvironments() {
       ) : null}
 
       {!projectsQuery.data?.length && !projectsQuery.isLoading ? (
-        <div className="rounded-md border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
-          No projects yet. Create a project first.
-        </div>
+        <EmptyState
+          title="No projects yet"
+          description="Environments live inside a project — create a project first."
+          action={
+            <Button asChild variant="outline" size="sm">
+              <Link to="/projects">Go to Projects</Link>
+            </Button>
+          }
+        />
       ) : anyLoading ? (
-        <div className="text-sm text-[var(--color-muted-foreground)]">Loading…</div>
+        <ListSkeleton />
       ) : rows.length === 0 ? (
-        <div className="rounded-md border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
-          No environments yet.
-        </div>
+        <EmptyState
+          title="No environments yet"
+          description="Create one with the button above — each environment is an independent deployment target."
+        />
       ) : (
         <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
           {rows.map(({ env, project }) => {

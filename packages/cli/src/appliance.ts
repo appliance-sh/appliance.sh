@@ -171,6 +171,17 @@ function showHelp(): void {
     console.log(`  ${name.padEnd(width)}  alias for \`appliance ${sc.target} ${sc.prefix.join(' ')}\``);
   }
   console.log();
+  console.log('Getting started:');
+  console.log('  appliance login                 authenticate against an api-server');
+  console.log('  appliance setup                 link this folder to a project/environment');
+  console.log('  appliance deploy                build and ship the linked appliance');
+  console.log('  appliance open                  open the deployed URL in a browser');
+  console.log();
+  console.log('Environment variables:');
+  console.log('  APPLIANCE_PROFILE               credential profile to use (overrides the active profile)');
+  console.log('  APPLIANCE_API_URL               override the api-server URL from the profile');
+  console.log('  APPLIANCE_TRUST_MANIFEST=1      skip the programmatic-manifest trust prompt (CI)');
+  console.log();
   console.log('Run `appliance <command> --help` for command-specific options.');
 }
 
@@ -216,7 +227,23 @@ async function main(): Promise<void> {
   await SUBCOMMANDS[canonical].load();
 }
 
+// Ctrl-C inside an @inquirer prompt rejects with ExitPromptError.
+// Subcommands that don't wrap their prompts in try/catch would
+// otherwise crash with a stack trace on a plain abort — catch it
+// centrally and exit with the conventional 130 instead.
+process.on('unhandledRejection', (err) => {
+  if (err instanceof Error && err.name === 'ExitPromptError') {
+    console.error('Cancelled.');
+    process.exit(130);
+  }
+  throw err;
+});
+
 main().catch((err) => {
+  if (err instanceof Error && err.name === 'ExitPromptError') {
+    console.error('Cancelled.');
+    process.exit(130);
+  }
   console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

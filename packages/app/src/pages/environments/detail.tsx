@@ -6,6 +6,7 @@ import { LiveUrl } from '@/components/ui/live-url';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { StatusDot } from '@/components/ui/status-dot';
+import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useHost } from '@/providers/host-provider';
 import { relativeTime } from '@/lib/time';
@@ -26,6 +27,7 @@ export function EnvironmentDetailPage() {
   const client = useApplianceClient();
   const queryClient = useQueryClient();
   const host = useHost();
+  const confirm = useConfirm();
   const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
 
   const envQuery = useQuery({
@@ -106,12 +108,13 @@ export function EnvironmentDetailPage() {
   const inFlight = env ? ENV_IN_FLIGHT.has(env.status) : false;
   const busy = deployMutation.isPending || destroyMutation.isPending || inFlight;
 
-  const onDestroy = () => {
+  const onDestroy = async () => {
     if (!env) return;
-    const ok =
-      typeof window !== 'undefined'
-        ? window.confirm(`Destroy environment "${env.name}"? This tears down its stack.`)
-        : true;
+    const ok = await confirm({
+      title: `Destroy environment "${env.name}"?`,
+      description: 'This tears down its deployed stack. The environment record stays and can be redeployed.',
+      confirmLabel: 'Destroy',
+    });
     if (!ok) return;
     destroyMutation.mutate();
   };

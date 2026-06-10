@@ -5,6 +5,8 @@ import { ChevronLeft, ExternalLink, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { relativeTime } from '@/lib/time';
 import { urlMapForEnvironments } from '@/lib/deployment';
@@ -18,6 +20,8 @@ export function ProjectDetailPage() {
   const navigate = useNavigate();
   const client = useApplianceClient();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
 
   const projectQuery = useQuery({
     queryKey: ['project', id],
@@ -76,6 +80,7 @@ export function ProjectDetailPage() {
     onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['projects'] });
+      toast(`Project "${projectQuery.data?.name ?? id}" deleted`);
       navigate('/projects');
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : String(err)),
@@ -83,12 +88,13 @@ export function ProjectDetailPage() {
 
   if (!id) return <Navigate to="/projects" replace />;
 
-  const onDelete = () => {
+  const onDelete = async () => {
     if (!projectQuery.data) return;
-    const ok =
-      typeof window !== 'undefined'
-        ? window.confirm(`Delete project "${projectQuery.data.name}"? Its environments must already be destroyed.`)
-        : true;
+    const ok = await confirm({
+      title: `Delete project "${projectQuery.data.name}"?`,
+      description: 'Its environments must already be destroyed.',
+      confirmLabel: 'Delete',
+    });
     if (!ok) return;
     deleteMutation.mutate();
   };

@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Check } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
@@ -13,6 +15,8 @@ import { cn } from '@/lib/utils';
 export function SettingsPage() {
   const host = useHost();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
   const canBootstrap = Boolean(host.bootstrap);
   const { config, isLoading } = useSelectedCluster();
   const clusters = config?.clusters ?? [];
@@ -24,19 +28,24 @@ export function SettingsPage() {
   });
 
   const removeMutation = useMutation({
-    mutationFn: async (id: string) => host.removeCluster(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['host', 'config'] }),
+    mutationFn: async (cluster: Cluster) => {
+      await host.removeCluster(cluster.id);
+      return cluster;
+    },
+    onSuccess: (cluster) => {
+      queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      toast(`Cluster "${cluster.name}" removed`);
+    },
   });
 
-  const onRemove = (cluster: Cluster) => {
-    const ok =
-      typeof window !== 'undefined'
-        ? window.confirm(
-            `Remove cluster "${cluster.name}"? This forgets the URL and API key on this machine but does not destroy any infrastructure.`
-          )
-        : true;
+  const onRemove = async (cluster: Cluster) => {
+    const ok = await confirm({
+      title: `Remove cluster "${cluster.name}"?`,
+      description: 'This forgets the URL and API key on this machine but does not destroy any infrastructure.',
+      confirmLabel: 'Remove',
+    });
     if (!ok) return;
-    removeMutation.mutate(cluster.id);
+    removeMutation.mutate(cluster);
   };
 
   return (

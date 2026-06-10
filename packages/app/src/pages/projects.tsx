@@ -3,6 +3,10 @@ import { Link } from 'react-router';
 import { useQueries, useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { ExternalLink, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ListSkeleton } from '@/components/ui/skeleton';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { urlMapForEnvironments } from '@/lib/deployment';
@@ -21,6 +25,8 @@ export function ProjectsPage() {
 function ConnectedProjects() {
   const client = useApplianceClient();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
 
   const projectsQuery = useQuery({
     queryKey: ['projects'],
@@ -92,24 +98,27 @@ function ConnectedProjects() {
       if (!r.success) throw r.error;
       return r.data;
     },
-    onSuccess: () => {
+    onSuccess: (project) => {
       setCreating(false);
       setName('');
       setDescription('');
       setMutationError(null);
       queryClient.invalidateQueries({ queryKey: ['projects'] });
+      toast(`Project "${project.name}" created`);
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
   });
 
   const deleteMutation = useMutation({
-    mutationFn: async (id: string) => {
-      const r = await client!.deleteProject(id);
+    mutationFn: async (p: Project) => {
+      const r = await client!.deleteProject(p.id);
       if (!r.success) throw r.error;
+      return p;
     },
-    onSuccess: () => {
+    onSuccess: (p) => {
       setMutationError(null);
       queryClient.invalidateQueries({ queryKey: ['projects'] });
+      toast(`Project "${p.name}" deleted`);
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
   });
@@ -120,10 +129,14 @@ function ConnectedProjects() {
     createMutation.mutate({ name, description: description || undefined });
   };
 
-  const onDelete = (p: Project) => {
-    const ok = typeof window !== 'undefined' ? window.confirm(`Delete project "${p.name}"?`) : true;
+  const onDelete = async (p: Project) => {
+    const ok = await confirm({
+      title: `Delete project "${p.name}"?`,
+      description: 'Its environments must already be destroyed.',
+      confirmLabel: 'Delete',
+    });
     if (!ok) return;
-    deleteMutation.mutate(p.id);
+    deleteMutation.mutate(p);
   };
 
   return (
@@ -194,12 +207,17 @@ function ConnectedProjects() {
       ) : null}
 
       {projectsQuery.isLoading ? (
-        <div className="text-sm text-[var(--color-muted-foreground)]">Loading…</div>
+        <ListSkeleton />
       ) : !projectsQuery.data || projectsQuery.data.length === 0 ? (
-        <div className="rounded-md border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
-          No projects yet. Create one above or via{' '}
-          <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance</code> on the CLI.
-        </div>
+        <EmptyState
+          title="No projects yet"
+          description={
+            <>
+              Create one with the button above, or via{' '}
+              <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance</code> on the CLI.
+            </>
+          }
+        />
       ) : (
         <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
           {projectsQuery.data.map((p) => {

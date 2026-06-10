@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
+import { startProgressLine } from './utils/progress.js';
 import chalk from 'chalk';
 
 const program = new Command();
@@ -15,7 +16,7 @@ program.action(async () => {
   const credentials = loadCredentials();
   if (!credentials) {
     console.log(chalk.red('✗ Credentials not found (~/.appliance/credentials.json)'));
-    console.log(chalk.dim('  Run `appliance init` to set up credentials.'));
+    console.log(chalk.dim('  Run `appliance login` to set up credentials.'));
     process.exit(1);
   }
   console.log(chalk.green(`✓ Credentials loaded (${credentials.keyId})`));
@@ -23,13 +24,14 @@ program.action(async () => {
   const client = createApplianceClient({ baseUrl: credentials.apiUrl });
 
   // 2. Check connectivity
+  const connectivity = startProgressLine(`Checking server at ${credentials.apiUrl}...`);
   const statusResult = await client.getBootstrapStatus();
   if (!statusResult.success) {
-    console.log(chalk.red(`✗ Server unreachable at ${credentials.apiUrl}`));
+    connectivity.fail(chalk.red(`✗ Server unreachable at ${credentials.apiUrl}`));
     console.log(chalk.dim(`  Error: ${statusResult.error.message}`));
     process.exit(1);
   }
-  console.log(chalk.green(`✓ Server reachable at ${credentials.apiUrl}`));
+  connectivity.done(chalk.green(`✓ Server reachable at ${credentials.apiUrl}`));
 
   // 3. Bootstrap status
   if (statusResult.data.initialized) {
@@ -45,13 +47,15 @@ program.action(async () => {
     credentials: { keyId: credentials.keyId, secret: credentials.secret },
   });
 
+  const signing = startProgressLine('Checking request signing...');
   const projectsResult = await signedClient.listProjects();
   if (!projectsResult.success) {
-    console.log(chalk.red('✗ Signed request failed'));
+    signing.fail(chalk.red('✗ Signed request failed'));
     console.log(chalk.dim(`  Error: ${projectsResult.error.message}`));
+    console.log(chalk.dim('  Run `appliance login` to refresh credentials.'));
     failed = true;
   } else {
-    console.log(chalk.green('✓ Signed request succeeded'));
+    signing.done(chalk.green('✓ Signed request succeeded'));
   }
 
   if (failed) {
