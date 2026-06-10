@@ -2,6 +2,7 @@ import * as React from 'react';
 import { Link, useNavigate, useParams, Navigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft, ExternalLink, Play, Rocket, Trash2 } from 'lucide-react';
+import { LiveUrl } from '@/components/ui/live-url';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { StatusDot } from '@/components/ui/status-dot';
@@ -208,17 +209,17 @@ export function EnvironmentDetailPage() {
             const url = urlForEnvironment(env, deploymentsQuery.data);
             if (!url) return null;
             return (
-              <a
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center justify-between gap-3 rounded-md border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-300 hover:bg-green-500/15"
-              >
-                <span>
-                  <span className="font-semibold">Live at</span> <code className="font-mono text-xs">{url}</code>
-                </span>
-                <ExternalLink className="h-4 w-4" />
-              </a>
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-3">
+                <div className="flex min-w-0 items-center gap-3 text-sm">
+                  <span className="h-2 w-2 shrink-0 rounded-full bg-green-400" />
+                  <LiveUrl url={url} className="min-w-0 text-sm" />
+                </div>
+                <Button asChild size="sm">
+                  <a href={url} target="_blank" rel="noreferrer">
+                    Visit <ExternalLink className="h-3.5 w-3.5" />
+                  </a>
+                </Button>
+              </div>
             );
           })()}
 

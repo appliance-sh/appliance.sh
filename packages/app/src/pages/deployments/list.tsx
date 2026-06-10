@@ -62,26 +62,29 @@ export function DeploymentsPage() {
           No deployments yet.
         </div>
       ) : (
-        <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
+        <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)]">
           {deploymentsQuery.data.map((d) => (
             <li key={d.id}>
               <Link
                 to={`/deployments/${d.id}`}
-                className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 hover:bg-[var(--color-muted)]"
+                className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 transition-colors hover:bg-[var(--color-accent)]"
               >
                 <StatusDot status={d.status} />
                 <div className="min-w-0">
                   <div className="text-sm font-medium">
-                    {d.action} · <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
+                    <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
                     <span className="text-[var(--color-muted-foreground)]">/</span>
                     <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
+                    <span className="ml-2 text-xs font-normal text-[var(--color-muted-foreground)]">{d.action}</span>
                   </div>
                   {d.message ? (
                     <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message}</div>
                   ) : null}
                 </div>
-                <div className="text-xs text-[var(--color-muted-foreground)]">{d.status}</div>
-                <div className="text-xs text-[var(--color-muted-foreground)]">{relativeTime(d.startedAt)}</div>
+                <div className="text-xs text-[var(--color-muted-foreground)]">{durationOf(d) ?? d.status}</div>
+                <div className="w-16 text-right text-xs text-[var(--color-muted-foreground)]">
+                  {relativeTime(d.startedAt)}
+                </div>
               </Link>
             </li>
           ))}
@@ -89,4 +92,14 @@ export function DeploymentsPage() {
       )}
     </div>
   );
+}
+
+/** Wall-clock duration of a finished run (e.g. "12s", "2m 4s"). */
+function durationOf(d: { startedAt: string; completedAt?: string }): string | null {
+  if (!d.completedAt) return null;
+  const ms = new Date(d.completedAt).getTime() - new Date(d.startedAt).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }

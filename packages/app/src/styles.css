@@ -4,18 +4,24 @@
    minimal for the initial scaffold. Dark-first to match the Docker
    Desktop aesthetic. Expand as real components land. */
 @theme {
-  --color-background: hsl(240 10% 4%);
-  --color-foreground: hsl(0 0% 98%);
-  --color-muted: hsl(240 4% 16%);
-  --color-muted-foreground: hsl(240 5% 65%);
-  --color-border: hsl(240 4% 16%);
-  --color-accent: hsl(240 5% 26%);
+  /* Vercel-style dark: true-black page, near-black surfaces, hairline
+     neutral borders, white primary actions. Status colors stay on
+     tailwind's green/amber/red utility classes. */
+  --color-background: hsl(0 0% 4%);
+  --color-foreground: hsl(0 0% 93%);
+  --color-surface: hsl(0 0% 7%);
+  --color-muted: hsl(0 0% 10%);
+  --color-muted-foreground: hsl(0 0% 63%);
+  --color-border: hsl(0 0% 18%);
+  --color-border-strong: hsl(0 0% 33%);
+  --color-accent: hsl(0 0% 14%);
   --color-accent-foreground: hsl(0 0% 98%);
-  --color-primary: hsl(160 84% 39%);
-  --color-primary-foreground: hsl(160 10% 4%);
-  --color-destructive: hsl(0 72% 51%);
+  --color-primary: hsl(0 0% 93%);
+  --color-primary-foreground: hsl(0 0% 4%);
+  --color-info: hsl(212 100% 48%);
+  --color-destructive: hsl(358 75% 50%);
   --color-destructive-foreground: hsl(0 0% 98%);
-  --radius: 0.5rem;
+  --radius: 0.375rem;
 }
 
 html,

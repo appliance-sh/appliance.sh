@@ -1,15 +1,20 @@
+import * as React from 'react';
 import { Link } from 'react-router';
 import { useQuery, useQueries } from '@tanstack/react-query';
-import { Rocket, Folder, Box, Plug, Wand, Laptop } from 'lucide-react';
+import { Plug, Wand, Laptop, Plus, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { StatusDot } from '@/components/ui/status-dot';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { EntityLabel } from '@/components/ui/entity-label';
+import { LiveUrl } from '@/components/ui/live-url';
+import { Skeleton } from '@/components/ui/skeleton';
+import { StatusDot } from '@/components/ui/status-dot';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 import { extractDeploymentUrl } from '@/lib/deployment';
+import type { Environment, Project } from '@appliance.sh/sdk/models';
 
 export function DashboardPage() {
   const host = useHost();
@@ -20,25 +25,14 @@ export function DashboardPage() {
   if (isLoading) return null;
   if (!cluster) return <GetStarted canBootstrap={canBootstrap} canBootstrapLocal={canBootstrapLocal} />;
 
-  return (
-    <ConnectedDashboard
-      serverUrl={cluster.apiServerUrl}
-      clusterName={cluster.name}
-      canDeployLocally={Boolean(host.local?.buildAndImportImage)}
-    />
-  );
+  return <Overview clusterName={cluster.name} serverUrl={cluster.apiServerUrl} />;
 }
 
-function ConnectedDashboard({
-  serverUrl,
-  clusterName,
-  canDeployLocally,
-}: {
-  serverUrl: string;
-  clusterName: string;
-  canDeployLocally: boolean;
-}) {
+// ---- the project grid (Vercel-style home) -------------------------------
+
+function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: string }) {
   const client = useApplianceClient();
+  const [filter, setFilter] = React.useState('');
 
   const projectsQuery = useQuery({
     queryKey: ['projects'],
@@ -48,6 +42,7 @@ function ConnectedDashboard({
       if (!r.success) throw r.error;
       return r.data;
     },
+    refetchInterval: 10_000,
   });
 
   const environmentQueries = useQueries({
@@ -59,13 +54,12 @@ function ConnectedDashboard({
         if (!r.success) throw r.error;
         return r.data;
       },
+      refetchInterval: 10_000,
     })),
   });
 
-  // Shares the deployments-list page's query (same key) so navigating
-  // between the two never double-fetches. The stat below counts this
-  // full window — a `limit: 10` query here used to pin the dashboard
-  // count at 10 forever.
+  // Shares the deployments-list page's query key so navigation between
+  // the two never double-fetches.
   const deploymentsQuery = useQuery({
     queryKey: ['deployments', 'all'],
     enabled: !!client,
@@ -77,27 +71,41 @@ function ConnectedDashboard({
     refetchInterval: 5_000,
   });
 
-  const environmentCount = environmentQueries.reduce((sum, q) => sum + (q.data?.length ?? 0), 0);
-  const environmentsLoading = environmentQueries.some((q) => q.isLoading);
-
   const error = projectsQuery.error ?? environmentQueries.find((q) => q.error)?.error ?? deploymentsQuery.error;
+  const loading = projectsQuery.isLoading;
+  const projects = projectsQuery.data ?? [];
+  const envsByProject = new Map<string, Environment[]>();
+  projects.forEach((p, i) => envsByProject.set(p.id, environmentQueries[i]?.data ?? []));
+
+  const visible = filter.trim()
+    ? projects.filter((p) => p.name.toLowerCase().includes(filter.trim().toLowerCase()))
+    : projects;
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-3">
+    <div className="space-y-8">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold">Dashboard</h1>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            {clusterName} · <code className="font-mono">{serverUrl}</code>
+          <h1 className="text-xl font-semibold tracking-tight">Overview</h1>
+          <p className="mt-0.5 text-sm text-[var(--color-muted-foreground)]">
+            {clusterName} · <span className="font-mono text-xs">{serverUrl}</span>
           </p>
         </div>
-        {canDeployLocally ? (
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--color-muted-foreground)]" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search projects…"
+              className="h-9 w-56 rounded-md border border-[var(--color-border)] bg-transparent pl-8 pr-3 text-sm placeholder:text-[var(--color-muted-foreground)] focus:border-[var(--color-border-strong)] focus:outline-none"
+            />
+          </div>
           <Button asChild>
-            <Link to="/local-runtime/deploy">
-              <Rocket className="h-4 w-4" /> Deploy
+            <Link to="/projects">
+              <Plus className="h-4 w-4" /> New Project
             </Link>
           </Button>
-        ) : null}
+        </div>
       </div>
 
       {error ? (
@@ -106,38 +114,91 @@ function ConnectedDashboard({
         </div>
       ) : null}
 
-      <div className="grid gap-3 sm:grid-cols-3">
-        <Stat
-          label="Projects"
-          value={projectsQuery.isLoading ? '…' : error ? '—' : String(projectsQuery.data?.length ?? 0)}
-          icon={Folder}
-          to="/projects"
-        />
-        <Stat
-          label="Environments"
-          value={environmentsLoading || projectsQuery.isLoading ? '…' : error ? '—' : String(environmentCount)}
-          icon={Box}
-          to="/environments"
-        />
-        <Stat
-          label="Deployments"
-          value={
-            deploymentsQuery.isLoading
-              ? '…'
-              : error
-                ? '—'
-                : // The list window is 100; at the cap we can't know the
-                  // true total, so say so instead of reporting a wrong one.
-                  (deploymentsQuery.data?.length ?? 0) >= 100
-                  ? '100+'
-                  : String(deploymentsQuery.data?.length ?? 0)
-          }
-          icon={Rocket}
-          to="/deployments"
-        />
-      </div>
+      {loading ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="space-y-3 rounded-lg border border-[var(--color-border)] p-5">
+              <Skeleton className="h-5 w-2/5" />
+              <Skeleton className="h-4 w-4/5" />
+              <Skeleton className="h-3 w-1/3" />
+            </div>
+          ))}
+        </div>
+      ) : projects.length === 0 ? (
+        <EmptyProjects />
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {visible.map((project) => (
+            <ProjectCard key={project.id} project={project} environments={envsByProject.get(project.id) ?? []} />
+          ))}
+          {visible.length === 0 ? (
+            <p className="col-span-full py-12 text-center text-sm text-[var(--color-muted-foreground)]">
+              No projects match “{filter.trim()}”.
+            </p>
+          ) : null}
+        </div>
+      )}
 
-      <RecentActivity deployments={deploymentsQuery.data?.slice(0, 10)} loading={deploymentsQuery.isLoading} />
+      {projects.length > 0 ? (
+        <RecentActivity deployments={deploymentsQuery.data?.slice(0, 8)} loading={deploymentsQuery.isLoading} />
+      ) : null}
+    </div>
+  );
+}
+
+function ProjectCard({ project, environments }: { project: Project; environments: Environment[] }) {
+  // Card status mirrors the "worst interesting" environment state:
+  // anything failed wins, else in-flight, else deployed.
+  const status = environments.some((e) => e.status === 'failed')
+    ? 'failed'
+    : environments.some((e) => ['deploying', 'destroying'].includes(e.status))
+      ? 'deploying'
+      : environments.some((e) => e.status === 'deployed')
+        ? 'deployed'
+        : 'pending';
+  const live = environments.find((e) => e.status === 'deployed' && e.url);
+  const deployedAts = environments
+    .map((e) => e.lastDeployedAt)
+    .filter((v): v is string => Boolean(v))
+    .sort();
+  const lastDeployed = deployedAts[deployedAts.length - 1];
+
+  return (
+    <Link
+      to={`/projects/${project.id}`}
+      className="group flex flex-col gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-5 transition-colors hover:border-[var(--color-border-strong)]"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-medium">{project.name}</span>
+        <StatusDot status={status} />
+      </div>
+      <div className="min-h-5 text-sm">
+        {live?.url ? (
+          <LiveUrl url={live.url} />
+        ) : (
+          <span className="text-[var(--color-muted-foreground)]">No live deployment</span>
+        )}
+      </div>
+      <div className="mt-auto flex items-center justify-between text-xs text-[var(--color-muted-foreground)]">
+        <span>
+          {environments.length} environment{environments.length === 1 ? '' : 's'}
+        </span>
+        <span>{lastDeployed ? `Updated ${relativeTime(lastDeployed)}` : 'Never deployed'}</span>
+      </div>
+    </Link>
+  );
+}
+
+function EmptyProjects() {
+  return (
+    <div className="mx-auto max-w-md space-y-4 py-16 text-center">
+      <h2 className="text-lg font-semibold">Deploy your first project</h2>
+      <p className="text-sm text-[var(--color-muted-foreground)]">
+        Run this from an application directory with an <code className="font-mono">appliance.json</code> — it creates
+        the project, builds, and deploys in one step.
+      </p>
+      <CommandSnippet command="appliance deploy" className="text-left" />
+      <p className="text-xs text-[var(--color-muted-foreground)]">The deployed app appears here with its live URL.</p>
     </div>
   );
 }
@@ -152,43 +213,49 @@ function RecentActivity({
   const envs = useEnvironmentsMap();
   const projects = useProjectsMap();
   return (
-    <section className="rounded-md border border-[var(--color-border)]">
-      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
-        <h2 className="text-sm font-semibold">Recent activity</h2>
-      </div>
+    <section>
+      <h2 className="mb-3 text-sm font-semibold text-[var(--color-muted-foreground)]">Recent activity</h2>
       {loading && !deployments ? (
-        <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">Loading…</div>
-      ) : !deployments || deployments.length === 0 ? (
-        <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">
-          No deployments yet. Runs triggered from the CLI or this shell will show up here.
+        <div className="space-y-2">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-10 w-full" />
+          ))}
         </div>
+      ) : !deployments || deployments.length === 0 ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          No deployments yet. Runs triggered from the CLI or this console show up here.
+        </p>
       ) : (
-        <ul className="divide-y divide-[var(--color-border)]">
+        <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)]">
           {deployments.map((d) => {
-            // Prefer the canonical env.url; legacy envs without one
-            // still fall back to scanning this deployment's message.
             const env = envs.get(d.environmentId);
             const url = env?.url ?? extractDeploymentUrl(d.message);
             return (
               <li key={d.id}>
                 <Link
                   to={`/deployments/${d.id}`}
-                  className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-4 py-2 hover:bg-[var(--color-muted)]"
+                  className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-[var(--color-accent)]"
                 >
                   <StatusDot status={d.status} />
                   <div className="min-w-0 text-sm">
-                    <div className="font-medium">
-                      {d.action} · <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
+                    <span className="font-medium">
+                      <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
                       <span className="text-[var(--color-muted-foreground)]">/</span>
-                      <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
-                    </div>
-                    <div className="truncate text-xs text-[var(--color-muted-foreground)]">
-                      {url ? <span className="font-mono">{url}</span> : (d.message ?? '—')}
-                    </div>
+                      <EntityLabel id={d.environmentId} name={env?.name} />
+                    </span>
+                    <span className="ml-2 text-xs text-[var(--color-muted-foreground)]">
+                      {d.action}
+                      {url ? (
+                        <>
+                          {' · '}
+                          <span className="font-mono">{url.replace(/^https?:\/\//, '')}</span>
+                        </>
+                      ) : null}
+                    </span>
                   </div>
-                  <div className="text-right text-xs text-[var(--color-muted-foreground)]">
+                  <span className="text-right text-xs text-[var(--color-muted-foreground)]">
                     {relativeTime(d.startedAt)}
-                  </div>
+                  </span>
                 </Link>
               </li>
             );
@@ -199,6 +266,8 @@ function RecentActivity({
   );
 }
 
+// ---- first-run (no cluster) ----------------------------------------------
+
 function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean; canBootstrapLocal: boolean }) {
   // Local is the recommended starting point — zero cloud cost, no
   // AWS credentials needed, runs on the operator's own machine. When
@@ -207,9 +276,9 @@ function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div>
-        <h1 className="text-2xl font-semibold">Welcome to Appliance</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Install and run applications on a cluster. Start with a local k3d runtime on this device, provision an AWS
+          Install and run applications on a cluster. Start with a local runtime on this device, provision an AWS
           cluster, or connect to one you already have.
         </p>
       </div>
@@ -219,7 +288,7 @@ function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean
           <ActionCard
             icon={Laptop}
             title="Start a local runtime"
-            body="Spin up a k3d cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
+            body="Spin up a local cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
             cta="Start"
             to="/bootstrap?mode=local"
             primary
@@ -238,38 +307,13 @@ function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean
         <ActionCard
           icon={Plug}
           title="Connect to existing"
-          body="Point this shell at an api-server you already have by entering its URL and an API key."
+          body="Point this console at an api-server you already have by entering its URL and an API key."
           cta="Connect"
           to="/connect"
           primary={!canBootstrap && !canBootstrapLocal}
         />
       </div>
     </div>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  icon: Icon,
-  to,
-}: {
-  label: string;
-  value: string;
-  icon: React.ComponentType<{ className?: string }>;
-  to: string;
-}) {
-  return (
-    <Link
-      to={to}
-      className="rounded-md border border-[var(--color-border)] p-4 transition-colors hover:border-[var(--color-muted-foreground)]"
-    >
-      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
-        <span>{label}</span>
-        <Icon className="h-3.5 w-3.5" />
-      </div>
-      <div className="mt-2 text-2xl font-semibold">{value}</div>
-    </Link>
   );
 }
 
@@ -289,7 +333,7 @@ function ActionCard({
   primary?: boolean;
 }) {
   return (
-    <div className="flex flex-col rounded-md border border-[var(--color-border)] p-4">
+    <div className="flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
       <Icon className="h-5 w-5 text-[var(--color-muted-foreground)]" />
       <h2 className="mt-3 text-sm font-semibold">{title}</h2>
       <p className="mt-1 flex-1 text-xs text-[var(--color-muted-foreground)]">{body}</p>

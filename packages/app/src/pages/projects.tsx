@@ -224,7 +224,7 @@ function ConnectedProjects() {
                             href={url}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1.5 font-mono text-[11px] text-green-300 hover:underline"
+                            className="inline-flex items-center gap-1.5 font-mono text-[11px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] hover:underline"
                             title={`${envName} — open deployed URL`}
                           >
                             <span className="text-[var(--color-muted-foreground)]">{envName}</span>

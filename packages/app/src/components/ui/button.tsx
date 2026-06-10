@@ -8,11 +8,15 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: 'bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:opacity-90',
+        // Vercel-style: primary is white-on-black; secondary borders
+        // brighten on hover instead of filling.
+        default: 'bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:bg-white',
         outline:
-          'border border-[var(--color-border)] bg-transparent hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-foreground)]',
-        ghost: 'hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-foreground)]',
-        destructive: 'bg-[var(--color-destructive)] text-[var(--color-destructive-foreground)] hover:opacity-90',
+          'border border-[var(--color-border)] bg-transparent text-[var(--color-foreground)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-accent)]',
+        ghost:
+          'text-[var(--color-muted-foreground)] hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-foreground)]',
+        destructive:
+          'border border-[var(--color-destructive)]/40 bg-transparent text-red-400 hover:bg-[var(--color-destructive)] hover:text-white',
       },
       size: {
         default: 'h-9 px-4 py-2',

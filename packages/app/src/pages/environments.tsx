@@ -265,7 +265,7 @@ function ConnectedEnvironments() {
                       href={url}
                       target="_blank"
                       rel="noreferrer"
-                      className="mt-0.5 inline-flex items-center gap-1 font-mono text-[11px] text-green-300 hover:underline"
+                      className="mt-0.5 inline-flex items-center gap-1 font-mono text-[11px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] hover:underline"
                       title="Open deployed URL"
                     >
                       {url}
