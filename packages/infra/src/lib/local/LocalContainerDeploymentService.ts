@@ -453,17 +453,22 @@ function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
 
 function resolveClusterConfig(baseConfig: ApplianceBaseConfig): ClusterConfig {
   // Common k8s params (namespace, hostnameSuffix, ingressClassName)
-  // come from whichever subobject the variant uses. hostPort is
-  // local-specific (the k3d serverlb publishes :80 on `hostPort` so
-  // the host can hit the Ingress); for `appliance-base-kubernetes`
-  // the cluster fronts Ingress on the canonical 80/443 and we render
-  // it port-less (applianceHostnameUrl elides :80). Stamping the
-  // k3d default (8081) onto a generic Kubernetes URL produced a
+  // come from whichever subobject the variant uses. hostPort is the
+  // host-side port the cluster's ingress/LB answers on, used only for
+  // the URLs reported back from deploys. `appliance-base-local`
+  // defaults to the k3d serverlb publish port (8081);
+  // `appliance-base-kubernetes` honors an explicit `hostPort` (set by
+  // the desktop/CLI-managed in-cluster runtime, whose serverlb also
+  // publishes on a non-80 port) and otherwise assumes the canonical
+  // 80, rendered port-less (applianceHostnameUrl elides :80) —
+  // stamping the k3d default onto a generic Kubernetes URL produced a
   // bogus `:8081` suffix on every reported deploy URL.
   const k8sParams = getKubernetesParams(baseConfig);
   const localCluster = baseConfig.local?.cluster ?? {};
   const hostPort =
-    baseConfig.type === ApplianceBaseType.ApplianceLocal ? (localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT) : 80;
+    baseConfig.type === ApplianceBaseType.ApplianceLocal
+      ? (localCluster.hostPort ?? DEFAULT_LOCAL_HOST_PORT)
+      : (baseConfig.kubernetes?.hostPort ?? 80);
   return {
     clusterName: localCluster.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME,
     namespace: k8sParams?.namespace ?? DEFAULT_LOCAL_NAMESPACE,

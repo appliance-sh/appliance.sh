@@ -1561,14 +1561,42 @@ async fn docker_daemon_reachable() -> bool {
     )
 }
 
-/// True when the `docker` CLI is wired to talk to colima's socket —
-/// i.e. colima is the runtime providing Docker on this machine. We key
-/// off the active docker *context* (and `DOCKER_HOST`) because those
-/// persist whether or not the VM is currently up: `docker context
-/// show` returns `colima` even while the VM is stopped. This is what
-/// guards auto-start — we only bring colima up when the user's docker
-/// is actually pointed at it, never when they're on Docker Desktop /
-/// OrbStack with a stray colima install sitting alongside.
+/// Docker contexts created by GUI runtimes. When any of these exist
+/// alongside colima, the machine has a competing runtime that may own
+/// the default socket — auto-starting colima could race or confuse
+/// it, so we stay hands-off and surface guidance instead.
+const GUI_RUNTIME_CONTEXTS: [&str; 3] = ["desktop-linux", "orbstack", "rancher-desktop"];
+
+/// Whether the user has a colima VM instance (running or stopped).
+/// `colima list -j` emits one JSON object per line, one per instance;
+/// empty when the user never created a VM (`colima start` would then
+/// build a fresh one — a bigger action than restarting the VM they
+/// already had, so we don't auto-start in that case).
+async fn colima_instance_exists() -> bool {
+    match run_status_command(&["colima", "list", "-j"]).await {
+        Ok((true, out, _)) => out.lines().filter(|l| !l.trim().is_empty()).any(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| !s.is_empty()))
+                .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+/// True when colima is the runtime providing Docker on this machine —
+/// the guard for auto-start: we only bring colima up when the user's
+/// docker is actually backed by it, never when they're on Docker
+/// Desktop / OrbStack with a stray colima install sitting alongside.
+///
+/// Detection, in order of confidence:
+///   1. `DOCKER_HOST` points at a colima socket.
+///   2. The active docker context is `colima`.
+///   3. The active context is `default` (a clean `colima stop` resets
+///      the context, so a stopped colima looks exactly like "no
+///      runtime" here), a colima VM instance exists, and no GUI
+///      runtime context is present to claim the default socket
+///      instead.
 async fn colima_is_active_runtime() -> bool {
     if !which_succeeds("colima").await {
         return false;
@@ -1579,10 +1607,29 @@ async fn colima_is_active_runtime() -> bool {
     {
         return true;
     }
-    matches!(
-        run_status_command(&["docker", "context", "show"]).await,
-        Ok((true, ctx, _)) if ctx.trim() == "colima"
-    )
+    let current = match run_status_command(&["docker", "context", "show"]).await {
+        Ok((true, ctx, _)) => ctx.trim().to_string(),
+        _ => return false,
+    };
+    if current == "colima" {
+        return true;
+    }
+    if current != "default" {
+        return false;
+    }
+    let names: Vec<String> =
+        match run_status_command(&["docker", "context", "ls", "--format", "{{.Name}}"]).await {
+            Ok((true, out, _)) => out
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            _ => return false,
+        };
+    if names.iter().any(|n| GUI_RUNTIME_CONTEXTS.contains(&n.as_str())) {
+        return false;
+    }
+    colima_instance_exists().await
 }
 
 /// Platform-appropriate nudge for "Docker is installed but the daemon
@@ -2435,6 +2482,11 @@ fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
         "namespace": cfg.namespace,
         "hostnameSuffix": "appliance.localhost",
         "ingressClassName": "traefik",
+        // The k3d serverlb publishes ingress :80 on this host port —
+        // deploy-result URLs must carry it to be clickable from the
+        // host (KubernetesDeploymentService composes
+        // `http://<stack>.<suffix>[:<hostPort>]` from it).
+        "hostPort": cfg.host_port,
     });
     if let Some(registry_url) = cfg.registry_url.as_deref() {
         kubernetes["registry"] = serde_json::json!({

@@ -76,7 +76,10 @@ export class BuildService {
       if (stored.type !== BuildType.RemoteImage) {
         throw new Error(`${config.type} bases only support remote-image builds`);
       }
-      return { imageUri: stored.source };
+      // The declared port rides on the build record (remote images
+      // have no manifest to read it from) and becomes the Service
+      // target port.
+      return { imageUri: stored.source, localPort: stored.port };
     }
 
     if (!config.aws?.dataBucketName) throw new Error('Data bucket not configured');

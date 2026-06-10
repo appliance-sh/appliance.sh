@@ -46,6 +46,20 @@ export interface CheckResult {
    * UIs distinguish "not installed" from "installed but broken".
    */
   error?: string;
+  /**
+   * For docker only: whether a daemon is actually *reachable*, not
+   * just whether the CLI is installed. Undefined for tools where
+   * daemon state is meaningless (k3d, kubectl), so callers only
+   * special-case docker. `false` here is "installed but not running".
+   */
+  daemonRunning?: boolean;
+  /**
+   * For docker only, meaningful when `daemonRunning` is false:
+   * whether appliance can start the runtime itself (colima is the
+   * active runtime). Drives a "start it for me" affordance vs.
+   * manual-start guidance.
+   */
+  daemonStartable?: boolean;
 }
 
 export interface ManualInstall {

@@ -21,11 +21,14 @@
   },
   "scripts": {
     "build": "tsc",
-    "clean": "rm -rf ./dist/"
+    "clean": "rm -rf ./dist/",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {},
   "devDependencies": {
     "@types/node": "24.12.2",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "^3.0.4"
   }
 }

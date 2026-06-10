@@ -2,13 +2,14 @@ import { Command } from 'commander';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { input } from '@inquirer/prompts';
-import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
-import type { Project, Environment, Deployment } from '@appliance.sh/sdk';
+import { ApplianceType, createApplianceClient, DeploymentStatus, isKubernetesBase } from '@appliance.sh/sdk';
+import type { ApplianceBaseConfig, Project, Environment, Deployment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
 import { getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
 import { buildApplianceZip } from './utils/build-package.js';
+import { publishLocalApplianceImage } from './utils/local-image.js';
 import { readLink, writeLink } from './utils/link.js';
 import { pollDeploymentUntilDone, extractDeploymentUrl } from './utils/deploy-poll.js';
 import { startProgressLine, BRAND } from './utils/progress.js';
@@ -186,15 +187,20 @@ async function resolveTarget(
   return { projectName, environmentName, source };
 }
 
-// Resolve which build to deploy. Three mutually-exclusive paths:
+// Resolve which build to deploy. Four mutually-exclusive paths:
 //   --image-uri <uri>    : register an external image build (no upload)
+//   <kubernetes base>    : build the image host-side, push/import it
+//                          into the cluster, register a remote-image
+//                          build (upload-flow builds aren't supported
+//                          by k8s-driven api-servers)
 //   <existing zip path>  : upload the existing zip
 //   <no zip + default>   : auto-build the manifest into appliance.zip,
 //                          then upload it
 async function resolveBuildId(
   client: ReturnType<typeof createApplianceClient>,
   program: Command,
-  opts: { imageUri?: string; build: string }
+  opts: { imageUri?: string; build: string },
+  kubernetesBase: ApplianceBaseConfig | null
 ): Promise<string> {
   if (opts.imageUri) {
     console.log(chalk.dim(`Using image: ${opts.imageUri}`));
@@ -202,6 +208,10 @@ async function resolveBuildId(
     if (!createResult.success) throw new Error(`Failed to create external build: ${createResult.error.message}`);
     console.log(chalk.dim(`External build created: ${createResult.data.buildId}`));
     return createResult.data.buildId;
+  }
+
+  if (kubernetesBase) {
+    return resolveKubernetesBuildId(client, program, kubernetesBase);
   }
 
   const buildPath = path.resolve(opts.build);
@@ -237,6 +247,47 @@ async function resolveBuildId(
   if (!uploadResult.success) throw new Error(`Upload failed: ${uploadResult.error.message}`);
   console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
   return uploadResult.data.buildId;
+}
+
+// Kubernetes-base build: produce a container image on the host and
+// hand the api-server an image reference. The in-cluster api-server
+// has no docker daemon, so it rejects zip uploads — image production
+// is the CLI's job here, exactly like the desktop's deploy wizard.
+async function resolveKubernetesBuildId(
+  client: ReturnType<typeof createApplianceClient>,
+  program: Command,
+  baseConfig: ApplianceBaseConfig
+): Promise<string> {
+  const manifest = await extractApplianceFile(program);
+  if (!manifest.success) {
+    throw new Error(
+      `This environment deploys container images, and no manifest was found to build one from: ${manifest.error.message}. ` +
+        'Pass --image-uri <ref> to deploy a pre-built image.'
+    );
+  }
+  const appliance = manifest.data;
+  if (appliance.type !== ApplianceType.container) {
+    throw new Error(
+      `This environment runs on a Kubernetes base, which deploys container images. ` +
+        `"${appliance.type}" appliances can't be built into an image by the CLI yet — ` +
+        'add a Dockerfile and switch to `"type": "container"`, or pass --image-uri <ref>.'
+    );
+  }
+
+  const registryUrl = baseConfig.kubernetes?.registry?.url ?? null;
+  const clusterName = baseConfig.local?.cluster?.clusterName;
+  const imageRef = await publishLocalApplianceImage({
+    name: appliance.name,
+    platform: appliance.platform,
+    buildScript: appliance.scripts?.build,
+    registryUrl,
+    clusterName,
+  });
+
+  const createResult = await client.createBuild({ uploadUrl: imageRef, port: appliance.port });
+  if (!createResult.success) throw new Error(`Failed to create image build: ${createResult.error.message}`);
+  console.log(chalk.dim(`Image build created: ${createResult.data.buildId}`));
+  return createResult.data.buildId;
 }
 
 function formatStatus(d: Deployment): string {
@@ -332,7 +383,20 @@ registerManifestOptions(program)
       const project = await findOrCreateProject(client, projectName);
       const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
-      const buildId = await resolveBuildId(client, program, { imageUri: opts.imageUri, build: opts.build });
+      // Kubernetes-driven bases deploy images, not uploaded zips —
+      // probe the server's base type once so the build step can pick
+      // the right pipeline. Treat probe failures as "not kubernetes":
+      // older api-servers without /cluster-info are cloud-shaped.
+      const clusterInfo = await client.getClusterInfo();
+      const kubernetesBase =
+        clusterInfo.success && isKubernetesBase(clusterInfo.data.baseConfig) ? clusterInfo.data.baseConfig : null;
+
+      const buildId = await resolveBuildId(
+        client,
+        program,
+        { imageUri: opts.imageUri, build: opts.build },
+        kubernetesBase
+      );
 
       const manifestRuntime = await renderRuntimeConfig(program, projectName, environmentName);
       const envFileVars = loadEnvFile(opts.envFile, environmentName);

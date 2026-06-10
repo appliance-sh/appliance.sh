@@ -200,21 +200,13 @@ describe('applianceInput schema', () => {
 });
 
 describe('environmentInput schema', () => {
-  const validBaseConfig = {
-    name: 'test-base',
-    type: ApplianceBaseType.ApplianceAwsPublic,
-    stateBackendUrl: 's3://my-bucket/state',
-    aws: {
-      region: 'us-east-1',
-      zoneId: 'Z1234567890',
-    },
-  };
-
+  // Environments inherit the cluster's base config from the
+  // api-server (APPLIANCE_BASE_CONFIG); callers only name the
+  // environment and its project.
   it('should accept valid environment input', () => {
     const result = environmentInput.safeParse({
       name: 'production',
       projectId: 'proj-123',
-      baseConfig: validBaseConfig,
     });
     expect(result.success).toBe(true);
   });
@@ -222,14 +214,13 @@ describe('environmentInput schema', () => {
   it('should reject missing projectId', () => {
     const result = environmentInput.safeParse({
       name: 'production',
-      baseConfig: validBaseConfig,
     });
     expect(result.success).toBe(false);
   });
 
-  it('should reject missing baseConfig', () => {
+  it('should reject an invalid DNS name', () => {
     const result = environmentInput.safeParse({
-      name: 'production',
+      name: 'Not A DNS Name!',
       projectId: 'proj-123',
     });
     expect(result.success).toBe(false);

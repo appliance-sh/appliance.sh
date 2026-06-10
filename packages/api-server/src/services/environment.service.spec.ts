@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { EnvironmentStatus, ApplianceBaseType } from '@appliance.sh/sdk';
+import { EnvironmentStatus } from '@appliance.sh/sdk';
 
 const mockStore = new Map<string, string>();
 
@@ -40,42 +40,36 @@ vi.mock('./storage.service', () => ({
 
 import { environmentService } from './environment.service';
 
-const validBaseConfig = {
-  name: 'test-base',
-  type: ApplianceBaseType.ApplianceAwsPublic as const,
-  stateBackendUrl: 's3://my-bucket/state',
-  aws: {
-    region: 'us-east-1',
-    zoneId: 'Z1234567890',
-  },
-};
-
 describe('EnvironmentService', () => {
   beforeEach(() => {
     mockStore.clear();
   });
 
   it('should create an environment with Pending status', async () => {
-    const env = await environmentService.create({
-      name: 'production',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const env = await environmentService.create(
+      {
+        name: 'production',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     expect(env.name).toBe('production');
     expect(env.projectId).toBe('proj-1');
     expect(env.status).toBe(EnvironmentStatus.Pending);
     expect(env.id).toBeDefined();
-    expect(env.stackName).toBe(`proj-1-${env.id}`);
+    expect(env.stackName).toBe('proj-1-production');
     expect(env.createdAt).toBeDefined();
   });
 
   it('should retrieve an environment by id', async () => {
-    const created = await environmentService.create({
-      name: 'staging',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const created = await environmentService.create(
+      {
+        name: 'staging',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     const fetched = await environmentService.get(created.id);
     expect(fetched).not.toBeNull();
@@ -88,21 +82,27 @@ describe('EnvironmentService', () => {
   });
 
   it('should list environments by projectId', async () => {
-    await environmentService.create({
-      name: 'prod',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
-    await environmentService.create({
-      name: 'staging',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
-    await environmentService.create({
-      name: 'dev',
-      projectId: 'proj-2',
-      baseConfig: validBaseConfig,
-    });
+    await environmentService.create(
+      {
+        name: 'prod',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
+    await environmentService.create(
+      {
+        name: 'staging',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
+    await environmentService.create(
+      {
+        name: 'dev',
+        projectId: 'proj-2',
+      },
+      'proj-1'
+    );
 
     const proj1Envs = await environmentService.listByProject('proj-1');
     expect(proj1Envs).toHaveLength(2);
@@ -112,11 +112,13 @@ describe('EnvironmentService', () => {
   });
 
   it('should delete an environment', async () => {
-    const created = await environmentService.create({
-      name: 'to-delete',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const created = await environmentService.create(
+      {
+        name: 'to-delete',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     await environmentService.delete(created.id);
     const result = await environmentService.get(created.id);
@@ -124,11 +126,13 @@ describe('EnvironmentService', () => {
   });
 
   it('should update environment status', async () => {
-    const created = await environmentService.create({
-      name: 'prod',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const created = await environmentService.create(
+      {
+        name: 'prod',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     const updated = await environmentService.updateStatus(created.id, EnvironmentStatus.Deploying);
     expect(updated).not.toBeNull();
@@ -137,11 +141,13 @@ describe('EnvironmentService', () => {
   });
 
   it('should set lastDeployedAt when status is Deployed', async () => {
-    const created = await environmentService.create({
-      name: 'prod',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const created = await environmentService.create(
+      {
+        name: 'prod',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     const updated = await environmentService.updateStatus(created.id, EnvironmentStatus.Deployed);
     expect(updated).not.toBeNull();
@@ -155,11 +161,13 @@ describe('EnvironmentService', () => {
   });
 
   it('should update environment preserving id and createdAt', async () => {
-    const created = await environmentService.create({
-      name: 'prod',
-      projectId: 'proj-1',
-      baseConfig: validBaseConfig,
-    });
+    const created = await environmentService.create(
+      {
+        name: 'prod',
+        projectId: 'proj-1',
+      },
+      'proj-1'
+    );
 
     const updated = await environmentService.update(created.id, { name: 'production' });
     expect(updated).not.toBeNull();

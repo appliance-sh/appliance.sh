@@ -16,7 +16,7 @@ buildRoutes.post('/', async (req, res) => {
 
     const result =
       parsed.data.type === BuildType.RemoteImage
-        ? await buildUploadService.createRemoteImage(parsed.data.uploadUrl)
+        ? await buildUploadService.createRemoteImage(parsed.data.uploadUrl, parsed.data.port)
         : await buildUploadService.createUpload();
 
     logger.info('build created', {

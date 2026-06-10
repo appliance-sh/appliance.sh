@@ -68,12 +68,13 @@ export class BuildUploadService {
     return { buildId, uploadUrl };
   }
 
-  async createRemoteImage(uploadUrl: string): Promise<BuildUploadResult> {
+  async createRemoteImage(uploadUrl: string, port?: number): Promise<BuildUploadResult> {
     const buildId = generateId('build');
     await this.persist({
       id: buildId,
       type: BuildType.RemoteImage,
       source: uploadUrl,
+      port,
       createdAt: new Date().toISOString(),
     });
     return { buildId };

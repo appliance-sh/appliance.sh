@@ -181,7 +181,10 @@ export function LocalRuntimeDeployPage() {
       const env = await findOrCreateEnvironment(client, project.id, projectName, envName);
 
       append({ stream: 'meta', message: `==> creating external build for ${resolvedImageRef}` });
-      const build = await client.createBuild({ uploadUrl: resolvedImageRef });
+      // `port` rides on the build record so the api-server's Service
+      // wiring targets the app's real port (remote images carry no
+      // manifest to read it from).
+      const build = await client.createBuild({ uploadUrl: resolvedImageRef, port: manifest.port });
       if (!build.success) throw new Error(`createBuild: ${build.error.message}`);
 
       const envVars: Record<string, string> = {};

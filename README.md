@@ -96,8 +96,25 @@ Optional fields available on all types:
 | `appliance deployment status <id>`  | Check a specific deployment's status                                          |
 | `appliance deployment cancel`       | Cancel an in-flight deployment                                                |
 | `appliance deployment refresh`      | Reconcile Pulumi state with cloud reality                                     |
+| `appliance local up`                | Start the full local runtime: container runtime → k3d cluster → api-server    |
+| `appliance local stop`              | Stop the local cluster without deleting its state                             |
+| `appliance local delete`            | Delete the local cluster + registry (host data dir is preserved)              |
+| `appliance local status`            | Check tools, the runtime daemon, the cluster, and the local api-server        |
+| `appliance local install`           | Install missing prerequisites (k3d, kubectl) into `~/.appliance/bin`          |
 
 Top-level commands like `setup`, `status`, and `list` are shortcuts for `appliance app setup`, `appliance app status`, and `appliance app list`.
+
+### Local development runtime
+
+`appliance local up` turns your machine into a self-contained Appliance target: it starts the container runtime (auto-starting colima when it's your active docker runtime), creates a k3d Kubernetes cluster with an attached image registry, deploys the Appliance api-server _into_ the cluster, and logs you in under the `local-runtime` profile. From there the normal flow works unchanged against `http://api.appliance.localhost:8081`:
+
+```bash
+appliance local up
+APPLIANCE_PROFILE=local-runtime appliance deploy my-app dev
+# → http://my-app-dev.appliance.localhost:8081
+```
+
+The same API and SDK drive both targets — deploys against the local cluster build a container image and hand the api-server an image reference, while cloud deploys upload a build for server-side processing.
 
 ### The link file
 

@@ -118,6 +118,12 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
     // Ingress controller class. Cluster-dependent; common values
     // are `nginx`, `traefik`, `alb`.
     ingressClassName: z.string().optional(),
+    // Host-side port the cluster's ingress/LB is reachable on from
+    // the operator's machine — used only to compose the URLs reported
+    // back from deploys (`http://<host>[:<hostPort>]`). Defaults to
+    // 80 (a directly-routable cluster); the desktop-managed k3d
+    // runtime publishes its serverlb on 8081 and sets this.
+    hostPort: z.number().int().min(1).max(65535).optional(),
     // Path mounted into the api-server pod that backs the
     // FilesystemObjectStore. Typically a PVC mount such as `/data`.
     dataDir: z.string(),
@@ -237,6 +243,9 @@ export const applianceBaseConfig = z.object({
       namespace: z.string().optional(),
       hostnameSuffix: z.string().optional(),
       ingressClassName: z.string().optional(),
+      // Host-side ingress/LB port for reported URLs. See the input
+      // schema's field of the same name.
+      hostPort: z.number().int().min(1).max(65535).optional(),
       dataDir: z.string(),
       registry: z
         .object({

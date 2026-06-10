@@ -9,6 +9,18 @@ const mockDeploymentService = vi.hoisted(() => ({
 
 vi.mock('../../services/deployment.service', () => ({
   deploymentService: mockDeploymentService,
+  // The real class must survive the module mock — the route's catch
+  // branches on `instanceof EnvironmentBusyError`, and an undefined
+  // right-hand side turns every 400 into a 500 TypeError.
+  EnvironmentBusyError: class EnvironmentBusyError extends Error {},
+}));
+
+const mockApiKeyService = vi.hoisted(() => ({
+  getByKeyId: vi.fn(),
+}));
+
+vi.mock('../../services/api-key.service', () => ({
+  apiKeyService: mockApiKeyService,
 }));
 
 import { deploymentRoutes } from './index';
@@ -16,6 +28,12 @@ import { deploymentRoutes } from './index';
 function createTestApp() {
   const app = express();
   app.use(express.json());
+  // Stand-in for the signature-auth middleware: the POST route reads
+  // req.apiKeyId to re-sign the worker dispatch with the caller's key.
+  app.use((req, _res, next) => {
+    req.apiKeyId = 'ak_test';
+    next();
+  });
   app.use('/api/v1/deployments', deploymentRoutes);
   return app;
 }
@@ -23,6 +41,7 @@ function createTestApp() {
 describe('Deployment routes', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    mockApiKeyService.getByKeyId.mockResolvedValue({ id: 'ak_test', secret: 'sk_test' });
   });
 
   describe('POST /api/v1/deployments', () => {

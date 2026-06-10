@@ -9,17 +9,17 @@ const TEST_CREDENTIALS = {
 const TEST_HOST = 'api.test.local';
 
 describe('computeContentDigest', () => {
-  it('should produce consistent sha-256 digest', () => {
+  it('should produce consistent sha-256 digest', async () => {
     const body = '{"name":"test"}';
-    const digest1 = computeContentDigest(body);
-    const digest2 = computeContentDigest(body);
+    const digest1 = await computeContentDigest(body);
+    const digest2 = await computeContentDigest(body);
     expect(digest1).toBe(digest2);
     expect(digest1).toMatch(/^sha-256=:.+:$/);
   });
 
-  it('should produce different digests for different bodies', () => {
-    const digest1 = computeContentDigest('{"a":1}');
-    const digest2 = computeContentDigest('{"a":2}');
+  it('should produce different digests for different bodies', async () => {
+    const digest1 = await computeContentDigest('{"a":1}');
+    const digest2 = await computeContentDigest('{"a":2}');
     expect(digest1).not.toBe(digest2);
   });
 });

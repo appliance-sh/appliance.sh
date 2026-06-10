@@ -1,8 +1,10 @@
 import { firstLine, tryVersion } from '../download.js';
+import { colimaIsActiveRuntime, dockerDaemonReachable, dockerUnreachableHint } from '../runtime.js';
 import type { CheckResult, Context, ManualInstall, Provider } from '../types.js';
 
-// Docker provider is *detect-only*. A working "docker engine" on a
-// user's machine is a combination of:
+// Docker provider is *install-detect-only*: we never install a
+// container runtime. A working "docker engine" on a user's machine
+// is a combination of:
 //
 //   * macOS:   Docker Desktop GUI install, OR Colima + lima + qemu
 //   * Linux:   dockerd + containerd + iptables + cgroups (root needed)
@@ -17,6 +19,11 @@ import type { CheckResult, Context, ManualInstall, Provider } from '../types.js'
 // `appliance local install docker` deliberately returns guidance
 // rather than attempting an install — paired with `manualInstall`
 // instructions the orchestrator surfaces in the CLI / UI.
+//
+// *Starting* an already-installed runtime is a separate question:
+// check() also probes whether a daemon is reachable, and runtime.ts
+// can auto-start colima (a userland, unprivileged CLI) when it's the
+// active runtime. GUI runtimes and system dockerd remain manual.
 
 export const dockerProvider: Provider = {
   name: 'docker',
@@ -27,7 +34,24 @@ export const dockerProvider: Provider = {
   async check(): Promise<CheckResult> {
     const r = await tryVersion('docker', ['--version']);
     if (!r) return { installed: false, error: 'not on PATH' };
-    return { installed: true, version: firstLine(r.stdout) };
+    // `--version` only proves the CLI exists — it exits 0 with no
+    // daemon running. Probe the daemon too so doctor surfaces can show
+    // "installed but not running" (and offer to start colima) instead
+    // of a misleading green check followed by a failed cluster start.
+    const daemonRunning = await dockerDaemonReachable();
+    if (daemonRunning) {
+      return { installed: true, version: firstLine(r.stdout), daemonRunning };
+    }
+    const daemonStartable = await colimaIsActiveRuntime();
+    return {
+      installed: true,
+      version: firstLine(r.stdout),
+      daemonRunning,
+      daemonStartable,
+      error: daemonStartable
+        ? 'Docker is installed but its colima VM isn’t running. Appliance can start it for you.'
+        : dockerUnreachableHint(),
+    };
   },
 
   manualInstall(ctx: Context): ManualInstall {

@@ -34,6 +34,13 @@ export const buildCreateInput = z.discriminatedUnion('type', [
   z.object({
     type: z.literal(BuildType.RemoteImage),
     uploadUrl: z.string(),
+    // Container port the image serves on. Upload builds carry this
+    // inside the zipped appliance.json; remote-image builds have no
+    // manifest to read, so the caller declares it here. Kubernetes
+    // bases use it for the Service/probe wiring (default 8080 when
+    // omitted); Lambda ignores it (AWS_LWA_PORT is baked into the
+    // image).
+    port: z.number().int().min(1).max(65535).optional(),
   }),
 ]);
 
@@ -57,6 +64,8 @@ export const build = z.object({
    * the zip is expected at.
    */
   source: z.string(),
+  /** Declared container port — remote-image builds only. */
+  port: z.number().int().min(1).max(65535).optional(),
   createdAt: z.string(),
 });
 

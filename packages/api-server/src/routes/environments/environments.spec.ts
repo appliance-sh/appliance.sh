@@ -13,6 +13,14 @@ vi.mock('../../services/environment.service', () => ({
   environmentService: mockEnvironmentService,
 }));
 
+const mockProjectService = vi.hoisted(() => ({
+  get: vi.fn(),
+}));
+
+vi.mock('../../services/project.service', () => ({
+  projectService: mockProjectService,
+}));
+
 import { environmentRoutes } from './index';
 
 function createTestApp() {
@@ -25,6 +33,9 @@ function createTestApp() {
 describe('Environment routes', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    // The create route resolves the project first (its name seeds the
+    // environment's stackName) and 404s when missing.
+    mockProjectService.get.mockResolvedValue({ id: 'proj-1', name: 'proj-1' });
   });
 
   describe('POST /api/v1/projects/:projectId/environments', () => {

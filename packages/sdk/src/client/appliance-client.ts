@@ -332,11 +332,17 @@ export class ApplianceClient {
    *     `uploadUrl` the caller PUTs their zip to.
    *   - `createBuild({ uploadUrl: "<uri>" })` — type: remote-image.
    *     Caller references an image/content URL that already exists.
-   *     Response is `{ buildId }` only.
+   *     Response is `{ buildId }` only. Pass `port` to declare the
+   *     container port the image serves on — Kubernetes bases wire
+   *     the Service to it (remote images carry no manifest to read
+   *     it from).
    */
-  async createBuild(options?: { uploadUrl?: string }): Promise<Result<{ buildId: string; uploadUrl?: string }>> {
+  async createBuild(options?: {
+    uploadUrl?: string;
+    port?: number;
+  }): Promise<Result<{ buildId: string; uploadUrl?: string }>> {
     const body = options?.uploadUrl
-      ? { type: 'remote-image' as const, uploadUrl: options.uploadUrl }
+      ? { type: 'remote-image' as const, uploadUrl: options.uploadUrl, port: options.port }
       : { type: 'upload' as const };
     return this.request<{ buildId: string; uploadUrl?: string }>('POST', '/api/v1/builds', body);
   }
