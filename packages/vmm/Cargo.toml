@@ -1,0 +1,48 @@
+[package]
+name = "appliance-vmm"
+version = "0.1.0"
+description = "Appliance microVM manager — one executable, multiple virtualization backends (Virtualization.framework, KVM, WSL2)"
+authors = ["Eliot Lim"]
+license = "MIT"
+edition = "2021"
+
+[[bin]]
+name = "appliance-vmm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+ureq = "2"
+flate2 = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-virtualization = { version = "0.3", features = [
+  "block2",
+  "dispatch2",
+  "VZBootLoader",
+  "VZLinuxBootLoader",
+  "VZVirtualMachine",
+  "VZVirtualMachineConfiguration",
+  "VZSerialPortConfiguration",
+  "VZSerialPortAttachment",
+  "VZFileSerialPortAttachment",
+  "VZVirtioConsoleDeviceSerialPortConfiguration",
+  "VZNetworkDeviceConfiguration",
+  "VZNetworkDeviceAttachment",
+  "VZNATNetworkDeviceAttachment",
+  "VZVirtioNetworkDeviceConfiguration",
+  "VZStorageDeviceConfiguration",
+  "VZStorageDeviceAttachment",
+  "VZDiskImageStorageDeviceAttachment",
+  "VZVirtioBlockDeviceConfiguration",
+  "VZEntropyDeviceConfiguration",
+  "VZVirtioEntropyDeviceConfiguration",
+] }
+dispatch2 = "0.3"
+block2 = "0.6"

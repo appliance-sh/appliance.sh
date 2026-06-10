@@ -191,3 +191,4 @@ packages/desktop/src-tauri/binaries/
 bun.lockb
 bun.lock
 .gstack/
+packages/vmm/target/
