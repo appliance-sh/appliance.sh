@@ -35,24 +35,34 @@ export function AppShell() {
   ];
 
   return (
-    <div className="grid h-full grid-cols-[220px_1fr] grid-rows-[auto_1fr_auto]">
+    // Below `sm` the sidebar collapses to an icon rail so narrow
+    // windows (small desktop panes, phones) keep a usable content
+    // column instead of a crushed two-column squeeze.
+    <div className="grid h-full grid-cols-[56px_1fr] grid-rows-[auto_1fr_auto] sm:grid-cols-[220px_1fr]">
       <aside className="row-span-3 border-r border-[var(--color-border)] bg-[var(--color-muted)]">
-        <div className="px-4 py-4 text-sm font-semibold tracking-tight">Appliance</div>
+        <div className="hidden px-4 py-4 text-sm font-semibold tracking-tight sm:block">Appliance</div>
+        <div className="px-4 py-4 text-sm font-semibold tracking-tight sm:hidden" aria-hidden>
+          A
+        </div>
         <nav className="flex flex-col gap-1 px-2">
           {nav.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.end}
+              title={item.label}
+              // Hover only brightens the text; the filled background is
+              // reserved for the active route so the two states never
+              // read the same while the pointer rests on the sidebar.
               className={({ isActive }) =>
                 cn(
-                  'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[var(--color-muted-foreground)] hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-foreground)]',
+                  'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-accent-foreground)]',
                   isActive && 'bg-[var(--color-accent)] text-[var(--color-accent-foreground)]'
                 )
               }
             >
-              <item.icon className="h-4 w-4" />
-              {item.label}
+              <item.icon className="h-4 w-4 shrink-0" />
+              <span className="hidden sm:inline">{item.label}</span>
             </NavLink>
           ))}
         </nav>

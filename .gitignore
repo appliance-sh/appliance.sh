@@ -190,3 +190,4 @@ packages/desktop/src-tauri/binaries/
 # pnpm-lock.yaml as the source of truth.
 bun.lockb
 bun.lock
+.gstack/

@@ -7,7 +7,7 @@ import { EntityLabel } from '@/components/ui/entity-label';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
-import { useEnvironmentsMap } from '@/hooks/use-lookups';
+import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
@@ -62,11 +62,15 @@ function ConnectedDashboard({
     })),
   });
 
+  // Shares the deployments-list page's query (same key) so navigating
+  // between the two never double-fetches. The stat below counts this
+  // full window — a `limit: 10` query here used to pin the dashboard
+  // count at 10 forever.
   const deploymentsQuery = useQuery({
-    queryKey: ['deployments', 'recent'],
+    queryKey: ['deployments', 'all'],
     enabled: !!client,
     queryFn: async () => {
-      const r = await client!.listDeployments({ limit: 10 });
+      const r = await client!.listDeployments({ limit: 100 });
       if (!r.success) throw r.error;
       return r.data;
     },
@@ -102,25 +106,38 @@ function ConnectedDashboard({
         </div>
       ) : null}
 
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid gap-3 sm:grid-cols-3">
         <Stat
           label="Projects"
           value={projectsQuery.isLoading ? '…' : error ? '—' : String(projectsQuery.data?.length ?? 0)}
           icon={Folder}
+          to="/projects"
         />
         <Stat
           label="Environments"
           value={environmentsLoading || projectsQuery.isLoading ? '…' : error ? '—' : String(environmentCount)}
           icon={Box}
+          to="/environments"
         />
         <Stat
           label="Deployments"
-          value={deploymentsQuery.isLoading ? '…' : error ? '—' : String(deploymentsQuery.data?.length ?? 0)}
+          value={
+            deploymentsQuery.isLoading
+              ? '…'
+              : error
+                ? '—'
+                : // The list window is 100; at the cap we can't know the
+                  // true total, so say so instead of reporting a wrong one.
+                  (deploymentsQuery.data?.length ?? 0) >= 100
+                  ? '100+'
+                  : String(deploymentsQuery.data?.length ?? 0)
+          }
           icon={Rocket}
+          to="/deployments"
         />
       </div>
 
-      <RecentActivity deployments={deploymentsQuery.data} loading={deploymentsQuery.isLoading} />
+      <RecentActivity deployments={deploymentsQuery.data?.slice(0, 10)} loading={deploymentsQuery.isLoading} />
     </div>
   );
 }
@@ -133,6 +150,7 @@ function RecentActivity({
   loading: boolean;
 }) {
   const envs = useEnvironmentsMap();
+  const projects = useProjectsMap();
   return (
     <section className="rounded-md border border-[var(--color-border)]">
       <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
@@ -160,7 +178,9 @@ function RecentActivity({
                   <StatusDot status={d.status} />
                   <div className="min-w-0 text-sm">
                     <div className="font-medium">
-                      {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
+                      {d.action} · <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
+                      <span className="text-[var(--color-muted-foreground)]">/</span>
+                      <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
                     </div>
                     <div className="truncate text-xs text-[var(--color-muted-foreground)]">
                       {url ? <span className="font-mono">{url}</span> : (d.message ?? '—')}
@@ -232,19 +252,24 @@ function Stat({
   label,
   value,
   icon: Icon,
+  to,
 }: {
   label: string;
   value: string;
   icon: React.ComponentType<{ className?: string }>;
+  to: string;
 }) {
   return (
-    <div className="rounded-md border border-[var(--color-border)] p-4">
+    <Link
+      to={to}
+      className="rounded-md border border-[var(--color-border)] p-4 transition-colors hover:border-[var(--color-muted-foreground)]"
+    >
       <div className="flex items-center justify-between text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
         <span>{label}</span>
         <Icon className="h-3.5 w-3.5" />
       </div>
       <div className="mt-2 text-2xl font-semibold">{value}</div>
-    </div>
+    </Link>
   );
 }
 

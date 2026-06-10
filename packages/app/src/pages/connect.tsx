@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
+import { createApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 
@@ -30,8 +31,16 @@ export function ConnectPage() {
     if (derived) setName(derived);
   }, [url]);
 
+  // No key-format gating here: ID/secret shapes have drifted before
+  // (the server mints `apikey_…` IDs while old docs said `ak_…`) and a
+  // prefix check that's wrong makes connecting impossible. The real
+  // validation is the authenticated probe in onSubmit.
   const canSubmit =
-    name.length > 0 && url.length > 0 && keyId.startsWith('ak') && secret.startsWith('sk_') && !submitting;
+    name.trim().length > 0 &&
+    url.trim().length > 0 &&
+    keyId.trim().length > 0 &&
+    secret.trim().length > 0 &&
+    !submitting;
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -39,12 +48,15 @@ export function ConnectPage() {
     setSubmitting(true);
     setError(null);
     try {
-      const normalizedUrl = url.replace(/\/+$/, '');
+      const normalizedUrl = url.trim().replace(/\/+$/, '');
+      const trimmedKeyId = keyId.trim();
+      const trimmedSecret = secret.trim();
       await verifyApiServer(normalizedUrl);
+      await verifyCredentials(normalizedUrl, trimmedKeyId, trimmedSecret);
       await host.addCluster({
-        name,
+        name: name.trim(),
         apiServerUrl: normalizedUrl,
-        apiKey: { id: keyId, secret },
+        apiKey: { id: trimmedKeyId, secret: trimmedSecret },
       });
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       navigate('/');
@@ -86,6 +98,20 @@ export function ConnectPage() {
     }
   }
 
+  // Make one signed request before stashing the key. A typo'd secret
+  // otherwise "connects" fine and then every page fails with opaque
+  // 401s — failing here, with the fix in hand, is the kinder UX.
+  async function verifyCredentials(serverUrl: string, id: string, secretValue: string): Promise<void> {
+    const client = createApplianceClient({ baseUrl: serverUrl, credentials: { keyId: id, secret: secretValue } });
+    const result = await client.listProjects();
+    if (!result.success) {
+      throw new Error(
+        `the server is reachable but rejected these credentials (${result.error.message}). ` +
+          'Check the access key ID and secret — `appliance whoami` shows the active key.'
+      );
+    }
+  }
+
   return (
     <div className="mx-auto max-w-md space-y-6 pt-16">
       <div className="space-y-2">
@@ -96,7 +122,9 @@ export function ConnectPage() {
             <>
               {' '}
               Don&apos;t have a cluster yet? Run{' '}
-              <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance bootstrap</code> from the CLI.
+              <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance local up</code> for a local k3d
+              runtime, or <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance bootstrap</code> for
+              AWS.
             </>
           )}
         </p>
@@ -128,12 +156,12 @@ export function ConnectPage() {
           />
         </Field>
 
-        <Field label="Access key ID" hint="ak_…">
+        <Field label="Access key ID" hint="apikey_…">
           <input
             type="text"
             value={keyId}
             onChange={(e) => setKeyId(e.target.value)}
-            placeholder="ak_…"
+            placeholder="apikey_…"
             required
             className={`${inputCls} font-mono`}
           />

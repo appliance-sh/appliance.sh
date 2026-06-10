@@ -151,7 +151,7 @@ function ConnectedProjects() {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              pattern="[a-z][a-z0-9-]*"
+              pattern="[a-z][a-z0-9\-]*"
               required
               placeholder="my-project"
               className={inputCls}

@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams, Navigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft, ExternalLink, Play, Rocket, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useHost } from '@/providers/host-provider';
@@ -152,9 +153,10 @@ export function EnvironmentDetailPage() {
                 // `client.deploy(id)` would fail with "No image available…"
                 // on the server. When the desktop's local-runtime wizard
                 // is available, route the user there with the env preset
-                // so they can build + push an image in one flow. Otherwise
-                // (web shell, cloud env) keep the existing button — the
-                // CLI is the documented escape hatch.
+                // so they can build + push an image in one flow. On the
+                // web shell the first deploy happens from the CLI — the
+                // guidance card below replaces a button that could only
+                // ever fail.
                 const hasImage = Boolean(env.lastDeployedAt);
                 if (!hasImage && canRunDeployWizard) {
                   const target = `/local-runtime/deploy?project=${encodeURIComponent(
@@ -168,10 +170,11 @@ export function EnvironmentDetailPage() {
                     </Button>
                   );
                 }
+                if (!hasImage) return null;
                 return (
                   <Button onClick={() => deployMutation.mutate()} disabled={busy}>
                     <Play className="h-4 w-4" />
-                    {deployMutation.isPending ? 'Starting…' : 'Deploy'}
+                    {deployMutation.isPending ? 'Starting…' : 'Redeploy'}
                   </Button>
                 );
               })()}
@@ -185,6 +188,17 @@ export function EnvironmentDetailPage() {
           {actionError ? (
             <div className="rounded-md border border-red-500/50 bg-red-500/5 p-3 text-xs text-red-400">
               {actionError}
+            </div>
+          ) : null}
+
+          {!env.lastDeployedAt && !canRunDeployWizard ? (
+            <div className="space-y-2 rounded-md border border-[var(--color-border)] p-4">
+              <div className="text-sm font-semibold">Deploy your first build</div>
+              <p className="text-xs text-[var(--color-muted-foreground)]">
+                This environment has no build yet. Run this from your application directory — it builds, uploads, and
+                deploys in one step. Redeploys are available here afterwards.
+              </p>
+              <CommandSnippet command={`appliance deploy ${projectQuery.data?.name ?? env.projectId} ${env.name}`} />
             </div>
           ) : null}
 

@@ -4,12 +4,13 @@ import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
-import { useEnvironmentsMap } from '@/hooks/use-lookups';
+import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 
 export function DeploymentsPage() {
   const client = useApplianceClient();
   const envs = useEnvironmentsMap();
+  const projects = useProjectsMap();
   const { cluster } = useSelectedCluster();
 
   const deploymentsQuery = useQuery({
@@ -71,7 +72,9 @@ export function DeploymentsPage() {
                 <StatusDot status={d.status} />
                 <div className="min-w-0">
                   <div className="text-sm font-medium">
-                    {d.action} · <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
+                    {d.action} · <EntityLabel id={d.projectId} name={projects.get(d.projectId)?.name} />
+                    <span className="text-[var(--color-muted-foreground)]">/</span>
+                    <EntityLabel id={d.environmentId} name={envs.get(d.environmentId)?.name} />
                   </div>
                   {d.message ? (
                     <div className="truncate text-xs text-[var(--color-muted-foreground)]">{d.message}</div>
