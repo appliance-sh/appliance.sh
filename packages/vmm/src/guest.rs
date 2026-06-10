@@ -366,9 +366,20 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
     eprintln!("guest address: {guest_ip}");
     fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
 
-    crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))?;
-    crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))?;
-    crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))?;
+    // Bind failures here are almost always the other engine (k3d's
+    // serverlb publishes the same 8081) — name the fix, don't let it
+    // surface as a generic timeout.
+    let bind_hint = |port: u16, what: &str| {
+        format!(
+            "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. If the k3d runtime is running, stop it first (`appliance local stop`)."
+        )
+    };
+    crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
+        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
+    crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))
+        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
+    crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
+        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
     eprintln!(
         "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT

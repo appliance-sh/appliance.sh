@@ -140,14 +140,7 @@ fn run() -> Result<()> {
             // resident. Spawning the same binary keeps it to one
             // executable, and gives every backend identical daemon
             // semantics.
-            let exe = std::env::current_exe().context("resolve current executable")?;
-            let child = Command::new(exe)
-                .args(["run", &name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("spawn VM host process")?;
+            let child = spawn_host_process(&name)?;
             println!("starting VM '{name}' (host pid {})", child.id());
             println!("console: appliance-vmm console {name} -f");
             Ok(())
@@ -163,14 +156,7 @@ fn run() -> Result<()> {
                 // observe files written by this boot.
                 let _ = std::fs::remove_file(paths.kubeconfig());
                 let _ = std::fs::remove_file(paths.guest_ip());
-                let exe = std::env::current_exe().context("resolve current executable")?;
-                let child = Command::new(exe)
-                    .args(["run", &name])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .context("spawn VM host process")?;
+                let child = spawn_host_process(&name)?;
                 println!("starting VM '{name}' (host pid {})", child.id());
             }
 
@@ -191,12 +177,16 @@ fn run() -> Result<()> {
                 if std::time::Instant::now() > liveness_grace && store::read_live_pid(&name).is_none() {
                     println!();
                     bail!(
-                        "VM host process exited during startup — check `appliance-vmm console {name}` and the boot log"
+                        "VM host process exited during startup:\n{}",
+                        tail_of(&paths.host_log(), 8)
                     );
                 }
                 if std::time::Instant::now() >= deadline {
                     println!();
-                    bail!("timed out waiting for the kubeconfig (see `appliance-vmm console {name}`)");
+                    bail!(
+                        "timed out waiting for the kubeconfig. Host log tail:\n{}\n(boot log: `appliance-vmm console {name}`)",
+                        tail_of(&paths.host_log(), 8)
+                    );
                 }
                 print!(".");
                 std::io::Write::flush(&mut std::io::stdout())?;
@@ -301,4 +291,36 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
     let spec = VmSpec::defaults(name);
     store::save_spec(&spec)?;
     Ok(spec)
+}
+
+/// Spawn the resident VM host process (this same binary, `run`),
+/// detached, with its output captured in the per-VM host.log — a
+/// silently discarded stderr turns every host-side failure (a proxy
+/// port already taken, a lease that never appears) into an
+/// undebuggable timeout.
+fn spawn_host_process(name: &str) -> Result<std::process::Child> {
+    let paths = VmPaths::for_name(name);
+    std::fs::create_dir_all(&paths.dir)?;
+    let log = std::fs::File::create(paths.host_log()).context("create host.log")?;
+    let log_err = log.try_clone()?;
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    Command::new(exe)
+        .args(["run", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
+        .spawn()
+        .context("spawn VM host process")
+}
+
+/// Last `n` lines of a log file, or a placeholder when unreadable.
+fn tail_of(path: &std::path::Path, n: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let lines: Vec<&str> = raw.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].join("\n")
+        }
+        Err(_) => format!("(no host log at {})", path.display()),
+    }
 }

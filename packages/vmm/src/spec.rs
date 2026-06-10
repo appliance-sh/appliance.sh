@@ -104,6 +104,9 @@ impl VmPaths {
     pub fn guest_ip(&self) -> PathBuf {
         self.dir.join("guest-ip")
     }
+    pub fn host_log(&self) -> PathBuf {
+        self.dir.join("host.log")
+    }
 }
 
 /// Runtime status reported by `status`.
