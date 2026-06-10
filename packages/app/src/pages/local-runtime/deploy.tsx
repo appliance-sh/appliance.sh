@@ -180,15 +180,22 @@ export function LocalRuntimeDeployPage() {
     const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
 
     try {
-      // 1. Resolve the cluster's registry URL (if one is attached)
-      //    so build_and_import_image pushes to it instead of falling
-      //    back to k3d image import. Registry path is required once
-      //    api-server moves in-cluster (no docker daemon available),
-      //    and works equally well when api-server is still on the
-      //    host — k3s pulls through the `--registry-use` mirror
-      //    either way.
-      const runtime = await local.runtimeStatus();
-      const registryUrl = runtime.config.registryUrl;
+      // 1. Resolve the registry from the *selected cluster's* own
+      //    /cluster-info — engine-agnostic: the k3d runtime advertises
+      //    its sibling registry (localhost:5050), the microVM its
+      //    forwarded in-VM registry (localhost:5052). Asking the k3d
+      //    runtimeStatus here used to misroute microVM builds into the
+      //    k3d registry. Fall back to the k3d probe only when the
+      //    server predates /cluster-info.
+      let registryUrl: string | undefined;
+      const info = await client.getClusterInfo();
+      if (info.success) {
+        registryUrl = info.data.baseConfig.kubernetes?.registry?.url ?? undefined;
+      }
+      if (!registryUrl) {
+        const runtime = await local.runtimeStatus();
+        registryUrl = runtime.config.registryUrl;
+      }
 
       // 2. docker build + push (or import fallback) — streams onto our log box.
       const imageTag = `${manifest.name}:latest`;

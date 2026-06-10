@@ -3633,11 +3633,25 @@ async fn build_and_import_image(
 
     if let Some(pushable) = pushable_tag {
         // Registry path: push, then return the registry-qualified
-        // reference so the cluster pulls via the `--registry-use`
-        // mirror configured at cluster create.
+        // reference so the cluster pulls through its mirror. A plain
+        // `docker push` executes inside the docker provider's VM
+        // (colima/Docker Desktop), where host-loopback registries (the
+        // microVM's forwarded 5052) don't exist — fall back to a
+        // host-side `docker save` + `crane push` in that case, exactly
+        // like the CLI deploy pipeline.
         let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
-        stream_child_to_channel("docker", &push_args, &on_event).await?;
-        return Ok(pushable);
+        if stream_child_to_channel("docker", &push_args, &on_event)
+            .await
+            .is_ok()
+        {
+            return Ok(pushable);
+        }
+        let _ = on_event.send(serde_json::json!({
+            "type": "log",
+            "stream": "meta",
+            "message": "docker push failed — retrying host-side with crane",
+        }));
+        return crane_push_fallback(&pushable, &on_event).await;
     }
 
     // Legacy path: no registry available — fall back to importing
@@ -3653,6 +3667,54 @@ async fn build_and_import_image(
     stream_child_to_channel("k3d", &import_args, &on_event).await?;
 
     Ok(input.image_tag)
+}
+
+/// Host-side image delivery for registries the docker daemon cannot
+/// reach: `docker save` to a temp tarball, then `crane push
+/// --insecure` from this process. Returns the digest-qualified ref so
+/// redeploys roll even under a reused tag. crane comes from the
+/// helper-managed bin dir (`appliance local install crane`) or PATH.
+async fn crane_push_fallback(
+    image_ref: &str,
+    on_event: &Channel<serde_json::Value>,
+) -> Result<String, String> {
+    let crane = helper_bin_dir()
+        .map(|d| d.join("crane"))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "crane".to_string());
+
+    let tar_path = std::env::temp_dir().join(format!("appliance-image-{}.tar", std::process::id()));
+    let tar_str = tar_path.to_string_lossy().to_string();
+    let save_args: Vec<String> = vec!["save".into(), "-o".into(), tar_str.clone(), image_ref.into()];
+    stream_child_to_channel("docker", &save_args, on_event).await?;
+
+    let result = run_status_command(&[&crane, "push", "--insecure", &tar_str, image_ref]).await;
+    let _ = std::fs::remove_file(&tar_path);
+    let (ok, stdout, stderr) = result?;
+    if !ok {
+        return Err(format!(
+            "crane push failed: {} (install crane with `appliance local install crane`)",
+            stderr.trim()
+        ));
+    }
+    // crane prints the digest-qualified reference as its final line.
+    let digest_ref = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .unwrap_or(image_ref)
+        .to_string();
+    if !digest_ref.contains("@sha256:") {
+        return Ok(image_ref.to_string());
+    }
+    let _ = on_event.send(serde_json::json!({
+        "type": "log",
+        "stream": "meta",
+        "message": format!("pushed {digest_ref}"),
+    }));
+    Ok(digest_ref)
 }
 
 /// Resolve the helper-managed bin dir (`~/.appliance/bin` on POSIX,
