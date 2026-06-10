@@ -3,6 +3,7 @@ import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type {
+  MicroVmStatus,
   AddClusterInput,
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
@@ -220,6 +221,25 @@ export const tauriHost: ConsoleHost = {
     },
     async bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult> {
       return invoke<BootstrapInClusterResult>('bootstrap_in_cluster_api_server', { input: input ?? {} });
+    },
+  },
+
+  vm: {
+    status() {
+      return invoke<MicroVmStatus>('microvm_status');
+    },
+    async up(onEvent) {
+      const channel = new Channel<{ type: string; message?: string }>();
+      channel.onmessage = (event) => {
+        if (event?.message) onEvent({ message: event.message });
+      };
+      await invoke('microvm_up', { onEvent: channel });
+    },
+    stop() {
+      return invoke('microvm_stop');
+    },
+    remove() {
+      return invoke('microvm_delete');
     },
   },
 };

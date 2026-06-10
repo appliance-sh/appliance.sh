@@ -195,13 +195,32 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
   }
 }
 
-/** Pick the freshest locally built api-server image. */
+/**
+ * Pick a locally built api-server image whose architecture matches
+ * the VM (= the host: Virtualization.framework doesn't emulate, so an
+ * amd64 image on Apple Silicon crashloops with `exec format error`).
+ * Tries the arch-suffixed tag first, then validates :latest.
+ */
 async function resolveApiServerImage(): Promise<string> {
   await ensureDockerRunning({ onProgress: printProgress });
-  const r = spawnSync('docker', ['image', 'inspect', 'appliance-api-server:latest'], { stdio: 'ignore' });
-  if (r.status === 0) return 'appliance-api-server:latest';
+  const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  for (const candidate of [`appliance-api-server:${hostArch}`, 'appliance-api-server:latest']) {
+    const r = spawnSync('docker', ['image', 'inspect', '--format', '{{.Architecture}}', candidate], {
+      encoding: 'utf8',
+    });
+    if (r.status !== 0) continue;
+    const arch = r.stdout.trim();
+    if (arch === hostArch) return candidate;
+    console.log(
+      chalk.dim(
+        `${candidate} is ${arch}, VM needs ${hostArch} — ${candidate === 'appliance-api-server:latest' ? 'skipping' : 'trying next'}`
+      )
+    );
+  }
   throw new Error(
-    'no local appliance-api-server image found. Build one with packages/api-server/scripts/docker-prep.sh, or pass --image <ref>.'
+    `no ${hostArch} appliance-api-server image found. Build one with:\n` +
+      `  cd packages/api-server && docker build --platform linux/${hostArch} -t appliance-api-server:${hostArch} .\n` +
+      '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
   );
 }
 

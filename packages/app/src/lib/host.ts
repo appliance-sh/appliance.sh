@@ -175,6 +175,32 @@ export interface ConsoleHost {
    * to k3d, so it can omit this entirely.
    */
   local?: LocalRuntimeHost;
+  /**
+   * MicroVM engine (appliance-vmm): an isolated VM Appliance boots
+   * itself — no docker provider required for the cluster. Optional;
+   * desktop-only, and only meaningful where a vmm backend exists.
+   */
+  vm?: MicroVmHost;
+}
+
+export interface MicroVmStatus {
+  /** appliance-vmm binary present on this machine. */
+  available: boolean;
+  exists: boolean;
+  running: boolean;
+  /** kubeconfig fetched — the kubernetes endpoint is (or was) ready. */
+  kubeconfigReady: boolean;
+  apiServerUrl: string;
+  message?: string;
+}
+
+export interface MicroVmHost {
+  status(): Promise<MicroVmStatus>;
+  /** Full `appliance vm up` orchestration, streaming progress lines. */
+  up(onEvent: (event: { message: string }) => void): Promise<void>;
+  stop(): Promise<void>;
+  /** Delete the VM and its state (stops first if needed). */
+  remove(): Promise<void>;
 }
 
 export interface LocalClusterInput {

@@ -42,4 +42,6 @@ export type {
   LocalApplianceManifest,
   LocalBuildAndImportInput,
   LocalLogEvent,
+  MicroVmHost,
+  MicroVmStatus,
 } from './lib/host';

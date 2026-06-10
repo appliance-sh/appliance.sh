@@ -23,6 +23,7 @@ import type {
   LocalPreflightCheck,
   LocalRuntimeStatus,
   LocalServiceInfo,
+  MicroVmStatus,
 } from '@/lib/host';
 
 // Docker Desktop-style overview page for the local k3d-backed
@@ -199,7 +200,155 @@ export function LocalRuntimePage() {
       {status ? <RuntimeOverview status={status} /> : null}
 
       {status?.cluster.running && status?.apiServer.running ? <WorkloadsPanel /> : null}
+
+      {host.vm ? <MicroVmPanel /> : null}
     </div>
+  );
+}
+
+// ---- microVM engine -----------------------------------------------------
+
+// The next-generation runtime: an isolated VM Appliance boots itself
+// (appliance-vmm) instead of renting the docker provider's. Surfaced
+// alongside the k3d runtime while both engines coexist; uses its own
+// credentials profile ("microvm") and the same
+// *.appliance.localhost:8081 URL surface.
+function MicroVmPanel() {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const vm = host.vm!;
+
+  const statusQuery = useQuery({
+    queryKey: ['microvm', 'status'],
+    queryFn: () => vm.status(),
+    refetchInterval: (q) => {
+      const data = q.state.data as MicroVmStatus | undefined;
+      if (!data?.available) return 30_000;
+      return data.running ? 8_000 : 4_000;
+    },
+  });
+
+  const [busy, setBusy] = React.useState<'up' | 'stop' | 'delete' | null>(null);
+  const [log, setLog] = React.useState<string[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const logRef = React.useRef<HTMLPreElement | null>(null);
+
+  React.useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log]);
+
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm'] });
+
+  const run = async (kind: 'up' | 'stop' | 'delete', action: () => Promise<void>) => {
+    setBusy(kind);
+    setError(null);
+    if (kind === 'up') setLog([]);
+    try {
+      await action();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+      refresh();
+    }
+  };
+
+  const onDelete = () => {
+    const ok =
+      typeof window === 'undefined' ||
+      window.confirm('Delete the microVM? In-VM state (projects, images, deployments) is destroyed.');
+    if (!ok) return;
+    void run('delete', () => vm.remove());
+  };
+
+  const status = statusQuery.data;
+  const state = !status
+    ? 'checking…'
+    : !status.available
+      ? 'unavailable'
+      : busy === 'up'
+        ? 'starting…'
+        : status.running
+          ? 'running'
+          : status.exists
+            ? 'stopped'
+            : 'not created';
+
+  return (
+    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+      <header className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">
+            MicroVM engine{' '}
+            <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">beta</span>
+          </h2>
+          <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
+            An isolated VM Appliance boots itself — no docker provider needed for the cluster. Deploys use the{' '}
+            <code className="font-mono">microvm</code> profile; apps publish at the same{' '}
+            <code className="font-mono">*.appliance.localhost</code> URLs.
+          </p>
+        </div>
+        <span
+          className={cn(
+            'inline-flex shrink-0 items-center rounded-md px-2 py-1 text-xs font-medium',
+            state === 'running'
+              ? 'border border-green-500/40 bg-green-500/15 text-green-300'
+              : state === 'starting…'
+                ? 'border border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
+                : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+          )}
+        >
+          {state}
+        </span>
+      </header>
+
+      {status && !status.available ? (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+          {status.message ?? 'appliance-vmm is not installed on this machine.'}
+        </p>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            onClick={() => run('up', () => vm.up((e) => setLog((prev) => [...prev.slice(-199), e.message])))}
+            disabled={busy !== null || status?.running === true}
+          >
+            <Play className="h-4 w-4" /> {busy === 'up' ? 'Starting…' : status?.running ? 'Running' : 'Start'}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => run('stop', () => vm.stop())}
+            disabled={busy !== null || !status?.running}
+          >
+            <Square className="h-4 w-4" /> {busy === 'stop' ? 'Stopping…' : 'Stop'}
+          </Button>
+          <Button variant="destructive" onClick={onDelete} disabled={busy !== null || !status?.exists}>
+            <Trash2 className="h-4 w-4" /> {busy === 'delete' ? 'Deleting…' : 'Delete'}
+          </Button>
+        </div>
+      )}
+
+      {error ? (
+        <div className="whitespace-pre-wrap rounded-md border border-red-500/40 bg-red-500/10 p-3 font-mono text-xs text-red-300">
+          {error}
+        </div>
+      ) : null}
+
+      {busy === 'up' || log.length > 0 ? (
+        <pre
+          ref={logRef}
+          className="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-black/40 p-3 font-mono text-[11px] leading-relaxed"
+        >
+          {log.join('\n') || 'Starting…'}
+        </pre>
+      ) : null}
+
+      {status?.running && status.kubeconfigReady ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Kubernetes at <code className="font-mono">{status.apiServerUrl}</code> · deploy with{' '}
+          <code className="font-mono">appliance deploy &lt;project&gt; &lt;env&gt; --profile microvm</code>
+        </p>
+      ) : null}
+    </section>
   );
 }
 

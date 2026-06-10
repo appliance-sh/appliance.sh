@@ -490,5 +490,48 @@ export function createMockHost(): ConsoleHost {
         };
       },
     },
+
+    vm: {
+      async status() {
+        return {
+          available: true,
+          exists: microVm.exists,
+          running: microVm.running,
+          kubeconfigReady: microVm.running,
+          apiServerUrl: 'http://api.appliance.localhost:8081',
+        };
+      },
+      async up(onEvent) {
+        const lines = [
+          "starting VM 'appliance' (host pid 4242)",
+          'waiting for kubernetes endpoint......',
+          "VM 'appliance' is up",
+          '» waiting for the in-VM registry',
+          '» pushing appliance-api-server:arm64 into the VM registry',
+          '» api-server applying api-server manifests',
+          '» api-server waiting for http://api.appliance.localhost:8081 to become reachable',
+          '✓ api-server bootstrapped; credentials saved to profile microvm',
+        ];
+        for (const message of lines) {
+          await sleep(400);
+          onEvent({ message });
+        }
+        microVm.exists = true;
+        microVm.running = true;
+      },
+      async stop() {
+        await sleep(800);
+        microVm.running = false;
+      },
+      async remove() {
+        await sleep(800);
+        microVm.running = false;
+        microVm.exists = false;
+      },
+    },
   };
 }
+
+// MicroVM mock state (module-level: survives SPA navigation, resets on
+// reload like the rest of the mock).
+const microVm = { exists: true, running: false };

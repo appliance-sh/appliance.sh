@@ -2889,6 +2889,200 @@ async fn bootstrap_in_cluster_api_server(
     })
 }
 
+// --- microVM engine ---------------------------------------------------
+//
+// The microVM runtime (packages/vmm — appliance-vmm) is driven through
+// two channels: lifecycle reads/stops go straight to the appliance-vmm
+// binary; the full `up` orchestration (in-VM registry wait, api-server
+// image push, bootstrap, profile registration) lives in the bundled
+// appliance CLI (`appliance vm up`) and is streamed here, so desktop
+// and CLI share one implementation of the control-plane logic.
+
+/// Locate the appliance-vmm binary: the helper-managed bin dir first
+/// (the CLI's `appliance vm` resolves the same path), then PATH.
+fn vmm_binary() -> Option<PathBuf> {
+    if let Some(home) = home_dir() {
+        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vmm");
+        if managed.exists() {
+            return Some(managed);
+        }
+    }
+    which_path("appliance-vmm")
+}
+
+fn which_path(cmd: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MicroVmStatus {
+    /// appliance-vmm binary present on this machine.
+    available: bool,
+    exists: bool,
+    running: bool,
+    /// kubeconfig fetched — the kubernetes endpoint is (or was) ready.
+    kubeconfig_ready: bool,
+    api_server_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+const MICROVM_NAME: &str = "appliance";
+const MICROVM_HOST_PORT: u16 = 8081;
+
+#[tauri::command]
+async fn microvm_status() -> MicroVmStatus {
+    let api_server_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT);
+    let Some(bin) = vmm_binary() else {
+        return MicroVmStatus {
+            available: false,
+            exists: false,
+            running: false,
+            kubeconfig_ready: false,
+            api_server_url,
+            message: Some(
+                "appliance-vmm is not installed (expected in ~/.appliance/bin or on PATH)".into(),
+            ),
+        };
+    };
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, stdout, stderr) = match run_status_command(&[&bin, "status", MICROVM_NAME]).await {
+        Ok(t) => t,
+        Err(e) => {
+            return MicroVmStatus {
+                available: false,
+                exists: false,
+                running: false,
+                kubeconfig_ready: false,
+                api_server_url,
+                message: Some(e),
+            }
+        }
+    };
+    if !ok {
+        return MicroVmStatus {
+            available: true,
+            exists: false,
+            running: false,
+            kubeconfig_ready: false,
+            api_server_url,
+            message: Some(stderr.trim().to_string()),
+        };
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+    let kubeconfig_ready = home_dir()
+        .map(|h| {
+            h.join(SHARED_PROFILES_DIR)
+                .join("vmm")
+                .join(MICROVM_NAME)
+                .join("kubeconfig.yaml")
+                .exists()
+        })
+        .unwrap_or(false);
+    MicroVmStatus {
+        available: true,
+        exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
+        running: parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        kubeconfig_ready,
+        api_server_url,
+        message: parsed
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+/// Run `appliance vm up` through the bundled CLI, streaming output
+/// lines to the frontend. Returns when the runtime is fully up
+/// (api-server bootstrapped + microvm profile registered).
+#[tauri::command]
+async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Result<(), String> {
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
+        .args(["vm", "up"]);
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+
+    let mut exit_code: Option<i32> = None;
+    let mut tail: Vec<String> = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                tail.push(line.clone());
+                if tail.len() > 12 {
+                    tail.remove(0);
+                }
+                let _ = on_event.send(serde_json::json!({
+                    "type": "log",
+                    "level": "info",
+                    "message": line,
+                }));
+            }
+            CommandEvent::Error(msg) => return Err(msg),
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
+        }
+    }
+    match exit_code {
+        Some(0) => Ok(()),
+        code => Err(format!(
+            "appliance vm up exited with {:?}\n{}",
+            code,
+            tail.join("\n")
+        )),
+    }
+}
+
+#[tauri::command]
+async fn microvm_stop() -> Result<(), String> {
+    let bin = vmm_binary().ok_or("appliance-vmm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _stdout, stderr) = run_status_command(&[&bin, "stop", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("appliance-vmm stop failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_delete() -> Result<(), String> {
+    let bin = vmm_binary().ok_or("appliance-vmm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    // Stop first (delete refuses while running), tolerating "not running".
+    let _ = run_status_command(&[&bin, "stop", MICROVM_NAME]).await;
+    // Give the host process a moment to exit before delete checks the pidfile.
+    for _ in 0..20 {
+        let (ok, stdout, _) = run_status_command(&[&bin, "status", MICROVM_NAME]).await?;
+        if ok {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+            if !parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (ok, _stdout, stderr) = run_status_command(&[&bin, "delete", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("appliance-vmm delete failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 // --- kubectl-driven workloads & logs --------------------------------
 
 #[derive(Serialize, Default)]
@@ -3620,7 +3814,11 @@ pub fn run() {
             tail_local_pod_logs,
             read_appliance_manifest,
             build_and_import_image,
-            bootstrap_in_cluster_api_server
+            bootstrap_in_cluster_api_server,
+            microvm_status,
+            microvm_up,
+            microvm_stop,
+            microvm_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
