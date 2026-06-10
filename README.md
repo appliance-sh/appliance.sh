@@ -101,6 +101,8 @@ Optional fields available on all types:
 | `appliance local delete`            | Delete the local cluster + registry (host data dir is preserved)              |
 | `appliance local status`            | Check tools, the runtime daemon, the cluster, and the local api-server        |
 | `appliance local install`           | Install missing prerequisites (k3d, kubectl) into `~/.appliance/bin`          |
+| `appliance vm up`                   | Boot the isolated microVM runtime (no docker provider needed for the cluster) |
+| `appliance vm stop` / `delete`      | Stop (state preserved) or delete the microVM                                  |
 
 Top-level commands like `setup`, `status`, and `list` are shortcuts for `appliance app setup`, `appliance app status`, and `appliance app list`.
 

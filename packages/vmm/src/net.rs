@@ -36,7 +36,6 @@ fn mac_octets(mac: &str) -> Option<[u8; 6]> {
 
 /// One pass over the lease table looking for `mac`.
 fn lookup_lease(mac: &str) -> Result<Option<IpAddr>> {
-    let needle = mac_octets(mac).context("invalid MAC")?;
     let raw = match std::fs::read_to_string(DHCPD_LEASES) {
         Ok(raw) => raw,
         // Absent until the framework's DHCP server hands out its
@@ -44,8 +43,13 @@ fn lookup_lease(mac: &str) -> Result<Option<IpAddr>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context(DHCPD_LEASES),
     };
+    parse_leases(&raw, mac)
+}
 
-    // Format: repeated `{\n\tname=…\n\tip_address=…\n\thw_address=1,<mac>\n…}` blocks.
+/// Parse macOS's `dhcpd_leases` plist-ish format: repeated
+/// `{\n\tname=…\n\tip_address=…\n\thw_address=1,<mac>\n…}` blocks.
+fn parse_leases(raw: &str, mac: &str) -> Result<Option<IpAddr>> {
+    let needle = mac_octets(mac).context("invalid MAC")?;
     let mut current_ip: Option<IpAddr> = None;
     for line in raw.lines() {
         let line = line.trim();
@@ -65,6 +69,31 @@ fn lookup_lease(mac: &str) -> Result<Option<IpAddr>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEASES: &str = "{\n\tname=appliance\n\tip_address=192.168.64.7\n\thw_address=1,5e:94:ef:e4:c:ee\n\tlease=0x12345\n}\n{\n\tname=other\n\tip_address=192.168.64.2\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
+
+    #[test]
+    fn finds_lease_with_zero_stripped_octets() {
+        // The lease file writes `c` where the spec MAC says `0c`.
+        let ip = parse_leases(LEASES, "5e:94:ef:e4:0c:ee").unwrap();
+        assert_eq!(ip, Some("192.168.64.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn misses_unknown_mac() {
+        let ip = parse_leases(LEASES, "02:00:00:00:00:01").unwrap();
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn rejects_invalid_mac() {
+        assert!(parse_leases(LEASES, "not-a-mac").is_err());
+    }
 }
 
 /// Poll the lease table until the VM's MAC shows up (the guest DHCPs

@@ -31,3 +31,15 @@ State lives under `~/.appliance/vmm/<name>/` (definition, sparse data
 disk, console log, pidfile); guest kernel/initramfs pairs are cached
 under `~/.appliance/vmm/images/<image>/` and unwrapped from EFI zboot
 packaging automatically.
+
+## The full Appliance flow
+
+`appliance vm up` (in the main CLI) wraps this binary and layers the
+control plane on top: in-VM image registry, api-server bootstrap, and
+the `microvm` credentials profile. After that:
+
+```bash
+appliance vm up
+appliance deploy <project> <env> --profile microvm
+# → http://<project>-<env>.appliance.localhost:8081, served from the VM
+```

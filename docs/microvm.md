@@ -159,8 +159,23 @@ routing needs zero new machinery — only the port forward.
    kubeconfig; `kubectl get nodes` is Ready ~30s after a warm boot and
    Traefik serves `<name>.appliance.localhost:8081` exactly like the
    k3d runtime.
-3. **DX integration**: `appliance vm up` registered as an
-   `appliance-base-kubernetes` cluster; deploy pipeline switches image
-   delivery to the VM path; desktop Local Runtime page grows a
-   runtime-engine selector (k3d ⇄ microVM).
-4. **KVM backend**, then **WSL backend**.
+3. **DX integration** _(done)_: `appliance vm up` boots the VM,
+   waits for the in-VM registry (registry:2 via k3s's auto-applying
+   manifests dir, NodePort 30500, host forward on 5052 — clear of
+   k3d's 5050 so both engines coexist), pushes the api-server image
+   host-side (`docker save` + `crane push` — a plain `docker push`
+   executes inside the docker provider's VM where the host's loopback
+   registries don't exist), bootstraps the api-server in-VM by digest
+   ref (reused tags don't roll deployments), and registers the
+   `microvm` profile. `appliance deploy` then works verbatim: the
+   pipeline reads the registry from `/cluster-info`, falls back to
+   crane when `docker push` can't reach it, and the resulting app
+   serves at `<project>-<env>.appliance.localhost:8081` exactly as on
+   k3d. State persists across `vm stop`/`vm up` on the data disk
+   (projects, credentials, images, running workloads all survive).
+   Note: images must match the VM's architecture — there is no binfmt
+   emulation in the guest (Lambda-targeted amd64 images need an arm64
+   rebuild on Apple Silicon).
+4. **KVM backend**, then **WSL backend**; desktop Local Runtime page
+   grows a runtime-engine selector (k3d ⇄ microVM); guest exec
+   channel (vsock) for logs/debugging without the console.

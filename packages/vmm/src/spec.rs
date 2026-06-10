@@ -123,3 +123,25 @@ pub struct VmStatus {
 fn default_registry_port() -> u16 {
     5052
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_macs_are_locally_administered_unicast() {
+        let mac = random_mac();
+        let first = u8::from_str_radix(&mac[0..2], 16).unwrap();
+        assert_eq!(first & 0x01, 0, "must be unicast");
+        assert_eq!(first & 0x02, 0x02, "must be locally administered");
+        assert_eq!(mac.split(':').count(), 6);
+    }
+
+    #[test]
+    fn spec_round_trips_through_json_with_defaults() {
+        // Old persisted specs lack registry_port — must still parse.
+        let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
+        let spec: VmSpec = serde_json::from_str(legacy).unwrap();
+        assert_eq!(spec.registry_port, 5052);
+    }
+}

@@ -138,3 +138,63 @@ pub fn download_to(url: &str, dest: &Path) -> Result<()> {
     fs::rename(&partial, dest)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn write_temp(name: &str, data: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("vmm-kernel-test-{}-{name}", std::process::id()));
+        fs::write(&path, data).unwrap();
+        path
+    }
+
+    #[test]
+    fn unwraps_zboot_kernels() {
+        // Synthetic zboot: MZ + zimg magic, payload offset/len header,
+        // gzip method, padding, then the gzip payload.
+        let payload = b"raw arm64 Image bytes".to_vec();
+        let compressed = gz(&payload);
+        let off: u32 = 0x40;
+        let mut file = Vec::new();
+        file.extend_from_slice(b"MZ\0\0zimg");
+        file.extend_from_slice(&off.to_le_bytes());
+        file.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        file.extend_from_slice(&[0u8; 8]); // reserved
+        file.extend_from_slice(b"gzip\0\0\0\0");
+        while file.len() < off as usize {
+            file.push(0);
+        }
+        file.extend_from_slice(&compressed);
+
+        let path = write_temp("zboot", &file);
+        normalize_kernel(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unwraps_plain_gzip_kernels() {
+        let payload = b"plain image".to_vec();
+        let path = write_temp("gzip", &gz(&payload));
+        normalize_kernel(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn passes_raw_kernels_through() {
+        let payload = b"\x4d\x5a__not_zimg_raw_kernel".to_vec();
+        let path = write_temp("raw", &payload);
+        normalize_kernel(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        fs::remove_file(&path).ok();
+    }
+}
