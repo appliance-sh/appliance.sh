@@ -140,13 +140,25 @@ routing needs zero new machinery — only the port forward.
 
 ### Phasing
 
-1. **Crate + macOS boot** _(this phase)_: backend trait, CLI, state
+1. **Crate + macOS boot** _(done)_: backend trait, CLI, state
    store, VZ backend booting the pinned guest kernel with console
    logging, NAT networking, persistent data disk. KVM/WSL backends
    present but report unavailable.
-2. **Guest image + k3s**: initramfs build pipeline (checked into
-   `packages/vmm/guest/`), vsock agent, k3s readiness + kubeconfig
-   handoff, port forwards.
+2. **Guest image + k3s** _(done)_: rather than a fully custom
+   initramfs, the boot media is a host-built FAT volume (pure Rust:
+   fatfs + tar) carrying the Alpine modloop, an apkovl overlay, and
+   the pinned k3s binary; Alpine's own diskless init handles module
+   loading and root assembly, then openrc runs our bootstrap which
+   formats/mounts the data disk and starts k3s. Host↔guest
+   connectivity needs no agent: the VZ NAT subnet is host-reachable,
+   the guest's address is discovered from the macOS DHCP lease table
+   via the VM's fixed MAC (the Lima approach), the kubeconfig is
+   served once over a guest-local HTTP handoff, and the resident host
+   process runs plain TCP forwards (`127.0.0.1:6443 → guest:6443`,
+   `127.0.0.1:8081 → guest:80`). `appliance-vmm up` returns a working
+   kubeconfig; `kubectl get nodes` is Ready ~30s after a warm boot and
+   Traefik serves `<name>.appliance.localhost:8081` exactly like the
+   k3d runtime.
 3. **DX integration**: `appliance vm up` registered as an
    `appliance-base-kubernetes` cluster; deploy pipeline switches image
    delivery to the VM path; desktop Local Runtime page grows a

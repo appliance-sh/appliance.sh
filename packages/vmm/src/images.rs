@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Pinned guest image sets. An image set is a (kernel, initramfs) pair
 /// booted directly — no firmware, no bootloader, no disk image to
@@ -115,6 +115,12 @@ fn normalize_kernel(path: &PathBuf) -> Result<()> {
 }
 
 fn download_once(url: &str, dest: &PathBuf) -> Result<()> {
+    download_to(url, dest)
+}
+
+/// Download a URL to a path, once (no-op when the file already
+/// exists). Atomic: stream to `.partial`, rename into place.
+pub fn download_to(url: &str, dest: &Path) -> Result<()> {
     if dest.exists() {
         return Ok(());
     }

@@ -18,6 +18,15 @@ pub struct VmSpec {
     pub image: String,
     /// Kernel command line.
     pub cmdline: String,
+    /// Fixed MAC address — how the host finds the guest's DHCP lease.
+    /// Generated once at create; locally administered unicast.
+    pub mac: String,
+    /// Host loopback port forwarded to the guest's ingress (:80).
+    /// Matches the k3d runtime's default so `*.appliance.localhost:8081`
+    /// behaves identically on either engine.
+    pub host_port: u16,
+    /// Host loopback port forwarded to the Kubernetes API (:6443).
+    pub api_port: u16,
 }
 
 impl VmSpec {
@@ -25,15 +34,38 @@ impl VmSpec {
         Self {
             name: name.to_string(),
             cpus: 2,
-            memory_mib: 2048,
+            memory_mib: 4096,
             disk_gib: 10,
             image: crate::images::DEFAULT_IMAGE.to_string(),
             // hvc0 is the virtio console the vz/kvm backends attach the
             // log file to. `quiet` is deliberately absent — boot logs are
             // the primary debugging surface for a headless VM.
-            cmdline: "console=hvc0".to_string(),
+            cmdline: crate::guest::guest_cmdline(),
+            mac: random_mac(),
+            host_port: 8081,
+            api_port: 6443,
         }
     }
+}
+
+/// Locally administered, unicast MAC (x2:…): bit 1 of the first octet
+/// set (local), bit 0 clear (unicast).
+fn random_mac() -> String {
+    let mut bytes = [0u8; 6];
+    // No external RNG dependency: hash process entropy sources.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ (std::process::id() as u128) << 64;
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = ((seed >> (i * 8)) & 0xff) as u8;
+    }
+    bytes[0] = (bytes[0] & 0xfe) | 0x02;
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
 }
 
 /// Where a VM keeps its state on the host.
@@ -59,6 +91,12 @@ impl VmPaths {
     }
     pub fn pidfile(&self) -> PathBuf {
         self.dir.join("vmm.pid")
+    }
+    pub fn kubeconfig(&self) -> PathBuf {
+        self.dir.join("kubeconfig.yaml")
+    }
+    pub fn guest_ip(&self) -> PathBuf {
+        self.dir.join("guest-ip")
     }
 }
 

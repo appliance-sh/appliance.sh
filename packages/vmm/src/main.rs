@@ -1,5 +1,7 @@
 mod backend;
+mod guest;
 mod images;
+mod net;
 mod spec;
 mod store;
 
@@ -40,6 +42,15 @@ enum Cmd {
     Start {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+    },
+    /// Start the VM and wait until its Kubernetes endpoint is ready:
+    /// kubeconfig fetched and the API answering on the forwarded port.
+    Up {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// Seconds to wait for readiness before giving up.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -139,6 +150,64 @@ fn run() -> Result<()> {
                 .context("spawn VM host process")?;
             println!("starting VM '{name}' (host pid {})", child.id());
             println!("console: appliance-vmm console {name} -f");
+            Ok(())
+        }
+
+        Cmd::Up { name, timeout } => {
+            backend.availability()?;
+            let spec = ensure_spec(&name)?;
+            let paths = VmPaths::for_name(&name);
+            if store::read_live_pid(&name).is_none() {
+                let exe = std::env::current_exe().context("resolve current executable")?;
+                let child = Command::new(exe)
+                    .args(["run", &name])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .context("spawn VM host process")?;
+                println!("starting VM '{name}' (host pid {})", child.id());
+            }
+
+            // The resident host process writes guest-ip then
+            // kubeconfig.yaml as the guest comes up — poll those, then
+            // confirm the forwarded API endpoint actually answers.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            print!("waiting for kubernetes endpoint");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            // The spawned host process needs a beat to write its
+            // pidfile — only treat "no live pid" as fatal after the
+            // grace period, or `up` races its own child.
+            let liveness_grace = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if paths.kubeconfig().exists() {
+                    break;
+                }
+                if std::time::Instant::now() > liveness_grace && store::read_live_pid(&name).is_none() {
+                    println!();
+                    bail!(
+                        "VM host process exited during startup — check `appliance-vmm console {name}` and the boot log"
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    println!();
+                    bail!("timed out waiting for the kubeconfig (see `appliance-vmm console {name}`)");
+                }
+                print!(".");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            println!();
+            net::wait_tcp(
+                std::net::SocketAddr::from(([127, 0, 0, 1], spec.api_port)),
+                std::time::Duration::from_secs(60),
+            )?;
+            println!("VM '{name}' is up");
+            println!("  kubeconfig:  {}", paths.kubeconfig().display());
+            println!("  kubernetes:  https://127.0.0.1:{}", spec.api_port);
+            println!("  ingress:     http://*.appliance.localhost:{}", spec.host_port);
+            println!();
+            println!("try: KUBECONFIG={} kubectl get nodes", paths.kubeconfig().display());
             Ok(())
         }
 

@@ -24,7 +24,7 @@ use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZFileSerialPortAttachment, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZSerialPortConfiguration,
+    VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZSerialPortConfiguration,
     VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
@@ -67,13 +67,18 @@ impl VmBackend for VzBackend {
         self.availability()?;
         let paths = VmPaths::for_name(&spec.name);
         let image = crate::images::ensure_image(&spec.image)?;
+        eprintln!("assembling boot media");
+        let boot_media = crate::guest::build_boot_media(&paths.dir)?;
 
         // The console log is the VM's primary observable output —
         // truncate per boot so `console` shows the current boot, not
         // an append-forever scroll of every boot since creation.
         std::fs::write(paths.console_log(), b"")?;
+        let _ = std::fs::remove_file(paths.kubeconfig());
+        let _ = std::fs::remove_file(paths.guest_ip());
 
-        let config = build_configuration(spec, &image.kernel, &image.initramfs, &paths)?;
+        let config =
+            build_configuration(spec, &image.kernel, &image.initramfs, &boot_media.image, &paths)?;
         unsafe { config.validateWithError() }
             .map_err(|e| anyhow!("invalid VM configuration: {}", error_text(&e)))?;
 
@@ -89,6 +94,19 @@ impl VmBackend for VzBackend {
 
         start_vm(&queue, &vm)?;
         eprintln!("VM '{}' started", spec.name);
+
+        // Guest-facing host services (IP discovery, port forwards,
+        // kubeconfig handoff) run on a side thread so the parking loop
+        // below stays the single owner of lifecycle decisions.
+        {
+            let spec = spec.clone();
+            let paths_dir = paths.dir.clone();
+            std::thread::spawn(move || {
+                if let Err(err) = crate::guest::host_services(&spec, &paths_dir) {
+                    eprintln!("host services: {err:#}");
+                }
+            });
+        }
 
         // Park until either the guest powers off on its own or a stop
         // is requested (SIGTERM from `appliance-vmm stop`, or ^C).
@@ -114,6 +132,7 @@ fn build_configuration(
     spec: &VmSpec,
     kernel: &Path,
     initramfs: &Path,
+    boot_media: &Path,
     paths: &VmPaths,
 ) -> Result<Retained<VZVirtualMachineConfiguration>> {
     unsafe {
@@ -139,6 +158,11 @@ fn build_configuration(
         let net = VZVirtioNetworkDeviceConfiguration::new();
         let nat = VZNATNetworkDeviceAttachment::new();
         net.setAttachment(Some(&nat));
+        // Fixed MAC: the host finds the guest's address by looking this
+        // MAC up in macOS's DHCP lease table.
+        let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&spec.mac))
+            .ok_or_else(|| anyhow!("invalid MAC address in spec: {}", spec.mac))?;
+        net.setMACAddress(&mac);
 
         // Storage: the persistent data disk (sparse raw image).
         let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -150,6 +174,19 @@ fn build_configuration(
         let block_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &disk_attachment,
+        );
+
+        // Boot media (FAT volume with modloop + apkovl + k3s) as the
+        // second disk (vdb). Read-only: it's regenerated host-side.
+        let media_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &file_url(boot_media),
+            true,
+        )
+        .map_err(|e| anyhow!("boot media attachment: {}", error_text(&e)))?;
+        let media_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            VZVirtioBlockDeviceConfiguration::alloc(),
+            &media_attachment,
         );
 
         let entropy = VZVirtioEntropyDeviceConfiguration::new();
@@ -164,10 +201,10 @@ fn build_configuration(
             as Retained<VZSerialPortConfiguration>]));
         config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)
             as Retained<VZNetworkDeviceConfiguration>]));
-        config.setStorageDevices(&NSArray::from_retained_slice(&[Retained::into_super(
-            block_device,
-        )
-            as Retained<VZStorageDeviceConfiguration>]));
+        config.setStorageDevices(&NSArray::from_retained_slice(&[
+            Retained::into_super(block_device) as Retained<VZStorageDeviceConfiguration>,
+            Retained::into_super(media_device) as Retained<VZStorageDeviceConfiguration>,
+        ]));
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             entropy,
         )]));
