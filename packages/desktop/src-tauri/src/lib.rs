@@ -1292,6 +1292,18 @@ struct PreflightCheck {
     /// "not installed" from "installed but broken".
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// For docker only: whether a daemon is actually *reachable*, not
+    /// just whether the CLI is installed. `None` for tools where daemon
+    /// state is meaningless (k3d, kubectl), so the UI only special-cases
+    /// docker. A `Some(false)` here is "installed but not running".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_running: Option<bool>,
+    /// For docker only, meaningful when `daemon_running` is `Some(false)`:
+    /// whether appliance can start the runtime itself (colima is the
+    /// active runtime). Drives a "Start runtime" button vs. manual-start
+    /// guidance in the doctor view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_startable: Option<bool>,
 }
 
 /// Probe each required CLI tool with `--version`. Designed to never
@@ -1302,7 +1314,26 @@ struct PreflightCheck {
 async fn local_preflight() -> Vec<PreflightCheck> {
     let mut out = Vec::with_capacity(LOCAL_PREREQS.len());
     for tool in LOCAL_PREREQS {
-        out.push(probe_tool(tool).await);
+        let mut check = probe_tool(tool).await;
+        // Docker is special: `--version` only proves the CLI exists, not
+        // that a daemon is reachable. Probe the daemon too so the doctor
+        // view can show "installed but not running" (and offer to start
+        // it) instead of a misleading green check followed by a failed
+        // Start. k3d/kubectl have no daemon, so leave their fields None.
+        if tool.name == "docker" && check.installed {
+            let reachable = docker_daemon_reachable().await;
+            check.daemon_running = Some(reachable);
+            if !reachable {
+                let startable = colima_is_active_runtime().await;
+                check.daemon_startable = Some(startable);
+                check.error = Some(if startable {
+                    "Docker is installed but its colima VM isn't running.".to_string()
+                } else {
+                    docker_unreachable_hint()
+                });
+            }
+        }
+        out.push(check);
     }
     out
 }
@@ -1324,6 +1355,8 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
                 install_hint: install_hint(tool.name).to_string(),
                 auto_installable: tool.auto_installable,
                 error: None,
+                daemon_running: None,
+                daemon_startable: None,
             }
         }
         Ok(output) => {
@@ -1338,6 +1371,8 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
                 install_hint: hint,
                 auto_installable: tool.auto_installable,
                 error,
+                daemon_running: None,
+                daemon_startable: None,
             }
         }
         Err(err) => {
@@ -1355,6 +1390,8 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
                 install_hint: hint,
                 auto_installable: tool.auto_installable,
                 error,
+                daemon_running: None,
+                daemon_startable: None,
             }
         }
     }
@@ -1504,6 +1541,190 @@ async fn local_cluster_status(input: LocalClusterInput) -> Result<LocalClusterSt
     })
 }
 
+// A cold colima VM boot (disk allocation, base image pull, network
+// setup) can take well over a minute on first start; bound it
+// generously so a genuinely wedged `colima start` still can't hang the
+// caller forever, while leaving plenty of headroom for a normal boot.
+const COLIMA_START_TIMEOUT_SECS: u64 = 240;
+
+/// Probe whether a Docker daemon is actually *reachable* — distinct
+/// from "the `docker` CLI is on PATH". The preflight's `docker
+/// --version` only proves the client binary exists; it exits 0 even
+/// when no daemon is running. `docker version --format
+/// {{.Server.Version}}` forces a round-trip to the daemon, so a
+/// non-zero exit here means "installed but not running" — the exact
+/// state a stopped colima VM leaves the machine in.
+async fn docker_daemon_reachable() -> bool {
+    matches!(
+        run_status_command(&["docker", "version", "--format", "{{.Server.Version}}"]).await,
+        Ok((true, _, _))
+    )
+}
+
+/// True when the `docker` CLI is wired to talk to colima's socket —
+/// i.e. colima is the runtime providing Docker on this machine. We key
+/// off the active docker *context* (and `DOCKER_HOST`) because those
+/// persist whether or not the VM is currently up: `docker context
+/// show` returns `colima` even while the VM is stopped. This is what
+/// guards auto-start — we only bring colima up when the user's docker
+/// is actually pointed at it, never when they're on Docker Desktop /
+/// OrbStack with a stray colima install sitting alongside.
+async fn colima_is_active_runtime() -> bool {
+    if !which_succeeds("colima").await {
+        return false;
+    }
+    if std::env::var("DOCKER_HOST")
+        .map(|h| h.contains(".colima"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        run_status_command(&["docker", "context", "show"]).await,
+        Ok((true, ctx, _)) if ctx.trim() == "colima"
+    )
+}
+
+/// Platform-appropriate nudge for "Docker is installed but the daemon
+/// isn't reachable" in the cases appliance can't safely auto-start
+/// (Docker Desktop is a GUI app, system dockerd needs root). colima is
+/// handled before we ever reach this, so we don't suggest it as the
+/// primary fix here.
+fn docker_unreachable_hint() -> String {
+    if cfg!(target_os = "macos") {
+        "Docker isn't running. Start your container runtime — Docker Desktop, OrbStack, or `colima start` — and retry.".to_string()
+    } else if cfg!(target_os = "linux") {
+        "Docker isn't running. Start it with `sudo systemctl start docker` and retry.".to_string()
+    } else {
+        "Docker isn't running. Start Docker Desktop and retry.".to_string()
+    }
+}
+
+/// Like `run_status_command` but bounded by `timeout`. Reserved for the
+/// few operations that can legitimately run for a minute-plus (booting
+/// a colima VM) where a wedged invocation must not hang the caller
+/// indefinitely.
+async fn run_command_with_timeout(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(bool, String, String), String> {
+    match tokio::time::timeout(timeout, run_status_command(args)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "`{}` timed out after {}s.",
+            args.join(" "),
+            timeout.as_secs()
+        )),
+    }
+}
+
+/// Bring the container runtime up if appliance can do so safely.
+///
+/// The `docker` provider is intentionally detect-only — we don't
+/// install or boot arbitrary runtimes (Docker Desktop is a GUI app,
+/// system dockerd needs root; both "fork system trust decisions").
+/// Colima is the one exception worth automating: it's a userland CLI
+/// the user installed themselves, and `colima start` is an ordinary
+/// unprivileged, idempotent command — exactly what they'd type by
+/// hand. So when Docker is unreachable *and* the CLI is wired to
+/// colima, we start it for them; every other "daemon down" case
+/// returns an actionable message instead of letting a cryptic k3d
+/// timeout surface downstream.
+async fn ensure_docker_running() -> Result<(), String> {
+    if docker_daemon_reachable().await {
+        return Ok(());
+    }
+    if !colima_is_active_runtime().await {
+        return Err(docker_unreachable_hint());
+    }
+    // colima start is idempotent: a no-op if already running, boots the
+    // VM otherwise.
+    match run_command_with_timeout(
+        &["colima", "start"],
+        Duration::from_secs(COLIMA_START_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok((true, _, _)) => {}
+        Ok((false, _, stderr)) => {
+            return Err(format!(
+                "Docker isn't running and `colima start` failed: {}",
+                stderr.trim()
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    // The host-side docker socket can lag a beat behind colima
+    // reporting ready while the forward is wired up, so poll briefly
+    // rather than assuming reachability the instant `colima start`
+    // returns.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if docker_daemon_reachable().await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "colima started but the Docker daemon is still unreachable. Check `colima status` and `docker info`."
+                    .to_string(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Start the container runtime (colima) on behalf of the user when
+/// appliance can do so safely. Thin command wrapper over
+/// `ensure_docker_running` so the doctor view's "Start runtime" button
+/// and the implicit cluster-start path share one code path; the error
+/// string carries actionable guidance for runtimes we can't auto-start.
+#[tauri::command]
+async fn start_container_runtime() -> Result<(), String> {
+    ensure_docker_running().await
+}
+
+/// Symptoms `k3d cluster start` emits when the cluster's containers
+/// came back in a half-initialised state — typically after the Docker
+/// VM was suspended/restarted underneath a stopped cluster. k3d reports
+/// the node `running=true` but stuck `restarting`, then times out
+/// waiting for k3s's startup log line. A clean stop+start of the node
+/// containers almost always clears it.
+fn is_wedged_start_failure(stderr: &str) -> bool {
+    stderr.contains("status=restarting")
+        || stderr.contains("stopped returning log lines")
+        || stderr.contains("error during post-start cluster preparation")
+}
+
+/// Start an existing (stopped) cluster, recovering once from the
+/// wedged-node failure above. On the retry we first force a clean `k3d
+/// cluster stop` so every node container is torn down before the second
+/// `start` — that full teardown is what actually unsticks a frozen
+/// kubelet/agent, which a bare re-`start` would leave wedged.
+async fn start_existing_cluster(name: &str) -> Result<(), String> {
+    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "start", name]).await?;
+    if ok {
+        return Ok(());
+    }
+    if !is_wedged_start_failure(&stderr) {
+        return Err(format!("k3d cluster start failed: {}", stderr.trim()));
+    }
+    // Wedged start — tear the half-up nodes down, then start once more.
+    let _ = run_status_command(&["k3d", "cluster", "stop", name]).await;
+    let (retry_ok, _stdout, retry_stderr) =
+        run_status_command(&["k3d", "cluster", "start", name]).await?;
+    if retry_ok {
+        return Ok(());
+    }
+    Err(format!(
+        "k3d cluster start failed after one recovery attempt: {}\n\
+         The cluster's containers may be in a bad state — try `k3d cluster delete {}` \
+         and recreate it, or inspect `docker logs k3d-{}-server-0`.",
+        retry_stderr.trim(),
+        name,
+        name
+    ))
+}
+
 /// Create-or-start the named k3d cluster. Idempotent: an existing
 /// stopped cluster is started; an existing running cluster is left
 /// alone. Maps the cluster LoadBalancer's :80 onto `host_port` so
@@ -1513,6 +1734,14 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
     let name = cluster_name_or_default(&input);
     let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
     let registry_name = registry_name_for_cluster(&name);
+
+    // Bring the container runtime up first — every k3d / registry call
+    // below needs a reachable Docker daemon, and a stopped colima VM is
+    // the single most common reason "start cluster" fails (with a
+    // cryptic k3d timeout rather than a clear "Docker isn't running").
+    // ensure_docker_running auto-starts colima when it's the active
+    // runtime and returns an actionable message for everything else.
+    ensure_docker_running().await?;
 
     // Ensure the registry exists regardless of whether we're about to
     // create or restart the cluster. It's a sibling container, not a
@@ -1533,12 +1762,9 @@ async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterSta
         if status.running {
             return Ok(status);
         }
-        // Stopped — start it back up.
-        let (ok, _stdout, stderr) =
-            run_status_command(&["k3d", "cluster", "start", &name]).await?;
-        if !ok {
-            return Err(format!("k3d cluster start failed: {}", stderr));
-        }
+        // Stopped — start it back up, recovering once if the nodes
+        // come up wedged (the post-suspend `status=restarting` case).
+        start_existing_cluster(&name).await?;
     } else {
         // Fresh creation. We publish two port ranges:
         //   1. host_port -> serverlb:80 for the in-cluster ingress/LB
@@ -3330,6 +3556,7 @@ pub fn run() {
             local_cluster_status,
             local_helper_install,
             local_preflight,
+            start_container_runtime,
             start_local_cluster,
             stop_local_cluster,
             delete_local_cluster,
@@ -3345,4 +3572,30 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_wedged_start_from_real_k3d_error() {
+        // The verbatim stderr from a post-suspend `k3d cluster start`
+        // failure — the case this recovery exists for.
+        let stderr = "FATA[0040] error during post-start cluster preparation: \
+            error waiting for log line `cluster dns configmap` from node \
+            'k3d-appliance-local-server-0': stopped returning log lines: node \
+            k3d-appliance-local-server-0 is running=true in status=restarting";
+        assert!(is_wedged_start_failure(stderr));
+    }
+
+    #[test]
+    fn ignores_unrelated_start_failures() {
+        // A genuine config/port error must NOT trigger a stop+start
+        // retry — retrying wouldn't help and would mask the real cause.
+        assert!(!is_wedged_start_failure(
+            "FATA[0000] failed to start cluster: Bind for 0.0.0.0:8081 failed: port is already allocated"
+        ));
+        assert!(!is_wedged_start_failure(""));
+    }
 }

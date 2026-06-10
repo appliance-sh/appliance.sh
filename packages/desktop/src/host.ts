@@ -23,6 +23,7 @@ import type {
   LocalBuildAndImportInput,
   LocalClusterInput,
   LocalClusterStatus,
+  LocalHelperInstallResult,
   LocalLogEvent,
   LocalPodLogsInput,
   LocalPreflightCheck,
@@ -155,13 +156,16 @@ export const tauriHost: ConsoleHost = {
       tools: string[] | undefined,
       onEvent: (event: { type: string; stage?: string; message?: string }) => void,
       opts?: { force?: boolean }
-    ): Promise<{ outcomes: Array<{ tool: string; status: string; message: string }> }> {
+    ): Promise<LocalHelperInstallResult> {
       const channel = new Channel<{ type: string; stage?: string; message?: string }>();
       channel.onmessage = onEvent;
-      return invoke<{ outcomes: Array<{ tool: string; status: string; message: string }> }>('local_helper_install', {
+      return invoke<LocalHelperInstallResult>('local_helper_install', {
         input: { tools, force: opts?.force ?? false },
         onEvent: channel,
       });
+    },
+    async startContainerRuntime(): Promise<void> {
+      await invoke('start_container_runtime');
     },
     async status(input?: LocalClusterInput): Promise<LocalClusterStatus> {
       return invoke<LocalClusterStatus>('local_cluster_status', { input: input ?? {} });

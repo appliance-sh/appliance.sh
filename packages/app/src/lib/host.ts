@@ -347,6 +347,19 @@ export interface LocalPreflightCheck {
   autoInstallable: boolean;
   /** stderr or io::Error captured when the version check failed. */
   error?: string;
+  /**
+   * For docker only: whether a daemon is actually reachable, not just
+   * whether the CLI is installed (`docker --version` exits 0 even with
+   * a stopped engine). Undefined for tools with no daemon (k3d,
+   * kubectl). `false` means "installed but not running".
+   */
+  daemonRunning?: boolean;
+  /**
+   * For docker only, when `daemonRunning` is false: whether appliance
+   * can start the runtime itself (colima is the active runtime). Drives
+   * a "Start runtime" button vs. manual-start guidance.
+   */
+  daemonStartable?: boolean;
 }
 
 /**
@@ -390,6 +403,14 @@ export interface LocalRuntimeHost {
     onEvent: (event: LocalHelperProgressEvent) => void,
     opts?: { force?: boolean }
   ): Promise<LocalHelperInstallResult>;
+  /**
+   * Start the container runtime (colima) when appliance can do so
+   * safely — wired to the doctor view's "Start runtime" button. Same
+   * code path the implicit cluster-start uses. Optional: only the
+   * desktop host can manage a local runtime; rejects with an actionable
+   * message for runtimes appliance can't auto-start.
+   */
+  startContainerRuntime?(): Promise<void>;
   /** Legacy cluster-only status (kept for backwards compat). */
   status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
   start(input?: LocalClusterInput): Promise<LocalClusterStatus>;
