@@ -226,6 +226,20 @@ api-server runs as a Kubernetes Deployment inside the cluster it manages — mir
 
 The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:latest`. For local iteration, build the image (`packages/api-server/scripts/docker-prep.sh`), push it to the cluster registry (`localhost:5050/appliance-api-server:<tag>`), then pass that ref through `BootstrapInClusterInput.image` / `appliance local up --image`.
 
+#### MicroVM engine
+
+The next-generation local runtime boots an isolated VM that Appliance
+owns end-to-end (`packages/vmm`, design in `docs/microvm.md`): direct
+kernel boot via the platform hypervisor (Virtualization.framework on
+macOS; KVM/WSL2 scaffolded), k3s on containerd inside, an in-VM image
+registry, and host-side TCP forwards that preserve the exact
+`*.appliance.localhost:8081` URL surface. `appliance vm up` boots it,
+bootstraps the in-VM api-server, and registers the `microvm` profile;
+`appliance deploy --profile microvm` then works verbatim. The k3d
+engine below remains supported — the two coexist (one at a time on
+host port 8081; the bind error names the fix) and the desktop's
+Runtimes page manages both.
+
 #### Local cluster lifecycle (k3d)
 
 Cluster lifecycle is a host-OS concern that doesn't fit in api-server. The shared implementation lives in `@appliance.sh/helper` (`cluster.ts`, `runtime.ts`, `api-server.ts`) and is exposed two ways: the CLI's `appliance local` commands and the desktop's Tauri commands (`packages/desktop/src-tauri/src/lib.rs`, an earlier Rust port of the same flows — keep the two in sync until the desktop delegates to the sidecar).
