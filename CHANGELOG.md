@@ -1,3 +1,36 @@
+## 1.46.0 (2026-06-11)
+
+### Features
+
+- sandboxed ts manifests ([74f9b61](https://github.com/appliance-sh/appliance.sh/commit/74f9b61))
+- k8s support for api-server ([ae848f4](https://github.com/appliance-sh/appliance.sh/commit/ae848f4))
+- enable k8s deployment ([#43](https://github.com/appliance-sh/appliance.sh/pull/43))
+- docker cluster bootstrap support ([555c2be](https://github.com/appliance-sh/appliance.sh/commit/555c2be))
+- headless local runtime — CLI-managed k3d cluster with cloud-parity deploys ([fabd6ff](https://github.com/appliance-sh/appliance.sh/commit/fabd6ff))
+- ui improvements ([169af36](https://github.com/appliance-sh/appliance.sh/commit/169af36))
+- **app:** Vercel-style interface — project-grid overview, live URLs, white-primary design language ([c2d2f69](https://github.com/appliance-sh/appliance.sh/commit/c2d2f69))
+- **desktop:** manage the microVM engine from the desktop shell ([ee99c88](https://github.com/appliance-sh/appliance.sh/commit/ee99c88))
+- **infra:** appliance.localhost routing ([68762c3](https://github.com/appliance-sh/appliance.sh/commit/68762c3))
+- **vmm:** appliance-vmm — microVM manager with a working macOS backend ([43f1bbc](https://github.com/appliance-sh/appliance.sh/commit/43f1bbc))
+- **vmm:** k3s guest — kubernetes microVM with appliance.localhost ingress ([158766f](https://github.com/appliance-sh/appliance.sh/commit/158766f))
+- **vmm:** appliance deploy parity on the microVM engine ([7b09105](https://github.com/appliance-sh/appliance.sh/commit/7b09105))
+
+### Bug Fixes
+
+- **app:** make the web console a working first-class surface ([ca61b17](https://github.com/appliance-sh/appliance.sh/commit/ca61b17))
+- **app:** audit desktop-only pages via a browser-runnable mock host ([c256ff8](https://github.com/appliance-sh/appliance.sh/commit/c256ff8))
+- **desktop:** deploy wizard routes images by the selected cluster's registry ([4926ea4](https://github.com/appliance-sh/appliance.sh/commit/4926ea4))
+- **dx:** platform-mismatch warning, Runtimes naming, vm kubeconfig command ([a636457](https://github.com/appliance-sh/appliance.sh/commit/a636457))
+- **vmm:** capture the host process's output in host.log; name port conflicts ([9e2bf92](https://github.com/appliance-sh/appliance.sh/commit/9e2bf92))
+
+### Documentation
+
+- microVM engine section in ARCHITECTURE ([57efd97](https://github.com/appliance-sh/appliance.sh/commit/57efd97))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.45.1 (2026-05-27)
 
 ### Bug Fixes
