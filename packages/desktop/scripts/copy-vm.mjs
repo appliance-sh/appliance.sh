@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Stage the appliance-vm microVM engine binary as a Tauri bundle
+// Stage the appliance-vm microVM engine binary (built by the
+// preceding `vm:build` script — build-vm.mjs) as a Tauri bundle
 // resource:
 //   packages/desktop/src-tauri/vm-bin/appliance-vm
 //
@@ -9,12 +10,11 @@
 // re-sign it with the virtualization entitlement) on demand — the
 // user never builds or fetches the engine by hand.
 //
-// Unlike the CLI sidecar (copy-cli.mjs), a missing source binary is
-// not fatal: the engine is platform-gated (Virtualization.framework
-// on macOS today) and absent from Linux/Windows CI builds. When it's
-// missing the resource glob simply matches nothing and the desktop
-// reports the engine as not installable. Dev builds don't need this
-// staging at all — the Rust side falls back to
+// The engine is platform-gated (Virtualization.framework on macOS
+// today): on platforms without a backend the staging dir stays empty,
+// the resource glob matches nothing, and the desktop reports the
+// engine as not installable. Dev (tauri dev) doesn't strictly need
+// this staging — the Rust side falls back to
 // packages/vm/target/{release,debug} directly.
 
 import * as fs from 'node:fs';
@@ -24,7 +24,6 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(__dirname, '..');
 const repoRoot = path.resolve(desktopRoot, '..', '..');
-const vmTarget = path.join(repoRoot, 'packages', 'vm', 'target');
 const stagingDir = path.join(desktopRoot, 'src-tauri', 'vm-bin');
 
 function main() {
@@ -32,12 +31,12 @@ function main() {
   // directory to scan even when no engine binary is available.
   fs.mkdirSync(stagingDir, { recursive: true });
 
-  const release = path.join(vmTarget, 'release', 'appliance-vm');
+  const release = path.join(repoRoot, 'packages', 'vm', 'target', 'release', 'appliance-vm');
   if (!fs.existsSync(release)) {
-    console.log(
-      'copy-vm: no packages/vm release build — packaging without the microVM engine. ' +
-        'Build it with `cargo build --release && ./scripts/sign-dev.sh --release` in packages/vm.'
-    );
+    if (process.platform === 'darwin') {
+      throw new Error(`copy-vm: ${release} not found — did the vm:build step run?`);
+    }
+    console.log(`copy-vm: no microVM engine for ${process.platform} yet — packaging without it.`);
     return;
   }
   const dest = path.join(stagingDir, 'appliance-vm');
