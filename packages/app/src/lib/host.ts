@@ -183,6 +183,15 @@ export interface ConsoleHost {
   vm?: MicroVmHost;
 }
 
+/**
+ * Stable cluster ids for the two local engines. They double as the
+ * CLI profile names in ~/.appliance/profiles.json — mirror
+ * LOCAL_RUNTIME_CLUSTER_ID / MICROVM_CLUSTER_ID in the desktop's
+ * lib.rs and MICROVM_PROFILE in the CLI.
+ */
+export const LOCAL_RUNTIME_CLUSTER_ID = 'local-runtime';
+export const MICROVM_CLUSTER_ID = 'microvm';
+
 export interface MicroVmStatus {
   /** appliance-vm binary present on this machine. */
   available: boolean;
@@ -233,6 +242,10 @@ export interface LocalRuntimeInput {
   /** Host-side port the k3d-attached registry publishes on. Falls
    *  back to the Tauri-side default (5050) when omitted. */
   registryPort?: number;
+  /** Which local engine kubectl-level reads (workloads, pod logs)
+   *  address: omitted → the k3d context, 'microvm' → the microVM's
+   *  kubeconfig. Lifecycle calls ignore it. */
+  engine?: 'microvm';
 }
 
 export interface ResolvedRuntimeConfig {
@@ -312,6 +325,8 @@ export interface LocalPodLogsInput {
   tailLines?: number;
   clusterName?: string;
   namespace?: string;
+  /** See LocalRuntimeInput.engine. */
+  engine?: 'microvm';
 }
 
 /** Parsed contents of an appliance manifest (json or sandbox-evaluated ts/js). */

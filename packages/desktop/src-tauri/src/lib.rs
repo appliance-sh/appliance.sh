@@ -73,6 +73,14 @@ struct Cluster {
     // before this field landed, and for clusters added via Connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_bootstrap_input: Option<serde_json::Value>,
+    // Key id last copied into the keychain from the shared profile.
+    // Only set on CLI-managed adoptions (the microVM cluster): it
+    // lets the recurring sync detect a CLI re-key by comparing files,
+    // without a keychain read — which macOS gates behind an access
+    // prompt when the binary's signing identity changed (every dev
+    // rebuild).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    synced_key_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -238,6 +246,14 @@ fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
     let mut file = read_shared_profiles().unwrap_or_default();
     file.profiles.retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
     for cluster in &cfg.clusters {
+        // An entry that survived the retain above is CLI-owned (e.g.
+        // the microVM engine's profile, written by `appliance vm up`).
+        // The desktop adopts such clusters via sync, never the other
+        // way: writing here would clobber a CLI re-key with whatever
+        // stale copy the keychain holds.
+        if file.profiles.contains_key(&cluster.id) {
+            continue;
+        }
         let secret = read_api_key(&cluster_keychain_account(&cluster.id));
         let (key_id, secret_value) = match secret {
             Some(k) => (k.id, k.secret),
@@ -288,6 +304,8 @@ fn ingest_shared_into_legacy(
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
             state_backend_url: entry.state_backend_url.clone(),
             last_bootstrap_input: entry.last_bootstrap_input.clone(),
+            // The keychain copy below comes from this very entry.
+            synced_key_id: Some(entry.key_id.clone()),
         };
         let _ = write_api_key(
             &cluster_keychain_account(id),
@@ -306,6 +324,17 @@ fn ingest_shared_into_legacy(
     let raw = serde_json::to_string_pretty(&cfg)?;
     fs::write(legacy_path, raw)?;
     Ok(cfg)
+}
+
+/// Serializes every read-modify-write of the persisted config.
+/// Multiple surfaces touch config.json concurrently — frontend
+/// commands (get_config's legacy migration, cluster CRUD) and
+/// background work (the launch-time microVM sync) — and an unguarded
+/// interleaving lets a later write clobber an earlier one with stale
+/// state. Take this for the full read→mutate→write span.
+fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn read_persisted_config(app: &AppHandle) -> Result<PersistedConfig, HostError> {
@@ -412,6 +441,7 @@ fn migrate_legacy_top_level_url(cfg: &mut PersistedConfig) -> Result<bool, HostE
         created_at: chrono::Utc::now().to_rfc3339(),
         state_backend_url: None,
         last_bootstrap_input: None,
+        synced_key_id: None,
     };
 
     write_api_key(&cluster_keychain_account(&id), &legacy_key)?;
@@ -467,6 +497,7 @@ fn derive_name_from_url(url: &str) -> String {
 
 #[tauri::command]
 fn get_config(app: AppHandle) -> Result<HostConfig, HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -484,6 +515,7 @@ fn get_config(app: AppHandle) -> Result<HostConfig, HostError> {
 
 #[tauri::command]
 fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -492,6 +524,7 @@ fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostEr
         name: input.name,
         api_server_url: input.api_server_url,
         created_at: chrono::Utc::now().to_rfc3339(),
+        synced_key_id: None,
         state_backend_url: input.state_backend_url,
         last_bootstrap_input: input.last_bootstrap_input,
     };
@@ -505,6 +538,7 @@ fn add_cluster(app: AppHandle, input: AddClusterInput) -> Result<Cluster, HostEr
 
 #[tauri::command]
 fn select_cluster(app: AppHandle, cluster_id: Option<String>) -> Result<(), HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -528,6 +562,7 @@ fn set_cluster_state_backend(
     cluster_id: String,
     url: Option<String>,
 ) -> Result<(), HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -542,6 +577,7 @@ fn set_cluster_state_backend(
 
 #[tauri::command]
 fn remove_cluster(app: AppHandle, cluster_id: String) -> Result<(), HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
@@ -1133,6 +1169,11 @@ const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
 // Stable cluster id == profile name used by the CLI's `--profile`
 // flag and the shared profiles.json key.
 const LOCAL_RUNTIME_CLUSTER_ID: &str = "local-runtime";
+const MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
+// Mirrors MICROVM_PROFILE in packages/cli/src/appliance-vm.ts — the
+// CLI's `vm up` writes this profile; the desktop adopts it as a
+// cluster with the same stable id.
+const MICROVM_CLUSTER_ID: &str = "microvm";
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1984,6 +2025,10 @@ struct LocalRuntimeInput {
     /// back to DEFAULT_LOCAL_REGISTRY_PORT when omitted. Override when
     /// 5050 collides with another local service.
     registry_port: Option<u16>,
+    /// Which local engine kubectl-level reads (workloads, pod logs)
+    /// address: omitted/k3d → the k3d context, "microvm" → the
+    /// microVM's fetched kubeconfig. Lifecycle commands ignore it.
+    engine: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2159,7 +2204,11 @@ fn random_bootstrap_token() -> String {
 
 /// Find the persisted "Local Runtime" cluster (if any). Identified by
 /// its loopback api-server URL — name is user-visible and may have
-/// been renamed.
+/// been renamed (legacy registrations also used a random UUID id).
+/// The microVM cluster shares the same URL (both engines publish on
+/// host port 8081, one at a time), so it's excluded explicitly: a URL
+/// match alone would let the k3d engine's register/unregister adopt —
+/// or delete — the other engine's registration.
 fn find_local_runtime_cluster<'a>(
     persisted: &'a PersistedConfig,
     api_server_url: &str,
@@ -2167,7 +2216,7 @@ fn find_local_runtime_cluster<'a>(
     persisted
         .clusters
         .iter()
-        .find(|c| c.api_server_url == api_server_url)
+        .find(|c| c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID)
 }
 
 /// Register (or refresh) the Local Runtime cluster + key in persisted
@@ -2177,14 +2226,11 @@ fn register_local_runtime_cluster(
     cfg: &ResolvedRuntimeConfig,
     api_key: &ApiKey,
 ) -> Result<String, HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(app)?;
     migrate_legacy(app, &mut persisted)?;
 
-    let existing_id = persisted
-        .clusters
-        .iter()
-        .find(|c| c.api_server_url == cfg.api_server_url)
-        .map(|c| c.id.clone());
+    let existing_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
 
     let cluster_id = match existing_id {
         Some(id) => {
@@ -2207,6 +2253,7 @@ fn register_local_runtime_cluster(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 state_backend_url: None,
                 last_bootstrap_input: None,
+                synced_key_id: None,
             };
             write_api_key(&cluster_keychain_account(&cluster.id), api_key)?;
             let id = cluster.id.clone();
@@ -2228,17 +2275,23 @@ fn register_local_runtime_cluster(
 /// Remove the persisted cluster entry pointing at a given
 /// api-server URL. Best-effort — silently no-ops if not present.
 fn unregister_local_runtime_cluster(app: &AppHandle, api_server_url: &str) -> Result<(), HostError> {
+    let _guard = config_lock();
     let mut persisted = read_persisted_config(app)?;
     migrate_legacy(app, &mut persisted)?;
 
     let before = persisted.clusters.len();
+    // Same exclusion as find_local_runtime_cluster: the microVM
+    // cluster lives on the identical URL and must survive a k3d
+    // runtime delete.
     let removed_ids: Vec<String> = persisted
         .clusters
         .iter()
-        .filter(|c| c.api_server_url == api_server_url)
+        .filter(|c| c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID)
         .map(|c| c.id.clone())
         .collect();
-    persisted.clusters.retain(|c| c.api_server_url != api_server_url);
+    persisted
+        .clusters
+        .retain(|c| !(c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID));
     if persisted.clusters.len() == before {
         return Ok(());
     }
@@ -2997,6 +3050,112 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// Adopt the CLI-managed microVM profile (~/.appliance/profiles.json,
+/// written by `appliance vm up`) as a desktop cluster, so the deploy
+/// wizard and cluster switcher target the engine like any other
+/// cluster. The CLI stays the source of truth for these credentials:
+/// the keychain copy is refreshed from the shared entry (catching CLI
+/// re-keys), and mirror_to_shared_profiles never writes over
+/// CLI-managed entries. Idempotent — no-ops once everything matches.
+fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
+    let _guard = config_lock();
+    let Some(shared) = read_shared_profiles() else {
+        return Ok(());
+    };
+    let Some(entry) = shared.profiles.get(MICROVM_CLUSTER_ID) else {
+        return Ok(());
+    };
+    if entry.api_url.is_empty() || entry.key_id.is_empty() || entry.secret.is_empty() {
+        return Ok(());
+    }
+
+    let mut persisted = read_persisted_config(app)?;
+    migrate_legacy(app, &mut persisted)?;
+
+    // Freshness is judged by comparing the shared entry against the
+    // cluster record (synced_key_id), never by reading the keychain:
+    // this runs on every status poll, and a keychain read can block on
+    // a macOS access prompt. The keychain is written only when the
+    // CLI actually re-keyed.
+    let api_key = ApiKey {
+        id: entry.key_id.clone(),
+        secret: entry.secret.clone(),
+    };
+    let changed = match persisted.clusters.iter_mut().find(|c| c.id == MICROVM_CLUSTER_ID) {
+        Some(cluster) => {
+            let mut changed = false;
+            if cluster.api_server_url != entry.api_url {
+                cluster.api_server_url = entry.api_url.clone();
+                changed = true;
+            }
+            // A bare ingest from profiles.json labels the cluster with
+            // its slug; upgrade it to the human name.
+            if cluster.name == MICROVM_CLUSTER_ID {
+                cluster.name = MICROVM_CLUSTER_NAME.to_string();
+                changed = true;
+            }
+            if cluster.synced_key_id.as_deref() != Some(entry.key_id.as_str()) {
+                write_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID), &api_key)?;
+                cluster.synced_key_id = Some(entry.key_id.clone());
+                changed = true;
+            }
+            changed
+        }
+        None => {
+            write_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID), &api_key)?;
+            persisted.clusters.push(Cluster {
+                id: MICROVM_CLUSTER_ID.to_string(),
+                name: MICROVM_CLUSTER_NAME.to_string(),
+                api_server_url: entry.api_url.clone(),
+                created_at: entry
+                    .created_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                state_backend_url: None,
+                last_bootstrap_input: None,
+                synced_key_id: Some(entry.key_id.clone()),
+            });
+            // Same first-cluster convenience as the k3d runtime: select
+            // it when nothing else is, never override a user's choice.
+            if persisted.selected_cluster_id.is_none() {
+                persisted.selected_cluster_id = Some(MICROVM_CLUSTER_ID.to_string());
+            }
+            true
+        }
+    };
+    if changed {
+        write_persisted_config(app, &persisted)?;
+    }
+    Ok(())
+}
+
+/// Drop the microVM cluster registration (config + keychain + shared
+/// profile) — its credentials live in the VM's data disk, so deleting
+/// the VM invalidates them. Best-effort.
+fn unregister_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
+    let _guard = config_lock();
+    let mut persisted = read_persisted_config(app)?;
+    migrate_legacy(app, &mut persisted)?;
+    let before = persisted.clusters.len();
+    persisted.clusters.retain(|c| c.id != MICROVM_CLUSTER_ID);
+    delete_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID));
+    if let Some(mut shared) = read_shared_profiles() {
+        if shared.profiles.remove(MICROVM_CLUSTER_ID).is_some() {
+            if shared.active_profile.as_deref() == Some(MICROVM_CLUSTER_ID) {
+                shared.active_profile = None;
+            }
+            let _ = write_shared_profiles(&shared);
+        }
+    }
+    if persisted.clusters.len() == before {
+        return Ok(());
+    }
+    if persisted.selected_cluster_id.as_deref() == Some(MICROVM_CLUSTER_ID) {
+        persisted.selected_cluster_id = persisted.clusters.first().map(|c| c.id.clone());
+    }
+    write_persisted_config(app, &persisted)
+}
+
 fn which_path(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -3086,11 +3245,20 @@ async fn microvm_status(app: AppHandle) -> MicroVmStatus {
                 .exists()
         })
         .unwrap_or(false);
+    let running = parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+    if running && kubeconfig_ready {
+        // Keep the desktop's cluster registration in step with the
+        // CLI-owned profile while the engine is up — this also catches
+        // an `appliance vm up` run outside the desktop, and re-keys.
+        if let Err(e) = sync_microvm_cluster(&app) {
+            eprintln!("warn: microvm cluster sync failed: {e}");
+        }
+    }
     MicroVmStatus {
         available: true,
         installable: false,
         exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
-        running: parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        running,
         kubeconfig_ready,
         api_server_url,
         message: parsed
@@ -3149,7 +3317,14 @@ async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Res
         }
     }
     match exit_code {
-        Some(0) => Ok(()),
+        Some(0) => {
+            // The CLI just wrote (or verified) the microvm profile —
+            // adopt it as a desktop cluster right away so the deploy
+            // wizard can target the engine without waiting for the
+            // next status poll.
+            sync_microvm_cluster(&app).map_err(|e| format!("register microVM cluster: {e}"))?;
+            Ok(())
+        }
         code => Err(format!(
             "appliance vm up exited with {:?}\n{}",
             code,
@@ -3170,7 +3345,7 @@ async fn microvm_stop() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_delete() -> Result<(), String> {
+async fn microvm_delete(app: AppHandle) -> Result<(), String> {
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     // Stop first (delete refuses while running), tolerating "not running".
@@ -3189,6 +3364,11 @@ async fn microvm_delete() -> Result<(), String> {
     let (ok, _stdout, stderr) = run_status_command(&[&bin, "delete", MICROVM_NAME]).await?;
     if !ok {
         return Err(format!("appliance-vm delete failed: {}", stderr.trim()));
+    }
+    // The credentials lived in the VM's data disk — drop the now-dead
+    // cluster registration (best-effort; the VM itself is gone).
+    if let Err(e) = unregister_microvm_cluster(&app) {
+        eprintln!("warn: microvm cluster unregister failed: {e}");
     }
     Ok(())
 }
@@ -3240,6 +3420,29 @@ fn kube_context(cluster_name: &str) -> String {
     format!("k3d-{}", cluster_name)
 }
 
+/// kubectl target-selection args per engine: the k3d cluster is
+/// addressed by context, the microVM by the kubeconfig appliance-vm
+/// fetched out of the guest.
+fn kube_target_args(engine: Option<&str>, cluster_name: &str) -> Result<Vec<String>, String> {
+    if engine == Some("microvm") {
+        let home = home_dir().ok_or("cannot resolve the home directory")?;
+        let kubeconfig = home
+            .join(SHARED_PROFILES_DIR)
+            .join("vm")
+            .join(MICROVM_NAME)
+            .join("kubeconfig.yaml");
+        if !kubeconfig.is_file() {
+            return Err("the microVM kubeconfig is not available — is the engine up?".into());
+        }
+        Ok(vec![
+            "--kubeconfig".to_string(),
+            kubeconfig.to_string_lossy().into_owned(),
+        ])
+    } else {
+        Ok(vec!["--context".to_string(), kube_context(cluster_name)])
+    }
+}
+
 #[tauri::command]
 async fn list_local_workloads(
     app: AppHandle,
@@ -3247,20 +3450,12 @@ async fn list_local_workloads(
 ) -> Result<LocalWorkloads, String> {
     let input = input.unwrap_or_default();
     let cfg = resolve_runtime_config(&app, &input)?;
-    let ctx = kube_context(&cfg.cluster_name);
+    let target = kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?;
 
-    let (ok, stdout, stderr) = run_status_command(&[
-        "kubectl",
-        "--context",
-        &ctx,
-        "-n",
-        &cfg.namespace,
-        "get",
-        "deploy,pod,svc",
-        "-o",
-        "json",
-    ])
-    .await?;
+    let mut args: Vec<&str> = vec!["kubectl"];
+    args.extend(target.iter().map(String::as_str));
+    args.extend(["-n", &cfg.namespace, "get", "deploy,pod,svc", "-o", "json"]);
+    let (ok, stdout, stderr) = run_status_command(&args).await?;
     if !ok {
         // Namespace-not-found shows up as a "NotFound" error. Treat
         // that as "no workloads yet" so the UI doesn't flash an error
@@ -3383,6 +3578,10 @@ struct PodLogsInput {
     cluster_name: Option<String>,
     #[serde(default)]
     namespace: Option<String>,
+    /// See LocalRuntimeInput.engine — "microvm" reads through the
+    /// microVM's kubeconfig instead of the k3d context.
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 #[tauri::command]
@@ -3396,19 +3595,11 @@ async fn tail_local_pod_logs(
         ..Default::default()
     };
     let cfg = resolve_runtime_config(&app, &runtime_input)?;
-    let ctx = kube_context(&cfg.cluster_name);
+    let target = kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?;
     let tail = input.tail_lines.unwrap_or(200).to_string();
-    let mut args: Vec<&str> = vec![
-        "kubectl",
-        "--context",
-        &ctx,
-        "-n",
-        &cfg.namespace,
-        "logs",
-        &input.pod_name,
-        "--tail",
-        &tail,
-    ];
+    let mut args: Vec<&str> = vec!["kubectl"];
+    args.extend(target.iter().map(String::as_str));
+    args.extend(["-n", &cfg.namespace, "logs", &input.pod_name, "--tail", &tail]);
     if let Some(c) = input.container.as_deref() {
         args.push("-c");
         args.push(c);
@@ -3958,6 +4149,20 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // Adopt a CLI-registered microVM cluster at launch —
+            // `appliance vm up` may have run while the desktop was
+            // closed, and the cluster switcher should reflect it
+            // without a visit to the Runtimes page. Off the main
+            // thread: keychain + file IO, and launch shouldn't block.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = sync_microvm_cluster(&handle) {
+                    eprintln!("warn: microvm cluster sync at launch failed: {e}");
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             add_cluster,

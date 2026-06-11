@@ -5,13 +5,17 @@ import { AlertTriangle, ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Roc
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
+import { LOCAL_RUNTIME_CLUSTER_ID, MICROVM_CLUSTER_ID } from '@/lib/host';
 import type { LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
-// Docker Desktop-style deploy wizard for the local runtime. Three
-// steps:
+// Docker Desktop-style deploy wizard for the local engines (k3d
+// runtime and microVM). It deploys into the *selected* cluster —
+// both engines register as regular clusters — gating readiness and
+// routing the image registry per engine. Three steps:
 //   1. Pick a folder containing an appliance.{json,ts,js} manifest
 //      + a Dockerfile. Programmatic .ts/.js manifests run in the
 //      CLI's QuickJS sandbox (sidecar invocation).
@@ -52,21 +56,33 @@ export function LocalRuntimeDeployPage() {
   const presetProject = React.useMemo(() => searchParams.get('project') ?? null, [searchParams]);
   const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
 
-  // The run step needs a running cluster + api-server (the build is
-  // pushed/imported into the cluster, the deploy goes through the
-  // api-server) and a selected cluster for SDK credentials. Surface
-  // both up front — the wizard is reachable while the runtime is down
-  // (deep links, or the user stopped it mid-session), and finding out
-  // at the end of step 3 is the worst place. Shares the Local Runtime
-  // page's query key so the two views never disagree.
+  // The wizard deploys into the *selected* cluster (the SDK client is
+  // bound to it), so readiness gating has to match the engine behind
+  // that cluster: the k3d runtime and the microVM engine are separate
+  // lifecycles. Surface the target + its state up front — the wizard
+  // is reachable while an engine is down (deep links, or the user
+  // stopped it mid-session), and finding out at the end of step 3 is
+  // the worst place. Query keys are shared with the Runtimes page so
+  // the two views never disagree.
+  const { cluster: selectedCluster } = useSelectedCluster();
+  const isMicroVmTarget = selectedCluster?.id === MICROVM_CLUSTER_ID;
   const runtimeQuery = useQuery({
     queryKey: ['local-runtime', 'status'],
-    enabled: Boolean(local?.runtimeStatus),
+    enabled: Boolean(local?.runtimeStatus) && !isMicroVmTarget,
     queryFn: () => local!.runtimeStatus(),
     refetchInterval: 5_000,
   });
+  const vmQuery = useQuery({
+    queryKey: ['microvm', 'status'],
+    enabled: Boolean(host.vm) && isMicroVmTarget,
+    queryFn: () => host.vm!.status(),
+    refetchInterval: 5_000,
+  });
   const runtimeUp = Boolean(runtimeQuery.data?.cluster.running && runtimeQuery.data?.apiServer.running);
-  const readyToDeploy = runtimeUp && Boolean(client);
+  const vmUp = Boolean(vmQuery.data?.running && vmQuery.data?.kubeconfigReady);
+  const targetUp = isMicroVmTarget ? vmUp : runtimeUp;
+  const targetLoading = isMicroVmTarget ? vmQuery.isLoading : runtimeQuery.isLoading;
+  const readyToDeploy = targetUp && Boolean(client);
 
   const [phase, setPhase] = React.useState<Phase>('pick');
 
@@ -163,13 +179,17 @@ export function LocalRuntimeDeployPage() {
     if (!client) {
       setRunStatus('failed');
       setRunError(
-        'No cluster is selected, so there are no credentials to deploy with. Start the local runtime (it registers its cluster automatically), then retry.'
+        'No cluster is selected, so there are no credentials to deploy with. Start a local engine (it registers its cluster automatically), then retry.'
       );
       return;
     }
-    if (!runtimeUp) {
+    if (!targetUp) {
       setRunStatus('failed');
-      setRunError('The local runtime is not running. Start it from the Local Runtime page, then retry.');
+      setRunError(
+        isMicroVmTarget
+          ? 'The microVM engine is not running. Start it from the Runtimes page, then retry.'
+          : 'The local runtime is not running. Start it from the Runtimes page, then retry.'
+      );
       return;
     }
     setRunStatus('running');
@@ -193,6 +213,14 @@ export function LocalRuntimeDeployPage() {
         registryUrl = info.data.baseConfig.kubernetes?.registry?.url ?? undefined;
       }
       if (!registryUrl) {
+        // The k3d probe is only a valid fallback for the k3d cluster —
+        // answering with localhost:5050 for a microVM target would
+        // misroute the image into the wrong engine's registry.
+        if (isMicroVmTarget) {
+          throw new Error(
+            'the microVM api-server did not advertise its registry (/cluster-info) — run "appliance vm up" to reconcile it, then retry'
+          );
+        }
         const runtime = await local.runtimeStatus();
         registryUrl = runtime.config.registryUrl;
       }
@@ -303,24 +331,45 @@ export function LocalRuntimeDeployPage() {
         <h1 className="text-xl font-semibold">Deploy Application</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
           Pick a folder with an <code>appliance.json</code>, <code>.ts</code>, or <code>.js</code> manifest, configure
-          overrides, then build and deploy directly to the local cluster.
+          overrides, then build and deploy directly to the target cluster.
         </p>
+        {selectedCluster ? (
+          <p className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]">
+            Target:
+            <span className="inline-flex items-center rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-medium text-[var(--color-foreground)]">
+              {selectedCluster.name}
+            </span>
+            {isMicroVmTarget ? (
+              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                microVM engine
+              </span>
+            ) : selectedCluster.id === LOCAL_RUNTIME_CLUSTER_ID ? (
+              <span className="rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium">k3d engine</span>
+            ) : null}
+            <span>· switch with the cluster menu in the top bar</span>
+          </p>
+        ) : null}
       </header>
 
-      {!readyToDeploy && !runtimeQuery.isLoading ? (
+      {!readyToDeploy && !targetLoading ? (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
-            {!runtimeUp ? (
+            {!targetUp ? (
               <>
-                The local runtime isn&apos;t running — builds deploy into its cluster, so the final step needs it up.{' '}
+                {isMicroVmTarget ? (
+                  <>The microVM engine isn&apos;t running</>
+                ) : (
+                  <>The local runtime isn&apos;t running</>
+                )}{' '}
+                — builds deploy into its cluster, so the final step needs it up.{' '}
                 <Link to="/local-runtime" className="underline">
-                  Start it from the Local Runtime page
+                  Start it from the Runtimes page
                 </Link>{' '}
                 first. You can still pick a folder and configure in the meantime.
               </>
             ) : (
-              <>No cluster is selected. Starting the local runtime registers its cluster automatically.</>
+              <>No cluster is selected. Starting a local engine registers its cluster automatically.</>
             )}
           </span>
         </div>

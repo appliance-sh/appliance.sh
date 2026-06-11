@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -18,6 +18,7 @@ import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
+import { MICROVM_CLUSTER_ID } from '@/lib/host';
 import type {
   LocalDeploymentInfo,
   LocalPodInfo,
@@ -100,6 +101,19 @@ export function LocalRuntimePage() {
   const status = statusQuery.data;
   const phase = derivePhase(status, startMutation.isPending, stopMutation.isPending, deleteMutation.isPending);
 
+  // The header's Deploy button serves both engines — the wizard
+  // targets the selected cluster, so it's useful as soon as either
+  // the k3d runtime or the microVM is up. Shares the MicroVmPanel's
+  // query key; its (faster) polling drives the freshness.
+  const vmStatusQuery = useQuery({
+    queryKey: ['microvm', 'status'],
+    enabled: Boolean(host.vm),
+    queryFn: () => host.vm!.status(),
+    refetchInterval: 30_000,
+  });
+  const microVmReady = Boolean(vmStatusQuery.data?.running && vmStatusQuery.data?.kubeconfigReady);
+  const canDeploy = phase === 'running' || microVmReady;
+
   if (!supported) {
     return (
       <div className="max-w-2xl space-y-4">
@@ -133,7 +147,7 @@ export function LocalRuntimePage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {phase === 'running' ? (
+          {canDeploy ? (
             <Button asChild variant="outline">
               <Link to="/local-runtime/deploy">
                 <Rocket className="h-4 w-4" /> Deploy application
@@ -143,7 +157,7 @@ export function LocalRuntimePage() {
             // `disabled` on an asChild Button renders an anchor, and
             // anchors ignore it — the wizard stayed reachable with the
             // runtime down. A real <button> actually gates.
-            <Button variant="outline" disabled title="Start the runtime to deploy applications">
+            <Button variant="outline" disabled title="Start an engine to deploy applications">
               <Rocket className="h-4 w-4" /> Deploy application
             </Button>
           )}
@@ -205,6 +219,8 @@ export function LocalRuntimePage() {
       {status?.cluster.running && status?.apiServer.running ? <WorkloadsPanel /> : null}
 
       {host.vm ? <MicroVmPanel /> : null}
+
+      {microVmReady ? <WorkloadsPanel engine="microvm" /> : null}
     </div>
   );
 }
@@ -213,11 +229,14 @@ export function LocalRuntimePage() {
 
 // The next-generation runtime: an isolated VM Appliance boots itself
 // (appliance-vm) instead of renting the docker provider's. Surfaced
-// alongside the k3d runtime while both engines coexist; uses its own
-// credentials profile ("microvm") and the same
+// alongside the k3d runtime while both engines coexist. Once up it
+// registers as a regular cluster (id "microvm" — also the CLI profile
+// name), so the deploy wizard, cluster switcher, and workload views
+// treat it like any other target, on the same
 // *.appliance.localhost:8081 URL surface.
 function MicroVmPanel() {
   const host = useHost();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
   const vm = host.vm!;
@@ -254,7 +273,30 @@ function MicroVmPanel() {
     } finally {
       setBusy(null);
       refresh();
+      // `up` registers the microVM cluster, `delete` removes it —
+      // nudge the cluster list (switcher, wizard target) either way.
+      if (kind === 'up' || kind === 'delete') {
+        queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      }
     }
+  };
+
+  // Deploy into this engine: make its cluster the selected one (the
+  // wizard targets the selection), then open the wizard. The cluster
+  // is guaranteed registered by the time the CTA renders — status
+  // reports ready only after the Rust side synced the registration.
+  const deployHere = async () => {
+    try {
+      const cfg = await host.getConfig();
+      if (cfg.selectedClusterId !== MICROVM_CLUSTER_ID) {
+        await host.selectCluster(MICROVM_CLUSTER_ID);
+        queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      }
+    } catch {
+      // Selection is a convenience — the wizard surfaces the actual
+      // target either way.
+    }
+    navigate('/local-runtime/deploy');
   };
 
   const onDelete = async () => {
@@ -365,10 +407,15 @@ function MicroVmPanel() {
       ) : null}
 
       {status?.running && status.kubeconfigReady ? (
-        <p className="text-xs text-[var(--color-muted-foreground)]">
-          Kubernetes at <code className="font-mono">{status.apiServerUrl}</code> · deploy with{' '}
-          <code className="font-mono">appliance deploy &lt;project&gt; &lt;env&gt; --profile microvm</code>
-        </p>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs text-[var(--color-muted-foreground)]">
+            Kubernetes at <code className="font-mono">{status.apiServerUrl}</code> · registered as the{' '}
+            <span className="font-medium text-[var(--color-foreground)]">MicroVM Runtime</span> cluster
+          </p>
+          <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
+            <Rocket className="h-4 w-4" /> Deploy application
+          </Button>
+        </div>
       ) : null}
     </section>
   );
@@ -729,12 +776,12 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function WorkloadsPanel() {
+function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
   const host = useHost();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
   const workloadsQuery = useQuery({
-    queryKey: ['local-runtime', 'workloads'],
-    queryFn: () => host.local!.listWorkloads(),
+    queryKey: ['local-runtime', 'workloads', engine ?? 'k3d'],
+    queryFn: () => host.local!.listWorkloads(engine ? { engine } : undefined),
     refetchInterval: 5_000,
   });
 
@@ -745,7 +792,7 @@ function WorkloadsPanel() {
     <>
       <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Workloads</h2>
+          <h2 className="text-sm font-semibold">{engine === 'microvm' ? 'MicroVM workloads' : 'Workloads'}</h2>
           <Button
             variant="ghost"
             size="icon"
@@ -774,7 +821,7 @@ function WorkloadsPanel() {
         ) : null}
       </section>
 
-      {activePod ? <PodLogsDrawer pod={activePod} onClose={() => setActivePod(null)} /> : null}
+      {activePod ? <PodLogsDrawer pod={activePod} engine={engine} onClose={() => setActivePod(null)} /> : null}
     </>
   );
 }
@@ -898,11 +945,11 @@ function ServicesTable({ services }: { services: LocalServiceInfo[] }) {
   );
 }
 
-function PodLogsDrawer({ pod, onClose }: { pod: LocalPodInfo; onClose: () => void }) {
+function PodLogsDrawer({ pod, engine, onClose }: { pod: LocalPodInfo; engine?: 'microvm'; onClose: () => void }) {
   const host = useHost();
   const logsQuery = useQuery({
-    queryKey: ['local-runtime', 'logs', pod.name],
-    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500 }),
+    queryKey: ['local-runtime', 'logs', engine ?? 'k3d', pod.name],
+    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500, engine }),
   });
   const logs = logsQuery.data ?? '';
 
