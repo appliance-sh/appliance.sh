@@ -532,10 +532,42 @@ export function createMockHost(): ConsoleHost {
         microVm.running = false;
         microVm.exists = false;
       },
+      egress: {
+        async get() {
+          await sleep(100);
+          return { ...microVm.egress };
+        },
+        async setDefault(action: 'allow' | 'deny') {
+          await sleep(150);
+          microVm.egress.default = action;
+        },
+        async addRule(action: 'allow' | 'deny', host: string) {
+          await sleep(150);
+          const list = action === 'allow' ? microVm.egress.allow : microVm.egress.deny;
+          if (!list.includes(host)) list.push(host);
+        },
+        async setMitm(enabled: boolean) {
+          await sleep(150);
+          microVm.egress.mitm = enabled;
+          microVm.egress.caPath = enabled ? '~/.appliance/vm/appliance/egress-ca.pem' : undefined;
+        },
+        async reset() {
+          await sleep(150);
+          microVm.egress = { default: 'allow', allow: [], deny: [], mitm: false };
+        },
+      },
     },
   };
 }
 
 // MicroVM mock state (module-level: survives SPA navigation, resets on
 // reload like the rest of the mock).
-const microVm = { exists: true, running: false };
+const microVm: {
+  exists: boolean;
+  running: boolean;
+  egress: { default: 'allow' | 'deny'; allow: string[]; deny: string[]; mitm: boolean; caPath?: string };
+} = {
+  exists: true,
+  running: false,
+  egress: { default: 'allow', allow: [], deny: [], mitm: false },
+};

@@ -7,8 +7,10 @@ import { spawnSync } from 'node:child_process';
 import {
   bootstrapInClusterApiServer,
   ensureDockerRunning,
+  ensureHelperBinOnPath,
   waitForApiServerUrl,
   apiServerUrlForHostPort,
+  DEFAULT_LOCAL_NAMESPACE,
 } from '@appliance.sh/helper';
 import type { ProgressEvent } from '@appliance.sh/helper';
 import { createApplianceClient } from '@appliance.sh/sdk';
@@ -29,6 +31,8 @@ import { readProfiles } from './utils/profile-store.js';
 //   appliance vm up
 //   appliance deploy <project> <env> --profile microvm
 //   → http://<project>-<env>.appliance.localhost:8081
+
+ensureHelperBinOnPath();
 
 const MICROVM_PROFILE = 'microvm';
 const DEFAULT_VM_NAME = 'appliance';
@@ -308,19 +312,200 @@ program
   .description("print the microVM's kubeconfig path (use: export KUBECONFIG=$(appliance vm kubeconfig))")
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .action((opts: { name: string }) => {
-    const p = path.join(vmDir(opts.name), 'kubeconfig.yaml');
-    if (!fs.existsSync(p)) {
-      console.error(chalk.red(`no kubeconfig at ${p} — is the VM up? (appliance vm up)`));
+    console.log(kubeconfigOrExit(opts.name));
+  });
+
+// ---- exec / shell -------------------------------------------------------
+
+function kubeconfigOrExit(name: string): string {
+  const p = path.join(vmDir(name), 'kubeconfig.yaml');
+  if (!fs.existsSync(p)) {
+    console.error(chalk.red(`no kubeconfig at ${p} — is the VM up? (appliance vm up)`));
+    process.exit(1);
+  }
+  return p;
+}
+
+/** kubectl exec's -t needs a real terminal on both ends; piped runs
+ *  (CI, scripts) still work interactively on stdin alone. */
+function ttyFlag(): string {
+  return process.stdin.isTTY && process.stdout.isTTY ? '-it' : '-i';
+}
+
+program
+  .command('exec')
+  .description('run a command in a workload pod (interactive shell by default)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('-n, --namespace <ns>', 'kubernetes namespace', DEFAULT_LOCAL_NAMESPACE)
+  .argument('<pod>', 'pod (any kubectl target works, e.g. deploy/my-app)')
+  .argument('[command...]', 'command to run (default: /bin/sh)')
+  .action((pod: string, command: string[], opts: { name: string; namespace: string }) => {
+    const kubeconfig = kubeconfigOrExit(opts.name);
+    const r = spawnSync(
+      'kubectl',
+      [
+        '--kubeconfig',
+        kubeconfig,
+        '-n',
+        opts.namespace,
+        'exec',
+        ttyFlag(),
+        pod,
+        '--',
+        ...(command.length ? command : ['/bin/sh']),
+      ],
+      { stdio: 'inherit' }
+    );
+    process.exit(r.status ?? 1);
+  });
+
+program
+  .command('shell')
+  .description('open a root shell inside the VM itself (or run one command: appliance vm shell -- uname -a)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .argument('[command...]', 'command to run instead of an interactive shell')
+  .action((command: string[], opts: { name: string }) => {
+    const kubeconfig = kubeconfigOrExit(opts.name);
+    const node = spawnSync(
+      'kubectl',
+      ['--kubeconfig', kubeconfig, 'get', 'nodes', '-o', 'jsonpath={.items[0].metadata.name}'],
+      { encoding: 'utf8' }
+    );
+    const nodeName = node.status === 0 ? node.stdout.trim() : '';
+    if (!nodeName) {
+      console.error(chalk.red('could not resolve the VM node — is the VM up? (appliance vm up)'));
       process.exit(1);
     }
-    console.log(p);
+    // `kubectl debug node/` attaches a pod with the VM's root fs at
+    // /host; chroot turns it into a real VM shell. No SSH or guest
+    // agent needed — it rides the same kubeconfig as everything else.
+    // --profile=sysadmin grants privileged + hostPID/hostNetwork.
+    // One-shot commands go through `sh -c` (attach streams reliably);
+    // no command means an interactive shell.
+    const entry = command.length ? ['/bin/sh', '-c', command.join(' ')] : ['/bin/sh'];
+    const r = spawnSync(
+      'kubectl',
+      [
+        '--kubeconfig',
+        kubeconfig,
+        'debug',
+        `node/${nodeName}`,
+        ttyFlag(),
+        '--image=busybox:1.36',
+        '--profile=sysadmin',
+        '--',
+        'chroot',
+        '/host',
+        ...entry,
+      ],
+      { stdio: 'inherit' }
+    );
+    // kubectl debug leaves its debugger pod behind by design; sweep
+    // ours so repeated shells don't accumulate Completed pods.
+    cleanupNodeDebuggerPods(kubeconfig, nodeName);
+    process.exit(r.status ?? 1);
   });
+
+function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
+  const list = spawnSync(
+    'kubectl',
+    ['--kubeconfig', kubeconfig, 'get', 'pods', '-o', 'jsonpath={.items[*].metadata.name}'],
+    { encoding: 'utf8' }
+  );
+  if (list.status !== 0) return;
+  const debuggers = list.stdout.split(/\s+/).filter((name) => name.startsWith(`node-debugger-${nodeName}-`));
+  if (debuggers.length === 0) return;
+  spawnSync('kubectl', ['--kubeconfig', kubeconfig, 'delete', 'pod', '--wait=false', ...debuggers], {
+    stdio: 'ignore',
+  });
+}
 
 program
   .command('doctor')
   .description('probe whether this machine can run microVMs')
   .action(() => {
     process.exit(runVm(['doctor']));
+  });
+
+// ---- egress (outbound-traffic control) ---------------------------------
+
+const egress = program.command('egress').description("control the VM's outbound traffic (allow/deny by host)");
+
+egress
+  .command('proxy')
+  .description('run the egress proxy in the foreground until killed')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--addr <host:port>', 'address to listen on')
+  .option('--log', 'log every allow/deny decision', false)
+  .action((opts: { name: string; addr?: string; log: boolean }) => {
+    const args = ['egress', 'proxy', opts.name];
+    if (opts.addr) args.push('--addr', opts.addr);
+    if (opts.log) args.push('--log');
+    process.exit(runVm(args));
+  });
+
+egress
+  .command('policy')
+  .description("print the VM's current egress policy as JSON")
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'policy', opts.name]));
+  });
+
+egress
+  .command('default <action>')
+  .description('set the default action when no rule matches (allow | deny)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((action: string, opts: { name: string }) => {
+    process.exit(runVm(['egress', 'default', action, '--name', opts.name]));
+  });
+
+egress
+  .command('allow <host>')
+  .description('allow outbound traffic to a host suffix (e.g. github.com)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((host: string, opts: { name: string }) => {
+    process.exit(runVm(['egress', 'allow', host, '--name', opts.name]));
+  });
+
+egress
+  .command('deny <host>')
+  .description('deny outbound traffic to a host suffix (deny wins over allow)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((host: string, opts: { name: string }) => {
+    process.exit(runVm(['egress', 'deny', host, '--name', opts.name]));
+  });
+
+egress
+  .command('reset')
+  .description('clear all rules and reset to the permissive default')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'reset', opts.name]));
+  });
+
+egress
+  .command('mitm <state>')
+  .description('enable or disable TLS interception (on | off)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((state: string, opts: { name: string }) => {
+    process.exit(runVm(['egress', 'mitm', state, '--name', opts.name]));
+  });
+
+egress
+  .command('ca')
+  .description("print the path to the VM's egress CA cert (generates on first use)")
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'ca', opts.name]));
+  });
+
+egress
+  .command('gateway')
+  .description('print the HTTPS_PROXY + CA values guest workloads should use')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'gateway', opts.name]));
   });
 
 program.parse(process.argv);

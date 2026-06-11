@@ -1,6 +1,8 @@
 mod backend;
+mod egress;
 mod guest;
 mod images;
+mod mitm;
 mod net;
 mod spec;
 mod store;
@@ -9,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spec::{VmPaths, VmSpec, VmStatus};
 use std::io::Read;
+use std::net::SocketAddr;
 use std::process::Command;
 
 /// Appliance microVM manager. One executable, one backend per
@@ -78,6 +81,75 @@ enum Cmd {
     },
     /// Delete a VM definition, its disk, and logs.
     Delete {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Control the VM's outbound traffic (egress proxy + policy).
+    Egress {
+        #[command(subcommand)]
+        action: EgressCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EgressCmd {
+    /// Run the egress proxy in the foreground until killed.
+    Proxy {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// Address to listen on (host:port).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Log every allow/deny decision to stderr.
+        #[arg(long, default_value_t = false)]
+        log: bool,
+    },
+    /// Print the VM's current egress policy as JSON.
+    Policy {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Set the default action when no rule matches (allow | deny).
+    Default {
+        action: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Add an allow rule (host suffix, e.g. github.com).
+    Allow {
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Add a deny rule (host suffix). Deny wins over allow.
+    Deny {
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Clear all rules and reset to the permissive default.
+    Reset {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Print the path to the VM's egress CA cert (generating it on
+    /// first use). Inject this into the guest trust store to let the
+    /// proxy intercept TLS.
+    Ca {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Enable or disable TLS interception (MITM) on allowed HTTPS.
+    Mitm {
+        /// on | off
+        state: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Print the proxy URL guest workloads should use (and the CA path
+    /// when interception is on) — the values to inject as HTTPS_PROXY
+    /// + trusted CA so the VM's egress flows through the proxy.
+    Gateway {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
@@ -212,6 +284,17 @@ fn run() -> Result<()> {
             store::ensure_disk(&spec)?;
             images::ensure_image(&spec.image)?;
             store::write_pidfile(&name)?;
+            // Start the egress proxy alongside the VM so the desktop's
+            // outbound-traffic policy takes effect without a separate
+            // command. Bound where the guest can reach it (the peer
+            // guard refuses anything off the VM subnet, so this is not
+            // an open LAN proxy). Best-effort: a bind clash must not
+            // stop the VM from booting.
+            let egress_addr =
+                SocketAddr::from(([0, 0, 0, 0], egress::DEFAULT_EGRESS_PORT));
+            if let Err(e) = egress::spawn(&name, egress_addr, false) {
+                eprintln!("warn: egress proxy not started ({e:#}); `appliance vm egress proxy` still works");
+            }
             let result = backend.run_foreground(&spec);
             store::clear_pidfile(&name);
             result
@@ -279,6 +362,103 @@ fn run() -> Result<()> {
             }
             store::delete_vm_dir(&name)?;
             println!("deleted VM '{name}'");
+            Ok(())
+        }
+
+        Cmd::Egress { action } => run_egress(action),
+    }
+}
+
+fn run_egress(action: EgressCmd) -> Result<()> {
+    match action {
+        EgressCmd::Proxy { name, addr, log } => {
+            let addr: SocketAddr = match addr {
+                Some(a) => a.parse().with_context(|| format!("invalid --addr '{a}'"))?,
+                None => SocketAddr::from(([127, 0, 0, 1], egress::DEFAULT_EGRESS_PORT)),
+            };
+            egress::run_proxy(&name, addr, log)
+        }
+        EgressCmd::Policy { name } => {
+            let policy = egress::load_policy(&name);
+            println!("{}", serde_json::to_string_pretty(&policy)?);
+            Ok(())
+        }
+        EgressCmd::Default { action, name } => {
+            let parsed = match action.to_ascii_lowercase().as_str() {
+                "allow" => egress::Action::Allow,
+                "deny" => egress::Action::Deny,
+                other => bail!("default action must be 'allow' or 'deny', got '{other}'"),
+            };
+            let mut policy = egress::load_policy(&name);
+            policy.default = parsed;
+            egress::save_policy(&name, &policy)?;
+            println!("egress default for '{name}' set to {:?}", parsed);
+            Ok(())
+        }
+        EgressCmd::Allow { host, name } => {
+            let mut policy = egress::load_policy(&name);
+            if !policy.allow.iter().any(|h| h == &host) {
+                policy.allow.push(host.clone());
+            }
+            policy.deny.retain(|h| h != &host);
+            egress::save_policy(&name, &policy)?;
+            println!("egress: allow {host}");
+            Ok(())
+        }
+        EgressCmd::Deny { host, name } => {
+            let mut policy = egress::load_policy(&name);
+            if !policy.deny.iter().any(|h| h == &host) {
+                policy.deny.push(host.clone());
+            }
+            policy.allow.retain(|h| h != &host);
+            egress::save_policy(&name, &policy)?;
+            println!("egress: deny {host}");
+            Ok(())
+        }
+        EgressCmd::Reset { name } => {
+            egress::save_policy(&name, &egress::EgressPolicy::default())?;
+            println!("egress policy for '{name}' reset (default allow, no rules)");
+            Ok(())
+        }
+        EgressCmd::Ca { name } => {
+            mitm::ensure_ca(&name)?;
+            println!("{}", mitm::ca_cert_path(&name).display());
+            Ok(())
+        }
+        EgressCmd::Mitm { state, name } => {
+            let on = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "enable" | "enabled" => true,
+                "off" | "false" | "disable" | "disabled" => false,
+                other => bail!("mitm state must be 'on' or 'off', got '{other}'"),
+            };
+            if on {
+                // Ensure the CA exists so the operator can fetch + trust
+                // it before sending traffic through the interceptor.
+                mitm::ensure_ca(&name)?;
+            }
+            let mut policy = egress::load_policy(&name);
+            policy.mitm = on;
+            egress::save_policy(&name, &policy)?;
+            println!("egress TLS interception for '{name}': {}", if on { "on" } else { "off" });
+            if on {
+                println!("CA: {}", mitm::ca_cert_path(&name).display());
+            }
+            Ok(())
+        }
+        EgressCmd::Gateway { name } => {
+            let policy = egress::load_policy(&name);
+            let url = egress::guest_proxy_url(&name, egress::DEFAULT_EGRESS_PORT);
+            println!("HTTPS_PROXY={url}");
+            println!("HTTP_PROXY={url}");
+            if policy.mitm {
+                println!("CA={}", mitm::ca_cert_path(&name).display());
+            } else {
+                println!("# TLS interception is off — workloads need no CA (blind tunnel).");
+            }
+            println!(
+                "# The egress proxy starts automatically with the VM. To run it standalone: appliance-vm egress proxy {name} --addr 0.0.0.0:{}",
+                egress::DEFAULT_EGRESS_PORT
+            );
             Ok(())
         }
     }

@@ -26,3 +26,4 @@ tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "m
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 base64 = "0.22.1"
+portable-pty = "0.8"

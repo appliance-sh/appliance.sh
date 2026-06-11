@@ -114,7 +114,7 @@ fn normalize_kernel(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn download_once(url: &str, dest: &PathBuf) -> Result<()> {
+fn download_once(url: &str, dest: &Path) -> Result<()> {
     download_to(url, dest)
 }
 

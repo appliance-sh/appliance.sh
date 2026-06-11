@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Rocket,
   Square,
+  Terminal as TerminalIcon,
   Trash2,
   X,
 } from 'lucide-react';
@@ -19,6 +20,7 @@ import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
 import { MICROVM_CLUSTER_ID } from '@/lib/host';
+import { TerminalDrawer } from './terminal-drawer';
 import type {
   LocalDeploymentInfo,
   LocalPodInfo,
@@ -113,6 +115,10 @@ export function LocalRuntimePage() {
   });
   const microVmReady = Boolean(vmStatusQuery.data?.running && vmStatusQuery.data?.kubeconfigReady);
   const canDeploy = phase === 'running' || microVmReady;
+  // Both engines publish on host port 8081 — only one can run at a
+  // time. Gate Start with an explanation instead of letting k3d fail
+  // mid-flight on the bind error.
+  const microVmHoldsPort = Boolean(vmStatusQuery.data?.running);
 
   if (!supported) {
     return (
@@ -186,8 +192,20 @@ export function LocalRuntimePage() {
       <section className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] p-4">
         <Button
           onClick={() => startMutation.mutate()}
-          disabled={!preflightReady || phase === 'running' || phase === 'starting' || startMutation.isPending}
-          title={!preflightReady ? 'Install the prerequisites listed above to enable Start' : undefined}
+          disabled={
+            !preflightReady ||
+            phase === 'running' ||
+            phase === 'starting' ||
+            startMutation.isPending ||
+            microVmHoldsPort
+          }
+          title={
+            !preflightReady
+              ? 'Install the prerequisites listed above to enable Start'
+              : microVmHoldsPort && phase !== 'running'
+                ? 'Stop the microVM first — both engines publish on host port 8081'
+                : undefined
+          }
         >
           <Play className="h-4 w-4" /> {phase === 'running' ? 'Running' : phase === 'starting' ? 'Starting…' : 'Start'}
         </Button>
@@ -250,6 +268,17 @@ function MicroVmPanel() {
       return data.running ? 8_000 : 4_000;
     },
   });
+
+  // Mirror of the page-level port gate, in the other direction: a
+  // running k3d cluster holds host port 8081, so the microVM can't
+  // boot until it stops. Shares the page's query key (cache-deduped).
+  const k3dQuery = useQuery({
+    queryKey: ['local-runtime', 'status'],
+    enabled: Boolean(host.local?.runtimeStatus),
+    queryFn: () => host.local!.runtimeStatus(),
+    refetchInterval: 30_000,
+  });
+  const k3dHoldsPort = Boolean(k3dQuery.data?.cluster.running);
 
   const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
@@ -374,7 +403,12 @@ function MicroVmPanel() {
         <div className="flex flex-wrap items-center gap-2">
           <Button
             onClick={() => run('up', () => vm.up((e) => setLog((prev) => [...prev.slice(-199), e.message])))}
-            disabled={busy !== null || status?.running === true}
+            disabled={busy !== null || status?.running === true || (k3dHoldsPort && !status?.running)}
+            title={
+              k3dHoldsPort && !status?.running
+                ? 'Stop the k3d runtime first — both engines publish on host port 8081'
+                : undefined
+            }
           >
             <Play className="h-4 w-4" /> {busy === 'up' ? 'Starting…' : status?.running ? 'Running' : 'Start'}
           </Button>
@@ -417,7 +451,163 @@ function MicroVmPanel() {
           </Button>
         </div>
       ) : null}
+
+      {status?.running && status.kubeconfigReady ? <EgressPanel /> : null}
     </section>
+  );
+}
+
+// Outbound-traffic control for the microVM: a desktop surface over the
+// egress proxy's allow/deny policy + optional TLS interception. The
+// engine enforces it (packages/vm egress.rs); this just edits the
+// policy the proxy reloads live.
+function EgressPanel() {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const egress = host.vm!.egress;
+  const [host_, setHost] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const policyQuery = useQuery({
+    queryKey: ['microvm', 'egress'],
+    queryFn: () => egress.get(),
+    refetchInterval: 15_000,
+  });
+  const policy = policyQuery.data;
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', 'egress'] });
+
+  const act = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await fn();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
+
+  const addRule = (action: 'allow' | 'deny') => {
+    const h = host_.trim();
+    if (!h) return;
+    setHost('');
+    void act(() => egress.addRule(action, h));
+  };
+
+  return (
+    <details className="rounded-md border border-[var(--color-border)] p-3">
+      <summary className="cursor-pointer text-xs font-medium">
+        Outbound traffic
+        {policy ? (
+          <span className="ml-2 text-[10px] text-[var(--color-muted-foreground)]">
+            default {policy.default}
+            {policy.mitm ? ' · TLS interception on' : ''}
+          </span>
+        ) : null}
+      </summary>
+
+      <p className="mt-2 text-[10px] text-[var(--color-muted-foreground)]">
+        The microVM routes workload egress through a proxy that enforces this policy. Deny wins over allow. TLS
+        interception lets the proxy see (and filter) decrypted HTTPS — workloads must trust the VM&rsquo;s CA.
+      </p>
+
+      {policy ? (
+        <div className="mt-3 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs">Default:</span>
+            <div className="inline-flex overflow-hidden rounded-md border border-[var(--color-border)]">
+              {(['allow', 'deny'] as const).map((a) => (
+                <button
+                  key={a}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => policy.default !== a && void act(() => egress.setDefault(a))}
+                  className={cn(
+                    'px-2 py-1 text-xs',
+                    policy.default === a
+                      ? a === 'deny'
+                        ? 'bg-red-500/20 text-red-200'
+                        : 'bg-green-500/20 text-green-200'
+                      : 'text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
+                  )}
+                >
+                  {a}
+                </button>
+              ))}
+            </div>
+            <label className="ml-2 inline-flex items-center gap-1.5 text-xs">
+              <input
+                type="checkbox"
+                checked={policy.mitm}
+                disabled={busy}
+                onChange={(e) => void act(() => egress.setMitm(e.target.checked))}
+              />
+              TLS interception
+            </label>
+            <Button variant="ghost" size="sm" disabled={busy} onClick={() => void act(() => egress.reset())}>
+              Reset
+            </Button>
+          </div>
+
+          {policy.mitm && policy.caPath ? (
+            <p className="rounded-md border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 font-mono text-[10px] text-cyan-200">
+              CA: {policy.caPath} — inject into workloads to trust the interceptor
+            </p>
+          ) : null}
+
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={host_}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder="host suffix, e.g. github.com"
+              className="flex-1 rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1 font-mono text-xs"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') addRule('allow');
+              }}
+            />
+            <Button variant="outline" size="sm" disabled={busy || !host_.trim()} onClick={() => addRule('allow')}>
+              Allow
+            </Button>
+            <Button variant="outline" size="sm" disabled={busy || !host_.trim()} onClick={() => addRule('deny')}>
+              Deny
+            </Button>
+          </div>
+
+          <RuleList label="Allowed" hosts={policy.allow} tone="green" />
+          <RuleList label="Denied" hosts={policy.deny} tone="red" />
+        </div>
+      ) : (
+        <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading policy…</p>
+      )}
+
+      {err ? <p className="mt-2 text-xs text-red-300">{err}</p> : null}
+    </details>
+  );
+}
+
+function RuleList({ label, hosts, tone }: { label: string; hosts: string[]; tone: 'green' | 'red' }) {
+  if (hosts.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-1 text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">{label}</div>
+      <ul className="flex flex-wrap gap-1.5">
+        {hosts.map((h) => (
+          <li
+            key={h}
+            className={cn(
+              'rounded-md border px-1.5 py-0.5 font-mono text-[11px]',
+              tone === 'green' ? 'border-green-500/30 text-green-200' : 'border-red-500/30 text-red-200'
+            )}
+          >
+            {h}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -779,6 +969,7 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
   const host = useHost();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
+  const [shellPod, setShellPod] = React.useState<LocalPodInfo | null>(null);
   const workloadsQuery = useQuery({
     queryKey: ['local-runtime', 'workloads', engine ?? 'k3d'],
     queryFn: () => host.local!.listWorkloads(engine ? { engine } : undefined),
@@ -815,13 +1006,14 @@ function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
         ) : data ? (
           <div className="space-y-5">
             <DeploymentsTable deployments={data.deployments} />
-            <PodsTable pods={data.pods} onLogs={setActivePod} />
+            <PodsTable pods={data.pods} onLogs={setActivePod} onShell={host.terminal ? setShellPod : undefined} />
             <ServicesTable services={data.services} />
           </div>
         ) : null}
       </section>
 
       {activePod ? <PodLogsDrawer pod={activePod} engine={engine} onClose={() => setActivePod(null)} /> : null}
+      {shellPod ? <TerminalDrawer target={shellPod.name} engine={engine} onClose={() => setShellPod(null)} /> : null}
     </>
   );
 }
@@ -859,7 +1051,15 @@ function DeploymentsTable({ deployments }: { deployments: LocalDeploymentInfo[] 
   );
 }
 
-function PodsTable({ pods, onLogs }: { pods: LocalPodInfo[]; onLogs: (pod: LocalPodInfo) => void }) {
+function PodsTable({
+  pods,
+  onLogs,
+  onShell,
+}: {
+  pods: LocalPodInfo[];
+  onLogs: (pod: LocalPodInfo) => void;
+  onShell?: (pod: LocalPodInfo) => void;
+}) {
   if (pods.length === 0) return null;
   return (
     <div>
@@ -886,9 +1086,16 @@ function PodsTable({ pods, onLogs }: { pods: LocalPodInfo[]; onLogs: (pod: Local
               <td className="py-1.5 pr-3">{p.restartCount}</td>
               <td className="py-1.5 pr-3 text-xs text-[var(--color-muted-foreground)]">{relativeAge(p.createdAt)}</td>
               <td className="py-1.5 pr-3 text-right">
-                <Button variant="ghost" size="sm" onClick={() => onLogs(p)}>
-                  <FileText className="h-3.5 w-3.5" /> Logs
-                </Button>
+                <div className="flex items-center justify-end gap-1">
+                  {onShell && p.phase === 'Running' ? (
+                    <Button variant="ghost" size="sm" onClick={() => onShell(p)}>
+                      <TerminalIcon className="h-3.5 w-3.5" /> Shell
+                    </Button>
+                  ) : null}
+                  <Button variant="ghost" size="sm" onClick={() => onLogs(p)}>
+                    <FileText className="h-3.5 w-3.5" /> Logs
+                  </Button>
+                </div>
               </td>
             </tr>
           ))}

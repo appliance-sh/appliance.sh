@@ -21,6 +21,11 @@ flate2 = "1"
 fatfs = "0.3"
 tar = "0.4"
 fscommon = "0.1"
+# Egress TLS interception: per-VM CA + on-the-fly leaf certs (rcgen),
+# TLS termination/origination (rustls), upstream trust roots.
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

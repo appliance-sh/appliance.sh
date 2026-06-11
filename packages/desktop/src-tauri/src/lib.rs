@@ -1,3 +1,5 @@
+mod terminal;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -639,10 +641,8 @@ fn list_aws_profiles() -> Result<Vec<AwsProfile>, HostError> {
                 // sections — they're not profiles, just shared config.
                 let profile_name = if name == "default" {
                     Some("default".to_string())
-                } else if let Some(rest) = name.strip_prefix("profile ") {
-                    Some(rest.trim().to_string())
                 } else {
-                    None
+                    name.strip_prefix("profile ").map(|rest| rest.trim().to_string())
                 };
                 if let Some(profile_name) = profile_name {
                     let is_sso = body.contains("sso_session") || body.contains("sso_start_url");
@@ -1444,11 +1444,11 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
 /// "I have a runtime" to the user but trips us up. Detect those and
 /// turn the generic "install a runtime" hint into one targeted line:
 ///
-///   * Colima present  → `brew install docker`  (Colima is the daemon,
-///                        the user just needs the matching CLI client)
-///   * Podman present  → suggest podman-mac-helper / aliasing (Podman
-///                        ships its own CLI; bridging it to `docker`
-///                        gives Appliance what it needs)
+///   * Colima present → `brew install docker` (Colima is the daemon;
+///     the user just needs the matching CLI client).
+///   * Podman present → suggest podman-mac-helper / aliasing (Podman
+///     ships its own CLI; bridging it to `docker` gives Appliance what
+///     it needs).
 ///
 /// Returns `(install_hint, error_message)`.
 async fn resolve_missing_hint(tool: &str, raw_error: Option<String>) -> (String, Option<String>) {
@@ -3373,6 +3373,105 @@ async fn microvm_delete(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// --- egress (outbound-traffic control) ------------------------------
+//
+// The desktop drives the same `appliance-vm egress` surface the CLI
+// uses, so the policy file stays single-sourced. Reads go through
+// `egress policy` (JSON); mutations through the typed subcommands —
+// the binary owns CA generation when MITM is switched on.
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EgressPolicy {
+    #[serde(default)]
+    default: String,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    mitm: bool,
+    /// CA cert path, populated for the UI when interception is on and
+    /// the cert exists — the user injects this into clients to trust
+    /// the interceptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_path: Option<String>,
+}
+
+fn microvm_ca_path() -> Option<PathBuf> {
+    let p = home_dir()?
+        .join(SHARED_PROFILES_DIR)
+        .join("vm")
+        .join(MICROVM_NAME)
+        .join("egress-ca.pem");
+    p.is_file().then_some(p)
+}
+
+#[tauri::command]
+async fn microvm_egress_get() -> Result<EgressPolicy, String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "egress", "policy", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("read egress policy failed: {}", stderr.trim()));
+    }
+    let mut policy: EgressPolicy = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    policy.ca_path = microvm_ca_path().map(|p| p.to_string_lossy().into_owned());
+    Ok(policy)
+}
+
+#[tauri::command]
+async fn microvm_egress_default(action: String) -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", "default", &action, "--name", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("set default failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_egress_rule(action: String, host: String) -> Result<(), String> {
+    // action: "allow" | "deny"
+    if action != "allow" && action != "deny" {
+        return Err(format!("rule action must be allow|deny, got '{action}'"));
+    }
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", &action, &host, "--name", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("add {action} rule failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_egress_mitm(enabled: bool) -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let state = if enabled { "on" } else { "off" };
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", "mitm", state, "--name", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("set mitm failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_egress_reset() -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) = run_status_command(&[&bin, "egress", "reset", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("reset egress failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 // --- kubectl-driven workloads & logs --------------------------------
 
 #[derive(Serialize, Default)]
@@ -3611,6 +3710,90 @@ async fn tail_local_pod_logs(
     Ok(stdout)
 }
 
+// --- interactive terminals (PTY) ------------------------------------
+//
+// xterm.js in the desktop drives a real PTY (see terminal.rs) so
+// `kubectl exec -it` into a workload behaves like a native shell.
+// Engine-aware target selection (k3d context vs microVM kubeconfig)
+// is resolved here, next to the other kube wiring; terminal.rs only
+// moves bytes.
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOpenInput {
+    /// kubectl target — a pod name, or any exec-able ref like
+    /// `deploy/my-app`.
+    target: String,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    cluster_name: Option<String>,
+    /// "microvm" routes through the microVM kubeconfig; omitted → k3d.
+    #[serde(default)]
+    engine: Option<String>,
+    /// Command to run; defaults to an interactive `/bin/sh`.
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    container: Option<String>,
+    cols: u16,
+    rows: u16,
+}
+
+/// Build the `kubectl exec -it` argv for an interactive terminal.
+fn terminal_exec_argv(app: &AppHandle, input: &TerminalOpenInput) -> Result<Vec<String>, String> {
+    let runtime_input = LocalRuntimeInput {
+        cluster_name: input.cluster_name.clone(),
+        namespace: input.namespace.clone(),
+        ..Default::default()
+    };
+    let cfg = resolve_runtime_config(app, &runtime_input)?;
+    let mut argv = vec!["kubectl".to_string()];
+    argv.extend(kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?);
+    argv.push("-n".to_string());
+    argv.push(cfg.namespace.clone());
+    argv.push("exec".to_string());
+    argv.push("-it".to_string());
+    if let Some(c) = input.container.as_deref() {
+        argv.push("-c".to_string());
+        argv.push(c.to_string());
+    }
+    argv.push(input.target.clone());
+    argv.push("--".to_string());
+    match input.command.as_deref() {
+        Some(cmd) if !cmd.is_empty() => argv.extend(cmd.iter().cloned()),
+        _ => argv.push("/bin/sh".to_string()),
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn terminal_open(
+    app: AppHandle,
+    input: TerminalOpenInput,
+    on_event: Channel<terminal::TermEvent>,
+) -> Result<String, String> {
+    let argv = terminal_exec_argv(&app, &input)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    terminal::open(id.clone(), argv, input.cols, input.rows, on_event)?;
+    Ok(id)
+}
+
+#[tauri::command]
+async fn terminal_write(id: String, data: String) -> Result<(), String> {
+    terminal::write(&id, &data)
+}
+
+#[tauri::command]
+async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), String> {
+    terminal::resize(&id, cols, rows)
+}
+
+#[tauri::command]
+async fn terminal_close(id: String) -> Result<(), String> {
+    terminal::close(&id)
+}
+
 // ============================================================
 // Build + deploy from a local source folder.
 //
@@ -3780,8 +3963,7 @@ async fn evaluate_manifest_via_sidecar(
     let last_json_line = stdout_buf
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .last()
+        .rfind(|l| !l.is_empty())
         .ok_or_else(|| {
             let stderr_tail = stderr_buf.trim();
             if stderr_tail.is_empty() {
@@ -4003,8 +4185,7 @@ async fn crane_push_fallback(
     let digest_ref = stdout
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or(image_ref)
         .to_string();
     if !digest_ref.contains("@sha256:") {
@@ -4196,7 +4377,16 @@ pub fn run() {
             microvm_install,
             microvm_up,
             microvm_stop,
-            microvm_delete
+            microvm_delete,
+            microvm_egress_get,
+            microvm_egress_default,
+            microvm_egress_rule,
+            microvm_egress_mitm,
+            microvm_egress_reset,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

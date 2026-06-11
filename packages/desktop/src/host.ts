@@ -35,6 +35,10 @@ import type {
   StateDemotionOptions,
   StatePromotionInput,
   StatePromotionOptions,
+  EgressPolicy,
+  TerminalEvent,
+  TerminalOpenOptions,
+  TerminalSession,
 } from '@appliance.sh/app';
 
 // Tauri host: each cluster's URL/name lives in a JSON config file
@@ -243,6 +247,37 @@ export const tauriHost: ConsoleHost = {
     },
     remove() {
       return invoke('microvm_delete');
+    },
+    egress: {
+      get() {
+        return invoke<EgressPolicy>('microvm_egress_get');
+      },
+      async setDefault(action: 'allow' | 'deny') {
+        await invoke('microvm_egress_default', { action });
+      },
+      async addRule(action: 'allow' | 'deny', host: string) {
+        await invoke('microvm_egress_rule', { action, host });
+      },
+      async setMitm(enabled: boolean) {
+        await invoke('microvm_egress_mitm', { enabled });
+      },
+      async reset() {
+        await invoke('microvm_egress_reset');
+      },
+    },
+  },
+
+  terminal: {
+    async open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession> {
+      const channel = new Channel<TerminalEvent>();
+      channel.onmessage = onEvent;
+      const id = await invoke<string>('terminal_open', { input: opts, onEvent: channel });
+      return {
+        id,
+        write: (data: string) => invoke('terminal_write', { id, data }),
+        resize: (cols: number, rows: number) => invoke('terminal_resize', { id, cols, rows }),
+        close: () => invoke('terminal_close', { id }),
+      };
     },
   },
 };

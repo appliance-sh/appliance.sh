@@ -44,4 +44,10 @@ export type {
   LocalLogEvent,
   MicroVmHost,
   MicroVmStatus,
+  MicroVmEgressHost,
+  EgressPolicy,
+  TerminalHost,
+  TerminalEvent,
+  TerminalOpenOptions,
+  TerminalSession,
 } from './lib/host';

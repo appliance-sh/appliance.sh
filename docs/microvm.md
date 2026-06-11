@@ -179,3 +179,53 @@ routing needs zero new machinery — only the port forward.
 4. **KVM backend**, then **WSL backend**; desktop Local Runtime page
    grows a runtime-engine selector (k3d ⇄ microVM); guest exec
    channel (vsock) for logs/debugging without the console.
+
+## Egress control (outbound-traffic policy + TLS interception)
+
+Borrowing Docker's sandbox model: the VM's outbound traffic flows
+through a forward proxy that Appliance runs and the desktop controls,
+so a workload can be confined to known endpoints and (optionally) have
+its TLS decrypted for inspection.
+
+- **Proxy + policy** (`packages/vm/src/egress.rs`): an HTTP proxy that
+  handles `CONNECT` (HTTPS) and plain HTTP, deciding by destination
+  host against an allow/deny policy (deny > allow > default). The
+  policy is JSON at `~/.appliance/vm/<name>/egress-policy.json`,
+  reloaded per connection so edits apply live. Default port 5053
+  (clear of the 5050/5052 registries). Drive it with
+  `appliance vm egress proxy|policy|default|allow|deny|reset`.
+- **TLS interception** (`packages/vm/src/mitm.rs`): with `egress mitm
+on`, allowed HTTPS connections are intercepted — the proxy presents
+  a leaf minted on the fly (per SNI) from a per-VM CA the workload
+  trusts, terminates the client TLS, re-originates a real TLS
+  connection upstream, and so sees the decrypted request for
+  host/path-level policy and logging. The CA is generated once
+  (`egress ca`, rcgen) and lives at
+  `~/.appliance/vm/<name>/egress-ca.pem`; leaves are minted with
+  rustls. Off by default (blind tunnel) — turning it on is opt-in
+  confinement, not a behavior change.
+- **Routing the guest through it**: the proxy starts automatically
+  with the VM (`vm run` spawns it on `0.0.0.0:5053`, best-effort) and
+  a peer guard refuses anything off the VM subnet, so it is reachable
+  by the guest but never an open LAN proxy. Workloads point
+  `HTTPS_PROXY` / `HTTP_PROXY` at it on the VM's subnet gateway (the
+  `.1` the host sits on under vz NAT, e.g. `http://192.168.64.1:5053`)
+  and — for interception — trust the CA. `appliance vm egress gateway`
+  prints the exact values. Verified end-to-end against a live VM: a
+  real pod with `HTTPS_PROXY` set reaches the host proxy (200 when
+  allowed; blocked the instant the policy flips to deny, no restart),
+  and with the CA trusted the proxy decrypts the request (`GET /`
+  logged) while the workload still gets a valid 200.
+- **Desktop control**: the Runtimes page's microVM panel has an
+  "Outbound traffic" section — default allow/deny, a TLS-interception
+  toggle, allow/deny host rules, and the CA path. Tauri commands
+  (`microvm_egress_*`) drive the same `appliance-vm egress` surface so
+  the policy file stays single-sourced.
+
+Remaining productization: auto-inject `HTTPS_PROXY` + the CA into
+workloads via the api-server's deployment service (today the env/CA
+are set per-workload), so confinement is on by policy without manual
+per-pod wiring. Node-level vs per-pod trust differ — pods carry their
+own image trust store, so the CA must be mounted per workload (or
+baked into a base image), which is why this rides the deployment path
+rather than guest boot.

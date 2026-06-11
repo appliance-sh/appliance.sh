@@ -181,6 +181,41 @@ export interface ConsoleHost {
    * desktop-only, and only meaningful where a VM backend exists.
    */
   vm?: MicroVmHost;
+  /**
+   * Interactive PTY terminals into local workloads (`kubectl exec
+   * -it`). Optional — desktop-only; needs a pseudo-terminal the web
+   * shell can't provide.
+   */
+  terminal?: TerminalHost;
+}
+
+export type TerminalEvent = { type: 'data'; data: string } | { type: 'exit'; code?: number };
+
+export interface TerminalOpenOptions {
+  /** kubectl target — a pod, or any exec-able ref like `deploy/app`. */
+  target: string;
+  namespace?: string;
+  clusterName?: string;
+  /** 'microvm' routes through the microVM kubeconfig; omitted → k3d. */
+  engine?: 'microvm';
+  /** Command to run; defaults to an interactive `/bin/sh`. */
+  command?: string[];
+  container?: string;
+  cols: number;
+  rows: number;
+}
+
+/** A live PTY session. Output arrives on the `onEvent` callback passed
+ *  to `open`; input + control go back through these methods. */
+export interface TerminalSession {
+  id: string;
+  write(data: string): Promise<void>;
+  resize(cols: number, rows: number): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface TerminalHost {
+  open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession>;
 }
 
 /**
@@ -205,6 +240,28 @@ export interface MicroVmStatus {
   message?: string;
 }
 
+/** Outbound-traffic policy for the microVM's egress proxy. Mirrors
+ *  EgressPolicy in packages/vm/src/egress.rs. */
+export interface EgressPolicy {
+  default: 'allow' | 'deny';
+  /** Host suffixes always allowed. */
+  allow: string[];
+  /** Host suffixes always denied (deny wins over allow). */
+  deny: string[];
+  /** TLS interception on — the proxy decrypts allowed HTTPS. */
+  mitm: boolean;
+  /** Path to the VM's egress CA cert, when interception is on. */
+  caPath?: string;
+}
+
+export interface MicroVmEgressHost {
+  get(): Promise<EgressPolicy>;
+  setDefault(action: 'allow' | 'deny'): Promise<void>;
+  addRule(action: 'allow' | 'deny', host: string): Promise<void>;
+  setMitm(enabled: boolean): Promise<void>;
+  reset(): Promise<void>;
+}
+
 export interface MicroVmHost {
   status(): Promise<MicroVmStatus>;
   /** Install the engine binary into the managed bin dir. */
@@ -214,6 +271,8 @@ export interface MicroVmHost {
   stop(): Promise<void>;
   /** Delete the VM and its state (stops first if needed). */
   remove(): Promise<void>;
+  /** Control the VM's outbound traffic (allow/deny + TLS MITM). */
+  egress: MicroVmEgressHost;
 }
 
 export interface LocalClusterInput {

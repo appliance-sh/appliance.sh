@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
+import { spawnSync } from 'node:child_process';
 import { confirm } from '@inquirer/prompts';
 import {
   apiServerUrlForHostPort,
@@ -16,7 +17,9 @@ import {
   stopLocalCluster,
   waitForApiServerUrl,
   bootstrapInClusterApiServer,
+  DEFAULT_LOCAL_CLUSTER_NAME,
   DEFAULT_LOCAL_HOST_PORT,
+  DEFAULT_LOCAL_NAMESPACE,
 } from '@appliance.sh/helper';
 import type { LocalClusterStatus, ProgressEvent, StatusEntry } from '@appliance.sh/helper';
 import { createApplianceClient } from '@appliance.sh/sdk';
@@ -288,6 +291,56 @@ program
       console.error(chalk.red(err instanceof Error ? err.message : String(err)));
       process.exit(1);
     }
+  });
+
+// ---- exec / shell ------------------------------------------------------
+
+/** kubectl/docker exec's -t needs a real terminal on both ends; piped
+ *  runs (CI, scripts) still work interactively on stdin alone. */
+function ttyFlag(): string {
+  return process.stdin.isTTY && process.stdout.isTTY ? '-it' : '-i';
+}
+
+program
+  .command('exec')
+  .description('run a command in a workload pod (interactive shell by default)')
+  .option('--cluster-name <name>', 'k3d cluster name (default: appliance-local)')
+  .option('-n, --namespace <ns>', 'kubernetes namespace', DEFAULT_LOCAL_NAMESPACE)
+  .argument('<pod>', 'pod (any kubectl target works, e.g. deploy/my-app)')
+  .argument('[command...]', 'command to run (default: /bin/sh)')
+  .action((pod: string, command: string[], opts: { clusterName?: string; namespace: string }) => {
+    const ctx = `k3d-${opts.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME}`;
+    const r = spawnSync(
+      'kubectl',
+      [
+        '--context',
+        ctx,
+        '-n',
+        opts.namespace,
+        'exec',
+        ttyFlag(),
+        pod,
+        '--',
+        ...(command.length ? command : ['/bin/sh']),
+      ],
+      { stdio: 'inherit' }
+    );
+    process.exit(r.status ?? 1);
+  });
+
+program
+  .command('shell')
+  .description('open a root shell inside the cluster node (or run one command: appliance local shell -- uname -a)')
+  .option('--cluster-name <name>', 'k3d cluster name (default: appliance-local)')
+  .argument('[command...]', 'command to run instead of an interactive shell')
+  .action((command: string[], opts: { clusterName?: string }) => {
+    // The k3d "node" is a docker container on the local daemon —
+    // docker exec is the native shell into it (k3s image ships
+    // busybox sh).
+    const container = `k3d-${opts.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME}-server-0`;
+    const entry = command.length ? ['/bin/sh', '-c', command.join(' ')] : ['/bin/sh'];
+    const r = spawnSync('docker', ['exec', ttyFlag(), container, ...entry], { stdio: 'inherit' });
+    process.exit(r.status ?? 1);
   });
 
 // ---- runtime ----------------------------------------------------------

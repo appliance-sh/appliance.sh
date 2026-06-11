@@ -5,6 +5,23 @@ import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
+import { LOCAL_RUNTIME_CLUSTER_ID, MICROVM_CLUSTER_ID } from '@/lib/host';
+
+/** Engine tag for the two local clusters, so they're tellable apart
+ *  at a glance (they even share the same URL — host port 8081). */
+function engineLabel(clusterId: string): string | null {
+  if (clusterId === LOCAL_RUNTIME_CLUSTER_ID) return 'k3d';
+  if (clusterId === MICROVM_CLUSTER_ID) return 'microVM';
+  return null;
+}
+
+function EngineBadge({ clusterId }: { clusterId: string }) {
+  const label = engineLabel(clusterId);
+  if (!label) return null;
+  return (
+    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{label}</span>
+  );
+}
 
 export function ClusterSwitcher() {
   const host = useHost();
@@ -60,6 +77,7 @@ export function ClusterSwitcher() {
         )}
       >
         <span className="font-medium">{cluster?.name ?? 'Select cluster'}</span>
+        {cluster ? <EngineBadge clusterId={cluster.id} /> : null}
         <ChevronDown className="h-3.5 w-3.5 text-[var(--color-muted-foreground)]" />
       </button>
       {open ? (
@@ -85,7 +103,9 @@ export function ClusterSwitcher() {
                       {isSelected ? <Check className="h-4 w-4 text-[var(--color-accent)]" /> : null}
                     </div>
                     <div className="min-w-0">
-                      <div className="font-medium">{c.name}</div>
+                      <div className="flex items-center gap-1.5 font-medium">
+                        {c.name} <EngineBadge clusterId={c.id} />
+                      </div>
                       <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
                         {c.apiServerUrl}
                       </div>
