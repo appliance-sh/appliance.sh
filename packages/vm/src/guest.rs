@@ -50,7 +50,7 @@ fn arch_tuple() -> Result<(&'static str, &'static str)> {
 }
 
 fn assets_dir() -> PathBuf {
-    crate::store::vmm_root().join("images").join("guest-assets")
+    crate::store::vm_root().join("images").join("guest-assets")
 }
 
 /// Download (once) the module loop + k3s binary the boot media embeds.

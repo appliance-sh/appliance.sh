@@ -39,7 +39,7 @@ pub struct GuestImage {
 }
 
 fn cache_dir(image: &str) -> PathBuf {
-    crate::store::vmm_root().join("images").join(image)
+    crate::store::vm_root().join("images").join(image)
 }
 
 /// Resolve (downloading on first use) the kernel + initramfs for an

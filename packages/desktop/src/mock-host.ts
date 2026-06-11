@@ -495,11 +495,15 @@ export function createMockHost(): ConsoleHost {
       async status() {
         return {
           available: true,
+          installable: false,
           exists: microVm.exists,
           running: microVm.running,
           kubeconfigReady: microVm.running,
           apiServerUrl: 'http://api.appliance.localhost:8081',
         };
+      },
+      async install() {
+        await sleep(800);
       },
       async up(onEvent) {
         const lines = [

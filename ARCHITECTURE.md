@@ -229,7 +229,7 @@ The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:lat
 #### MicroVM engine
 
 The next-generation local runtime boots an isolated VM that Appliance
-owns end-to-end (`packages/vmm`, design in `docs/microvm.md`): direct
+owns end-to-end (`packages/vm`, design in `docs/microvm.md`): direct
 kernel boot via the platform hypervisor (Virtualization.framework on
 macOS; KVM/WSL2 scaffolded), k3s on containerd inside, an in-VM image
 registry, and host-side TCP forwards that preserve the exact

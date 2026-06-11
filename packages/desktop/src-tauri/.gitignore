@@ -5,3 +5,6 @@ Cargo.lock
 # right before each desktop build; same binaries are also released as
 # GitHub Release assets by release-cli-binaries.yml.
 binaries
+# Bundle-resource staging for the microVM engine binary. Populated
+# by ../scripts/copy-vm.mjs when packages/vm has a release build.
+vm-bin

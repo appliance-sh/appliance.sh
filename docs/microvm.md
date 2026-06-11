@@ -27,7 +27,7 @@ the k3d nodes live inside whatever Docker provider the user installed
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ appliance-vmm (single Rust executable)                    │
+│ appliance-vm (single Rust executable)                     │
 │                                                           │
 │  CLI: create / start / stop / delete / status / console   │
 │                                                           │
@@ -86,7 +86,7 @@ A deliberately tiny, versioned guest — not a general-purpose distro:
 - **Boot**: direct kernel boot (no firmware, no bootloader) of a
   pinned Alpine `virt` kernel + a custom initramfs. Sub-second kernel
   start; the image pair is a few tens of MB, downloaded once into
-  `~/.appliance/vmm/images/<version>/` (same managed-asset model as
+  `~/.appliance/vm/images/<version>/` (same managed-asset model as
   `appliance local install` uses for k3d/kubectl).
 - **Init**: our own minimal init (busybox + a shell script baked into
   the initramfs): bring up virtio-net via DHCP, mount the virtio-blk
@@ -102,7 +102,7 @@ A deliberately tiny, versioned guest — not a general-purpose distro:
   host contract.)
 - **Control channel**: virtio-vsock for host↔guest exec and readiness
   (no SSH keys, no TCP exposure). The guest init runs a tiny vsock
-  agent; `appliance-vmm exec` rides it.
+  agent; `appliance-vm exec` rides it.
 
 ### Host wiring — same DX, new engine
 
@@ -129,7 +129,7 @@ routing needs zero new machinery — only the port forward.
 
 ### Packaging — one executable
 
-`appliance-vmm` builds as a single static-ish binary per platform:
+`appliance-vm` builds as a single static-ish binary per platform:
 
 - The desktop bundles it the same way it bundles the Node sidecar
   today, and drives it in-process on macOS (library) or as a child
@@ -155,7 +155,7 @@ routing needs zero new machinery — only the port forward.
    via the VM's fixed MAC (the Lima approach), the kubeconfig is
    served once over a guest-local HTTP handoff, and the resident host
    process runs plain TCP forwards (`127.0.0.1:6443 → guest:6443`,
-   `127.0.0.1:8081 → guest:80`). `appliance-vmm up` returns a working
+   `127.0.0.1:8081 → guest:80`). `appliance-vm up` returns a working
    kubeconfig; `kubectl get nodes` is Ready ~30s after a warm boot and
    Traefik serves `<name>.appliance.localhost:8081` exactly like the
    k3d runtime.

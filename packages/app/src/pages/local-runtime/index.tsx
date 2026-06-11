@@ -212,7 +212,7 @@ export function LocalRuntimePage() {
 // ---- microVM engine -----------------------------------------------------
 
 // The next-generation runtime: an isolated VM Appliance boots itself
-// (appliance-vmm) instead of renting the docker provider's. Surfaced
+// (appliance-vm) instead of renting the docker provider's. Surfaced
 // alongside the k3d runtime while both engines coexist; uses its own
 // credentials profile ("microvm") and the same
 // *.appliance.localhost:8081 URL surface.
@@ -232,7 +232,7 @@ function MicroVmPanel() {
     },
   });
 
-  const [busy, setBusy] = React.useState<'up' | 'stop' | 'delete' | null>(null);
+  const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const logRef = React.useRef<HTMLPreElement | null>(null);
@@ -243,7 +243,7 @@ function MicroVmPanel() {
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm'] });
 
-  const run = async (kind: 'up' | 'stop' | 'delete', action: () => Promise<void>) => {
+  const run = async (kind: 'install' | 'up' | 'stop' | 'delete', action: () => Promise<void>) => {
     setBusy(kind);
     setError(null);
     if (kind === 'up') setLog([]);
@@ -271,7 +271,11 @@ function MicroVmPanel() {
   const state = !status
     ? 'checking…'
     : !status.available
-      ? 'unavailable'
+      ? busy === 'install'
+        ? 'installing…'
+        : status.installable
+          ? 'not installed'
+          : 'unavailable'
       : busy === 'up'
         ? 'starting…'
         : status.running
@@ -309,9 +313,21 @@ function MicroVmPanel() {
       </header>
 
       {status && !status.available ? (
-        <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
-          {status.message ?? 'appliance-vmm is not installed on this machine.'}
-        </p>
+        status.installable ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[var(--color-border)] px-3 py-2">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              The engine binary (<code className="font-mono">appliance-vm</code>) isn't installed yet — Appliance
+              installs it into <code className="font-mono">~/.appliance/bin</code>.
+            </p>
+            <Button onClick={() => run('install', () => vm.install())} disabled={busy !== null}>
+              <Download className="h-4 w-4" /> {busy === 'install' ? 'Installing…' : 'Install engine'}
+            </Button>
+          </div>
+        ) : (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+            {status.message ?? 'appliance-vm is not installed on this machine.'}
+          </p>
+        )
       ) : (
         <div className="flex flex-wrap items-center gap-2">
           <Button

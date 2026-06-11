@@ -15,13 +15,13 @@ import { createApplianceClient } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
 import { readProfiles } from './utils/profile-store.js';
 
-// `appliance vm` — the microVM runtime engine (appliance-vmm). Same
+// `appliance vm` — the microVM runtime engine (appliance-vm). Same
 // developer surface as `appliance local` (the k3d engine), but the
 // workloads run inside an isolated VM that Appliance itself boots:
 // no docker provider required for the cluster, only for building and
 // pushing application images.
 //
-// The heavy lifting lives in the `appliance-vmm` Rust binary; this
+// The heavy lifting lives in the `appliance-vm` Rust binary; this
 // command drives it and layers the Appliance control plane on top
 // (in-VM api-server bootstrap + credential registration), ending at
 // the exact same DX as every other engine:
@@ -34,22 +34,23 @@ const MICROVM_PROFILE = 'microvm';
 const DEFAULT_VM_NAME = 'appliance';
 const VM_HOST_PORT = 8081;
 const VM_REGISTRY_PORT = 5052;
-// Mirrors VmSpec defaults in packages/vmm/src/spec.rs — keep in sync.
+// Mirrors VmSpec defaults in packages/vm/src/spec.rs — keep in sync.
 
 const program = new Command();
 program.description('manage the microVM runtime (isolated VM engine, no docker required)');
 
-function vmmBinary(): string {
-  // Resolution order: explicit override → PATH → the repo build.
-  // The npm distribution will ship per-platform binaries; until then
-  // the repo path keeps `pnpm`-checkout workflows working.
+function vmBinary(): string {
+  // Resolution order: explicit override → managed install → PATH →
+  // the repo build. The desktop installs into ~/.appliance/bin (and
+  // the npm distribution will ship per-platform binaries); the repo
+  // paths keep `pnpm`-checkout workflows working.
   const candidates = [
-    process.env.APPLIANCE_VMM,
-    'appliance-vmm',
-    path.join(os.homedir(), '.appliance', 'bin', 'appliance-vmm'),
+    process.env.APPLIANCE_VM,
+    path.join(os.homedir(), '.appliance', 'bin', 'appliance-vm'),
+    'appliance-vm',
     // Repo-checkout fallbacks, resolved from the working directory.
-    path.resolve('packages/vmm/target/release/appliance-vmm'),
-    path.resolve('packages/vmm/target/debug/appliance-vmm'),
+    path.resolve('packages/vm/target/release/appliance-vm'),
+    path.resolve('packages/vm/target/debug/appliance-vm'),
   ].filter((c): c is string => Boolean(c));
   for (const candidate of candidates) {
     const probe = spawnSync(candidate, ['--version'], { stdio: 'ignore' });
@@ -57,18 +58,18 @@ function vmmBinary(): string {
   }
   console.error(
     chalk.red(
-      'appliance-vmm binary not found. Build it with `cargo build && ./scripts/sign-dev.sh` in packages/vmm, or set APPLIANCE_VMM.'
+      'appliance-vm binary not found. Build it with `cargo build && ./scripts/sign-dev.sh` in packages/vm, or set APPLIANCE_VM.'
     )
   );
   process.exit(1);
 }
 
 function vmDir(name: string): string {
-  return path.join(os.homedir(), '.appliance', 'vmm', name);
+  return path.join(os.homedir(), '.appliance', 'vm', name);
 }
 
-function runVmm(args: string[]): number {
-  const bin = vmmBinary();
+function runVm(args: string[]): number {
+  const bin = vmBinary();
   const r = spawnSync(bin, args, { stdio: 'inherit' });
   return r.status ?? 1;
 }
@@ -97,13 +98,13 @@ program
 
 async function runUp(name: string, imageOverride: string | undefined, timeout: number): Promise<void> {
   // 1. Boot the VM + wait for its kubernetes endpoint.
-  const status = runVmm(['up', name, '--timeout', String(timeout)]);
+  const status = runVm(['up', name, '--timeout', String(timeout)]);
   if (status !== 0) process.exit(status);
   const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
   const kubeconfigDeadline = Date.now() + 30_000;
   while (!fs.existsSync(kubeconfigPath)) {
     if (Date.now() >= kubeconfigDeadline) {
-      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vmm up`);
+      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vm up`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
@@ -287,7 +288,7 @@ for (const [cmd, desc] of [
     .description(desc)
     .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
     .action((opts: { name: string }) => {
-      process.exit(runVmm([cmd, opts.name]));
+      process.exit(runVm([cmd, opts.name]));
     });
 }
 
@@ -299,7 +300,7 @@ program
   .action((opts: { name: string; follow: boolean }) => {
     const args = ['console', opts.name];
     if (opts.follow) args.push('-f');
-    process.exit(runVmm(args));
+    process.exit(runVm(args));
   });
 
 program
@@ -319,7 +320,7 @@ program
   .command('doctor')
   .description('probe whether this machine can run microVMs')
   .action(() => {
-    process.exit(runVmm(['doctor']));
+    process.exit(runVm(['doctor']));
   });
 
 program.parse(process.argv);

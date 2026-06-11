@@ -185,10 +185,11 @@ resources/*
 # populates this with the host-triple-matched CLI binary right before
 # tauri-build packages it. Also covered by the subpackage gitignore.
 packages/desktop/src-tauri/binaries/
+packages/desktop/src-tauri/vm-bin/
 
 # Bun's internal lockfile if used alongside pnpm. We commit
 # pnpm-lock.yaml as the source of truth.
 bun.lockb
 bun.lock
 .gstack/
-packages/vmm/target/
+packages/vm/target/

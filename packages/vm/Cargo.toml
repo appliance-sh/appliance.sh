@@ -1,5 +1,5 @@
 [package]
-name = "appliance-vmm"
+name = "appliance-vm"
 version = "0.1.0"
 description = "Appliance microVM manager — one executable, multiple virtualization backends (Virtualization.framework, KVM, WSL2)"
 authors = ["Eliot Lim"]
@@ -7,7 +7,7 @@ license = "MIT"
 edition = "2021"
 
 [[bin]]
-name = "appliance-vmm"
+name = "appliance-vm"
 path = "src/main.rs"
 
 [dependencies]

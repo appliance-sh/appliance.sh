@@ -82,7 +82,7 @@ impl VmBackend for VzBackend {
         unsafe { config.validateWithError() }
             .map_err(|e| anyhow!("invalid VM configuration: {}", error_text(&e)))?;
 
-        let queue = DispatchQueue::new(&format!("sh.appliance.vmm.{}", spec.name), None);
+        let queue = DispatchQueue::new(&format!("sh.appliance.vm.{}", spec.name), None);
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
         };
@@ -109,7 +109,7 @@ impl VmBackend for VzBackend {
         }
 
         // Park until either the guest powers off on its own or a stop
-        // is requested (SIGTERM from `appliance-vmm stop`, or ^C).
+        // is requested (SIGTERM from `appliance-vm stop`, or ^C).
         loop {
             std::thread::sleep(Duration::from_millis(200));
             let state = vm_state(&queue, &vm);

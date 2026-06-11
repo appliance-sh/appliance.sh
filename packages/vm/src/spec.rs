@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Persisted definition of one microVM. Lives at
-/// `~/.appliance/vmm/<name>/vm.json`; everything else in that
+/// `~/.appliance/vm/<name>/vm.json`; everything else in that
 /// directory (disk image, console log, pidfile) is derived state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +83,7 @@ pub struct VmPaths {
 impl VmPaths {
     pub fn for_name(name: &str) -> Self {
         Self {
-            dir: crate::store::vmm_root().join(name),
+            dir: crate::store::vm_root().join(name),
         }
     }
     pub fn spec(&self) -> PathBuf {
@@ -96,7 +96,7 @@ impl VmPaths {
         self.dir.join("console.log")
     }
     pub fn pidfile(&self) -> PathBuf {
-        self.dir.join("vmm.pid")
+        self.dir.join("vm.pid")
     }
     pub fn kubeconfig(&self) -> PathBuf {
         self.dir.join("kubeconfig.yaml")

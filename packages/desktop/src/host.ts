@@ -228,6 +228,9 @@ export const tauriHost: ConsoleHost = {
     status() {
       return invoke<MicroVmStatus>('microvm_status');
     },
+    async install() {
+      await invoke('microvm_install');
+    },
     async up(onEvent) {
       const channel = new Channel<{ type: string; message?: string }>();
       channel.onmessage = (event) => {

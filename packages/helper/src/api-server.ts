@@ -428,7 +428,7 @@ export interface BootstrapInClusterOptions {
   readyTimeoutMs?: number;
   /** Kubeconfig the kubectl calls should use. Defaults to the
    *  ambient kubeconfig (the k3d path); the microVM engine passes
-   *  the per-VM file appliance-vmm fetched. */
+   *  the per-VM file appliance-vm fetched. */
   kubeconfigPath?: string;
   /** Override the api-server image reference (see
    *  IN_CLUSTER_API_SERVER_DEFAULT_IMAGE for the default + rationale). */

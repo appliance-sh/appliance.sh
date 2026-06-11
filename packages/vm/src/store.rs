@@ -3,15 +3,39 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
-/// Root for all VMM state: VM definitions, disks, cached guest images.
+/// Root for all VM state: VM definitions, disks, cached guest images.
 /// Sits under the same `~/.appliance` umbrella as credentials and the
 /// helper-managed binaries so `rm -rf ~/.appliance` remains the one
 /// true uninstall.
-pub fn vmm_root() -> PathBuf {
+pub fn vm_root() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".appliance").join("vmm")
+    let root = home.join(".appliance").join("vm");
+    migrate_legacy_root(&home.join(".appliance").join("vmm"), &root);
+    root
+}
+
+/// One-time move of pre-rename state (`~/.appliance/vmm`, binary then
+/// called appliance-vmm) into the current root, so existing VMs keep
+/// working across the rename. No-op once the new root exists.
+fn migrate_legacy_root(legacy: &std::path::Path, root: &std::path::Path) {
+    if root.exists() || !legacy.exists() {
+        return;
+    }
+    if fs::rename(legacy, root).is_err() {
+        return;
+    }
+    // Pidfiles were named vmm.pid; carry them over so a VM that was
+    // running through the rename is still seen (and stoppable).
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let old_pid = entry.path().join("vmm.pid");
+            if old_pid.exists() {
+                let _ = fs::rename(&old_pid, entry.path().join("vm.pid"));
+            }
+        }
+    }
 }
 
 pub fn save_spec(spec: &VmSpec) -> Result<()> {

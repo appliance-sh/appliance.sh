@@ -2891,23 +2891,110 @@ async fn bootstrap_in_cluster_api_server(
 
 // --- microVM engine ---------------------------------------------------
 //
-// The microVM runtime (packages/vmm — appliance-vmm) is driven through
-// two channels: lifecycle reads/stops go straight to the appliance-vmm
+// The microVM runtime (packages/vm — appliance-vm) is driven through
+// two channels: lifecycle reads/stops go straight to the appliance-vm
 // binary; the full `up` orchestration (in-VM registry wait, api-server
 // image push, bootstrap, profile registration) lives in the bundled
 // appliance CLI (`appliance vm up`) and is streamed here, so desktop
 // and CLI share one implementation of the control-plane logic.
+//
+// The engine binary itself is desktop-managed: packaged builds carry
+// it as a bundle resource (scripts/copy-vm.mjs), dev builds reach for
+// the repo's cargo output, and `microvm_install` places it in
+// ~/.appliance/bin — the shared managed location the CLI resolves too.
 
-/// Locate the appliance-vmm binary: the helper-managed bin dir first
+/// Locate the appliance-vm binary: the helper-managed bin dir first
 /// (the CLI's `appliance vm` resolves the same path), then PATH.
-fn vmm_binary() -> Option<PathBuf> {
+fn vm_binary() -> Option<PathBuf> {
     if let Some(home) = home_dir() {
-        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vmm");
+        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm");
         if managed.exists() {
             return Some(managed);
         }
     }
-    which_path("appliance-vmm")
+    which_path("appliance-vm")
+}
+
+/// Where an installable appliance-vm binary can come from: the
+/// bundled resource (packaged builds; placed by scripts/copy-vm.mjs),
+/// or — in dev builds — the repo checkout's cargo output.
+fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(resource) = app
+        .path()
+        .resolve("vm-bin/appliance-vm", tauri::path::BaseDirectory::Resource)
+    {
+        if resource.is_file() {
+            return Some(resource);
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        let vm_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vm/target");
+        for profile in ["release", "debug"] {
+            let candidate = vm_target.join(profile).join("appliance-vm");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The entitlement Virtualization.framework gates VM creation on —
+/// compiled in from packages/vm/vz.entitlements (one source of truth).
+#[cfg(target_os = "macos")]
+const VZ_ENTITLEMENTS: &str = include_str!("../../../vm/vz.entitlements");
+
+/// Re-sign an installed appliance-vm with the virtualization
+/// entitlement (ad-hoc). Copying the binary out of the app bundle
+/// leaves it outside the bundle's signature, and an unentitled binary
+/// can't create VMs.
+#[cfg(target_os = "macos")]
+async fn sign_with_vz_entitlement(binary: &std::path::Path) -> Result<(), String> {
+    let entitlements_path = std::env::temp_dir().join("appliance-vz.entitlements");
+    fs::write(&entitlements_path, VZ_ENTITLEMENTS)
+        .map_err(|e| format!("write {}: {e}", entitlements_path.display()))?;
+    let entitlements = entitlements_path.to_string_lossy().to_string();
+    let binary = binary.to_string_lossy().to_string();
+    let (ok, _stdout, stderr) = run_status_command(&[
+        "codesign",
+        "--force",
+        "--sign",
+        "-",
+        "--entitlements",
+        &entitlements,
+        &binary,
+    ])
+    .await?;
+    if !ok {
+        return Err(format!("codesign {binary} failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Install the appliance-vm engine into ~/.appliance/bin, where both
+/// the desktop and the CLI resolve it. Returns the installed path.
+#[tauri::command]
+async fn microvm_install(app: AppHandle) -> Result<String, String> {
+    let source = vm_install_source(&app)
+        .ok_or("no installable appliance-vm binary ships with this build")?;
+    let home = home_dir().ok_or("cannot resolve the home directory")?;
+    let bin_dir = home.join(SHARED_PROFILES_DIR).join("bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+    let dest = bin_dir.join("appliance-vm");
+    // Unlink first: overwriting in place would truncate the inode a
+    // still-running VM host process executes from.
+    let _ = fs::remove_file(&dest);
+    fs::copy(&source, &dest).map_err(|e| format!("copy to {}: {e}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", dest.display()))?;
+    }
+    #[cfg(target_os = "macos")]
+    sign_with_vz_entitlement(&dest).await?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 fn which_path(cmd: &str) -> Option<PathBuf> {
@@ -2924,8 +3011,11 @@ fn which_path(cmd: &str) -> Option<PathBuf> {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MicroVmStatus {
-    /// appliance-vmm binary present on this machine.
+    /// appliance-vm binary present on this machine.
     available: bool,
+    /// Not installed, but this build carries a binary it can install
+    /// (surface an Install action instead of a dead-end message).
+    installable: bool,
     exists: bool,
     running: bool,
     /// kubeconfig fetched — the kubernetes endpoint is (or was) ready.
@@ -2939,18 +3029,25 @@ const MICROVM_NAME: &str = "appliance";
 const MICROVM_HOST_PORT: u16 = 8081;
 
 #[tauri::command]
-async fn microvm_status() -> MicroVmStatus {
+async fn microvm_status(app: AppHandle) -> MicroVmStatus {
     let api_server_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT);
-    let Some(bin) = vmm_binary() else {
+    let Some(bin) = vm_binary() else {
+        let installable = vm_install_source(&app).is_some();
         return MicroVmStatus {
             available: false,
+            installable,
             exists: false,
             running: false,
             kubeconfig_ready: false,
             api_server_url,
-            message: Some(
-                "appliance-vmm is not installed (expected in ~/.appliance/bin or on PATH)".into(),
-            ),
+            message: Some(if installable {
+                "The microVM engine isn't installed yet.".into()
+            } else {
+                "appliance-vm is not installed (expected in ~/.appliance/bin or on PATH) \
+                 and this build has no bundled copy. In a repo checkout: \
+                 `cargo build --release && ./scripts/sign-dev.sh --release` in packages/vm."
+                    .into()
+            }),
         };
     };
     let bin = bin.to_string_lossy().to_string();
@@ -2959,6 +3056,7 @@ async fn microvm_status() -> MicroVmStatus {
         Err(e) => {
             return MicroVmStatus {
                 available: false,
+                installable: false,
                 exists: false,
                 running: false,
                 kubeconfig_ready: false,
@@ -2970,6 +3068,7 @@ async fn microvm_status() -> MicroVmStatus {
     if !ok {
         return MicroVmStatus {
             available: true,
+            installable: false,
             exists: false,
             running: false,
             kubeconfig_ready: false,
@@ -2981,7 +3080,7 @@ async fn microvm_status() -> MicroVmStatus {
     let kubeconfig_ready = home_dir()
         .map(|h| {
             h.join(SHARED_PROFILES_DIR)
-                .join("vmm")
+                .join("vm")
                 .join(MICROVM_NAME)
                 .join("kubeconfig.yaml")
                 .exists()
@@ -2989,6 +3088,7 @@ async fn microvm_status() -> MicroVmStatus {
         .unwrap_or(false);
     MicroVmStatus {
         available: true,
+        installable: false,
         exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
         running: parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
         kubeconfig_ready,
@@ -3005,6 +3105,16 @@ async fn microvm_status() -> MicroVmStatus {
 /// (api-server bootstrapped + microvm profile registered).
 #[tauri::command]
 async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Result<(), String> {
+    // Self-heal: install the engine binary first when it's missing —
+    // the CLI spawned below resolves the same ~/.appliance/bin path.
+    if vm_binary().is_none() && vm_install_source(&app).is_some() {
+        let _ = on_event.send(serde_json::json!({
+            "type": "log",
+            "level": "info",
+            "message": "installing the microVM engine (appliance-vm) into ~/.appliance/bin",
+        }));
+        microvm_install(app.clone()).await?;
+    }
     let sidecar = app
         .shell()
         .sidecar("appliance")
@@ -3050,18 +3160,18 @@ async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Res
 
 #[tauri::command]
 async fn microvm_stop() -> Result<(), String> {
-    let bin = vmm_binary().ok_or("appliance-vmm is not installed")?;
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let (ok, _stdout, stderr) = run_status_command(&[&bin, "stop", MICROVM_NAME]).await?;
     if !ok {
-        return Err(format!("appliance-vmm stop failed: {}", stderr.trim()));
+        return Err(format!("appliance-vm stop failed: {}", stderr.trim()));
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn microvm_delete() -> Result<(), String> {
-    let bin = vmm_binary().ok_or("appliance-vmm is not installed")?;
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     // Stop first (delete refuses while running), tolerating "not running".
     let _ = run_status_command(&[&bin, "stop", MICROVM_NAME]).await;
@@ -3078,7 +3188,7 @@ async fn microvm_delete() -> Result<(), String> {
     }
     let (ok, _stdout, stderr) = run_status_command(&[&bin, "delete", MICROVM_NAME]).await?;
     if !ok {
-        return Err(format!("appliance-vmm delete failed: {}", stderr.trim()));
+        return Err(format!("appliance-vm delete failed: {}", stderr.trim()));
     }
     Ok(())
 }
@@ -3878,6 +3988,7 @@ pub fn run() {
             build_and_import_image,
             bootstrap_in_cluster_api_server,
             microvm_status,
+            microvm_install,
             microvm_up,
             microvm_stop,
             microvm_delete

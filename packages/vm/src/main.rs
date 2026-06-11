@@ -15,7 +15,7 @@ use std::process::Command;
 /// platform (Virtualization.framework / KVM / WSL2), one guest
 /// contract. See docs/microvm.md in the repo for the architecture.
 #[derive(Parser)]
-#[command(name = "appliance-vmm", version, about)]
+#[command(name = "appliance-vm", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -142,7 +142,7 @@ fn run() -> Result<()> {
             // semantics.
             let child = spawn_host_process(&name)?;
             println!("starting VM '{name}' (host pid {})", child.id());
-            println!("console: appliance-vmm console {name} -f");
+            println!("console: appliance-vm console {name} -f");
             Ok(())
         }
 
@@ -184,7 +184,7 @@ fn run() -> Result<()> {
                 if std::time::Instant::now() >= deadline {
                     println!();
                     bail!(
-                        "timed out waiting for the kubeconfig. Host log tail:\n{}\n(boot log: `appliance-vmm console {name}`)",
+                        "timed out waiting for the kubeconfig. Host log tail:\n{}\n(boot log: `appliance-vm console {name}`)",
                         tail_of(&paths.host_log(), 8)
                     );
                 }
