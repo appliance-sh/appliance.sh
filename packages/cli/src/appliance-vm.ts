@@ -34,11 +34,36 @@ import { readProfiles } from './utils/profile-store.js';
 
 ensureHelperBinOnPath();
 
-const MICROVM_PROFILE = 'microvm';
 const DEFAULT_VM_NAME = 'appliance';
-const VM_HOST_PORT = 8081;
-const VM_REGISTRY_PORT = 5052;
 // Mirrors VmSpec defaults in packages/vm/src/spec.rs — keep in sync.
+// These are the *default* VM's canonical ports; additional VMs get an
+// allocated block, read per-VM from their persisted spec (vmPorts).
+const DEFAULT_VM_PORTS = { hostPort: 8081, apiPort: 6443, registryPort: 5052, egressPort: 5053 } as const;
+
+/** The credentials profile a VM owns. The default VM keeps the plain
+ *  `microvm` profile (back-compat + parity with the desktop); each
+ *  additional VM gets its own `microvm-<name>` profile so multiple VMs
+ *  coexist without clobbering each other's credentials. */
+function profileForVm(name: string): string {
+  return name === DEFAULT_VM_NAME ? 'microvm' : `microvm-${name}`;
+}
+
+/** Read a VM's forwarded host ports from its persisted spec, falling
+ *  back to the canonical defaults when the spec isn't written yet. */
+function vmPorts(name: string): { hostPort: number; apiPort: number; registryPort: number; egressPort: number } {
+  try {
+    const raw = fs.readFileSync(path.join(vmDir(name), 'vm.json'), 'utf8');
+    const spec = JSON.parse(raw) as Partial<typeof DEFAULT_VM_PORTS>;
+    return {
+      hostPort: spec.hostPort ?? DEFAULT_VM_PORTS.hostPort,
+      apiPort: spec.apiPort ?? DEFAULT_VM_PORTS.apiPort,
+      registryPort: spec.registryPort ?? DEFAULT_VM_PORTS.registryPort,
+      egressPort: spec.egressPort ?? DEFAULT_VM_PORTS.egressPort,
+    };
+  } catch {
+    return { ...DEFAULT_VM_PORTS };
+  }
+}
 
 const program = new Command();
 program.description('manage the microVM runtime (isolated VM engine, no docker required)');
@@ -101,9 +126,14 @@ program
   });
 
 async function runUp(name: string, imageOverride: string | undefined, timeout: number): Promise<void> {
+  const profile = profileForVm(name);
+  const ports = vmPorts(name);
   // 1. Boot the VM + wait for its kubernetes endpoint.
   const status = runVm(['up', name, '--timeout', String(timeout)]);
   if (status !== 0) process.exit(status);
+  // Re-read ports: `vm up` creates the spec (with allocated ports) if
+  // it didn't exist, so the canonical-fallback above may be stale now.
+  Object.assign(ports, vmPorts(name));
   const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
   const kubeconfigDeadline = Date.now() + 30_000;
   while (!fs.existsSync(kubeconfigPath)) {
@@ -117,7 +147,7 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
   //    the api-server below and every later `appliance deploy` rides
   //    this. First boot includes the registry:2 image pull.
   console.log(chalk.cyan('» waiting for the in-VM registry'));
-  await waitForRegistry(`http://127.0.0.1:${VM_REGISTRY_PORT}/v2/`, 240_000);
+  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
 
   // 3. Deliver the api-server image. The image must be present in the
   //    local docker daemon (built via packages/api-server's
@@ -129,16 +159,16 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
   // Deploy by digest: pushing a different image under a reused tag
   // would leave the Deployment spec unchanged (no rollout) and
   // IfNotPresent would keep serving the stale cached image.
-  const vmImage = await pushImageHostSide(image, `localhost:${VM_REGISTRY_PORT}/appliance-api-server:latest`);
+  const vmImage = await pushImageHostSide(image, `localhost:${ports.registryPort}/appliance-api-server:latest`);
 
   // 4. In-VM api-server: same shared bootstrap as the k3d engine,
   //    pointed at the VM's kubeconfig and registry.
-  const existing = readProfiles().profiles[MICROVM_PROFILE];
-  const apiServerUrl = apiServerUrlForHostPort(VM_HOST_PORT);
+  const existing = readProfiles().profiles[profile];
+  const apiServerUrl = apiServerUrlForHostPort(ports.hostPort);
   const runtime = {
     dataDir: '/persist/appliance-data',
-    hostPort: VM_HOST_PORT,
-    registryUrl: `localhost:${VM_REGISTRY_PORT}`,
+    hostPort: ports.hostPort,
+    registryUrl: `localhost:${ports.registryPort}`,
   };
   let verified = false;
   if (existing) {
@@ -157,24 +187,17 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
     }
   }
   if (verified) {
-    console.log(
-      `${chalk.green('✓')} api-server reachable; profile ${chalk.bold(MICROVM_PROFILE)} already authenticated`
-    );
+    console.log(`${chalk.green('✓')} api-server reachable; profile ${chalk.bold(profile)} already authenticated`);
   } else {
     const result = await bootstrapInClusterApiServer({
       runtime,
       image: vmImage,
       kubeconfigPath,
-      keyName: 'MicroVM Runtime',
+      keyName: name === DEFAULT_VM_NAME ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`,
       onProgress: printProgress,
     });
-    saveCredentials(
-      { apiUrl: result.apiServerUrl, keyId: result.apiKey.id, secret: result.apiKey.secret },
-      MICROVM_PROFILE
-    );
-    console.log(
-      `${chalk.green('✓')} api-server bootstrapped; credentials saved to profile ${chalk.bold(MICROVM_PROFILE)}`
-    );
+    saveCredentials({ apiUrl: result.apiServerUrl, keyId: result.apiKey.id, secret: result.apiKey.secret }, profile);
+    console.log(`${chalk.green('✓')} api-server bootstrapped; credentials saved to profile ${chalk.bold(profile)}`);
   }
 
   // Publish the egress policy into the cluster now that the namespace
@@ -183,10 +206,11 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
   runVm(['egress', 'sync', name]);
 
   console.log();
-  console.log(chalk.green('MicroVM runtime is up.'));
+  console.log(chalk.green(`MicroVM runtime '${name}' is up.`));
   console.log(`  API server:  ${apiServerUrl}`);
-  console.log(`  Profile:     ${MICROVM_PROFILE}`);
-  console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${MICROVM_PROFILE}`);
+  console.log(`  Ingress:     http://*.appliance.localhost:${ports.hostPort}`);
+  console.log(`  Profile:     ${profile}`);
+  console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${profile}`);
 }
 
 async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
@@ -424,6 +448,49 @@ function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
     stdio: 'ignore',
   });
 }
+
+program
+  .command('list')
+  .alias('ls')
+  .description('list all microVMs with their ports and running state')
+  .option('--json', 'print raw JSON instead of a table', false)
+  .action((opts: { json: boolean }) => {
+    const bin = vmBinary();
+    const r = spawnSync(bin, ['list'], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      process.stderr.write(r.stderr ?? '');
+      process.exit(r.status ?? 1);
+    }
+    if (opts.json) {
+      process.stdout.write(r.stdout);
+      return;
+    }
+    type Entry = {
+      name: string;
+      running: boolean;
+      hostPort: number;
+      apiPort: number;
+      registryPort: number;
+      egressPort: number;
+    };
+    const entries = JSON.parse(r.stdout) as Entry[];
+    if (entries.length === 0) {
+      console.log(chalk.dim('no microVMs defined — create one with `appliance vm up --name <name>`'));
+      return;
+    }
+    console.log(
+      `${'NAME'.padEnd(16)} ${'STATE'.padEnd(9)} ${'INGRESS'.padEnd(8)} ${'K8S'.padEnd(6)} ${'REGISTRY'.padEnd(9)} ${'EGRESS'.padEnd(7)} PROFILE`
+    );
+    for (const e of entries) {
+      // padEnd before colorizing would miscount the ANSI codes, so pad
+      // the plain text and color the already-padded cell.
+      const statePad = (e.running ? 'running' : 'stopped').padEnd(9);
+      const stateCell = e.running ? chalk.green(statePad) : chalk.dim(statePad);
+      console.log(
+        `${e.name.padEnd(16)} ${stateCell} ${String(e.hostPort).padEnd(8)} ${String(e.apiPort).padEnd(6)} ${String(e.registryPort).padEnd(9)} ${String(e.egressPort).padEnd(7)} ${profileForVm(e.name)}`
+      );
+    }
+  });
 
 program
   .command('doctor')
