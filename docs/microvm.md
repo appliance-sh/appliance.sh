@@ -222,10 +222,18 @@ on`, allowed HTTPS connections are intercepted — the proxy presents
   (`microvm_egress_*`) drive the same `appliance-vm egress` surface so
   the policy file stays single-sourced.
 
-Remaining productization: auto-inject `HTTPS_PROXY` + the CA into
-workloads via the api-server's deployment service (today the env/CA
-are set per-workload), so confinement is on by policy without manual
-per-pod wiring. Node-level vs per-pod trust differ — pods carry their
-own image trust store, so the CA must be mounted per workload (or
-baked into a base image), which is why this rides the deployment path
-rather than guest boot.
+- **Automatic workload injection**: confinement is applied by policy,
+  no per-pod wiring. The host mirrors the active policy into the
+  cluster as the `appliance-egress` ConfigMap (proxy URL, NO_PROXY,
+  mitm flag, CA) on `vm up` and every policy change; an inert policy
+  removes it. The api-server's deployment service reads it and injects
+  `HTTP(S)_PROXY` + `NO_PROXY` into every workload, and — when
+  intercepting — mounts the CA with `NODE_EXTRA_CA_CERTS` (additive)
+  plus `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`GIT_SSL_CAINFO` pointed at
+  a combined system-roots+CA bundle the api-server builds from its own
+  image roots (so direct TLS to NO_PROXY hosts still validates).
+  Node-level vs per-pod trust differ: the guest's system store gets the
+  CA at boot (above), while pods — which carry their own image trust
+  store — get it via this mount. Taking the api-server change live
+  needs its image rebuilt + redeployed (`vm up`); the guest CA needs
+  the VM's next boot.
