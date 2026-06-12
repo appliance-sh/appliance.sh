@@ -91,6 +91,14 @@ const APPLIANCE_START: &str = r#"#!/bin/sh
 exec >/dev/console 2>&1
 set -x
 
+# --- egress CA trust (node-side) ------------------------------------
+# Trust the per-VM Appliance egress CA the apkovl placed, so node-side
+# tooling (containerd, host curl) validates the interception proxy.
+# No-op when the file is absent (CA not generated / older media).
+if [ -f /usr/local/share/ca-certificates/appliance-egress.crt ]; then
+  update-ca-certificates 2>/dev/null || true
+fi
+
 # --- persistent data disk (vda) -------------------------------------
 # First boot: no filesystem signature -> mkfs. ext4 is built into the
 # alpine virt kernel; e2fsprogs comes from the apkovl world file.
@@ -204,7 +212,7 @@ mkdir -p /srv/handoff
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
-fn build_apkovl(registry_host_port: u16) -> Result<Vec<u8>> {
+fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -257,6 +265,13 @@ fn build_apkovl(registry_host_port: u16) -> Result<Vec<u8>> {
             .as_bytes(),
     )?;
 
+    // The per-VM egress CA, trusted node-wide by appliance.start's
+    // update-ca-certificates step. Placed even when interception is
+    // off — harmless until the proxy actually intercepts.
+    if let Some(pem) = egress_ca_pem {
+        file("usr/local/share/ca-certificates/appliance-egress.crt", 0o644, pem.as_bytes())?;
+    }
+
     // openrc runlevels. Normally `lbu` captures these from a
     // setup-alpine'd system; we declare the minimal diskless set by
     // hand. Symlink targets resolve once the packages are installed.
@@ -294,7 +309,15 @@ fn build_apkovl(registry_host_port: u16) -> Result<Vec<u8>> {
 /// code that produced it.
 pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
-    let apkovl = build_apkovl(registry_host_port)?;
+    // Generate (once) and bake the per-VM egress CA into the overlay so
+    // the guest's system trust store includes it. Best-effort: a CA
+    // failure must not block boot media assembly.
+    let egress_ca_pem: Option<String> = vm_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|name| crate::mitm::ensure_ca(name).is_ok())
+        .and_then(|name| fs::read_to_string(crate::mitm::ca_cert_path(name)).ok());
+    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref())?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
@@ -399,4 +422,57 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
     eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn apkovl_paths(ovl: &[u8]) -> Vec<String> {
+        let gz = flate2::read::GzDecoder::new(ovl);
+        let mut ar = tar::Archive::new(gz);
+        let mut paths = Vec::new();
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            paths.push(entry.path().unwrap().to_string_lossy().into_owned());
+        }
+        paths
+    }
+
+    #[test]
+    fn apkovl_embeds_egress_ca_when_provided() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let ovl = build_apkovl(5052, Some(pem)).unwrap();
+        let paths = apkovl_paths(&ovl);
+        assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
+        // And the bootstrap trusts it node-wide.
+        assert!(APPLIANCE_START.contains("update-ca-certificates"));
+        assert!(APPLIANCE_START.contains("appliance-egress.crt"));
+    }
+
+    #[test]
+    fn apkovl_omits_egress_ca_when_absent() {
+        let ovl = build_apkovl(5052, None).unwrap();
+        let paths = apkovl_paths(&ovl);
+        assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
+    }
+
+    #[test]
+    fn apkovl_ca_pem_round_trips() {
+        let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
+        let ovl = build_apkovl(5052, Some(pem)).unwrap();
+        let gz = flate2::read::GzDecoder::new(&ovl[..]);
+        let mut ar = tar::Archive::new(gz);
+        let mut got = None;
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "usr/local/share/ca-certificates/appliance-egress.crt" {
+                let mut s = String::new();
+                entry.read_to_string(&mut s).unwrap();
+                got = Some(s);
+            }
+        }
+        assert_eq!(got.as_deref(), Some(pem));
+    }
 }
