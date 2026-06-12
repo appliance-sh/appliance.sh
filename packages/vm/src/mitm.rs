@@ -223,14 +223,23 @@ pub fn intercept(
         crate::traffic::record(name, host, port, method, Some(path), "mitm");
     }
 
+    // Credential capture: lift a configured credential header off the
+    // request into the host-side secret store (best-effort).
+    crate::creds::capture_from_head(name, host, &head);
+
     // Only now dial upstream — no wasted connection on a dead client.
     let upstream_tcp = TcpStream::connect((host, port)).with_context(|| format!("connect {host}:{port}"))?;
     let sni = ServerName::try_from(host.to_string()).context("server name")?;
     let client_conn = ClientConnection::new(client_cfg, sni).context("client tls conn")?;
     let mut up_tls = StreamOwned::new(client_conn, upstream_tcp);
 
-    // Force a single request/response, then close.
-    let rewritten = force_connection_close(&head);
+    // Force a single request/response, then close. Credential
+    // injection (if configured) sets the header on the outbound copy,
+    // so the workload need never hold the secret itself.
+    let mut rewritten = force_connection_close(&head);
+    if let Some((header, value)) = crate::creds::injection_for(name, host) {
+        rewritten = crate::creds::set_header(&rewritten, &header, &value);
+    }
     up_tls.write_all(rewritten.as_bytes())?;
     copy_request_body(&mut client_tls, &mut up_tls, &head)?;
     up_tls.flush()?;

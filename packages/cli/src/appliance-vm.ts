@@ -533,4 +533,62 @@ egress
     process.exit(runVm(args));
   });
 
+// ---- creds (per-host credential capture / injection) -------------------
+
+const creds = program.command('creds').description('manage per-host credential capture/injection (apiKeyHelper)');
+
+creds
+  .command('list')
+  .description('print credential rules + stored secrets (masked) as JSON')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['creds', 'list', opts.name]));
+  });
+
+creds
+  .command('add <host>')
+  .description('add/update a per-host credential rule')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--capture', 'capture the credential header off requests into the store', false)
+  .option('--inject', 'inject the credential header onto outbound requests', false)
+  .option('--header <header>', 'header to capture/inject (default: authorization)')
+  .option('--helper <cmd>', 'command whose stdout is the credential to inject (apiKeyHelper)')
+  .action(
+    (host: string, opts: { name: string; capture: boolean; inject: boolean; header?: string; helper?: string }) => {
+      const args = ['creds', 'add', host, '--name', opts.name];
+      if (opts.capture) args.push('--capture');
+      if (opts.inject) args.push('--inject');
+      if (opts.header) args.push('--header', opts.header);
+      if (opts.helper) args.push('--helper', opts.helper);
+      process.exit(runVm(args));
+    }
+  );
+
+creds
+  .command('rm <host>')
+  .description("remove a host's credential rule")
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((host: string, opts: { name: string }) => {
+    process.exit(runVm(['creds', 'rm', host, '--name', opts.name]));
+  });
+
+creds
+  .command('set <host> <value>')
+  .description('manually store a secret for a host (e.g. paste an API key)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--header <header>', 'header the secret is for (default: authorization)')
+  .action((host: string, value: string, opts: { name: string; header?: string }) => {
+    const args = ['creds', 'set', host, value, '--name', opts.name];
+    if (opts.header) args.push('--header', opts.header);
+    process.exit(runVm(args));
+  });
+
+creds
+  .command('forget')
+  .description('forget all stored secrets (rules are kept)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['creds', 'forget', opts.name]));
+  });
+
 program.parse(process.argv);

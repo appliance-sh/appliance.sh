@@ -1,4 +1,5 @@
 mod backend;
+mod creds;
 mod egress;
 mod guest;
 mod images;
@@ -89,6 +90,59 @@ enum Cmd {
     Egress {
         #[command(subcommand)]
         action: EgressCmd,
+    },
+    /// Manage per-host credential capture/injection (apiKeyHelper).
+    Creds {
+        #[command(subcommand)]
+        action: CredsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredsCmd {
+    /// Print credential rules + stored secrets (masked) as JSON.
+    List {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Add or update a per-host credential rule.
+    Add {
+        /// Host suffix (e.g. api.openai.com).
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+        /// Capture the credential header off requests into the store.
+        #[arg(long, default_value_t = false)]
+        capture: bool,
+        /// Inject the credential header onto outbound requests.
+        #[arg(long, default_value_t = false)]
+        inject: bool,
+        /// Header to capture/inject (default: authorization).
+        #[arg(long)]
+        header: Option<String>,
+        /// Command whose stdout is the credential to inject (apiKeyHelper).
+        #[arg(long)]
+        helper: Option<String>,
+    },
+    /// Remove a host's credential rule.
+    Rm {
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Manually store a secret for a host (e.g. paste an API key).
+    Set {
+        host: String,
+        value: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+        #[arg(long)]
+        header: Option<String>,
+    },
+    /// Forget all stored secrets (rules are kept).
+    Forget {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
     },
 }
 
@@ -386,6 +440,62 @@ fn run() -> Result<()> {
         }
 
         Cmd::Egress { action } => run_egress(action),
+
+        Cmd::Creds { action } => run_creds(action),
+    }
+}
+
+fn run_creds(action: CredsCmd) -> Result<()> {
+    use creds::CredentialRule;
+    match action {
+        CredsCmd::List { name } => {
+            #[derive(serde::Serialize)]
+            struct Listing {
+                rules: Vec<CredentialRule>,
+                secrets: Vec<creds::StoredSecret>,
+            }
+            let listing = Listing {
+                rules: creds::load_config(&name).rules,
+                secrets: creds::list_secrets(&name),
+            };
+            println!("{}", serde_json::to_string_pretty(&listing)?);
+            Ok(())
+        }
+        CredsCmd::Add { host, name, capture, inject, header, helper } => {
+            let rule = CredentialRule {
+                host: host.clone(),
+                capture,
+                inject,
+                header: header.unwrap_or_else(|| "authorization".to_string()).to_ascii_lowercase(),
+                helper,
+            };
+            creds::upsert_rule(&name, rule)?;
+            println!("credential rule for '{host}' saved (capture={capture}, inject={inject})");
+            Ok(())
+        }
+        CredsCmd::Rm { host, name } => {
+            let removed = creds::remove_rule(&name, &host)?;
+            println!(
+                "{}",
+                if removed {
+                    format!("removed credential rule for '{host}'")
+                } else {
+                    format!("no credential rule for '{host}'")
+                }
+            );
+            Ok(())
+        }
+        CredsCmd::Set { host, value, name, header } => {
+            let header = header.unwrap_or_else(|| "authorization".to_string()).to_ascii_lowercase();
+            creds::store_secret(&name, &host, &header, &value)?;
+            println!("stored secret for '{host}' ({header})");
+            Ok(())
+        }
+        CredsCmd::Forget { name } => {
+            creds::forget_secrets(&name);
+            println!("forgot all stored secrets for '{name}'");
+            Ok(())
+        }
     }
 }
 

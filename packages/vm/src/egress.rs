@@ -77,7 +77,7 @@ impl Default for EgressPolicy {
     }
 }
 
-fn host_matches(host: &str, suffix: &str) -> bool {
+pub fn host_matches(host: &str, suffix: &str) -> bool {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     let suffix = suffix.trim().trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
     if suffix.is_empty() {
