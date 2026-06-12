@@ -339,6 +339,25 @@ function MicroVmPanel() {
   };
 
   const status = statusQuery.data;
+
+  // The Rust side registers the microVM as a regular cluster once it's
+  // ready (sync_microvm_cluster, run from microvm_status). That can
+  // happen on a passive status poll — e.g. the VM was started from the
+  // CLI, or came up after the desktop launched — in which case nothing
+  // has told the cluster switcher to refetch. Nudge the host-config
+  // query once per ready transition so the freshly-registered cluster
+  // becomes selectable without a desktop restart.
+  const microVmReady = Boolean(status?.running && status?.kubeconfigReady);
+  const refreshedForReady = React.useRef(false);
+  React.useEffect(() => {
+    if (microVmReady && !refreshedForReady.current) {
+      refreshedForReady.current = true;
+      queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+    } else if (!microVmReady) {
+      refreshedForReady.current = false;
+    }
+  }, [microVmReady, queryClient]);
+
   const state = !status
     ? 'checking…'
     : !status.available
