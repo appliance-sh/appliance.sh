@@ -254,12 +254,30 @@ export interface EgressPolicy {
   caPath?: string;
 }
 
+/** One recorded egress request — mirrors TrafficEvent in
+ *  packages/vm/src/traffic.rs. */
+export interface EgressEvent {
+  /** Unix epoch milliseconds. */
+  ts: number;
+  host: string;
+  port: number;
+  method: string;
+  /** Present for intercepted HTTPS / plain HTTP; absent for blind CONNECT. */
+  path?: string;
+  /** 'allow' | 'deny' | 'mitm'. */
+  decision: 'allow' | 'deny' | 'mitm';
+}
+
 export interface MicroVmEgressHost {
   get(): Promise<EgressPolicy>;
   setDefault(action: 'allow' | 'deny'): Promise<void>;
   addRule(action: 'allow' | 'deny', host: string): Promise<void>;
   setMitm(enabled: boolean): Promise<void>;
   reset(): Promise<void>;
+  /** Recent recorded traffic, oldest-first. */
+  log(tail?: number): Promise<EgressEvent[]>;
+  /** Forget all recorded traffic. */
+  clearLog(): Promise<void>;
 }
 
 export interface MicroVmHost {

@@ -3472,6 +3472,45 @@ async fn microvm_egress_reset() -> Result<(), String> {
     Ok(())
 }
 
+/// One recorded egress request — mirrors TrafficEvent in
+/// packages/vm/src/traffic.rs.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EgressEvent {
+    ts: u64,
+    host: String,
+    port: u16,
+    method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    decision: String,
+}
+
+#[tauri::command]
+async fn microvm_egress_log(tail: Option<u32>) -> Result<Vec<EgressEvent>, String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let tail = tail.unwrap_or(200).to_string();
+    let (ok, stdout, stderr) =
+        run_status_command(&[&bin, "egress", "log", MICROVM_NAME, "--tail", &tail]).await?;
+    if !ok {
+        return Err(format!("read egress log failed: {}", stderr.trim()));
+    }
+    serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn microvm_egress_clear_log() -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", "log", MICROVM_NAME, "--clear"]).await?;
+    if !ok {
+        return Err(format!("clear egress log failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 // --- kubectl-driven workloads & logs --------------------------------
 
 #[derive(Serialize, Default)]
@@ -4383,6 +4422,8 @@ pub fn run() {
             microvm_egress_rule,
             microvm_egress_mitm,
             microvm_egress_reset,
+            microvm_egress_log,
+            microvm_egress_clear_log,
             terminal_open,
             terminal_write,
             terminal_resize,

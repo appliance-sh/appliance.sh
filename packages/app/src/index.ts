@@ -46,6 +46,7 @@ export type {
   MicroVmStatus,
   MicroVmEgressHost,
   EgressPolicy,
+  EgressEvent,
   TerminalHost,
   TerminalEvent,
   TerminalOpenOptions,

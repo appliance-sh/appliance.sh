@@ -555,6 +555,26 @@ export function createMockHost(): ConsoleHost {
           await sleep(150);
           microVm.egress = { default: 'allow', allow: [], deny: [], mitm: false };
         },
+        async log(tail?: number) {
+          await sleep(100);
+          const now = 1_700_000_000_000;
+          const events = [
+            {
+              ts: now,
+              host: 'api.openai.com',
+              port: 443,
+              method: 'POST',
+              path: '/v1/chat/completions',
+              decision: 'mitm' as const,
+            },
+            { ts: now + 1000, host: 'github.com', port: 443, method: 'CONNECT', decision: 'allow' as const },
+            { ts: now + 2000, host: 'evil.test', port: 443, method: 'CONNECT', decision: 'deny' as const },
+          ];
+          return events.slice(-(tail ?? 200));
+        },
+        async clearLog() {
+          await sleep(50);
+        },
       },
     },
   };

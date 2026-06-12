@@ -22,6 +22,8 @@ import { cn } from '@/lib/utils';
 import { MICROVM_CLUSTER_ID } from '@/lib/host';
 import { TerminalDrawer } from './terminal-drawer';
 import type {
+  EgressEvent,
+  EgressPolicy,
   LocalDeploymentInfo,
   LocalPodInfo,
   LocalPreflightCheck,
@@ -496,6 +498,14 @@ function EgressPanel() {
   const policy = policyQuery.data;
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', 'egress'] });
 
+  // Live traffic feed — the proxy records every request decision.
+  const trafficQuery = useQuery({
+    queryKey: ['microvm', 'egress', 'log'],
+    queryFn: () => egress.log(200),
+    refetchInterval: 4_000,
+  });
+  const events = trafficQuery.data ?? [];
+
   const act = async (fn: () => Promise<void>) => {
     setBusy(true);
     setErr(null);
@@ -598,6 +608,19 @@ function EgressPanel() {
 
           <RuleList label="Allowed" hosts={policy.allow} tone="green" />
           <RuleList label="Denied" hosts={policy.deny} tone="red" />
+
+          <TrafficView
+            events={events}
+            policy={policy}
+            busy={busy}
+            onAllow={(h) => void act(() => egress.addRule('allow', h))}
+            onBlock={(h) => void act(() => egress.addRule('deny', h))}
+            onClear={() =>
+              void egress
+                .clearLog()
+                .then(() => queryClient.invalidateQueries({ queryKey: ['microvm', 'egress', 'log'] }))
+            }
+          />
         </div>
       ) : (
         <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading policy…</p>
@@ -606,6 +629,120 @@ function EgressPanel() {
       {err ? <p className="mt-2 text-xs text-red-300">{err}</p> : null}
     </details>
   );
+}
+
+// Docker-Desktop-style live traffic feed: most-recent requests the
+// proxy saw, each allow/deny/mitm-tagged, with one-click allow or block
+// per host that updates the policy live.
+function TrafficView({
+  events,
+  policy,
+  busy,
+  onAllow,
+  onBlock,
+  onClear,
+}: {
+  events: EgressEvent[];
+  policy: EgressPolicy;
+  busy: boolean;
+  onAllow: (host: string) => void;
+  onBlock: (host: string) => void;
+  onClear: () => void;
+}) {
+  // Newest first, capped so the panel stays compact.
+  const rows = [...events].reverse().slice(0, 40);
+  const tone = (d: EgressEvent['decision']) =>
+    d === 'deny' ? 'text-red-300' : d === 'mitm' ? 'text-cyan-300' : 'text-green-300';
+  const ruled = (host: string) =>
+    policy.deny.some((s) => hostMatches(host, s))
+      ? 'denied'
+      : policy.allow.some((s) => hostMatches(host, s))
+        ? 'allowed'
+        : null;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <div className="text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">Live traffic</div>
+        {events.length > 0 ? (
+          <button
+            type="button"
+            onClick={onClear}
+            className="text-[10px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+      {rows.length === 0 ? (
+        <p className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-1.5 text-[11px] text-[var(--color-muted-foreground)]">
+          No traffic yet. Requests appear here as workloads make them.
+        </p>
+      ) : (
+        <ul className="max-h-56 space-y-0.5 overflow-auto rounded-md border border-[var(--color-border)] p-1">
+          {rows.map((e, i) => {
+            const status = ruled(e.host);
+            return (
+              <li key={`${e.ts}-${i}`} className="flex items-center gap-2 px-1 py-0.5 text-[11px]">
+                <span className={cn('w-9 shrink-0 font-mono uppercase', tone(e.decision))}>{e.decision}</span>
+                <span className="min-w-0 flex-1 truncate font-mono">
+                  <span className="text-[var(--color-muted-foreground)]">{e.method} </span>
+                  {e.host}
+                  {e.path ? <span className="text-[var(--color-muted-foreground)]">{e.path}</span> : null}
+                </span>
+                {status === 'allowed' ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onBlock(e.host)}
+                    className="shrink-0 rounded border border-red-500/40 px-1.5 text-[10px] text-red-200 hover:bg-red-500/10 disabled:opacity-50"
+                  >
+                    Block
+                  </button>
+                ) : status === 'denied' ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onAllow(e.host)}
+                    className="shrink-0 rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
+                  >
+                    Allow
+                  </button>
+                ) : (
+                  <span className="flex shrink-0 gap-1">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onAllow(e.host)}
+                      className="rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
+                    >
+                      Allow
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onBlock(e.host)}
+                      className="rounded border border-red-500/40 px-1.5 text-[10px] text-red-200 hover:bg-red-500/10 disabled:opacity-50"
+                    >
+                      Block
+                    </button>
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Mirror of the Rust host-suffix match (egress.rs): exact host or a
+ *  dot-suffix. Used to show whether a row's host is already ruled. */
+function hostMatches(host: string, suffix: string): boolean {
+  const h = host.trim().replace(/\.$/, '').toLowerCase();
+  const s = suffix.trim().replace(/^\./, '').replace(/\.$/, '').toLowerCase();
+  return s !== '' && (h === s || h.endsWith('.' + s));
 }
 
 function RuleList({ label, hosts, tone }: { label: string; hosts: string[]; tone: 'green' | 'red' }) {

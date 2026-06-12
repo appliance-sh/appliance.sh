@@ -521,4 +521,16 @@ egress
     process.exit(runVm(['egress', 'sync', opts.name]));
   });
 
+egress
+  .command('log')
+  .description('print recorded egress traffic as JSON (the desktop traffic view feed)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--tail <n>', 'most-recent events to print', '200')
+  .option('--clear', 'forget all recorded traffic instead of printing', false)
+  .action((opts: { name: string; tail: string; clear: boolean }) => {
+    const args = ['egress', 'log', opts.name, '--tail', opts.tail];
+    if (opts.clear) args.push('--clear');
+    process.exit(runVm(args));
+  });
+
 program.parse(process.argv);

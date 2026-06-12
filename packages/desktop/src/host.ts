@@ -36,6 +36,7 @@ import type {
   StatePromotionInput,
   StatePromotionOptions,
   EgressPolicy,
+  EgressEvent,
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
@@ -263,6 +264,12 @@ export const tauriHost: ConsoleHost = {
       },
       async reset() {
         await invoke('microvm_egress_reset');
+      },
+      log(tail?: number) {
+        return invoke<EgressEvent[]>('microvm_egress_log', { tail: tail ?? null });
+      },
+      async clearLog() {
+        await invoke('microvm_egress_clear_log');
       },
     },
   },
