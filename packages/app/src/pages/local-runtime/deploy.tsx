@@ -345,7 +345,9 @@ export function LocalRuntimeDeployPage() {
                 microVM engine
               </span>
             ) : selectedCluster.id === LOCAL_RUNTIME_CLUSTER_ID ? (
-              <span className="rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium">k3d engine</span>
+              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                k3d engine
+              </span>
             ) : null}
             <span>· switch with the cluster menu in the top bar</span>
           </p>

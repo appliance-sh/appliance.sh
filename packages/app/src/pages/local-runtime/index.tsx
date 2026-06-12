@@ -148,54 +148,16 @@ export function LocalRuntimePage() {
     deleteMutation.mutate();
   };
 
-  return (
-    <div className="max-w-4xl space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-semibold">Runtimes</h1>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Local engines for running appliances on this machine — the k3d cluster and the isolated microVM. Both wire
-            into the console as regular clusters.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {canDeploy ? (
-            <Button asChild variant="outline">
-              <Link to="/local-runtime/deploy">
-                <Rocket className="h-4 w-4" /> Deploy application
-              </Link>
-            </Button>
-          ) : (
-            // `disabled` on an asChild Button renders an anchor, and
-            // anchors ignore it — the wizard stayed reachable with the
-            // runtime down. A real <button> actually gates.
-            <Button variant="outline" disabled title="Start an engine to deploy applications">
-              <Rocket className="h-4 w-4" /> Deploy application
-            </Button>
-          )}
-          <PhaseBadge phase={phase} />
-        </div>
-      </header>
-
-      <PreflightPanel
-        checks={preflightChecks}
-        loading={preflightQuery.isLoading}
-        onRefresh={() => preflightQuery.refetch()}
-        canInstall={Boolean(local?.installPrereq)}
-        onInstall={async (tool) => {
-          if (!local?.installPrereq) return;
-          await local.installPrereq([tool], () => {});
-          preflightQuery.refetch();
-        }}
-        canStartRuntime={Boolean(local?.startContainerRuntime)}
-        onStartRuntime={async () => {
-          if (!local?.startContainerRuntime) return;
-          await local.startContainerRuntime();
-          preflightQuery.refetch();
-        }}
-      />
-
-      <section className="flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] p-4">
+  // The k3d runtime, presented as one engine card — a peer of every
+  // microVM card below it, not a privileged "primary runtime".
+  const k3dCard = (
+    <EngineCard
+      name={status?.config.clusterName ?? 'appliance-local'}
+      engine="k3d"
+      statusPill={<PhaseBadge phase={phase} />}
+      description="Kubernetes-in-Docker — rents the docker provider's VM. Registers as a regular cluster."
+    >
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           onClick={() => startMutation.mutate()}
           disabled={
@@ -209,7 +171,7 @@ export function LocalRuntimePage() {
             !preflightReady
               ? 'Install the prerequisites listed above to enable Start'
               : microVmHoldsPort && phase !== 'running'
-                ? 'Stop the microVM first — both engines publish on host port 8081'
+                ? 'Stop the default microVM first — both engines publish on host port 8081'
                 : undefined
           }
         >
@@ -234,27 +196,126 @@ export function LocalRuntimePage() {
         >
           <RefreshCw className={cn('h-4 w-4', statusQuery.isFetching && 'animate-spin')} />
         </Button>
-      </section>
+      </div>
 
       <MutationErrors errors={[startMutation.error, stopMutation.error, deleteMutation.error]} />
 
       {status ? <RuntimeOverview status={status} /> : null}
 
       {status?.cluster.running && status?.apiServer.running ? <WorkloadsPanel /> : null}
+    </EngineCard>
+  );
 
-      {host.vm ? <MicroVmSection vms={vms} loading={vmListQuery.isLoading} /> : null}
+  return (
+    <div className="max-w-4xl space-y-6">
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold">Runtimes</h1>
+          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+            Local engines for running appliances on this machine. Each registers as a regular cluster you can deploy to
+            and switch between.
+          </p>
+        </div>
+        {canDeploy ? (
+          <Button asChild variant="outline">
+            <Link to="/local-runtime/deploy">
+              <Rocket className="h-4 w-4" /> Deploy application
+            </Link>
+          </Button>
+        ) : (
+          // `disabled` on an asChild Button renders an anchor, and
+          // anchors ignore it — the wizard stayed reachable with the
+          // runtime down. A real <button> actually gates.
+          <Button variant="outline" disabled title="Start an engine to deploy applications">
+            <Rocket className="h-4 w-4" /> Deploy application
+          </Button>
+        )}
+      </header>
+
+      <PreflightPanel
+        checks={preflightChecks}
+        loading={preflightQuery.isLoading}
+        onRefresh={() => preflightQuery.refetch()}
+        canInstall={Boolean(local?.installPrereq)}
+        onInstall={async (tool) => {
+          if (!local?.installPrereq) return;
+          await local.installPrereq([tool], () => {});
+          preflightQuery.refetch();
+        }}
+        canStartRuntime={Boolean(local?.startContainerRuntime)}
+        onStartRuntime={async () => {
+          if (!local?.startContainerRuntime) return;
+          await local.startContainerRuntime();
+          preflightQuery.refetch();
+        }}
+      />
+
+      <EnginesSection showMicroVm={Boolean(host.vm)} vms={vms} loading={vmListQuery.isLoading} leadingPanel={k3dCard} />
     </div>
   );
 }
 
-// ---- microVM section (multiple VMs) -------------------------------------
+// A consistent card shell for every local engine — k3d and each
+// microVM render with identical chrome (name + engine tag + status
+// pill), so no engine reads as more "primary" than another.
+function EngineCard({
+  name,
+  engine,
+  statusPill,
+  description,
+  headerTag,
+  children,
+}: {
+  name: string;
+  engine: 'k3d' | 'microVM';
+  statusPill: React.ReactNode;
+  description?: React.ReactNode;
+  headerTag?: React.ReactNode;
+  children?: React.ReactNode;
+}) {
+  return (
+    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+      <header className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="font-mono text-sm font-semibold text-[var(--color-foreground)]">{name}</code>
+            <EngineTag engine={engine} />
+            {headerTag}
+          </div>
+          {description ? <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">{description}</p> : null}
+        </div>
+        <div className="shrink-0">{statusPill}</div>
+      </header>
+      {children}
+    </section>
+  );
+}
+
+// Engine-type tag, identical styling for every engine — the type is
+// informational, never a hierarchy.
+function EngineTag({ engine }: { engine: 'k3d' | 'microVM' }) {
+  return <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{engine}</span>;
+}
+
+// ---- engines (k3d + microVMs, presented as peers) -----------------------
 //
-// Appliance can run several microVMs at once — e.g. one for interactive
-// development and another dedicated to traffic testing. Each is its own
-// isolated VM on its own host ports, registered as its own cluster. The
-// section lists every defined VM (plus the canonical "appliance" VM even
-// before it's created) and offers a New VM control.
-function MicroVmSection({ vms, loading }: { vms: MicroVmSummary[]; loading: boolean }) {
+// One unified list of local engines: the k3d runtime card first, then a
+// card per microVM. Appliance can run several microVMs at once — e.g.
+// one for interactive development and another dedicated to traffic
+// testing — each its own isolated VM on its own host ports, registered
+// as its own cluster. The default "appliance" VM is always surfaced
+// (even before it's created) and a New VM control adds more.
+function EnginesSection({
+  vms,
+  loading,
+  showMicroVm,
+  leadingPanel,
+}: {
+  vms: MicroVmSummary[];
+  loading: boolean;
+  showMicroVm: boolean;
+  leadingPanel: React.ReactNode;
+}) {
   // VMs added through the UI but not yet in `list` (their spec lands
   // only once Start boots them). Tracked locally so the panel appears
   // immediately, then folds into the list view once it materializes.
@@ -278,26 +339,22 @@ function MicroVmSection({ vms, loading }: { vms: MicroVmSummary[]; loading: bool
   return (
     <section className="space-y-3">
       <header className="flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold">
-            MicroVM engines{' '}
-            <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">beta</span>
-          </h2>
-          <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-            Isolated VMs Appliance boots itself — run several at once (e.g. one for development, one for traffic
-            testing). Each registers as its own cluster on its own ports.
-          </p>
-        </div>
-        <NewVmButton existing={names} onAdd={(n) => setPending((p) => [...p, n])} />
+        <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Engines</h2>
+        {showMicroVm ? <NewVmButton existing={names} onAdd={(n) => setPending((p) => [...p, n])} /> : null}
       </header>
 
-      {loading && vms.length === 0 ? (
-        <p className="text-xs text-[var(--color-muted-foreground)]">Loading VMs…</p>
-      ) : null}
+      {leadingPanel}
 
-      {names.map((name) => (
-        <MicroVmPanel key={name} name={name} />
-      ))}
+      {showMicroVm ? (
+        <>
+          {loading && vms.length === 0 ? (
+            <p className="text-xs text-[var(--color-muted-foreground)]">Loading VMs…</p>
+          ) : null}
+          {names.map((name) => (
+            <MicroVmPanel key={name} name={name} summary={vms.find((v) => v.name === name)} />
+          ))}
+        </>
+      ) : null}
     </section>
   );
 }
@@ -365,16 +422,16 @@ function NewVmButton({ existing, onAdd }: { existing: string[]; onAdd: (name: st
   );
 }
 
-// ---- microVM engine -----------------------------------------------------
+// ---- a single microVM engine --------------------------------------------
 
-// The next-generation runtime: an isolated VM Appliance boots itself
-// (appliance-vm) instead of renting the docker provider's. Surfaced
-// alongside the k3d runtime while both engines coexist. Once up it
-// registers as a regular cluster (id "microvm" — also the CLI profile
-// name), so the deploy wizard, cluster switcher, and workload views
-// treat it like any other target, on the same
-// *.appliance.localhost:8081 URL surface.
-function MicroVmPanel({ name }: { name: string }) {
+// One microVM: an isolated VM Appliance boots itself (appliance-vm)
+// instead of renting the docker provider's. Each VM registers as a
+// regular cluster (id "microvm" / "microvm-<name>" — also its CLI
+// profile name) on its own host ports, so the deploy wizard, cluster
+// switcher, and workload views treat it like any other target. Rendered
+// in the same EngineCard chrome as the k3d runtime — a peer, not an
+// add-on.
+function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummary }) {
   const host = useHost();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -503,43 +560,39 @@ function MicroVmPanel({ name }: { name: string }) {
             ? 'stopped'
             : 'not created';
 
-  return (
-    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-      <header className="flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold">
-            <code className="font-mono">{name}</code>
-            {isDefault ? (
-              <span className="ml-2 rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-muted-foreground)]">
-                default
-              </span>
-            ) : null}
-          </h2>
-          <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-            Deploys use the <code className="font-mono">{clusterId}</code> profile
-            {status?.apiServerUrl ? (
-              <>
-                {' '}
-                · ingress at <code className="font-mono">{status.apiServerUrl}</code>
-              </>
-            ) : null}
-            .
-          </p>
-        </div>
-        <span
-          className={cn(
-            'inline-flex shrink-0 items-center rounded-md px-2 py-1 text-xs font-medium',
-            state === 'running'
-              ? 'border border-green-500/40 bg-green-500/15 text-green-300'
-              : state === 'starting…'
-                ? 'border border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
-                : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
-          )}
-        >
-          {state}
-        </span>
-      </header>
+  const statusPill = (
+    <span
+      className={cn(
+        'inline-flex shrink-0 items-center rounded-md px-2 py-1 text-xs font-medium',
+        state === 'running'
+          ? 'border border-green-500/40 bg-green-500/15 text-green-300'
+          : state === 'starting…'
+            ? 'border border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
+            : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+      )}
+    >
+      {state}
+    </span>
+  );
 
+  return (
+    <EngineCard
+      name={name}
+      engine="microVM"
+      statusPill={statusPill}
+      headerTag={
+        isDefault ? (
+          <span className="rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-muted-foreground)]">
+            default
+          </span>
+        ) : null
+      }
+      description={
+        <>
+          Deploys use the <code className="font-mono">{clusterId}</code> profile.
+        </>
+      }
+    >
       {status && !status.available ? (
         status.installable ? (
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[var(--color-border)] px-3 py-2">
@@ -598,21 +651,61 @@ function MicroVmPanel({ name }: { name: string }) {
       ) : null}
 
       {status?.running && status.kubeconfigReady ? (
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs text-[var(--color-muted-foreground)]">
-            Kubernetes at <code className="font-mono">{status.apiServerUrl}</code> · registered as the{' '}
-            <span className="font-medium text-[var(--color-foreground)]">{microVmClusterLabel(name)}</span> cluster
-          </p>
-          <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
-            <Rocket className="h-4 w-4" /> Deploy application
-          </Button>
-        </div>
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Registered as the{' '}
+              <span className="font-medium text-[var(--color-foreground)]">{microVmClusterLabel(name)}</span> cluster
+            </p>
+            <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
+              <Rocket className="h-4 w-4" /> Deploy application
+            </Button>
+          </div>
+          <MicroVmFacts apiServerUrl={status.apiServerUrl} clusterId={clusterId} summary={summary} />
+        </>
       ) : null}
 
       {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <WorkloadsPanel engine="microvm" vmName={name} /> : null}
-    </section>
+    </EngineCard>
+  );
+}
+
+// Compact at-a-glance facts for a running microVM — Kubernetes URL,
+// cluster id, and its allocated host ports — so a VM carries the same
+// weight of detail as the k3d runtime's overview cards.
+function MicroVmFacts({
+  apiServerUrl,
+  clusterId,
+  summary,
+}: {
+  apiServerUrl: string;
+  clusterId: string;
+  summary?: MicroVmSummary;
+}) {
+  const facts: Array<[string, React.ReactNode]> = [
+    ['Kubernetes', <code className="font-mono">{apiServerUrl}</code>],
+    ['Cluster id', <code className="font-mono">{clusterId}</code>],
+  ];
+  if (summary) {
+    facts.push([
+      'Ports',
+      <code className="font-mono">
+        ingress :{summary.hostPort} · k8s :{summary.apiPort} · registry :{summary.registryPort} · egress :
+        {summary.egressPort}
+      </code>,
+    ]);
+  }
+  return (
+    <dl className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 rounded-md border border-[var(--color-border)] px-3 py-2">
+      {facts.map(([label, value]) => (
+        <React.Fragment key={label}>
+          <dt className="text-[11px] text-[var(--color-muted-foreground)]">{label}</dt>
+          <dd className="min-w-0 truncate text-[11px]">{value}</dd>
+        </React.Fragment>
+      ))}
+    </dl>
   );
 }
 
