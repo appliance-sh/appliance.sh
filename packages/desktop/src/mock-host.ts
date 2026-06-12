@@ -576,6 +576,45 @@ export function createMockHost(): ConsoleHost {
           await sleep(50);
         },
       },
+      creds: {
+        async list() {
+          await sleep(100);
+          return {
+            rules: [...microVm.creds.rules],
+            secrets: microVm.creds.secrets.map((s) => ({ ...s })),
+          };
+        },
+        async add(rule) {
+          await sleep(120);
+          const next = {
+            host: rule.host,
+            capture: rule.capture,
+            inject: rule.inject,
+            header: rule.header || 'authorization',
+            helper: rule.helper,
+          };
+          const i = microVm.creds.rules.findIndex((r) => r.host === rule.host);
+          if (i >= 0) microVm.creds.rules[i] = next;
+          else microVm.creds.rules.push(next);
+        },
+        async remove(host: string) {
+          await sleep(120);
+          microVm.creds.rules = microVm.creds.rules.filter((r) => r.host !== host);
+        },
+        async setSecret(host: string, value: string, header?: string) {
+          await sleep(120);
+          const h = (header || 'authorization').toLowerCase();
+          const masked = value.length > 4 ? `••••${value.slice(-4)}` : '••••';
+          const i = microVm.creds.secrets.findIndex((s) => s.host === host && s.header === h);
+          const rec = { host, header: h, masked };
+          if (i >= 0) microVm.creds.secrets[i] = rec;
+          else microVm.creds.secrets.push(rec);
+        },
+        async forget() {
+          await sleep(80);
+          microVm.creds.secrets = [];
+        },
+      },
     },
   };
 }
@@ -586,8 +625,16 @@ const microVm: {
   exists: boolean;
   running: boolean;
   egress: { default: 'allow' | 'deny'; allow: string[]; deny: string[]; mitm: boolean; caPath?: string };
+  creds: {
+    rules: Array<{ host: string; capture: boolean; inject: boolean; header: string; helper?: string }>;
+    secrets: Array<{ host: string; header: string; masked: string }>;
+  };
 } = {
   exists: true,
   running: false,
   egress: { default: 'allow', allow: [], deny: [], mitm: false },
+  creds: {
+    rules: [{ host: 'api.openai.com', capture: true, inject: true, header: 'authorization' }],
+    secrets: [{ host: 'api.openai.com', header: 'authorization', masked: '••••k7Qx' }],
+  },
 };

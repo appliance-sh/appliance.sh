@@ -280,6 +280,38 @@ export interface MicroVmEgressHost {
   clearLog(): Promise<void>;
 }
 
+/** Per-host credential capture/injection rule — mirrors
+ *  CredentialRule in packages/vm/src/creds.rs. */
+export interface CredentialRule {
+  host: string;
+  capture: boolean;
+  inject: boolean;
+  header: string;
+  helper?: string;
+}
+
+/** A stored secret, value masked. */
+export interface StoredSecret {
+  host: string;
+  header: string;
+  masked: string;
+}
+
+export interface CredentialsState {
+  rules: CredentialRule[];
+  secrets: StoredSecret[];
+}
+
+export interface MicroVmCredsHost {
+  list(): Promise<CredentialsState>;
+  add(rule: { host: string; capture: boolean; inject: boolean; header?: string; helper?: string }): Promise<void>;
+  remove(host: string): Promise<void>;
+  /** Manually store a secret (e.g. paste an API key). */
+  setSecret(host: string, value: string, header?: string): Promise<void>;
+  /** Forget all stored secrets (rules are kept). */
+  forget(): Promise<void>;
+}
+
 export interface MicroVmHost {
   status(): Promise<MicroVmStatus>;
   /** Install the engine binary into the managed bin dir. */
@@ -291,6 +323,8 @@ export interface MicroVmHost {
   remove(): Promise<void>;
   /** Control the VM's outbound traffic (allow/deny + TLS MITM). */
   egress: MicroVmEgressHost;
+  /** Per-host credential capture/injection (apiKeyHelper). */
+  creds: MicroVmCredsHost;
 }
 
 export interface LocalClusterInput {

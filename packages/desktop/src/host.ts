@@ -37,6 +37,7 @@ import type {
   StatePromotionOptions,
   EgressPolicy,
   EgressEvent,
+  CredentialsState,
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
@@ -270,6 +271,23 @@ export const tauriHost: ConsoleHost = {
       },
       async clearLog() {
         await invoke('microvm_egress_clear_log');
+      },
+    },
+    creds: {
+      list() {
+        return invoke<CredentialsState>('microvm_creds_list');
+      },
+      async add(rule) {
+        await invoke('microvm_creds_add', { input: rule });
+      },
+      async remove(host: string) {
+        await invoke('microvm_creds_remove', { host });
+      },
+      async setSecret(host: string, value: string, header?: string) {
+        await invoke('microvm_creds_set', { host, value, header: header ?? null });
+      },
+      async forget() {
+        await invoke('microvm_creds_forget');
       },
     },
   },

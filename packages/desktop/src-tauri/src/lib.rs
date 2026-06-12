@@ -3511,6 +3511,134 @@ async fn microvm_egress_clear_log() -> Result<(), String> {
     Ok(())
 }
 
+// --- credential capture/injection (apiKeyHelper) --------------------
+//
+// Per-host rules + a host-side secret store, driven through the same
+// `appliance-vm creds` surface the CLI uses.
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CredentialRule {
+    host: String,
+    #[serde(default)]
+    capture: bool,
+    #[serde(default)]
+    inject: bool,
+    #[serde(default)]
+    header: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    helper: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StoredSecret {
+    host: String,
+    header: String,
+    masked: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CredentialsState {
+    #[serde(default)]
+    rules: Vec<CredentialRule>,
+    #[serde(default)]
+    secrets: Vec<StoredSecret>,
+}
+
+#[tauri::command]
+async fn microvm_creds_list() -> Result<CredentialsState, String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "creds", "list", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("read creds failed: {}", stderr.trim()));
+    }
+    serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredsAddInput {
+    host: String,
+    capture: bool,
+    inject: bool,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    helper: Option<String>,
+}
+
+#[tauri::command]
+async fn microvm_creds_add(input: CredsAddInput) -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let mut args: Vec<String> =
+        vec![bin.clone(), "creds".into(), "add".into(), input.host.clone(), "--name".into(), MICROVM_NAME.into()];
+    if input.capture {
+        args.push("--capture".into());
+    }
+    if input.inject {
+        args.push("--inject".into());
+    }
+    if let Some(h) = input.header.filter(|h| !h.trim().is_empty()) {
+        args.push("--header".into());
+        args.push(h);
+    }
+    if let Some(c) = input.helper.filter(|c| !c.trim().is_empty()) {
+        args.push("--helper".into());
+        args.push(c);
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, _o, stderr) = run_status_command(&argv).await?;
+    if !ok {
+        return Err(format!("add credential rule failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_creds_remove(host: String) -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "creds", "rm", &host, "--name", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("remove credential rule failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_creds_set(host: String, value: String, header: Option<String>) -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let mut args: Vec<String> =
+        vec![bin.clone(), "creds".into(), "set".into(), host, value, "--name".into(), MICROVM_NAME.into()];
+    if let Some(h) = header.filter(|h| !h.trim().is_empty()) {
+        args.push("--header".into());
+        args.push(h);
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, _o, stderr) = run_status_command(&argv).await?;
+    if !ok {
+        return Err(format!("store secret failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn microvm_creds_forget() -> Result<(), String> {
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) = run_status_command(&[&bin, "creds", "forget", MICROVM_NAME]).await?;
+    if !ok {
+        return Err(format!("forget secrets failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 // --- kubectl-driven workloads & logs --------------------------------
 
 #[derive(Serialize, Default)]
@@ -4424,6 +4552,11 @@ pub fn run() {
             microvm_egress_reset,
             microvm_egress_log,
             microvm_egress_clear_log,
+            microvm_creds_list,
+            microvm_creds_add,
+            microvm_creds_remove,
+            microvm_creds_set,
+            microvm_creds_forget,
             terminal_open,
             terminal_write,
             terminal_resize,
