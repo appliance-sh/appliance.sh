@@ -686,6 +686,9 @@ function TrafficView({
             const status = ruled(e.host);
             return (
               <li key={`${e.ts}-${i}`} className="flex items-center gap-2 px-1 py-0.5 text-[11px]">
+                <span className="w-8 shrink-0 text-right font-mono text-[10px] text-[var(--color-muted-foreground)]">
+                  {relativeAge(new Date(e.ts).toISOString())}
+                </span>
                 <span className={cn('w-9 shrink-0 font-mono uppercase', tone(e.decision))}>{e.decision}</span>
                 <span className="min-w-0 flex-1 truncate font-mono">
                   <span className="text-[var(--color-muted-foreground)]">{e.method} </span>
