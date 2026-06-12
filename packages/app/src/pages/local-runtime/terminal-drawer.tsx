@@ -13,10 +13,13 @@ import type { TerminalSession } from '@/lib/host';
 export function TerminalDrawer({
   target,
   engine,
+  clusterName,
   onClose,
 }: {
   target: string;
   engine?: 'microvm';
+  /** For the microVM engine, the VM name (routes to its kubeconfig). */
+  clusterName?: string;
   onClose: () => void;
 }) {
   const host = useHost();
@@ -48,7 +51,7 @@ export function TerminalDrawer({
     let disposed = false;
 
     host.terminal
-      .open({ target, engine, cols: term.cols, rows: term.rows }, (event) => {
+      .open({ target, engine, clusterName, cols: term.cols, rows: term.rows }, (event) => {
         if (event.type === 'data') {
           term.write(event.data);
         } else if (event.type === 'exit') {
@@ -91,7 +94,7 @@ export function TerminalDrawer({
       void session?.close();
       term.dispose();
     };
-  }, [host, target, engine]);
+  }, [host, target, engine, clusterName]);
 
   return (
     <div

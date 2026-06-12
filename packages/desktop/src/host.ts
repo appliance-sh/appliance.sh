@@ -4,6 +4,7 @@ import { sendNotification } from '@tauri-apps/plugin-notification';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type {
   MicroVmStatus,
+  MicroVmSummary,
   AddClusterInput,
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
@@ -231,64 +232,75 @@ export const tauriHost: ConsoleHost = {
   },
 
   vm: {
-    status() {
-      return invoke<MicroVmStatus>('microvm_status');
+    list() {
+      return invoke<MicroVmSummary[]>('microvm_list');
     },
     async install() {
       await invoke('microvm_install');
     },
-    async up(onEvent) {
-      const channel = new Channel<{ type: string; message?: string }>();
-      channel.onmessage = (event) => {
-        if (event?.message) onEvent({ message: event.message });
+    instance(name?: string) {
+      // `name` rides along on every call; the Rust side defaults a
+      // null/empty name to the canonical "appliance" VM.
+      const vm = name ?? null;
+      return {
+        name: name ?? 'appliance',
+        status() {
+          return invoke<MicroVmStatus>('microvm_status', { name: vm });
+        },
+        async up(onEvent: (event: { message: string }) => void) {
+          const channel = new Channel<{ type: string; message?: string }>();
+          channel.onmessage = (event) => {
+            if (event?.message) onEvent({ message: event.message });
+          };
+          await invoke('microvm_up', { name: vm, onEvent: channel });
+        },
+        stop() {
+          return invoke('microvm_stop', { name: vm });
+        },
+        remove() {
+          return invoke('microvm_delete', { name: vm });
+        },
+        egress: {
+          get() {
+            return invoke<EgressPolicy>('microvm_egress_get', { name: vm });
+          },
+          async setDefault(action: 'allow' | 'deny') {
+            await invoke('microvm_egress_default', { name: vm, action });
+          },
+          async addRule(action: 'allow' | 'deny', host: string) {
+            await invoke('microvm_egress_rule', { name: vm, action, host });
+          },
+          async setMitm(enabled: boolean) {
+            await invoke('microvm_egress_mitm', { name: vm, enabled });
+          },
+          async reset() {
+            await invoke('microvm_egress_reset', { name: vm });
+          },
+          log(tail?: number) {
+            return invoke<EgressEvent[]>('microvm_egress_log', { name: vm, tail: tail ?? null });
+          },
+          async clearLog() {
+            await invoke('microvm_egress_clear_log', { name: vm });
+          },
+        },
+        creds: {
+          list() {
+            return invoke<CredentialsState>('microvm_creds_list', { name: vm });
+          },
+          async add(rule: { host: string; capture: boolean; inject: boolean; header?: string; helper?: string }) {
+            await invoke('microvm_creds_add', { name: vm, input: rule });
+          },
+          async remove(host: string) {
+            await invoke('microvm_creds_remove', { name: vm, host });
+          },
+          async setSecret(host: string, value: string, header?: string) {
+            await invoke('microvm_creds_set', { name: vm, host, value, header: header ?? null });
+          },
+          async forget() {
+            await invoke('microvm_creds_forget', { name: vm });
+          },
+        },
       };
-      await invoke('microvm_up', { onEvent: channel });
-    },
-    stop() {
-      return invoke('microvm_stop');
-    },
-    remove() {
-      return invoke('microvm_delete');
-    },
-    egress: {
-      get() {
-        return invoke<EgressPolicy>('microvm_egress_get');
-      },
-      async setDefault(action: 'allow' | 'deny') {
-        await invoke('microvm_egress_default', { action });
-      },
-      async addRule(action: 'allow' | 'deny', host: string) {
-        await invoke('microvm_egress_rule', { action, host });
-      },
-      async setMitm(enabled: boolean) {
-        await invoke('microvm_egress_mitm', { enabled });
-      },
-      async reset() {
-        await invoke('microvm_egress_reset');
-      },
-      log(tail?: number) {
-        return invoke<EgressEvent[]>('microvm_egress_log', { tail: tail ?? null });
-      },
-      async clearLog() {
-        await invoke('microvm_egress_clear_log');
-      },
-    },
-    creds: {
-      list() {
-        return invoke<CredentialsState>('microvm_creds_list');
-      },
-      async add(rule) {
-        await invoke('microvm_creds_add', { input: rule });
-      },
-      async remove(host: string) {
-        await invoke('microvm_creds_remove', { host });
-      },
-      async setSecret(host: string, value: string, header?: string) {
-        await invoke('microvm_creds_set', { host, value, header: header ?? null });
-      },
-      async forget() {
-        await invoke('microvm_creds_forget');
-      },
     },
   },
 

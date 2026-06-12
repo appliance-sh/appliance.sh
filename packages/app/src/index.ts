@@ -43,6 +43,8 @@ export type {
   LocalBuildAndImportInput,
   LocalLogEvent,
   MicroVmHost,
+  MicroVmInstanceHost,
+  MicroVmSummary,
   MicroVmStatus,
   MicroVmEgressHost,
   EgressPolicy,

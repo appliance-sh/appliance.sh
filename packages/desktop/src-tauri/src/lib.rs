@@ -3057,12 +3057,14 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
 /// the keychain copy is refreshed from the shared entry (catching CLI
 /// re-keys), and mirror_to_shared_profiles never writes over
 /// CLI-managed entries. Idempotent — no-ops once everything matches.
-fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
+fn sync_microvm_cluster(app: &AppHandle, name: &str) -> Result<(), HostError> {
     let _guard = config_lock();
+    let cluster_id = microvm_cluster_id(name);
+    let cluster_label = microvm_cluster_label(name);
     let Some(shared) = read_shared_profiles() else {
         return Ok(());
     };
-    let Some(entry) = shared.profiles.get(MICROVM_CLUSTER_ID) else {
+    let Some(entry) = shared.profiles.get(&cluster_id) else {
         return Ok(());
     };
     if entry.api_url.is_empty() || entry.key_id.is_empty() || entry.secret.is_empty() {
@@ -3081,7 +3083,7 @@ fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
         id: entry.key_id.clone(),
         secret: entry.secret.clone(),
     };
-    let changed = match persisted.clusters.iter_mut().find(|c| c.id == MICROVM_CLUSTER_ID) {
+    let changed = match persisted.clusters.iter_mut().find(|c| c.id == cluster_id) {
         Some(cluster) => {
             let mut changed = false;
             if cluster.api_server_url != entry.api_url {
@@ -3090,22 +3092,22 @@ fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
             }
             // A bare ingest from profiles.json labels the cluster with
             // its slug; upgrade it to the human name.
-            if cluster.name == MICROVM_CLUSTER_ID {
-                cluster.name = MICROVM_CLUSTER_NAME.to_string();
+            if cluster.name == cluster_id {
+                cluster.name = cluster_label.clone();
                 changed = true;
             }
             if cluster.synced_key_id.as_deref() != Some(entry.key_id.as_str()) {
-                write_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID), &api_key)?;
+                write_api_key(&cluster_keychain_account(&cluster_id), &api_key)?;
                 cluster.synced_key_id = Some(entry.key_id.clone());
                 changed = true;
             }
             changed
         }
         None => {
-            write_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID), &api_key)?;
+            write_api_key(&cluster_keychain_account(&cluster_id), &api_key)?;
             persisted.clusters.push(Cluster {
-                id: MICROVM_CLUSTER_ID.to_string(),
-                name: MICROVM_CLUSTER_NAME.to_string(),
+                id: cluster_id.clone(),
+                name: cluster_label,
                 api_server_url: entry.api_url.clone(),
                 created_at: entry
                     .created_at
@@ -3118,7 +3120,7 @@ fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
             // Same first-cluster convenience as the k3d runtime: select
             // it when nothing else is, never override a user's choice.
             if persisted.selected_cluster_id.is_none() {
-                persisted.selected_cluster_id = Some(MICROVM_CLUSTER_ID.to_string());
+                persisted.selected_cluster_id = Some(cluster_id.clone());
             }
             true
         }
@@ -3132,16 +3134,17 @@ fn sync_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
 /// Drop the microVM cluster registration (config + keychain + shared
 /// profile) — its credentials live in the VM's data disk, so deleting
 /// the VM invalidates them. Best-effort.
-fn unregister_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
+fn unregister_microvm_cluster(app: &AppHandle, name: &str) -> Result<(), HostError> {
     let _guard = config_lock();
+    let cluster_id = microvm_cluster_id(name);
     let mut persisted = read_persisted_config(app)?;
     migrate_legacy(app, &mut persisted)?;
     let before = persisted.clusters.len();
-    persisted.clusters.retain(|c| c.id != MICROVM_CLUSTER_ID);
-    delete_api_key(&cluster_keychain_account(MICROVM_CLUSTER_ID));
+    persisted.clusters.retain(|c| c.id != cluster_id);
+    delete_api_key(&cluster_keychain_account(&cluster_id));
     if let Some(mut shared) = read_shared_profiles() {
-        if shared.profiles.remove(MICROVM_CLUSTER_ID).is_some() {
-            if shared.active_profile.as_deref() == Some(MICROVM_CLUSTER_ID) {
+        if shared.profiles.remove(&cluster_id).is_some() {
+            if shared.active_profile.as_deref() == Some(cluster_id.as_str()) {
                 shared.active_profile = None;
             }
             let _ = write_shared_profiles(&shared);
@@ -3150,7 +3153,7 @@ fn unregister_microvm_cluster(app: &AppHandle) -> Result<(), HostError> {
     if persisted.clusters.len() == before {
         return Ok(());
     }
-    if persisted.selected_cluster_id.as_deref() == Some(MICROVM_CLUSTER_ID) {
+    if persisted.selected_cluster_id.as_deref() == Some(cluster_id.as_str()) {
         persisted.selected_cluster_id = persisted.clusters.first().map(|c| c.id.clone());
     }
     write_persisted_config(app, &persisted)
@@ -3187,8 +3190,83 @@ struct MicroVmStatus {
 const MICROVM_NAME: &str = "appliance";
 const MICROVM_HOST_PORT: u16 = 8081;
 
+/// Resolve a VM name from an optional command argument. Defaults to the
+/// canonical "appliance" VM so existing single-VM callers keep working.
+fn vm_name(name: Option<String>) -> String {
+    name.map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| MICROVM_NAME.to_string())
+}
+
+/// The desktop cluster id (and CLI profile name) a VM owns. Mirrors
+/// profileForVm in packages/cli/src/appliance-vm.ts: the default VM
+/// keeps the plain "microvm" id; each other VM gets "microvm-<name>".
+fn microvm_cluster_id(name: &str) -> String {
+    if name == MICROVM_NAME {
+        MICROVM_CLUSTER_ID.to_string()
+    } else {
+        format!("{MICROVM_CLUSTER_ID}-{name}")
+    }
+}
+
+/// Human-facing cluster label for a VM.
+fn microvm_cluster_label(name: &str) -> String {
+    if name == MICROVM_NAME {
+        MICROVM_CLUSTER_NAME.to_string()
+    } else {
+        format!("{MICROVM_CLUSTER_NAME} ({name})")
+    }
+}
+
+/// One VM as reported by `appliance-vm list` — its allocated ports and
+/// running state, plus the desktop cluster id it registers under.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MicroVmSummary {
+    name: String,
+    running: bool,
+    host_port: u16,
+    api_port: u16,
+    registry_port: u16,
+    egress_port: u16,
+    cluster_id: String,
+}
+
 #[tauri::command]
-async fn microvm_status(app: AppHandle) -> MicroVmStatus {
+async fn microvm_list() -> Result<Vec<MicroVmSummary>, String> {
+    let Some(bin) = vm_binary() else {
+        return Ok(Vec::new());
+    };
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "list"]).await?;
+    if !ok {
+        return Err(format!("appliance-vm list failed: {}", stderr.trim()));
+    }
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    Ok(parsed
+        .into_iter()
+        .map(|v| {
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let cluster_id = microvm_cluster_id(&name);
+            MicroVmSummary {
+                running: v.get("running").and_then(|r| r.as_bool()).unwrap_or(false),
+                host_port: v.get("hostPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
+                api_port: v.get("apiPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
+                registry_port: v.get("registryPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
+                egress_port: v.get("egressPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
+                cluster_id,
+                name,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
+    let name = vm_name(name);
+    // Fallback URL before we know the VM's allocated port (binary
+    // missing, or status failed). The default VM keeps 8081; a named VM
+    // we can't probe yet gets its host:port filled in from status below.
     let api_server_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT);
     let Some(bin) = vm_binary() else {
         let installable = vm_install_source(&app).is_some();
@@ -3210,7 +3288,7 @@ async fn microvm_status(app: AppHandle) -> MicroVmStatus {
         };
     };
     let bin = bin.to_string_lossy().to_string();
-    let (ok, stdout, stderr) = match run_status_command(&[&bin, "status", MICROVM_NAME]).await {
+    let (ok, stdout, stderr) = match run_status_command(&[&bin, "status", &name]).await {
         Ok(t) => t,
         Err(e) => {
             return MicroVmStatus {
@@ -3236,11 +3314,17 @@ async fn microvm_status(app: AppHandle) -> MicroVmStatus {
         };
     }
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+    // Prefer the VM's actual forwarded ingress port (status now reports
+    // it) so a named VM resolves to its own api-server URL.
+    let api_server_url = match parsed.get("hostPort").and_then(|v| v.as_u64()) {
+        Some(port) => format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, port),
+        None => api_server_url,
+    };
     let kubeconfig_ready = home_dir()
         .map(|h| {
             h.join(SHARED_PROFILES_DIR)
                 .join("vm")
-                .join(MICROVM_NAME)
+                .join(&name)
                 .join("kubeconfig.yaml")
                 .exists()
         })
@@ -3250,7 +3334,7 @@ async fn microvm_status(app: AppHandle) -> MicroVmStatus {
         // Keep the desktop's cluster registration in step with the
         // CLI-owned profile while the engine is up — this also catches
         // an `appliance vm up` run outside the desktop, and re-keys.
-        if let Err(e) = sync_microvm_cluster(&app) {
+        if let Err(e) = sync_microvm_cluster(&app, &name) {
             eprintln!("warn: microvm cluster sync failed: {e}");
         }
     }
@@ -3272,7 +3356,12 @@ async fn microvm_status(app: AppHandle) -> MicroVmStatus {
 /// lines to the frontend. Returns when the runtime is fully up
 /// (api-server bootstrapped + microvm profile registered).
 #[tauri::command]
-async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Result<(), String> {
+async fn microvm_up(
+    app: AppHandle,
+    name: Option<String>,
+    on_event: Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let name = vm_name(name);
     // Self-heal: install the engine binary first when it's missing —
     // the CLI spawned below resolves the same ~/.appliance/bin path.
     if vm_binary().is_none() && vm_install_source(&app).is_some() {
@@ -3287,7 +3376,7 @@ async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Res
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
-        .args(["vm", "up"]);
+        .args(["vm", "up", "--name", &name]);
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -3322,7 +3411,7 @@ async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Res
             // adopt it as a desktop cluster right away so the deploy
             // wizard can target the engine without waiting for the
             // next status poll.
-            sync_microvm_cluster(&app).map_err(|e| format!("register microVM cluster: {e}"))?;
+            sync_microvm_cluster(&app, &name).map_err(|e| format!("register microVM cluster: {e}"))?;
             Ok(())
         }
         code => Err(format!(
@@ -3334,10 +3423,11 @@ async fn microvm_up(app: AppHandle, on_event: Channel<serde_json::Value>) -> Res
 }
 
 #[tauri::command]
-async fn microvm_stop() -> Result<(), String> {
+async fn microvm_stop(name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, _stdout, stderr) = run_status_command(&[&bin, "stop", MICROVM_NAME]).await?;
+    let (ok, _stdout, stderr) = run_status_command(&[&bin, "stop", &name]).await?;
     if !ok {
         return Err(format!("appliance-vm stop failed: {}", stderr.trim()));
     }
@@ -3345,14 +3435,15 @@ async fn microvm_stop() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_delete(app: AppHandle) -> Result<(), String> {
+async fn microvm_delete(app: AppHandle, name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     // Stop first (delete refuses while running), tolerating "not running".
-    let _ = run_status_command(&[&bin, "stop", MICROVM_NAME]).await;
+    let _ = run_status_command(&[&bin, "stop", &name]).await;
     // Give the host process a moment to exit before delete checks the pidfile.
     for _ in 0..20 {
-        let (ok, stdout, _) = run_status_command(&[&bin, "status", MICROVM_NAME]).await?;
+        let (ok, stdout, _) = run_status_command(&[&bin, "status", &name]).await?;
         if ok {
             let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
             if !parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -3361,13 +3452,13 @@ async fn microvm_delete(app: AppHandle) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let (ok, _stdout, stderr) = run_status_command(&[&bin, "delete", MICROVM_NAME]).await?;
+    let (ok, _stdout, stderr) = run_status_command(&[&bin, "delete", &name]).await?;
     if !ok {
         return Err(format!("appliance-vm delete failed: {}", stderr.trim()));
     }
     // The credentials lived in the VM's data disk — drop the now-dead
     // cluster registration (best-effort; the VM itself is gone).
-    if let Err(e) = unregister_microvm_cluster(&app) {
+    if let Err(e) = unregister_microvm_cluster(&app, &name) {
         eprintln!("warn: microvm cluster unregister failed: {e}");
     }
     Ok(())
@@ -3398,34 +3489,36 @@ struct EgressPolicy {
     ca_path: Option<String>,
 }
 
-fn microvm_ca_path() -> Option<PathBuf> {
+fn microvm_ca_path(name: &str) -> Option<PathBuf> {
     let p = home_dir()?
         .join(SHARED_PROFILES_DIR)
         .join("vm")
-        .join(MICROVM_NAME)
+        .join(name)
         .join("egress-ca.pem");
     p.is_file().then_some(p)
 }
 
 #[tauri::command]
-async fn microvm_egress_get() -> Result<EgressPolicy, String> {
+async fn microvm_egress_get(name: Option<String>) -> Result<EgressPolicy, String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, stdout, stderr) = run_status_command(&[&bin, "egress", "policy", MICROVM_NAME]).await?;
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "egress", "policy", &name]).await?;
     if !ok {
         return Err(format!("read egress policy failed: {}", stderr.trim()));
     }
     let mut policy: EgressPolicy = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
-    policy.ca_path = microvm_ca_path().map(|p| p.to_string_lossy().into_owned());
+    policy.ca_path = microvm_ca_path(&name).map(|p| p.to_string_lossy().into_owned());
     Ok(policy)
 }
 
 #[tauri::command]
-async fn microvm_egress_default(action: String) -> Result<(), String> {
+async fn microvm_egress_default(name: Option<String>, action: String) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let (ok, _o, stderr) =
-        run_status_command(&[&bin, "egress", "default", &action, "--name", MICROVM_NAME]).await?;
+        run_status_command(&[&bin, "egress", "default", &action, "--name", &name]).await?;
     if !ok {
         return Err(format!("set default failed: {}", stderr.trim()));
     }
@@ -3433,15 +3526,16 @@ async fn microvm_egress_default(action: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_egress_rule(action: String, host: String) -> Result<(), String> {
+async fn microvm_egress_rule(name: Option<String>, action: String, host: String) -> Result<(), String> {
     // action: "allow" | "deny"
     if action != "allow" && action != "deny" {
         return Err(format!("rule action must be allow|deny, got '{action}'"));
     }
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let (ok, _o, stderr) =
-        run_status_command(&[&bin, "egress", &action, &host, "--name", MICROVM_NAME]).await?;
+        run_status_command(&[&bin, "egress", &action, &host, "--name", &name]).await?;
     if !ok {
         return Err(format!("add {action} rule failed: {}", stderr.trim()));
     }
@@ -3449,12 +3543,13 @@ async fn microvm_egress_rule(action: String, host: String) -> Result<(), String>
 }
 
 #[tauri::command]
-async fn microvm_egress_mitm(enabled: bool) -> Result<(), String> {
+async fn microvm_egress_mitm(name: Option<String>, enabled: bool) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let state = if enabled { "on" } else { "off" };
     let (ok, _o, stderr) =
-        run_status_command(&[&bin, "egress", "mitm", state, "--name", MICROVM_NAME]).await?;
+        run_status_command(&[&bin, "egress", "mitm", state, "--name", &name]).await?;
     if !ok {
         return Err(format!("set mitm failed: {}", stderr.trim()));
     }
@@ -3462,10 +3557,11 @@ async fn microvm_egress_mitm(enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_egress_reset() -> Result<(), String> {
+async fn microvm_egress_reset(name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, _o, stderr) = run_status_command(&[&bin, "egress", "reset", MICROVM_NAME]).await?;
+    let (ok, _o, stderr) = run_status_command(&[&bin, "egress", "reset", &name]).await?;
     if !ok {
         return Err(format!("reset egress failed: {}", stderr.trim()));
     }
@@ -3487,12 +3583,13 @@ struct EgressEvent {
 }
 
 #[tauri::command]
-async fn microvm_egress_log(tail: Option<u32>) -> Result<Vec<EgressEvent>, String> {
+async fn microvm_egress_log(name: Option<String>, tail: Option<u32>) -> Result<Vec<EgressEvent>, String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let tail = tail.unwrap_or(200).to_string();
     let (ok, stdout, stderr) =
-        run_status_command(&[&bin, "egress", "log", MICROVM_NAME, "--tail", &tail]).await?;
+        run_status_command(&[&bin, "egress", "log", &name, "--tail", &tail]).await?;
     if !ok {
         return Err(format!("read egress log failed: {}", stderr.trim()));
     }
@@ -3500,11 +3597,12 @@ async fn microvm_egress_log(tail: Option<u32>) -> Result<Vec<EgressEvent>, Strin
 }
 
 #[tauri::command]
-async fn microvm_egress_clear_log() -> Result<(), String> {
+async fn microvm_egress_clear_log(name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let (ok, _o, stderr) =
-        run_status_command(&[&bin, "egress", "log", MICROVM_NAME, "--clear"]).await?;
+        run_status_command(&[&bin, "egress", "log", &name, "--clear"]).await?;
     if !ok {
         return Err(format!("clear egress log failed: {}", stderr.trim()));
     }
@@ -3548,10 +3646,11 @@ struct CredentialsState {
 }
 
 #[tauri::command]
-async fn microvm_creds_list() -> Result<CredentialsState, String> {
+async fn microvm_creds_list(name: Option<String>) -> Result<CredentialsState, String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, stdout, stderr) = run_status_command(&[&bin, "creds", "list", MICROVM_NAME]).await?;
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "creds", "list", &name]).await?;
     if !ok {
         return Err(format!("read creds failed: {}", stderr.trim()));
     }
@@ -3571,11 +3670,12 @@ struct CredsAddInput {
 }
 
 #[tauri::command]
-async fn microvm_creds_add(input: CredsAddInput) -> Result<(), String> {
+async fn microvm_creds_add(name: Option<String>, input: CredsAddInput) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let mut args: Vec<String> =
-        vec![bin.clone(), "creds".into(), "add".into(), input.host.clone(), "--name".into(), MICROVM_NAME.into()];
+        vec![bin.clone(), "creds".into(), "add".into(), input.host.clone(), "--name".into(), name];
     if input.capture {
         args.push("--capture".into());
     }
@@ -3599,11 +3699,12 @@ async fn microvm_creds_add(input: CredsAddInput) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_creds_remove(host: String) -> Result<(), String> {
+async fn microvm_creds_remove(name: Option<String>, host: String) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let (ok, _o, stderr) =
-        run_status_command(&[&bin, "creds", "rm", &host, "--name", MICROVM_NAME]).await?;
+        run_status_command(&[&bin, "creds", "rm", &host, "--name", &name]).await?;
     if !ok {
         return Err(format!("remove credential rule failed: {}", stderr.trim()));
     }
@@ -3611,11 +3712,17 @@ async fn microvm_creds_remove(host: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn microvm_creds_set(host: String, value: String, header: Option<String>) -> Result<(), String> {
+async fn microvm_creds_set(
+    name: Option<String>,
+    host: String,
+    value: String,
+    header: Option<String>,
+) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
     let mut args: Vec<String> =
-        vec![bin.clone(), "creds".into(), "set".into(), host, value, "--name".into(), MICROVM_NAME.into()];
+        vec![bin.clone(), "creds".into(), "set".into(), host, value, "--name".into(), name];
     if let Some(h) = header.filter(|h| !h.trim().is_empty()) {
         args.push("--header".into());
         args.push(h);
@@ -3629,10 +3736,11 @@ async fn microvm_creds_set(host: String, value: String, header: Option<String>) 
 }
 
 #[tauri::command]
-async fn microvm_creds_forget() -> Result<(), String> {
+async fn microvm_creds_forget(name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, _o, stderr) = run_status_command(&[&bin, "creds", "forget", MICROVM_NAME]).await?;
+    let (ok, _o, stderr) = run_status_command(&[&bin, "creds", "forget", &name]).await?;
     if !ok {
         return Err(format!("forget secrets failed: {}", stderr.trim()));
     }
@@ -3691,11 +3799,19 @@ fn kube_context(cluster_name: &str) -> String {
 /// fetched out of the guest.
 fn kube_target_args(engine: Option<&str>, cluster_name: &str) -> Result<Vec<String>, String> {
     if engine == Some("microvm") {
+        // For the microVM engine `cluster_name` carries the VM name
+        // (the frontend passes it). The k3d default sentinel means
+        // "unset" — fall back to the canonical VM.
+        let vm = if cluster_name.is_empty() || cluster_name == DEFAULT_LOCAL_CLUSTER_NAME {
+            MICROVM_NAME
+        } else {
+            cluster_name
+        };
         let home = home_dir().ok_or("cannot resolve the home directory")?;
         let kubeconfig = home
             .join(SHARED_PROFILES_DIR)
             .join("vm")
-            .join(MICROVM_NAME)
+            .join(vm)
             .join("kubeconfig.yaml");
         if !kubeconfig.is_file() {
             return Err("the microVM kubeconfig is not available — is the engine up?".into());
@@ -4498,15 +4614,22 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // Adopt a CLI-registered microVM cluster at launch —
-            // `appliance vm up` may have run while the desktop was
-            // closed, and the cluster switcher should reflect it
-            // without a visit to the Runtimes page. Off the main
-            // thread: keychain + file IO, and launch shouldn't block.
+            // Adopt CLI-registered microVM clusters at launch —
+            // `appliance vm up` may have run (for any VM) while the
+            // desktop was closed, and the cluster switcher should
+            // reflect each one without a visit to the Runtimes page.
+            // Off the main thread: keychain + file IO, and launch
+            // shouldn't block.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = sync_microvm_cluster(&handle) {
-                    eprintln!("warn: microvm cluster sync at launch failed: {e}");
+                let names = match microvm_list().await {
+                    Ok(vms) => vms.into_iter().map(|v| v.name).collect::<Vec<_>>(),
+                    Err(_) => vec![MICROVM_NAME.to_string()],
+                };
+                for name in names {
+                    if let Err(e) = sync_microvm_cluster(&handle, &name) {
+                        eprintln!("warn: microvm cluster sync at launch failed for '{name}': {e}");
+                    }
                 }
             });
             Ok(())
@@ -4540,6 +4663,7 @@ pub fn run() {
             read_appliance_manifest,
             build_and_import_image,
             bootstrap_in_cluster_api_server,
+            microvm_list,
             microvm_status,
             microvm_install,
             microvm_up,

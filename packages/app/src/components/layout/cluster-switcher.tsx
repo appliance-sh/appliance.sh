@@ -5,13 +5,14 @@ import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
-import { LOCAL_RUNTIME_CLUSTER_ID, MICROVM_CLUSTER_ID } from '@/lib/host';
+import { LOCAL_RUNTIME_CLUSTER_ID, isMicroVmClusterId } from '@/lib/host';
 
-/** Engine tag for the two local clusters, so they're tellable apart
- *  at a glance (they even share the same URL — host port 8081). */
+/** Engine tag for the local clusters, so they're tellable apart at a
+ *  glance (the default k3d and microVM clusters even share host port
+ *  8081). Every microVM — there can be several — gets the microVM tag. */
 function engineLabel(clusterId: string): string | null {
   if (clusterId === LOCAL_RUNTIME_CLUSTER_ID) return 'k3d';
-  if (clusterId === MICROVM_CLUSTER_ID) return 'microVM';
+  if (isMicroVmClusterId(clusterId)) return 'microVM';
   return null;
 }
 

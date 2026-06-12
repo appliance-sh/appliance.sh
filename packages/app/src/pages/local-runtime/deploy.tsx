@@ -8,7 +8,7 @@ import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
-import { LOCAL_RUNTIME_CLUSTER_ID, MICROVM_CLUSTER_ID } from '@/lib/host';
+import { LOCAL_RUNTIME_CLUSTER_ID, microVmNameFromClusterId } from '@/lib/host';
 import type { LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
@@ -65,7 +65,8 @@ export function LocalRuntimeDeployPage() {
   // the worst place. Query keys are shared with the Runtimes page so
   // the two views never disagree.
   const { cluster: selectedCluster } = useSelectedCluster();
-  const isMicroVmTarget = selectedCluster?.id === MICROVM_CLUSTER_ID;
+  const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
+  const isMicroVmTarget = vmName !== null;
   const runtimeQuery = useQuery({
     queryKey: ['local-runtime', 'status'],
     enabled: Boolean(local?.runtimeStatus) && !isMicroVmTarget,
@@ -73,9 +74,9 @@ export function LocalRuntimeDeployPage() {
     refetchInterval: 5_000,
   });
   const vmQuery = useQuery({
-    queryKey: ['microvm', 'status'],
+    queryKey: ['microvm', 'status', vmName],
     enabled: Boolean(host.vm) && isMicroVmTarget,
-    queryFn: () => host.vm!.status(),
+    queryFn: () => host.vm!.instance(vmName!).status(),
     refetchInterval: 5_000,
   });
   const runtimeUp = Boolean(runtimeQuery.data?.cluster.running && runtimeQuery.data?.apiServer.running);

@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
-import { MICROVM_CLUSTER_ID } from '@/lib/host';
+import { microVmClusterId } from '@/lib/host';
 import { TerminalDrawer } from './terminal-drawer';
 import type {
   EgressEvent,
@@ -30,7 +30,9 @@ import type {
   LocalPreflightCheck,
   LocalRuntimeStatus,
   LocalServiceInfo,
+  MicroVmInstanceHost,
   MicroVmStatus,
+  MicroVmSummary,
 } from '@/lib/host';
 
 // Docker Desktop-style overview page for the local k3d-backed
@@ -106,22 +108,23 @@ export function LocalRuntimePage() {
   const status = statusQuery.data;
   const phase = derivePhase(status, startMutation.isPending, stopMutation.isPending, deleteMutation.isPending);
 
-  // The header's Deploy button serves both engines — the wizard
-  // targets the selected cluster, so it's useful as soon as either
-  // the k3d runtime or the microVM is up. Shares the MicroVmPanel's
-  // query key; its (faster) polling drives the freshness.
-  const vmStatusQuery = useQuery({
-    queryKey: ['microvm', 'status'],
+  // The header's Deploy button serves every engine — the wizard
+  // targets the selected cluster, so it's useful as soon as the k3d
+  // runtime or any microVM is up. The VM list drives both the deploy
+  // gate and the per-VM panels below.
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
     enabled: Boolean(host.vm),
-    queryFn: () => host.vm!.status(),
-    refetchInterval: 30_000,
+    queryFn: () => host.vm!.list(),
+    refetchInterval: 8_000,
   });
-  const microVmReady = Boolean(vmStatusQuery.data?.running && vmStatusQuery.data?.kubeconfigReady);
-  const canDeploy = phase === 'running' || microVmReady;
-  // Both engines publish on host port 8081 — only one can run at a
-  // time. Gate Start with an explanation instead of letting k3d fail
-  // mid-flight on the bind error.
-  const microVmHoldsPort = Boolean(vmStatusQuery.data?.running);
+  const vms = vmListQuery.data ?? [];
+  const anyVmRunning = vms.some((v) => v.running);
+  const canDeploy = phase === 'running' || anyVmRunning;
+  // The default VM shares host port 8081 with the k3d runtime — only
+  // one can hold it. Named VMs get their own ports, so they never
+  // conflict. Gate k3d Start on the *default* VM running.
+  const microVmHoldsPort = vms.some((v) => v.name === 'appliance' && v.running);
 
   if (!supported) {
     return (
@@ -239,9 +242,125 @@ export function LocalRuntimePage() {
 
       {status?.cluster.running && status?.apiServer.running ? <WorkloadsPanel /> : null}
 
-      {host.vm ? <MicroVmPanel /> : null}
+      {host.vm ? <MicroVmSection vms={vms} loading={vmListQuery.isLoading} /> : null}
+    </div>
+  );
+}
 
-      {microVmReady ? <WorkloadsPanel engine="microvm" /> : null}
+// ---- microVM section (multiple VMs) -------------------------------------
+//
+// Appliance can run several microVMs at once — e.g. one for interactive
+// development and another dedicated to traffic testing. Each is its own
+// isolated VM on its own host ports, registered as its own cluster. The
+// section lists every defined VM (plus the canonical "appliance" VM even
+// before it's created) and offers a New VM control.
+function MicroVmSection({ vms, loading }: { vms: MicroVmSummary[]; loading: boolean }) {
+  // VMs added through the UI but not yet in `list` (their spec lands
+  // only once Start boots them). Tracked locally so the panel appears
+  // immediately, then folds into the list view once it materializes.
+  const [pending, setPending] = React.useState<string[]>([]);
+
+  // Always surface the default "appliance" VM, even when nothing is
+  // defined yet, so the first-run Start affordance is present. Then any
+  // VMs from `list`, then still-pending additions.
+  const names = React.useMemo(() => {
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    for (const n of ['appliance', ...vms.map((v) => v.name), ...pending]) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        ordered.push(n);
+      }
+    }
+    return ordered;
+  }, [vms, pending]);
+
+  return (
+    <section className="space-y-3">
+      <header className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">
+            MicroVM engines{' '}
+            <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">beta</span>
+          </h2>
+          <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
+            Isolated VMs Appliance boots itself — run several at once (e.g. one for development, one for traffic
+            testing). Each registers as its own cluster on its own ports.
+          </p>
+        </div>
+        <NewVmButton existing={names} onAdd={(n) => setPending((p) => [...p, n])} />
+      </header>
+
+      {loading && vms.length === 0 ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">Loading VMs…</p>
+      ) : null}
+
+      {names.map((name) => (
+        <MicroVmPanel key={name} name={name} />
+      ))}
+    </section>
+  );
+}
+
+// Name a new VM. It doesn't exist on the engine until its panel's Start
+// boots it (which allocates ports + bootstraps), so this just validates
+// the name and surfaces a panel for it — the Start there streams boot
+// progress, exactly like the default VM.
+function NewVmButton({ existing, onAdd }: { existing: string[]; onAdd: (name: string) => void }) {
+  const [open, setOpen] = React.useState(false);
+  const [name, setName] = React.useState('');
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const submit = () => {
+    const n = name.trim();
+    if (!n) return;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(n)) {
+      setErr('Use lowercase letters, digits, and dashes (e.g. "traffic").');
+      return;
+    }
+    if (existing.includes(n)) {
+      setErr(`A VM named "${n}" already exists.`);
+      return;
+    }
+    onAdd(n);
+    setOpen(false);
+    setName('');
+    setErr(null);
+  };
+
+  if (!open) {
+    return (
+      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+        <Plus className="h-4 w-4" /> New VM
+      </Button>
+    );
+  }
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-center gap-2">
+        <input
+          autoFocus
+          type="text"
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value);
+            setErr(null);
+          }}
+          placeholder="vm name, e.g. traffic"
+          className="w-40 rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1 font-mono text-xs"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submit();
+            if (e.key === 'Escape') setOpen(false);
+          }}
+        />
+        <Button size="sm" disabled={!name.trim()} onClick={submit}>
+          Add
+        </Button>
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+      {err ? <p className="text-[10px] text-red-300">{err}</p> : null}
     </div>
   );
 }
@@ -255,15 +374,16 @@ export function LocalRuntimePage() {
 // name), so the deploy wizard, cluster switcher, and workload views
 // treat it like any other target, on the same
 // *.appliance.localhost:8081 URL surface.
-function MicroVmPanel() {
+function MicroVmPanel({ name }: { name: string }) {
   const host = useHost();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
-  const vm = host.vm!;
+  const vm = React.useMemo(() => host.vm!.instance(name), [host, name]);
+  const isDefault = name === 'appliance';
 
   const statusQuery = useQuery({
-    queryKey: ['microvm', 'status'],
+    queryKey: ['microvm', name, 'status'],
     queryFn: () => vm.status(),
     refetchInterval: (q) => {
       const data = q.state.data as MicroVmStatus | undefined;
@@ -273,15 +393,17 @@ function MicroVmPanel() {
   });
 
   // Mirror of the page-level port gate, in the other direction: a
-  // running k3d cluster holds host port 8081, so the microVM can't
-  // boot until it stops. Shares the page's query key (cache-deduped).
+  // running k3d cluster holds host port 8081, so the *default* microVM
+  // (which shares that port) can't boot until it stops. Named VMs get
+  // their own ports and aren't gated. Shares the page's query key
+  // (cache-deduped).
   const k3dQuery = useQuery({
     queryKey: ['local-runtime', 'status'],
-    enabled: Boolean(host.local?.runtimeStatus),
+    enabled: isDefault && Boolean(host.local?.runtimeStatus),
     queryFn: () => host.local!.runtimeStatus(),
     refetchInterval: 30_000,
   });
-  const k3dHoldsPort = Boolean(k3dQuery.data?.cluster.running);
+  const k3dHoldsPort = isDefault && Boolean(k3dQuery.data?.cluster.running);
 
   const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
@@ -292,7 +414,10 @@ function MicroVmPanel() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log]);
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm'] });
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['microvm', name] });
+    queryClient.invalidateQueries({ queryKey: ['microvm', 'list'] });
+  };
 
   const run = async (kind: 'install' | 'up' | 'stop' | 'delete', action: () => Promise<void>) => {
     setBusy(kind);
@@ -317,11 +442,12 @@ function MicroVmPanel() {
   // wizard targets the selection), then open the wizard. The cluster
   // is guaranteed registered by the time the CTA renders — status
   // reports ready only after the Rust side synced the registration.
+  const clusterId = microVmClusterId(name);
   const deployHere = async () => {
     try {
       const cfg = await host.getConfig();
-      if (cfg.selectedClusterId !== MICROVM_CLUSTER_ID) {
-        await host.selectCluster(MICROVM_CLUSTER_ID);
+      if (cfg.selectedClusterId !== clusterId) {
+        await host.selectCluster(clusterId);
         queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       }
     } catch {
@@ -333,7 +459,7 @@ function MicroVmPanel() {
 
   const onDelete = async () => {
     const ok = await confirm({
-      title: 'Delete the microVM?',
+      title: `Delete the "${name}" microVM?`,
       description: 'In-VM state (projects, images, deployments) is destroyed.',
       confirmLabel: 'Delete microVM',
     });
@@ -382,13 +508,22 @@ function MicroVmPanel() {
       <header className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-semibold">
-            MicroVM engine{' '}
-            <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">beta</span>
+            <code className="font-mono">{name}</code>
+            {isDefault ? (
+              <span className="ml-2 rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-muted-foreground)]">
+                default
+              </span>
+            ) : null}
           </h2>
           <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-            An isolated VM Appliance boots itself — no docker provider needed for the cluster. Deploys use the{' '}
-            <code className="font-mono">microvm</code> profile; apps publish at the same{' '}
-            <code className="font-mono">*.appliance.localhost</code> URLs.
+            Deploys use the <code className="font-mono">{clusterId}</code> profile
+            {status?.apiServerUrl ? (
+              <>
+                {' '}
+                · ingress at <code className="font-mono">{status.apiServerUrl}</code>
+              </>
+            ) : null}
+            .
           </p>
         </div>
         <span
@@ -412,7 +547,7 @@ function MicroVmPanel() {
               The engine binary (<code className="font-mono">appliance-vm</code>) isn't installed yet — Appliance
               installs it into <code className="font-mono">~/.appliance/bin</code>.
             </p>
-            <Button onClick={() => run('install', () => vm.install())} disabled={busy !== null}>
+            <Button onClick={() => run('install', () => host.vm!.install())} disabled={busy !== null}>
               <Download className="h-4 w-4" /> {busy === 'install' ? 'Installing…' : 'Install engine'}
             </Button>
           </div>
@@ -466,7 +601,7 @@ function MicroVmPanel() {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-xs text-[var(--color-muted-foreground)]">
             Kubernetes at <code className="font-mono">{status.apiServerUrl}</code> · registered as the{' '}
-            <span className="font-medium text-[var(--color-foreground)]">MicroVM Runtime</span> cluster
+            <span className="font-medium text-[var(--color-foreground)]">{microVmClusterLabel(name)}</span> cluster
           </p>
           <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
             <Rocket className="h-4 w-4" /> Deploy application
@@ -474,35 +609,41 @@ function MicroVmPanel() {
         </div>
       ) : null}
 
-      {status?.running && status.kubeconfigReady ? <EgressPanel /> : null}
-      {status?.running && status.kubeconfigReady ? <CredentialsPanel /> : null}
+      {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
+      {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
+      {status?.running && status.kubeconfigReady ? <WorkloadsPanel engine="microvm" vmName={name} /> : null}
     </section>
   );
+}
+
+/** Human label for a VM's registered cluster — mirrors
+ *  microvm_cluster_label in the desktop's lib.rs. */
+function microVmClusterLabel(name: string): string {
+  return name === 'appliance' ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`;
 }
 
 // Outbound-traffic control for the microVM: a desktop surface over the
 // egress proxy's allow/deny policy + optional TLS interception. The
 // engine enforces it (packages/vm egress.rs); this just edits the
 // policy the proxy reloads live.
-function EgressPanel() {
-  const host = useHost();
+function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
   const queryClient = useQueryClient();
-  const egress = host.vm!.egress;
+  const egress = vm.egress;
   const [host_, setHost] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
   const policyQuery = useQuery({
-    queryKey: ['microvm', 'egress'],
+    queryKey: ['microvm', name, 'egress'],
     queryFn: () => egress.get(),
     refetchInterval: 15_000,
   });
   const policy = policyQuery.data;
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', 'egress'] });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', name, 'egress'] });
 
   // Live traffic feed — the proxy records every request decision.
   const trafficQuery = useQuery({
-    queryKey: ['microvm', 'egress', 'log'],
+    queryKey: ['microvm', name, 'egress', 'log'],
     queryFn: () => egress.log(200),
     refetchInterval: 4_000,
   });
@@ -620,7 +761,7 @@ function EgressPanel() {
             onClear={() =>
               void egress
                 .clearLog()
-                .then(() => queryClient.invalidateQueries({ queryKey: ['microvm', 'egress', 'log'] }))
+                .then(() => queryClient.invalidateQueries({ queryKey: ['microvm', name, 'egress', 'log'] }))
             }
           />
         </div>
@@ -755,11 +896,10 @@ function hostMatches(host: string, suffix: string): boolean {
 // store and/or inject it onto outbound requests, so secrets live
 // outside the VM. Requires TLS interception (the proxy must see
 // decrypted headers).
-function CredentialsPanel() {
-  const host = useHost();
+function CredentialsPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
   const queryClient = useQueryClient();
-  const creds = host.vm!.creds;
-  const egress = host.vm!.egress;
+  const creds = vm.creds;
+  const egress = vm.egress;
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
@@ -770,15 +910,19 @@ function CredentialsPanel() {
   const [header, setHeader] = React.useState('authorization');
   const [helper, setHelper] = React.useState('');
 
-  const credsQuery = useQuery({ queryKey: ['microvm', 'creds'], queryFn: () => creds.list(), refetchInterval: 15_000 });
+  const credsQuery = useQuery({
+    queryKey: ['microvm', name, 'creds'],
+    queryFn: () => creds.list(),
+    refetchInterval: 15_000,
+  });
   const policyQuery = useQuery({
-    queryKey: ['microvm', 'egress'],
+    queryKey: ['microvm', name, 'egress'],
     queryFn: () => egress.get(),
     refetchInterval: 15_000,
   });
   const data = credsQuery.data;
   const mitmOn = policyQuery.data?.mitm ?? false;
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', 'creds'] });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['microvm', name, 'creds'] });
 
   const act = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -1316,13 +1460,15 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
+function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: string }) {
   const host = useHost();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
   const [shellPod, setShellPod] = React.useState<LocalPodInfo | null>(null);
+  // For the microVM engine, clusterName carries the VM name so the host
+  // resolves that VM's kubeconfig (multiple VMs run concurrently).
   const workloadsQuery = useQuery({
-    queryKey: ['local-runtime', 'workloads', engine ?? 'k3d'],
-    queryFn: () => host.local!.listWorkloads(engine ? { engine } : undefined),
+    queryKey: ['local-runtime', 'workloads', engine ?? 'k3d', vmName ?? ''],
+    queryFn: () => host.local!.listWorkloads(engine ? { engine, clusterName: vmName } : undefined),
     refetchInterval: 5_000,
   });
 
@@ -1333,7 +1479,9 @@ function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
     <>
       <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">{engine === 'microvm' ? 'MicroVM workloads' : 'Workloads'}</h2>
+          <h2 className="text-sm font-semibold">
+            {engine === 'microvm' ? `Workloads · ${vmName ?? 'appliance'}` : 'Workloads'}
+          </h2>
           <Button
             variant="ghost"
             size="icon"
@@ -1362,8 +1510,12 @@ function WorkloadsPanel({ engine }: { engine?: 'microvm' }) {
         ) : null}
       </section>
 
-      {activePod ? <PodLogsDrawer pod={activePod} engine={engine} onClose={() => setActivePod(null)} /> : null}
-      {shellPod ? <TerminalDrawer target={shellPod.name} engine={engine} onClose={() => setShellPod(null)} /> : null}
+      {activePod ? (
+        <PodLogsDrawer pod={activePod} engine={engine} vmName={vmName} onClose={() => setActivePod(null)} />
+      ) : null}
+      {shellPod ? (
+        <TerminalDrawer target={shellPod.name} engine={engine} clusterName={vmName} onClose={() => setShellPod(null)} />
+      ) : null}
     </>
   );
 }
@@ -1502,11 +1654,21 @@ function ServicesTable({ services }: { services: LocalServiceInfo[] }) {
   );
 }
 
-function PodLogsDrawer({ pod, engine, onClose }: { pod: LocalPodInfo; engine?: 'microvm'; onClose: () => void }) {
+function PodLogsDrawer({
+  pod,
+  engine,
+  vmName,
+  onClose,
+}: {
+  pod: LocalPodInfo;
+  engine?: 'microvm';
+  vmName?: string;
+  onClose: () => void;
+}) {
   const host = useHost();
   const logsQuery = useQuery({
-    queryKey: ['local-runtime', 'logs', engine ?? 'k3d', pod.name],
-    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500, engine }),
+    queryKey: ['local-runtime', 'logs', engine ?? 'k3d', vmName ?? '', pod.name],
+    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500, engine, clusterName: vmName }),
   });
   const logs = logsQuery.data ?? '';
 

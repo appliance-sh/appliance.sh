@@ -227,6 +227,31 @@ export interface TerminalHost {
 export const LOCAL_RUNTIME_CLUSTER_ID = 'local-runtime';
 export const MICROVM_CLUSTER_ID = 'microvm';
 
+/** The canonical (default) microVM name — keeps the bare `microvm`
+ *  cluster id. Mirrors DEFAULT_VM_NAME in the CLI and MICROVM_NAME in
+ *  the desktop's lib.rs. */
+export const DEFAULT_MICROVM_NAME = 'appliance';
+
+/** Desktop cluster id a VM registers under. The default VM keeps the
+ *  bare `microvm`; others get `microvm-<name>`. Mirrors
+ *  microvm_cluster_id in lib.rs and profileForVm in the CLI. */
+export function microVmClusterId(name: string): string {
+  return name === DEFAULT_MICROVM_NAME ? MICROVM_CLUSTER_ID : `${MICROVM_CLUSTER_ID}-${name}`;
+}
+
+/** The VM name behind a cluster id, or null if the id isn't a microVM
+ *  cluster. `microvm` → `appliance`; `microvm-<name>` → `<name>`. */
+export function microVmNameFromClusterId(clusterId: string): string | null {
+  if (clusterId === MICROVM_CLUSTER_ID) return DEFAULT_MICROVM_NAME;
+  const prefix = `${MICROVM_CLUSTER_ID}-`;
+  return clusterId.startsWith(prefix) ? clusterId.slice(prefix.length) : null;
+}
+
+/** Whether a cluster id belongs to the microVM engine (any VM). */
+export function isMicroVmClusterId(clusterId: string): boolean {
+  return microVmNameFromClusterId(clusterId) !== null;
+}
+
 export interface MicroVmStatus {
   /** appliance-vm binary present on this machine. */
   available: boolean;
@@ -312,10 +337,27 @@ export interface MicroVmCredsHost {
   forget(): Promise<void>;
 }
 
-export interface MicroVmHost {
+/** One microVM as reported by the engine — its allocated host ports,
+ *  running state, and the desktop cluster id it registers under.
+ *  Mirrors MicroVmSummary in the desktop's lib.rs. */
+export interface MicroVmSummary {
+  name: string;
+  running: boolean;
+  hostPort: number;
+  apiPort: number;
+  registryPort: number;
+  egressPort: number;
+  /** Desktop cluster id this VM registers under (`microvm` / `microvm-<name>`). */
+  clusterId: string;
+}
+
+/** Operations scoped to a single microVM. Appliance can run several
+ *  concurrently (e.g. one for interactive dev, one for traffic
+ *  testing); each is addressed by name. */
+export interface MicroVmInstanceHost {
+  /** The VM this handle targets. */
+  readonly name: string;
   status(): Promise<MicroVmStatus>;
-  /** Install the engine binary into the managed bin dir. */
-  install(): Promise<void>;
   /** Full `appliance vm up` orchestration, streaming progress lines. */
   up(onEvent: (event: { message: string }) => void): Promise<void>;
   stop(): Promise<void>;
@@ -325,6 +367,17 @@ export interface MicroVmHost {
   egress: MicroVmEgressHost;
   /** Per-host credential capture/injection (apiKeyHelper). */
   creds: MicroVmCredsHost;
+}
+
+export interface MicroVmHost {
+  /** All defined VMs (running or not). */
+  list(): Promise<MicroVmSummary[]>;
+  /** Install the engine binary into the managed bin dir. Engine-wide,
+   *  not per-VM (one binary serves every VM). */
+  install(): Promise<void>;
+  /** A handle scoped to one VM. Defaults to the canonical `appliance`
+   *  VM, so single-VM callers can stay terse. */
+  instance(name?: string): MicroVmInstanceHost;
 }
 
 export interface LocalClusterInput {

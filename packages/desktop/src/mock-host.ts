@@ -492,149 +492,229 @@ export function createMockHost(): ConsoleHost {
     },
 
     vm: {
-      async status() {
-        return {
-          available: true,
-          installable: false,
-          exists: microVm.exists,
-          running: microVm.running,
-          kubeconfigReady: microVm.running,
-          apiServerUrl: 'http://api.appliance.localhost:8081',
-        };
+      async list() {
+        await sleep(80);
+        return Object.values(microVms).map((vm) => ({
+          name: vm.name,
+          running: vm.running,
+          hostPort: vm.hostPort,
+          apiPort: vm.apiPort,
+          registryPort: vm.registryPort,
+          egressPort: vm.egressPort,
+          clusterId: vm.name === 'appliance' ? 'microvm' : `microvm-${vm.name}`,
+        }));
       },
       async install() {
         await sleep(800);
       },
-      async up(onEvent) {
-        const lines = [
-          "starting VM 'appliance' (host pid 4242)",
-          'waiting for kubernetes endpoint......',
-          "VM 'appliance' is up",
-          '» waiting for the in-VM registry',
-          '» pushing appliance-api-server:arm64 into the VM registry',
-          '» api-server applying api-server manifests',
-          '» api-server waiting for http://api.appliance.localhost:8081 to become reachable',
-          '✓ api-server bootstrapped; credentials saved to profile microvm',
-        ];
-        for (const message of lines) {
-          await sleep(400);
-          onEvent({ message });
-        }
-        microVm.exists = true;
-        microVm.running = true;
-      },
-      async stop() {
-        await sleep(800);
-        microVm.running = false;
-      },
-      async remove() {
-        await sleep(800);
-        microVm.running = false;
-        microVm.exists = false;
-      },
-      egress: {
-        async get() {
-          await sleep(100);
-          return { ...microVm.egress };
-        },
-        async setDefault(action: 'allow' | 'deny') {
-          await sleep(150);
-          microVm.egress.default = action;
-        },
-        async addRule(action: 'allow' | 'deny', host: string) {
-          await sleep(150);
-          const list = action === 'allow' ? microVm.egress.allow : microVm.egress.deny;
-          if (!list.includes(host)) list.push(host);
-        },
-        async setMitm(enabled: boolean) {
-          await sleep(150);
-          microVm.egress.mitm = enabled;
-          microVm.egress.caPath = enabled ? '~/.appliance/vm/appliance/egress-ca.pem' : undefined;
-        },
-        async reset() {
-          await sleep(150);
-          microVm.egress = { default: 'allow', allow: [], deny: [], mitm: false };
-        },
-        async log(tail?: number) {
-          await sleep(100);
-          const now = 1_700_000_000_000;
-          const events = [
-            {
-              ts: now,
-              host: 'api.openai.com',
-              port: 443,
-              method: 'POST',
-              path: '/v1/chat/completions',
-              decision: 'mitm' as const,
+      instance(name?: string) {
+        const vm = mockVm(name ?? 'appliance');
+        return {
+          name: vm.name,
+          async status() {
+            await sleep(60);
+            return {
+              available: true,
+              installable: false,
+              exists: vm.exists,
+              running: vm.running,
+              kubeconfigReady: vm.running,
+              apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
+            };
+          },
+          async up(onEvent: (event: { message: string }) => void) {
+            const profile = vm.name === 'appliance' ? 'microvm' : `microvm-${vm.name}`;
+            const lines = [
+              `starting VM '${vm.name}' (host pid 4242)`,
+              'waiting for kubernetes endpoint......',
+              `VM '${vm.name}' is up`,
+              '» waiting for the in-VM registry',
+              '» pushing appliance-api-server:arm64 into the VM registry',
+              '» api-server applying api-server manifests',
+              `» api-server waiting for http://api.appliance.localhost:${vm.hostPort} to become reachable`,
+              `✓ api-server bootstrapped; credentials saved to profile ${profile}`,
+            ];
+            for (const message of lines) {
+              await sleep(400);
+              onEvent({ message });
+            }
+            vm.exists = true;
+            vm.running = true;
+          },
+          async stop() {
+            await sleep(800);
+            vm.running = false;
+          },
+          async remove() {
+            await sleep(800);
+            vm.running = false;
+            vm.exists = false;
+            delete microVms[vm.name];
+          },
+          egress: {
+            async get() {
+              await sleep(100);
+              return { ...vm.egress };
             },
-            { ts: now + 1000, host: 'github.com', port: 443, method: 'CONNECT', decision: 'allow' as const },
-            { ts: now + 2000, host: 'evil.test', port: 443, method: 'CONNECT', decision: 'deny' as const },
-          ];
-          return events.slice(-(tail ?? 200));
-        },
-        async clearLog() {
-          await sleep(50);
-        },
-      },
-      creds: {
-        async list() {
-          await sleep(100);
-          return {
-            rules: [...microVm.creds.rules],
-            secrets: microVm.creds.secrets.map((s) => ({ ...s })),
-          };
-        },
-        async add(rule) {
-          await sleep(120);
-          const next = {
-            host: rule.host,
-            capture: rule.capture,
-            inject: rule.inject,
-            header: rule.header || 'authorization',
-            helper: rule.helper,
-          };
-          const i = microVm.creds.rules.findIndex((r) => r.host === rule.host);
-          if (i >= 0) microVm.creds.rules[i] = next;
-          else microVm.creds.rules.push(next);
-        },
-        async remove(host: string) {
-          await sleep(120);
-          microVm.creds.rules = microVm.creds.rules.filter((r) => r.host !== host);
-        },
-        async setSecret(host: string, value: string, header?: string) {
-          await sleep(120);
-          const h = (header || 'authorization').toLowerCase();
-          const masked = value.length > 4 ? `••••${value.slice(-4)}` : '••••';
-          const i = microVm.creds.secrets.findIndex((s) => s.host === host && s.header === h);
-          const rec = { host, header: h, masked };
-          if (i >= 0) microVm.creds.secrets[i] = rec;
-          else microVm.creds.secrets.push(rec);
-        },
-        async forget() {
-          await sleep(80);
-          microVm.creds.secrets = [];
-        },
+            async setDefault(action: 'allow' | 'deny') {
+              await sleep(150);
+              vm.egress.default = action;
+            },
+            async addRule(action: 'allow' | 'deny', host: string) {
+              await sleep(150);
+              const list = action === 'allow' ? vm.egress.allow : vm.egress.deny;
+              if (!list.includes(host)) list.push(host);
+            },
+            async setMitm(enabled: boolean) {
+              await sleep(150);
+              vm.egress.mitm = enabled;
+              vm.egress.caPath = enabled ? `~/.appliance/vm/${vm.name}/egress-ca.pem` : undefined;
+            },
+            async reset() {
+              await sleep(150);
+              vm.egress = { default: 'allow', allow: [], deny: [], mitm: false };
+            },
+            async log(tail?: number) {
+              await sleep(100);
+              const now = 1_700_000_000_000;
+              const events = [
+                {
+                  ts: now,
+                  host: 'api.openai.com',
+                  port: 443,
+                  method: 'POST',
+                  path: '/v1/chat/completions',
+                  decision: 'mitm' as const,
+                },
+                { ts: now + 1000, host: 'github.com', port: 443, method: 'CONNECT', decision: 'allow' as const },
+                { ts: now + 2000, host: 'evil.test', port: 443, method: 'CONNECT', decision: 'deny' as const },
+              ];
+              return events.slice(-(tail ?? 200));
+            },
+            async clearLog() {
+              await sleep(50);
+            },
+          },
+          creds: {
+            async list() {
+              await sleep(100);
+              return {
+                rules: [...vm.creds.rules],
+                secrets: vm.creds.secrets.map((s) => ({ ...s })),
+              };
+            },
+            async add(rule: { host: string; capture: boolean; inject: boolean; header?: string; helper?: string }) {
+              await sleep(120);
+              const next = {
+                host: rule.host,
+                capture: rule.capture,
+                inject: rule.inject,
+                header: rule.header || 'authorization',
+                helper: rule.helper,
+              };
+              const i = vm.creds.rules.findIndex((r) => r.host === rule.host);
+              if (i >= 0) vm.creds.rules[i] = next;
+              else vm.creds.rules.push(next);
+            },
+            async remove(host: string) {
+              await sleep(120);
+              vm.creds.rules = vm.creds.rules.filter((r) => r.host !== host);
+            },
+            async setSecret(host: string, value: string, header?: string) {
+              await sleep(120);
+              const h = (header || 'authorization').toLowerCase();
+              const masked = value.length > 4 ? `••••${value.slice(-4)}` : '••••';
+              const i = vm.creds.secrets.findIndex((s) => s.host === host && s.header === h);
+              const rec = { host, header: h, masked };
+              if (i >= 0) vm.creds.secrets[i] = rec;
+              else vm.creds.secrets.push(rec);
+            },
+            async forget() {
+              await sleep(80);
+              vm.creds.secrets = [];
+            },
+          },
+        };
       },
     },
   };
 }
 
 // MicroVM mock state (module-level: survives SPA navigation, resets on
-// reload like the rest of the mock).
-const microVm: {
+// reload like the rest of the mock). Keyed by VM name so the browser
+// dev shell can exercise the multi-VM UI — one VM for interactive dev,
+// one for traffic testing.
+interface MockVm {
+  name: string;
   exists: boolean;
   running: boolean;
+  hostPort: number;
+  apiPort: number;
+  registryPort: number;
+  egressPort: number;
   egress: { default: 'allow' | 'deny'; allow: string[]; deny: string[]; mitm: boolean; caPath?: string };
   creds: {
     rules: Array<{ host: string; capture: boolean; inject: boolean; header: string; helper?: string }>;
     secrets: Array<{ host: string; header: string; masked: string }>;
   };
-} = {
-  exists: true,
-  running: false,
-  egress: { default: 'allow', allow: [], deny: [], mitm: false },
-  creds: {
-    rules: [{ host: 'api.openai.com', capture: true, inject: true, header: 'authorization' }],
-    secrets: [{ host: 'api.openai.com', header: 'authorization', masked: '••••k7Qx' }],
+}
+
+const microVms: Record<string, MockVm> = {
+  appliance: {
+    name: 'appliance',
+    exists: true,
+    running: false,
+    hostPort: 8081,
+    apiPort: 6443,
+    registryPort: 5052,
+    egressPort: 5053,
+    egress: { default: 'allow', allow: [], deny: [], mitm: false },
+    creds: {
+      rules: [{ host: 'api.openai.com', capture: true, inject: true, header: 'authorization' }],
+      secrets: [{ host: 'api.openai.com', header: 'authorization', masked: '••••k7Qx' }],
+    },
+  },
+  traffic: {
+    name: 'traffic',
+    exists: true,
+    running: true,
+    hostPort: 8100,
+    apiPort: 8101,
+    registryPort: 8102,
+    egressPort: 8103,
+    egress: {
+      default: 'deny',
+      allow: ['api.openai.com', 'github.com'],
+      deny: [],
+      mitm: true,
+      caPath: '~/.appliance/vm/traffic/egress-ca.pem',
+    },
+    creds: { rules: [], secrets: [] },
   },
 };
+
+/** Look up (or lazily create) a mock VM by name, so `instance('new')`
+ *  followed by `up()` materializes a VM the way the real engine does. */
+function mockVm(name: string): MockVm {
+  let vm = microVms[name];
+  if (!vm) {
+    // Mirror the allocator: pick the next free 4-port block from 8100.
+    const used = new Set(Object.values(microVms).flatMap((v) => [v.hostPort]));
+    let slot = 0;
+    while (used.has(8100 + slot * 4)) slot += 1;
+    const base = 8100 + slot * 4;
+    vm = {
+      name,
+      exists: false,
+      running: false,
+      hostPort: base,
+      apiPort: base + 1,
+      registryPort: base + 2,
+      egressPort: base + 3,
+      egress: { default: 'allow', allow: [], deny: [], mitm: false },
+      creds: { rules: [], secrets: [] },
+    };
+    microVms[name] = vm;
+  }
+  return vm;
+}
