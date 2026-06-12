@@ -426,8 +426,20 @@ fn split_host_port(target: &str) -> (String, u16) {
 }
 
 /// Default proxy port — clear of the k3d (5050) and microVM (5052)
-/// registry ports and the ingress/api forwards.
+/// registry ports and the ingress/api forwards. The default VM keeps
+/// this; additional VMs get an allocated port (see VmSpec::allocate_ports).
 pub const DEFAULT_EGRESS_PORT: u16 = 5053;
+
+/// The egress port this VM actually binds, read from its persisted
+/// spec so concurrent VMs don't collide. Falls back to the default
+/// when the spec is missing (e.g. a not-yet-created VM).
+pub fn vm_egress_port(name: &str) -> u16 {
+    crate::store::load_spec(name)
+        .ok()
+        .flatten()
+        .map(|spec| spec.egress_port)
+        .unwrap_or(DEFAULT_EGRESS_PORT)
+}
 
 /// Kubernetes namespace the api-server + workloads live in (mirrors
 /// DEFAULT_LOCAL_NAMESPACE in @appliance.sh/infra).
@@ -505,7 +517,7 @@ pub fn publish_configmap(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let proxy_url = guest_proxy_url(name, DEFAULT_EGRESS_PORT);
+    let proxy_url = guest_proxy_url(name, vm_egress_port(name));
     let ca = if policy.mitm {
         std::fs::read_to_string(mitm::ca_cert_path(name)).ok()
     } else {

@@ -32,7 +32,15 @@ pub struct VmSpec {
     /// so both engines can coexist on one machine.
     #[serde(default = "default_registry_port")]
     pub registry_port: u16,
+    /// Host port the egress proxy binds for this VM (default 5053).
+    #[serde(default = "default_egress_port")]
+    pub egress_port: u16,
 }
+
+/// The default VM name. The default VM keeps the canonical host ports
+/// (8081/6443/5052/5053) for backward compatibility and parity with
+/// the k3d runtime; additional VMs get allocated distinct blocks.
+pub const DEFAULT_VM_NAME: &str = "appliance";
 
 impl VmSpec {
     pub fn defaults(name: &str) -> Self {
@@ -50,6 +58,34 @@ impl VmSpec {
             host_port: 8081,
             api_port: 6443,
             registry_port: 5052,
+            egress_port: 5053,
+        }
+    }
+
+    /// Resolve the four host ports for `name` so multiple VMs can run
+    /// concurrently without colliding. An existing VM keeps its ports;
+    /// the default VM gets the canonical block; any other new VM gets
+    /// the lowest free contiguous block of four from 8100 upward
+    /// (ingress, api, registry, egress).
+    pub fn allocate_ports(name: &str) -> (u16, u16, u16, u16) {
+        if let Ok(Some(existing)) = crate::store::load_spec(name) {
+            return (existing.host_port, existing.api_port, existing.registry_port, existing.egress_port);
+        }
+        if name == DEFAULT_VM_NAME {
+            return (8081, 6443, 5052, 5053);
+        }
+        let mut used: std::collections::HashSet<u16> = [8081, 6443, 5052, 5053].into_iter().collect();
+        for spec in crate::store::list_specs() {
+            used.extend([spec.host_port, spec.api_port, spec.registry_port, spec.egress_port]);
+        }
+        let mut slot: u16 = 0;
+        loop {
+            let base = 8100 + slot * 4;
+            let block = [base, base + 1, base + 2, base + 3];
+            if block.iter().all(|p| !used.contains(p)) {
+                return (block[0], block[1], block[2], block[3]);
+            }
+            slot += 1;
         }
     }
 }
@@ -121,10 +157,23 @@ pub struct VmStatus {
     pub backend: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Forwarded host ports (present once the VM is defined).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_port: Option<u16>,
 }
 
 fn default_registry_port() -> u16 {
     5052
+}
+
+fn default_egress_port() -> u16 {
+    5053
 }
 
 #[cfg(test)]

@@ -65,6 +65,29 @@ pub fn delete_vm_dir(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// All defined VMs (one per `~/.appliance/vm/<name>/vm.json`). Used to
+/// list VMs and to allocate non-colliding ports for a new one.
+/// Skips the shared `images` dir and any unparseable specs.
+pub fn list_specs() -> Vec<VmSpec> {
+    let mut specs = Vec::new();
+    let Ok(entries) = fs::read_dir(vm_root()) else {
+        return specs;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let spec_path = entry.path().join("vm.json");
+        if let Ok(raw) = fs::read_to_string(&spec_path) {
+            if let Ok(spec) = serde_json::from_str::<VmSpec>(&raw) {
+                specs.push(spec);
+            }
+        }
+    }
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    specs
+}
+
 /// Create the sparse raw data disk if it doesn't exist yet. Sparse so a
 /// 10 GiB disk costs nothing until the guest writes to it.
 pub fn ensure_disk(spec: &VmSpec) -> Result<PathBuf> {

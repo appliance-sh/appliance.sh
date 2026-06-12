@@ -32,6 +32,8 @@ const DEFAULT_VM: &str = "appliance";
 enum Cmd {
     /// Probe whether this machine can run microVMs.
     Doctor,
+    /// List all defined VMs with their ports and running state (JSON).
+    List,
     /// Create (or update) a VM definition and its data disk.
     Create {
         #[arg(default_value = DEFAULT_VM)]
@@ -258,16 +260,25 @@ fn run() -> Result<()> {
             memory,
             disk,
         } => {
+            // Allocate a non-colliding port block so this VM can run
+            // alongside others (the default VM keeps the canonical
+            // 8081/6443/5052/5053; an existing VM keeps its ports).
+            let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(&name);
             let spec = VmSpec {
                 cpus,
                 memory_mib: memory,
                 disk_gib: disk,
+                host_port,
+                api_port,
+                registry_port,
+                egress_port,
                 ..VmSpec::defaults(&name)
             };
             store::save_spec(&spec)?;
             store::ensure_disk(&spec)?;
             images::ensure_image(&spec.image)?;
             println!("created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk)");
+            println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}");
             Ok(())
         }
 
@@ -364,8 +375,7 @@ fn run() -> Result<()> {
             // guard refuses anything off the VM subnet, so this is not
             // an open LAN proxy). Best-effort: a bind clash must not
             // stop the VM from booting.
-            let egress_addr =
-                SocketAddr::from(([0, 0, 0, 0], egress::DEFAULT_EGRESS_PORT));
+            let egress_addr = SocketAddr::from(([0, 0, 0, 0], spec.egress_port));
             if let Err(e) = egress::spawn(&name, egress_addr, false) {
                 eprintln!("warn: egress proxy not started ({e:#}); `appliance vm egress proxy` still works");
             }
@@ -391,17 +401,53 @@ fn run() -> Result<()> {
         }
 
         Cmd::Status { name } => {
-            let exists = store::load_spec(&name)?.is_some();
+            let spec = store::load_spec(&name)?;
             let pid = store::read_live_pid(&name);
             let status = VmStatus {
                 name: name.clone(),
-                exists,
+                exists: spec.is_some(),
                 running: pid.is_some(),
                 pid,
                 backend: backend.name(),
                 message: backend.availability().err().map(|e| format!("{e:#}")),
+                host_port: spec.as_ref().map(|s| s.host_port),
+                api_port: spec.as_ref().map(|s| s.api_port),
+                registry_port: spec.as_ref().map(|s| s.registry_port),
+                egress_port: spec.as_ref().map(|s| s.egress_port),
             };
             println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(())
+        }
+
+        Cmd::List => {
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct VmEntry {
+                name: String,
+                running: bool,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pid: Option<i32>,
+                host_port: u16,
+                api_port: u16,
+                registry_port: u16,
+                egress_port: u16,
+            }
+            let entries: Vec<VmEntry> = store::list_specs()
+                .into_iter()
+                .map(|spec| {
+                    let pid = store::read_live_pid(&spec.name);
+                    VmEntry {
+                        running: pid.is_some(),
+                        pid,
+                        host_port: spec.host_port,
+                        api_port: spec.api_port,
+                        registry_port: spec.registry_port,
+                        egress_port: spec.egress_port,
+                        name: spec.name,
+                    }
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
             Ok(())
         }
 
@@ -504,7 +550,7 @@ fn run_egress(action: EgressCmd) -> Result<()> {
         EgressCmd::Proxy { name, addr, log } => {
             let addr: SocketAddr = match addr {
                 Some(a) => a.parse().with_context(|| format!("invalid --addr '{a}'"))?,
-                None => SocketAddr::from(([127, 0, 0, 1], egress::DEFAULT_EGRESS_PORT)),
+                None => SocketAddr::from(([127, 0, 0, 1], egress::vm_egress_port(&name))),
             };
             egress::run_proxy(&name, addr, log)
         }
@@ -582,7 +628,8 @@ fn run_egress(action: EgressCmd) -> Result<()> {
         }
         EgressCmd::Gateway { name } => {
             let policy = egress::load_policy(&name);
-            let url = egress::guest_proxy_url(&name, egress::DEFAULT_EGRESS_PORT);
+            let port = egress::vm_egress_port(&name);
+            let url = egress::guest_proxy_url(&name, port);
             println!("HTTPS_PROXY={url}");
             println!("HTTP_PROXY={url}");
             if policy.mitm {
@@ -591,8 +638,7 @@ fn run_egress(action: EgressCmd) -> Result<()> {
                 println!("# TLS interception is off — workloads need no CA (blind tunnel).");
             }
             println!(
-                "# The egress proxy starts automatically with the VM. To run it standalone: appliance-vm egress proxy {name} --addr 0.0.0.0:{}",
-                egress::DEFAULT_EGRESS_PORT
+                "# The egress proxy starts automatically with the VM. To run it standalone: appliance-vm egress proxy {name} --addr 0.0.0.0:{port}"
             );
             Ok(())
         }
@@ -618,7 +664,16 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
     if let Some(spec) = store::load_spec(name)? {
         return Ok(spec);
     }
-    let spec = VmSpec::defaults(name);
+    // A VM started without an explicit `create` still needs a
+    // non-colliding port block so it can run beside existing VMs.
+    let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(name);
+    let spec = VmSpec {
+        host_port,
+        api_port,
+        registry_port,
+        egress_port,
+        ..VmSpec::defaults(name)
+    };
     store::save_spec(&spec)?;
     Ok(spec)
 }
