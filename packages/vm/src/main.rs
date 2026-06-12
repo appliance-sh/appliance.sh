@@ -6,6 +6,7 @@ mod mitm;
 mod net;
 mod spec;
 mod store;
+mod traffic;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -159,6 +160,18 @@ enum EgressCmd {
     Sync {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+    },
+    /// Print recorded egress traffic (one JSON event per line / array)
+    /// — the live feed the desktop traffic view consumes.
+    Log {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// Maximum number of most-recent events to print.
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+        /// Forget all recorded traffic instead of printing.
+        #[arg(long, default_value_t = false)]
+        clear: bool,
     },
 }
 
@@ -476,6 +489,16 @@ fn run_egress(action: EgressCmd) -> Result<()> {
         EgressCmd::Sync { name } => {
             egress::publish_configmap(&name)?;
             println!("egress policy published to the cluster for '{name}'");
+            Ok(())
+        }
+        EgressCmd::Log { name, tail, clear } => {
+            if clear {
+                traffic::clear(&name);
+                println!("egress traffic log cleared for '{name}'");
+                return Ok(());
+            }
+            let events = traffic::tail(&name, tail);
+            println!("{}", serde_json::to_string(&events)?);
             Ok(())
         }
     }

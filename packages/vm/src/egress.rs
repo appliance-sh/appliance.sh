@@ -259,14 +259,17 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
             };
             eprintln!("egress: CONNECT {target} -> {action}");
         }
+        let (host, port) = split_host_port(&target);
         if !allowed {
+            crate::traffic::record(&ctx.name, &host, port, "CONNECT", None, "deny");
             return refuse(&mut client, &target);
         }
         if intercept {
-            let (host, port) = split_host_port(&target);
             // The client expects the tunnel up before its TLS hello.
+            // intercept() records the decrypted request line itself.
             client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
             return mitm::intercept(
+                &ctx.name,
                 client,
                 &host,
                 port,
@@ -275,6 +278,7 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
                 log,
             );
         }
+        crate::traffic::record(&ctx.name, &host, port, "CONNECT", None, "allow");
         let upstream = TcpStream::connect(&target).with_context(|| format!("connect {target}"))?;
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         splice(client, upstream)
@@ -288,6 +292,15 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
         if log {
             eprintln!("egress: {method} {host} -> {}", if allowed { "allow" } else { "deny" });
         }
+        let req_path = target_path(&target);
+        crate::traffic::record(
+            &ctx.name,
+            &host,
+            80,
+            &method,
+            Some(&req_path),
+            if allowed { "allow" } else { "deny" },
+        );
         if !allowed {
             return refuse(&mut client, &host);
         }
@@ -341,6 +354,22 @@ fn authority_of(target: &str) -> Option<String> {
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
     (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The path of a proxy request target: origin-form (`/path`) is
+/// returned as-is; absolute-form (`http://host/path`) is reduced to
+/// its path. Defaults to `/`.
+fn target_path(target: &str) -> String {
+    if let Some(rest) = target.strip_prefix("http://").or_else(|| target.strip_prefix("https://")) {
+        match rest.find('/') {
+            Some(i) => rest[i..].to_string(),
+            None => "/".to_string(),
+        }
+    } else if target.starts_with('/') {
+        target.to_string()
+    } else {
+        "/".to_string()
+    }
 }
 
 /// May this peer use the proxy? Loopback (local testing) always; the

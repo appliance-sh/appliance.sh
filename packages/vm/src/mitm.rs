@@ -191,6 +191,7 @@ pub fn client_config() -> Result<Arc<ClientConfig>> {
 /// `client_tcp` has already received the proxy's `200` and is about
 /// to start its TLS handshake.
 pub fn intercept(
+    name: &str,
     client_tcp: TcpStream,
     host: &str,
     port: u16,
@@ -213,6 +214,13 @@ pub fn intercept(
     }
     if log {
         eprintln!("egress mitm: {host} :: {request_line}");
+    }
+    // Record the decrypted request for the desktop traffic view.
+    {
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or("/");
+        crate::traffic::record(name, host, port, method, Some(path), "mitm");
     }
 
     // Only now dial upstream — no wasted connection on a dead client.
