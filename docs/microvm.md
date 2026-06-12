@@ -222,6 +222,23 @@ on`, allowed HTTPS connections are intercepted — the proxy presents
   (`microvm_egress_*`) drive the same `appliance-vm egress` surface so
   the policy file stays single-sourced.
 
+- **Live traffic view**: the proxy records every request decision
+  (host/port/method/path/allow|deny|mitm) to a bounded JSONL log
+  (`traffic.rs`; `appliance vm egress log`). The desktop polls it and
+  renders a Docker-Desktop-style feed with one-click per-host Allow /
+  Block that edits the policy live.
+
+- **Credential capture & injection (apiKeyHelper)**: with
+  interception on, the proxy can keep secrets out of workloads
+  (`creds.rs`). Per host, **capture** lifts a credential header off the
+  decrypted request into a host-side store (`egress-secrets.json`,
+  0600, under the VM dir — outside the guest); **inject** sets that
+  header on the outbound copy, sourced from the stored secret or an
+  `apiKeyHelper` command (its stdout is the credential). Hooked into
+  `mitm::intercept` alongside the `Connection: close` rewrite. Driven
+  by `appliance vm creds …` and the desktop's "Credentials" panel
+  (`microvm_creds_*`). Host-side only — the guest never sees the store.
+
 - **Automatic workload injection**: confinement is applied by policy,
   no per-pod wiring. The host mirrors the active policy into the
   cluster as the `appliance-egress` ConfigMap (proxy URL, NO_PROXY,

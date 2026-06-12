@@ -69,9 +69,35 @@ appliance vm egress allow github.com
 appliance vm egress deny  gist.github.com   # deny wins over allow
 appliance vm egress mitm on         # intercept TLS (decrypt) on allowed HTTPS
 appliance vm egress gateway         # HTTPS_PROXY + CA values for workloads
+appliance vm egress log             # recent traffic as JSON (desktop feed)
 appliance vm egress reset           # back to permissive default
 ```
 
 With `mitm on`, workloads must trust the per-VM CA
 (`~/.appliance/vm/<name>/egress-ca.pem`); the proxy then mints a leaf
 per host on the fly and sees the decrypted request.
+
+The desktop's Runtimes page shows a live **traffic feed** (every
+request the proxy saw, allow/deny/mitm-tagged) with one-click per-host
+Allow / Block — like Docker Desktop's network panel.
+
+## Credential capture & injection (apiKeyHelper)
+
+With interception on, the proxy can keep credentials out of workloads:
+per host, **capture** a credential header off requests into a
+host-side store (outside the VM, written 0600) and/or **inject** it
+onto outbound requests — sourcing the value from the stored secret or
+from an `apiKeyHelper` command (its stdout is the credential).
+
+```bash
+appliance vm creds add api.openai.com --capture --inject   # lift + re-inject Authorization
+appliance vm creds add api.foo.com --inject --helper 'op read op://vault/foo/key'
+appliance vm creds set api.bar.com 'Bearer sk-…'           # paste a secret by hand
+appliance vm creds list                                    # rules + masked secrets (JSON)
+appliance vm creds rm api.openai.com
+appliance vm creds forget                                  # drop all stored secrets
+```
+
+Header defaults to `authorization`; override with `--header`. The
+desktop's **Credentials** panel offers the same per-host rules,
+apiKeyHelper field, and masked secret list.
