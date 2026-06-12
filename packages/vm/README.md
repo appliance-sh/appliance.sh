@@ -44,6 +44,24 @@ appliance deploy <project> <env> --profile microvm
 # → http://<project>-<env>.appliance.localhost:8081, served from the VM
 ```
 
+## Multiple VMs
+
+Several VMs can run at once — e.g. one for interactive development and
+another dedicated to traffic testing. Every command takes a name
+(default `appliance`); each VM gets its own non-colliding block of host
+ports (ingress / kubernetes / registry / egress) and its own
+credentials profile (`microvm` for the default, `microvm-<name>` for
+the rest).
+
+```bash
+appliance vm up --name traffic        # boots a second VM on its own ports
+appliance vm list                     # all VMs with ports + running state
+appliance deploy <project> <env> --profile microvm-traffic
+```
+
+The default `appliance` VM keeps the canonical 8081/6443/5052/5053;
+additional VMs are allocated a contiguous block from 8100 upward.
+
 ## Connect & shell
 
 ```bash

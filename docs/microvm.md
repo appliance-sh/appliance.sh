@@ -127,6 +127,19 @@ point; nothing above it changes:
 Because `.localhost` names resolve to 127.0.0.1 everywhere, hostname
 routing needs zero new machinery — only the port forward.
 
+### Multiple VMs
+
+Several VMs run concurrently — one for interactive development, another
+for traffic testing. Each VM persists its own four host ports (ingress /
+kubernetes / registry / egress) in its `vm.json` and gets a
+non-colliding block at create: the default `appliance` VM keeps the
+canonical `8081/6443/5052/5053`; any other VM is allocated the lowest
+free contiguous block of four from `8100` upward (`VmSpec::allocate_ports`).
+Each registers as its own desktop cluster (`microvm` / `microvm-<name>`,
+the same string as its CLI credentials profile), so the deploy wizard,
+cluster switcher, and kubectl reads target the right VM. `appliance vm
+list` reports every VM with its ports and running state.
+
 ### Packaging — one executable
 
 `appliance-vm` builds as a single static-ish binary per platform:
