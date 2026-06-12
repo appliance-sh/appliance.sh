@@ -1,9 +1,19 @@
 import * as k8s from '@kubernetes/client-node';
+import * as fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
 
 const execFileAsync = promisify(execFile);
+
+// Egress confinement (see docs/microvm.md): the host (appliance-vm)
+// publishes the policy into this ConfigMap; the executor reflects it
+// into every workload's pod spec so the desktop's outbound-traffic
+// controls apply without per-deploy wiring.
+const EGRESS_CONFIGMAP = 'appliance-egress';
+// CA the api-server derives for interception: `ca.crt` (the CA alone)
+// + `ca-bundle.crt` (system roots + the CA), mounted into workloads.
+const EGRESS_CA_BUNDLE_CONFIGMAP = 'appliance-egress-ca-bundle';
 
 export const DEFAULT_LOCAL_CLUSTER_NAME = 'appliance-local';
 export const DEFAULT_LOCAL_NAMESPACE = 'appliance';
@@ -130,6 +140,7 @@ export class KubernetesDeploymentService {
 
     const nodePort = deterministicNodePort(stackName);
     const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
+    const egress = await this.resolveEgress();
     const manifest = renderManifest({
       name: stackName,
       namespace: this.cluster.namespace,
@@ -140,6 +151,7 @@ export class KubernetesDeploymentService {
       metadata,
       hostname,
       ingressClassName: this.cluster.ingressClassName,
+      egress,
     });
 
     const before = await this.getDeploymentImage(stackName);
@@ -169,6 +181,73 @@ export class KubernetesDeploymentService {
       stackName,
       url: hostnameUrl,
     };
+  }
+
+  /**
+   * Resolve the active egress confinement (if any) from the
+   * host-published `appliance-egress` ConfigMap. Absent ConfigMap →
+   * no confinement (the common case; only the microVM engine
+   * publishes it). When interception is on, the per-workload CA
+   * bundle is ensured here and its ConfigMap name returned for
+   * mounting. Best-effort throughout: egress wiring must never break
+   * an otherwise-valid deploy.
+   */
+  private async resolveEgress(): Promise<EgressInjection | undefined> {
+    let data: Record<string, string> | undefined;
+    try {
+      const cm = await this.core.readNamespacedConfigMap({
+        name: EGRESS_CONFIGMAP,
+        namespace: this.cluster.namespace,
+      });
+      data = cm.data ?? undefined;
+    } catch {
+      return undefined; // not configured (or unreadable) → no confinement
+    }
+    if (!data?.proxyUrl) return undefined;
+
+    let caConfigMap: string | undefined;
+    if (data.mitm === 'true' && data['ca.crt']) {
+      try {
+        caConfigMap = await this.ensureCaBundleConfigMap(data['ca.crt']);
+      } catch (err) {
+        // Degrade to blind tunnel: the proxy still enforces allow/deny
+        // (the load-bearing control); only TLS decrypt-trust is lost.
+        console.warn(`egress: CA bundle unavailable, deploying without interceptor trust: ${String(err)}`);
+      }
+    }
+    return { proxyUrl: data.proxyUrl, noProxy: data.noProxy ?? '', caConfigMap };
+  }
+
+  /**
+   * Ensure the `appliance-egress-ca-bundle` ConfigMap holds the CA the
+   * proxy signs with, both alone (`ca.crt`, for additive trust stores
+   * like Node) and combined with this api-server image's own root
+   * bundle (`ca-bundle.crt`, for replace-style stores like OpenSSL so
+   * direct TLS to NO_PROXY hosts keeps validating). Returns its name.
+   */
+  private async ensureCaBundleConfigMap(caPem: string): Promise<string> {
+    const ca = `${caPem.trim()}\n`;
+    const roots = readSystemRootsBundle();
+    const data = {
+      'ca.crt': ca,
+      'ca-bundle.crt': roots ? `${roots.trimEnd()}\n${ca}` : ca,
+    };
+    const name = EGRESS_CA_BUNDLE_CONFIGMAP;
+    const namespace = this.cluster.namespace;
+    const body: k8s.V1ConfigMap = { metadata: { name, namespace }, data };
+    let exists = false;
+    try {
+      await this.core.readNamespacedConfigMap({ name, namespace });
+      exists = true;
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      await this.core.replaceNamespacedConfigMap({ name, namespace, body });
+    } else {
+      await this.core.createNamespacedConfigMap({ namespace, body });
+    }
+    return name;
   }
 
   async destroy(stackName: string): Promise<LocalDeploymentResult> {
@@ -555,6 +634,59 @@ export interface ManifestParams {
   hostname: string;
   /** IngressClass the Ingress declares (k3s/k3d ships `traefik`). */
   ingressClassName: string;
+  /** Outbound-traffic confinement. When set, the workload is wired to
+   *  route egress through the runtime's proxy (HTTP(S)_PROXY) so the
+   *  desktop's allow/deny policy applies. Absent → no confinement. */
+  egress?: EgressInjection;
+}
+
+export interface EgressInjection {
+  /** Forward-proxy URL workloads send outbound traffic through
+   *  (e.g. `http://192.168.64.1:5053`). */
+  proxyUrl: string;
+  /** Comma-separated NO_PROXY value bypassing cluster-internal
+   *  destinations (kube API, services, pod/service CIDRs). */
+  noProxy: string;
+  /** When TLS interception is on, the name of a ConfigMap holding the
+   *  CA the proxy signs with. Mounted into the pod so it trusts the
+   *  interceptor. Expected keys: `ca.crt` (the CA alone, for
+   *  additive trust stores like Node) and `ca-bundle.crt` (system
+   *  roots + the CA, for replace-style stores like OpenSSL). Omitted →
+   *  blind tunnel, no CA needed. */
+  caConfigMap?: string;
+}
+
+/** Where the egress CA ConfigMap is mounted inside workloads. */
+const EGRESS_CA_MOUNT = '/etc/appliance-egress';
+
+/**
+ * Proxy env + (when intercepting) CA-trust env a confined workload
+ * gets. Egress vars take precedence over user env so confinement
+ * can't be silently disabled by an app's own PROXY settings.
+ */
+function egressEnv(egress: EgressInjection): Record<string, string> {
+  const env: Record<string, string> = {
+    HTTP_PROXY: egress.proxyUrl,
+    HTTPS_PROXY: egress.proxyUrl,
+    NO_PROXY: egress.noProxy,
+    // Lowercase variants — many runtimes only read one casing.
+    http_proxy: egress.proxyUrl,
+    https_proxy: egress.proxyUrl,
+    no_proxy: egress.noProxy,
+  };
+  if (egress.caConfigMap) {
+    const ca = `${EGRESS_CA_MOUNT}/ca.crt`;
+    const bundle = `${EGRESS_CA_MOUNT}/ca-bundle.crt`;
+    // NODE_EXTRA_CA_CERTS is additive (keeps Node's built-ins) → the
+    // CA alone. The OpenSSL-family vars replace the trust store, so
+    // they get the combined bundle to avoid breaking direct TLS to
+    // NO_PROXY hosts.
+    env.NODE_EXTRA_CA_CERTS = ca;
+    env.SSL_CERT_FILE = bundle;
+    env.REQUESTS_CA_BUNDLE = bundle;
+    env.GIT_SSL_CAINFO = bundle;
+  }
+  return env;
 }
 
 /**
@@ -574,7 +706,17 @@ export function deterministicNodePort(stackName: string): number {
 }
 
 export function renderManifest(params: ManifestParams): string {
-  const { name, namespace, image, port, nodePort, env, metadata, hostname, ingressClassName } = params;
+  const { name, namespace, image, port, nodePort, metadata, hostname, ingressClassName, egress } = params;
+  // Egress confinement overlays proxy/CA vars on the user env (egress
+  // wins) and, when intercepting, mounts the CA the proxy signs with.
+  const env: Record<string, string> = egress ? { ...params.env, ...egressEnv(egress) } : params.env;
+  const mountCa = Boolean(egress?.caConfigMap);
+  const volumeMountsSection = mountCa
+    ? `\n        volumeMounts:\n        - name: appliance-egress-ca\n          mountPath: ${yamlString(EGRESS_CA_MOUNT)}\n          readOnly: true`
+    : '';
+  const volumesSection = mountCa
+    ? `\n      volumes:\n      - name: appliance-egress-ca\n        configMap:\n          name: ${yamlString(egress!.caConfigMap!)}`
+    : '';
   // Cluster-IP for in-cluster reachability would be ideal, but the
   // dev story is "hit the appliance from a browser on the host", so
   // we publish via NodePort. k3d's built-in loadbalancer hairpins
@@ -620,7 +762,7 @@ spec:
         image: ${yamlString(image)}
         imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: ${port}${envSection}
+        - containerPort: ${port}${envSection}${volumeMountsSection}${volumesSection}
 ---
 apiVersion: v1
 kind: Service
@@ -671,6 +813,21 @@ spec:
  * makes the rendered manifest unambiguous regardless of caller
  * input. Escapes only `\` and `"` inside the quoted form.
  */
+/** Read this process's system CA root bundle (the api-server runs in
+ *  a container whose image ships public roots) so the egress CA can be
+ *  appended to it rather than replacing it. Empty when none is found. */
+function readSystemRootsBundle(): string {
+  for (const p of ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt', '/etc/ssl/cert.pem']) {
+    try {
+      const pem = fs.readFileSync(p, 'utf8');
+      if (pem.includes('BEGIN CERTIFICATE')) return pem;
+    } catch {
+      // try next
+    }
+  }
+  return '';
+}
+
 function yamlString(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }

@@ -142,6 +142,63 @@ describe('renderManifest', () => {
     const yaml = renderManifest({ ...baseParams });
     expect(yaml).not.toContain('nodePort:');
   });
+
+  describe('egress injection', () => {
+    const egress = { proxyUrl: 'http://192.168.64.1:5053', noProxy: '.svc,10.42.0.0/16' };
+
+    it('injects proxy env (both casings) and NO_PROXY when egress is set', () => {
+      const yaml = renderManifest({ ...baseParams, egress });
+      expect(yaml).toContain('- name: "HTTP_PROXY"');
+      expect(yaml).toContain('- name: "HTTPS_PROXY"');
+      expect(yaml).toContain('- name: "http_proxy"');
+      expect(yaml).toContain('value: "http://192.168.64.1:5053"');
+      expect(yaml).toContain('- name: "NO_PROXY"');
+      expect(yaml).toContain('value: ".svc,10.42.0.0/16"');
+    });
+
+    it('does not mount a CA when interception is off (blind tunnel)', () => {
+      const yaml = renderManifest({ ...baseParams, egress });
+      expect(yaml).not.toContain('volumeMounts:');
+      expect(yaml).not.toContain('appliance-egress-ca');
+      expect(yaml).not.toContain('NODE_EXTRA_CA_CERTS');
+    });
+
+    it('mounts the CA configmap and sets CA-trust env when intercepting', () => {
+      const yaml = renderManifest({
+        ...baseParams,
+        egress: { ...egress, caConfigMap: 'appliance-egress-ca-bundle' },
+      });
+      // CA-trust env: additive for Node, combined bundle for OpenSSL.
+      expect(yaml).toContain('- name: "NODE_EXTRA_CA_CERTS"');
+      expect(yaml).toContain('value: "/etc/appliance-egress/ca.crt"');
+      expect(yaml).toContain('- name: "SSL_CERT_FILE"');
+      expect(yaml).toContain('- name: "REQUESTS_CA_BUNDLE"');
+      expect(yaml).toContain('value: "/etc/appliance-egress/ca-bundle.crt"');
+      // Volume + mount wired to the configmap.
+      expect(yaml).toContain('volumeMounts:');
+      expect(yaml).toContain('mountPath: "/etc/appliance-egress"');
+      expect(yaml).toContain('volumes:');
+      expect(yaml).toContain('name: "appliance-egress-ca-bundle"');
+    });
+
+    it('egress proxy vars win over user-supplied env', () => {
+      const yaml = renderManifest({
+        ...baseParams,
+        env: { HTTP_PROXY: 'http://evil:9999', PORT: '3000' },
+        egress,
+      });
+      expect(yaml).toContain('value: "http://192.168.64.1:5053"');
+      expect(yaml).not.toContain('http://evil:9999');
+      // User's non-conflicting env is preserved.
+      expect(yaml).toContain('- name: "PORT"');
+    });
+
+    it('renders no proxy env or volumes when egress is absent', () => {
+      const yaml = renderManifest(baseParams);
+      expect(yaml).not.toContain('HTTP_PROXY');
+      expect(yaml).not.toContain('volumes:');
+    });
+  });
 });
 
 describe('applianceHostname / applianceHostnameUrl', () => {
