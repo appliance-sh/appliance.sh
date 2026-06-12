@@ -1,3 +1,22 @@
+## 1.47.0 (2026-06-12)
+
+### Features
+
+- **api-server:** inject egress proxy + CA into local workloads ([452aaff](https://github.com/appliance-sh/appliance.sh/commit/452aaff))
+- **desktop:** build and copy vm image ([a675280](https://github.com/appliance-sh/appliance.sh/commit/a675280))
+- **vm:** improve installation experience ([a9eb457](https://github.com/appliance-sh/appliance.sh/commit/a9eb457))
+- **vm:** improve installation experience ([58c9394](https://github.com/appliance-sh/appliance.sh/commit/58c9394))
+- **vm:** shell into local runtimes + egress control with TLS interception ([e796cb9](https://github.com/appliance-sh/appliance.sh/commit/e796cb9))
+- **vm:** publish egress policy to the cluster for api-server injection ([95b5d50](https://github.com/appliance-sh/appliance.sh/commit/95b5d50))
+
+### Bug Fixes
+
+- **desktop:** local runtime improvements ([5b9f45b](https://github.com/appliance-sh/appliance.sh/commit/5b9f45b))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.46.0 (2026-06-11)
 
 ### Features
