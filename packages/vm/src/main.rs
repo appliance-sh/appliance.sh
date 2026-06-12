@@ -153,6 +153,13 @@ enum EgressCmd {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
+    /// Publish the current policy into the cluster (the api-server
+    /// reads it to inject proxy + CA into workloads). Runs
+    /// automatically after policy changes and on `vm up`.
+    Sync {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
 }
 
 fn main() {
@@ -392,6 +399,7 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             let mut policy = egress::load_policy(&name);
             policy.default = parsed;
             egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
             println!("egress default for '{name}' set to {:?}", parsed);
             Ok(())
         }
@@ -402,6 +410,7 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             }
             policy.deny.retain(|h| h != &host);
             egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
             println!("egress: allow {host}");
             Ok(())
         }
@@ -412,11 +421,13 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             }
             policy.allow.retain(|h| h != &host);
             egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
             println!("egress: deny {host}");
             Ok(())
         }
         EgressCmd::Reset { name } => {
             egress::save_policy(&name, &egress::EgressPolicy::default())?;
+            let _ = egress::publish_configmap(&name);
             println!("egress policy for '{name}' reset (default allow, no rules)");
             Ok(())
         }
@@ -439,6 +450,7 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             let mut policy = egress::load_policy(&name);
             policy.mitm = on;
             egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
             println!("egress TLS interception for '{name}': {}", if on { "on" } else { "off" });
             if on {
                 println!("CA: {}", mitm::ca_cert_path(&name).display());
@@ -459,6 +471,11 @@ fn run_egress(action: EgressCmd) -> Result<()> {
                 "# The egress proxy starts automatically with the VM. To run it standalone: appliance-vm egress proxy {name} --addr 0.0.0.0:{}",
                 egress::DEFAULT_EGRESS_PORT
             );
+            Ok(())
+        }
+        EgressCmd::Sync { name } => {
+            egress::publish_configmap(&name)?;
+            println!("egress policy published to the cluster for '{name}'");
             Ok(())
         }
     }

@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::mitm;
@@ -86,6 +87,13 @@ fn host_matches(host: &str, suffix: &str) -> bool {
 }
 
 impl EgressPolicy {
+    /// Is this policy doing anything? A permissive default with no
+    /// rules and no interception is inert — workloads need not be
+    /// routed through the proxy at all.
+    pub fn is_active(&self) -> bool {
+        self.default == Action::Deny || !self.allow.is_empty() || !self.deny.is_empty() || self.mitm
+    }
+
     /// Allow this destination host? Deny rules win, then allow rules,
     /// then the default. `host` may carry a `:port` — it's stripped.
     pub fn allows(&self, host_port: &str) -> bool {
@@ -392,6 +400,107 @@ fn split_host_port(target: &str) -> (String, u16) {
 /// registry ports and the ingress/api forwards.
 pub const DEFAULT_EGRESS_PORT: u16 = 5053;
 
+/// Kubernetes namespace the api-server + workloads live in (mirrors
+/// DEFAULT_LOCAL_NAMESPACE in @appliance.sh/infra).
+const CLUSTER_NAMESPACE: &str = "appliance";
+
+/// NO_PROXY value for confined workloads: bypass the proxy for
+/// cluster-internal destinations (kube API, services, the k3s pod/
+/// service CIDRs) so only real outbound traffic is policed.
+fn default_no_proxy() -> &'static str {
+    "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,.cluster.local,10.42.0.0/16,10.43.0.0/16,kubernetes.default"
+}
+
+fn which_kubectl() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let managed = home.join(".appliance").join("bin").join("kubectl");
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
+    // Fall back to PATH resolution by name.
+    Some(PathBuf::from("kubectl"))
+}
+
+/// Render the `appliance-egress` ConfigMap the in-VM api-server reads
+/// to inject proxy + CA into workloads. `ca` (PEM) is embedded only
+/// when interception is on.
+fn render_configmap(proxy_url: &str, no_proxy: &str, mitm: bool, ca: Option<&str>) -> String {
+    let mut out = format!(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: appliance-egress\n  namespace: {CLUSTER_NAMESPACE}\n  labels:\n    app.kubernetes.io/managed-by: appliance.sh\ndata:\n  proxyUrl: {proxy_url:?}\n  noProxy: {no_proxy:?}\n  mitm: {:?}\n",
+        if mitm { "true" } else { "false" }
+    );
+    if let Some(pem) = ca {
+        out.push_str("  ca.crt: |\n");
+        for line in pem.lines() {
+            out.push_str("    ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Publish the current egress policy into the cluster as the
+/// `appliance-egress` ConfigMap. Best-effort: needs the VM up
+/// (kubeconfig present) and kubectl available; silently no-ops
+/// otherwise so policy edits never fail on a down cluster.
+pub fn publish_configmap(name: &str) -> Result<()> {
+    let kubeconfig = VmPaths::for_name(name).kubeconfig();
+    if !kubeconfig.exists() {
+        return Ok(());
+    }
+    let Some(kubectl) = which_kubectl() else {
+        return Ok(());
+    };
+    let kc = kubeconfig.to_string_lossy();
+    let policy = load_policy(name);
+
+    // Inert policy → no confinement: remove any prior ConfigMap so the
+    // api-server stops routing workloads through the proxy.
+    if !policy.is_active() {
+        let _ = Command::new(&kubectl)
+            .args([
+                "--kubeconfig",
+                &kc,
+                "-n",
+                CLUSTER_NAMESPACE,
+                "delete",
+                "configmap",
+                "appliance-egress",
+                "--ignore-not-found",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return Ok(());
+    }
+
+    let proxy_url = guest_proxy_url(name, DEFAULT_EGRESS_PORT);
+    let ca = if policy.mitm {
+        std::fs::read_to_string(mitm::ca_cert_path(name)).ok()
+    } else {
+        None
+    };
+    let manifest = render_configmap(&proxy_url, default_no_proxy(), policy.mitm, ca.as_deref());
+
+    let mut child = match Command::new(&kubectl)
+        .args(["--kubeconfig", &kc, "apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // kubectl missing → skip
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(manifest.as_bytes());
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +574,26 @@ mod tests {
         assert_eq!(authority_of("http://example.com:8080/p").as_deref(), Some("example.com"));
         assert_eq!(authority_of("https://api.test").as_deref(), Some("api.test"));
         assert_eq!(authority_of("/just/a/path"), None);
+    }
+
+    #[test]
+    fn configmap_embeds_policy_and_quotes_values() {
+        let cm = render_configmap("http://192.168.64.1:5053", "localhost,.svc", true, Some("PEMDATA"));
+        assert!(cm.contains("kind: ConfigMap"));
+        assert!(cm.contains("name: appliance-egress"));
+        assert!(cm.contains("namespace: appliance"));
+        assert!(cm.contains("proxyUrl: \"http://192.168.64.1:5053\""));
+        assert!(cm.contains("noProxy: \"localhost,.svc\""));
+        assert!(cm.contains("mitm: \"true\""));
+        // CA embedded as an indented block scalar.
+        assert!(cm.contains("ca.crt: |\n    PEMDATA"));
+    }
+
+    #[test]
+    fn configmap_omits_ca_when_mitm_off() {
+        let cm = render_configmap("http://x:5053", "localhost", false, None);
+        assert!(cm.contains("mitm: \"false\""));
+        assert!(!cm.contains("ca.crt"));
     }
 
     #[test]

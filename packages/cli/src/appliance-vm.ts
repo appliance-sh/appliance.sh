@@ -177,6 +177,11 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
     );
   }
 
+  // Publish the egress policy into the cluster now that the namespace
+  // exists, so the api-server can confine workloads per policy. Best-
+  // effort: a permissive default policy is a harmless no-op.
+  runVm(['egress', 'sync', name]);
+
   console.log();
   console.log(chalk.green('MicroVM runtime is up.'));
   console.log(`  API server:  ${apiServerUrl}`);
@@ -506,6 +511,14 @@ egress
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .action((opts: { name: string }) => {
     process.exit(runVm(['egress', 'gateway', opts.name]));
+  });
+
+egress
+  .command('sync')
+  .description('publish the policy into the cluster (the api-server injects it into workloads)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'sync', opts.name]));
   });
 
 program.parse(process.argv);
