@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link } from 'react-router';
 import { useQuery, useQueries } from '@tanstack/react-query';
-import { Plug, Wand, Laptop, Plus, Search } from 'lucide-react';
+import { Plug, Wand, Laptop, Plus, Search, Server } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -20,10 +20,18 @@ export function DashboardPage() {
   const host = useHost();
   const canBootstrap = Boolean(host.bootstrap);
   const canBootstrapLocal = Boolean(host.local?.startRuntime);
+  const canBootstrapMicroVm = Boolean(host.vm);
   const { cluster, isLoading } = useSelectedCluster();
 
   if (isLoading) return null;
-  if (!cluster) return <GetStarted canBootstrap={canBootstrap} canBootstrapLocal={canBootstrapLocal} />;
+  if (!cluster)
+    return (
+      <GetStarted
+        canBootstrap={canBootstrap}
+        canBootstrapLocal={canBootstrapLocal}
+        canBootstrapMicroVm={canBootstrapMicroVm}
+      />
+    );
 
   return <Overview clusterName={cluster.name} serverUrl={cluster.apiServerUrl} />;
 }
@@ -268,30 +276,49 @@ function RecentActivity({
 
 // ---- first-run (no cluster) ----------------------------------------------
 
-function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean; canBootstrapLocal: boolean }) {
-  // Local is the recommended starting point — zero cloud cost, no
-  // AWS credentials needed, runs on the operator's own machine. When
-  // available we promote it to primary and let AWS / Connect sit
-  // alongside as alternatives.
+function GetStarted({
+  canBootstrap,
+  canBootstrapLocal,
+  canBootstrapMicroVm,
+}: {
+  canBootstrap: boolean;
+  canBootstrapLocal: boolean;
+  canBootstrapMicroVm: boolean;
+}) {
+  // Local engines are the recommended starting point — zero cloud cost,
+  // no AWS credentials, run on the operator's own machine. When
+  // available we promote them to primary and let AWS / Connect sit
+  // alongside as alternatives. k3d and the microVM are peers.
+  const anyLocal = canBootstrapLocal || canBootstrapMicroVm;
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Install and run applications on a cluster. Start with a local runtime on this device, provision an AWS
-          cluster, or connect to one you already have.
+          Install and run applications on a cluster. Start a local engine on this device, provision an AWS cluster, or
+          connect to one you already have.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {canBootstrapLocal ? (
           <ActionCard
             icon={Laptop}
             title="Start a local runtime"
-            body="Spin up a local cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
+            body="A k3d cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
             cta="Start"
             to="/bootstrap?mode=local"
             primary
+          />
+        ) : null}
+        {canBootstrapMicroVm ? (
+          <ActionCard
+            icon={Server}
+            title="Start a microVM"
+            body="An isolated VM Appliance boots itself — stronger isolation, no docker provider for the cluster. Same local dev loop."
+            cta="Start"
+            to="/bootstrap?mode=microvm"
+            primary={!canBootstrapLocal}
           />
         ) : null}
         {canBootstrap ? (
@@ -301,7 +328,7 @@ function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean
             body="Provision the base AWS infrastructure from this machine using your current credentials."
             cta="Start wizard"
             to="/bootstrap?mode=aws"
-            primary={!canBootstrapLocal}
+            primary={!anyLocal}
           />
         ) : null}
         <ActionCard
@@ -310,7 +337,7 @@ function GetStarted({ canBootstrap, canBootstrapLocal }: { canBootstrap: boolean
           body="Point this console at an api-server you already have by entering its URL and an API key."
           cta="Connect"
           to="/connect"
-          primary={!canBootstrap && !canBootstrapLocal}
+          primary={!canBootstrap && !anyLocal}
         />
       </div>
     </div>

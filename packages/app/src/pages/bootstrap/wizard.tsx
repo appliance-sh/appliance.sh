@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
-import { Cloud, ChevronLeft, Laptop } from 'lucide-react';
+import { Cloud, ChevronLeft, Laptop, Server } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 
@@ -23,18 +23,21 @@ const REGIONS = [
 /**
  * Discriminator for the two bootstrap paths the wizard now drives.
  *
- *   - 'aws'   : the existing 3-phase Pulumi flow (installer stack +
- *               api-server + state promotion). Targets a cloud
- *               install reachable from anywhere.
- *   - 'local' : a single-step setup that spins up the desktop's k3d
- *               cluster and in-process api-server. Targets a dev
- *               loop on the operator's own machine.
+ *   - 'aws'     : the existing 3-phase Pulumi flow (installer stack +
+ *                 api-server + state promotion). Targets a cloud
+ *                 install reachable from anywhere.
+ *   - 'local'   : a single-step setup that spins up the desktop's k3d
+ *                 cluster and in-process api-server. Targets a dev
+ *                 loop on the operator's own machine.
+ *   - 'microvm' : boots an isolated VM Appliance owns (appliance-vm) —
+ *                 no docker provider for the cluster — and registers it.
+ *                 The same local dev loop, a different engine.
  *
- * Both modes funnel through `/bootstrap/run` which dispatches on this
+ * All modes funnel through `/bootstrap/run` which dispatches on this
  * field. The mode can be pre-selected via `?mode=local` (the
- * dashboard's "Local Runtime" card uses this to skip the picker).
+ * dashboard's engine cards use this to skip the picker).
  */
-export type WizardMode = 'aws' | 'local';
+export type WizardMode = 'aws' | 'local' | 'microvm';
 
 export interface AwsWizardValues {
   mode: 'aws';
@@ -66,7 +69,13 @@ export interface LocalWizardValues {
   hostnameSuffix?: string;
 }
 
-export type WizardValues = AwsWizardValues | LocalWizardValues;
+export interface MicroVmWizardValues {
+  mode: 'microvm';
+  /** VM name. Defaults to the canonical `appliance` VM. */
+  name?: string;
+}
+
+export type WizardValues = AwsWizardValues | LocalWizardValues | MicroVmWizardValues;
 
 export function BootstrapWizardPage() {
   const host = useHost();
@@ -74,13 +83,18 @@ export function BootstrapWizardPage() {
   const [searchParams] = useSearchParams();
   const bootstrapAvailable = Boolean(host.bootstrap);
   const localAvailable = Boolean(host.local?.startRuntime);
+  const microVmAvailable = Boolean(host.vm);
 
   // Read `?mode=` once so deep-linking from the dashboard (e.g.
   // `/bootstrap?mode=local`) skips the picker. Default to the picker.
-  const presetMode = parseMode(searchParams.get('mode'), { aws: bootstrapAvailable, local: localAvailable });
+  const presetMode = parseMode(searchParams.get('mode'), {
+    aws: bootstrapAvailable,
+    local: localAvailable,
+    microvm: microVmAvailable,
+  });
   const [mode, setMode] = React.useState<WizardMode | null>(presetMode);
 
-  if (!bootstrapAvailable && !localAvailable) {
+  if (!bootstrapAvailable && !localAvailable && !microVmAvailable) {
     return (
       <div className="mx-auto max-w-md space-y-4 pt-16">
         <h1 className="text-2xl font-semibold">Bootstrap unavailable</h1>
@@ -98,6 +112,7 @@ export function BootstrapWizardPage() {
       <ModePicker
         awsAvailable={bootstrapAvailable}
         localAvailable={localAvailable}
+        microVmAvailable={microVmAvailable}
         onPick={(m) => setMode(m)}
         onCancel={() => navigate('/')}
       />
@@ -107,6 +122,15 @@ export function BootstrapWizardPage() {
   if (mode === 'aws') {
     return (
       <AwsForm
+        onBack={presetMode ? null : () => setMode(null)}
+        onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
+      />
+    );
+  }
+
+  if (mode === 'microvm') {
+    return (
+      <MicroVmForm
         onBack={presetMode ? null : () => setMode(null)}
         onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
       />
@@ -126,37 +150,52 @@ export function BootstrapWizardPage() {
 function ModePicker({
   awsAvailable,
   localAvailable,
+  microVmAvailable,
   onPick,
   onCancel,
 }: {
   awsAvailable: boolean;
   localAvailable: boolean;
+  microVmAvailable: boolean;
   onPick: (mode: WizardMode) => void;
   onCancel: () => void;
 }) {
   return (
-    <div className="mx-auto max-w-2xl space-y-6 pt-12">
+    <div className="mx-auto max-w-3xl space-y-6 pt-12">
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">New installation</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Pick a target. Local runs entirely on this machine via a k3d cluster — perfect for development. AWS provisions
-          a cloud-resident installation reachable from anywhere.
+          Pick a target. The two local engines run entirely on this machine — perfect for development. AWS provisions a
+          cloud-resident installation reachable from anywhere.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-3">
         <ModeCard
           icon={Laptop}
           title="Local Runtime"
           body={
             <>
-              Spin up a k3d cluster + in-process api-server on this device. Requires Docker. Apps publish at{' '}
+              A k3d cluster + in-process api-server on this device. Requires Docker. Apps publish at{' '}
               <code className="text-[11px]">&lt;project&gt;-&lt;env&gt;.appliance.localhost</code>.
             </>
           }
           available={localAvailable}
           disabledReason="Local Runtime needs the desktop app — the web shell can't drive k3d."
           onClick={() => onPick('local')}
+        />
+        <ModeCard
+          icon={Server}
+          title="MicroVM"
+          body={
+            <>
+              An isolated VM Appliance boots itself — no docker provider for the cluster. Same{' '}
+              <code className="text-[11px]">*.appliance.localhost</code> dev loop, stronger isolation.
+            </>
+          }
+          available={microVmAvailable}
+          disabledReason="The microVM engine needs the desktop app."
+          onClick={() => onPick('microvm')}
         />
         <ModeCard
           icon={Cloud}
@@ -206,10 +245,77 @@ function ModeCard({
   );
 }
 
-function parseMode(raw: string | null, capability: { aws: boolean; local: boolean }): WizardMode | null {
+function parseMode(
+  raw: string | null,
+  capability: { aws: boolean; local: boolean; microvm: boolean }
+): WizardMode | null {
   if (raw === 'aws' && capability.aws) return 'aws';
   if (raw === 'local' && capability.local) return 'local';
+  if (raw === 'microvm' && capability.microvm) return 'microvm';
   return null;
+}
+
+// ---- microVM form -----------------------------------------------------
+
+function MicroVmForm({
+  onBack,
+  onSubmit,
+}: {
+  onBack: (() => void) | null;
+  onSubmit: (values: MicroVmWizardValues) => void;
+}) {
+  const [name, setName] = React.useState('');
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const n = name.trim();
+    if (n && !/^[a-z0-9][a-z0-9-]*$/.test(n)) {
+      setErr('Use lowercase letters, digits, and dashes (e.g. "traffic").');
+      return;
+    }
+    onSubmit({ mode: 'microvm', name: n || undefined });
+  };
+
+  return (
+    <div className="mx-auto max-w-md space-y-6 pt-12">
+      {onBack ? (
+        <Button variant="ghost" size="sm" className="-ml-2" onClick={onBack}>
+          <ChevronLeft className="h-4 w-4" /> Back
+        </Button>
+      ) : null}
+
+      <div className="space-y-2">
+        <h1 className="text-2xl font-semibold">MicroVM</h1>
+        <p className="text-sm text-[var(--color-muted-foreground)]">
+          Start brings up an isolated VM, bootstraps its api-server, and registers it as a cluster. The engine binary
+          installs automatically if needed; host ports are allocated for you. Run several VMs side by side — one for
+          development, one for traffic testing.
+        </p>
+      </div>
+
+      <form className="space-y-4" onSubmit={handleSubmit}>
+        <Field label="VM name" hint="default: appliance — name a second VM (e.g. traffic) to run it alongside">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setErr(null);
+            }}
+            placeholder="appliance"
+            className={inputCls}
+          />
+        </Field>
+
+        {err ? <p className="text-xs text-red-300">{err}</p> : null}
+
+        <Button type="submit" className="w-full">
+          Start
+        </Button>
+      </form>
+    </div>
+  );
 }
 
 // ---- local form -------------------------------------------------------

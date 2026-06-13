@@ -12,7 +12,8 @@ import type {
   BootstrapResult,
   LocalRuntimeStatus,
 } from '@/lib/host';
-import type { AwsWizardValues, LocalWizardValues, WizardValues } from './wizard';
+import type { AwsWizardValues, LocalWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
+import { microVmClusterId } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
 type PhaseState = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -37,6 +38,9 @@ export function BootstrapProgressPage() {
   // bootstrap's state machine stays untouched.
   if (values?.mode === 'local') {
     return <LocalProgress values={values} />;
+  }
+  if (values?.mode === 'microvm') {
+    return <MicroVmProgress values={values} />;
   }
   if (!values || values.mode === 'aws') {
     return <AwsProgress values={values} />;
@@ -494,6 +498,143 @@ function LocalProgress({ values }: { values: LocalWizardValues }) {
             ) : null}
           </dl>
           <Button onClick={() => navigate('/')}>Open dashboard</Button>
+        </div>
+      ) : null}
+
+      {error ? (
+        <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
+          <div className="font-medium text-red-400">Start failed</div>
+          <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div>
+          <div className="mt-3 flex gap-2">
+            <Button onClick={() => void start()} disabled={retrying}>
+              {retrying ? 'Retrying…' : 'Retry'}
+            </Button>
+            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
+              Start over
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
+  const host = useHost();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const name = values.name?.trim() || 'appliance';
+  const vmHost = host.vm;
+
+  const [phase, setPhase] = React.useState<LocalPhase>('starting');
+  const [logs, setLogs] = React.useState<LogLine[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const [retrying, setRetrying] = React.useState(false);
+  const startedRef = React.useRef(false);
+  const logIdRef = React.useRef(0);
+
+  const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
+    logIdRef.current += 1;
+    setLogs((prev) => [...prev, { id: logIdRef.current, level, message }]);
+  }, []);
+
+  const start = React.useCallback(async () => {
+    if (!vmHost) {
+      setError('The microVM engine is only available in the desktop app.');
+      setPhase('failed');
+      return;
+    }
+    setError(null);
+    setPhase('starting');
+    setRetrying(true);
+    setLogs([]);
+    try {
+      appendLog('info', `Booting microVM "${name}" and bootstrapping its api-server…`);
+      // up() streams the same lines the CLI prints, installs the engine
+      // binary if missing, and registers the VM as a cluster on success.
+      await vmHost.instance(name).up((e) => appendLog('info', e.message));
+      appendLog('info', `microVM "${name}" is up and registered as a cluster.`);
+      setPhase('running');
+      await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      await queryClient.invalidateQueries({ queryKey: ['microvm'] });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      appendLog('error', message);
+      setError(message);
+      setPhase('failed');
+    } finally {
+      setRetrying(false);
+    }
+  }, [vmHost, name, appendLog, queryClient]);
+
+  React.useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    void start();
+  }, [start]);
+
+  if (!vmHost) {
+    return <Navigate to="/bootstrap" replace />;
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6 pt-8">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold">Starting microVM</h1>
+        <p className="text-sm text-[var(--color-muted-foreground)]">
+          {name} · registers as <code className="font-mono text-xs">{microVmClusterId(name)}</code>
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3">
+        <PhaseCard
+          phase={'phase1' as BootstrapPhase /* glyph reuse — the VM boot is a single node */}
+          label="VM boot + api-server"
+          state={phase === 'starting' ? 'running' : phase === 'running' ? 'completed' : 'failed'}
+          canRetry={phase === 'failed' && !retrying}
+          onRetry={() => void start()}
+        />
+      </div>
+
+      <div className="rounded-md border border-[var(--color-border)] bg-black/30">
+        <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
+          Event log
+        </div>
+        <div className="h-80 overflow-auto font-mono text-xs leading-relaxed">
+          {logs.length === 0 ? (
+            <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
+          ) : (
+            logs.map((l) => (
+              <div
+                key={l.id}
+                className={cn(
+                  'whitespace-pre-wrap px-3 py-0.5',
+                  l.level === 'warn' && 'text-yellow-400',
+                  l.level === 'error' && 'text-red-400'
+                )}
+              >
+                {l.message}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {phase === 'running' ? (
+        <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ microVM ready</div>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+            <dt className="text-[var(--color-muted-foreground)]">VM</dt>
+            <dd className="font-mono">{name}</dd>
+            <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
+            <dd className="font-mono">{microVmClusterId(name)}</dd>
+          </dl>
+          <div className="flex gap-2">
+            <Button onClick={() => navigate('/')}>Open dashboard</Button>
+            <Button variant="outline" onClick={() => navigate('/local-runtime')}>
+              Manage engines
+            </Button>
+          </div>
         </div>
       ) : null}
 
