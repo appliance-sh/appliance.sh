@@ -1,3 +1,33 @@
+## 1.48.0 (2026-06-13)
+
+### Features
+
+- improve micro vm cluster switcher and interface ([3d7bf25](https://github.com/appliance-sh/appliance.sh/commit/3d7bf25))
+- **cli:** thread per-VM ports and profiles through `appliance vm` ([0530dc2](https://github.com/appliance-sh/appliance.sh/commit/0530dc2))
+- **desktop:** live egress traffic view with per-host allow/block ([32280e2](https://github.com/appliance-sh/appliance.sh/commit/32280e2))
+- **desktop:** credential capture/injection config UI ([6b0f82c](https://github.com/appliance-sh/appliance.sh/commit/6b0f82c))
+- **desktop:** manage multiple microVMs, each as its own cluster ([c72846a](https://github.com/appliance-sh/appliance.sh/commit/c72846a))
+- **desktop:** offer the microVM engine in first-run onboarding ([759ed61](https://github.com/appliance-sh/appliance.sh/commit/759ed61))
+- **vm:** trust the egress CA in the guest system store ([2119afb](https://github.com/appliance-sh/appliance.sh/commit/2119afb))
+- **vm:** record egress traffic for the desktop view ([0910abb](https://github.com/appliance-sh/appliance.sh/commit/0910abb))
+- **vm:** per-host credential capture + injection in the MITM proxy ([967317f](https://github.com/appliance-sh/appliance.sh/commit/967317f))
+- **vm:** per-VM port allocation so multiple microVMs run concurrently ([485ca2a](https://github.com/appliance-sh/appliance.sh/commit/485ca2a))
+
+### Bug Fixes
+
+- **desktop:** refresh cluster list when the microVM registers ([4a20709](https://github.com/appliance-sh/appliance.sh/commit/4a20709))
+- **desktop:** present microVMs as first-class engines, not beta add-ons ([917ea5a](https://github.com/appliance-sh/appliance.sh/commit/917ea5a))
+
+### Documentation
+
+- **microvm:** document automatic egress injection into workloads ([b90ed3d](https://github.com/appliance-sh/appliance.sh/commit/b90ed3d))
+- **microvm:** document egress traffic view + credential injection ([df9f3f3](https://github.com/appliance-sh/appliance.sh/commit/df9f3f3))
+- **vm:** document running multiple microVMs concurrently ([6854f1b](https://github.com/appliance-sh/appliance.sh/commit/6854f1b))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.47.0 (2026-06-12)
 
 ### Features
