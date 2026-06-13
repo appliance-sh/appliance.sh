@@ -439,8 +439,8 @@ function LocalProgress({ values }: { values: LocalWizardValues }) {
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold">Starting local runtime</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          {values.clusterName ?? 'appliance-local'} · {values.hostnameSuffix ?? 'appliance.localhost'} · host port{' '}
-          {values.hostPort ?? 8081}
+          On this host (not sandboxed) · {values.clusterName ?? 'appliance-local'} ·{' '}
+          {values.hostnameSuffix ?? 'appliance.localhost'} · host port {values.hostPort ?? 8081}
         </p>
       </div>
 
@@ -580,9 +580,10 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold">Starting microVM</h1>
+        <h1 className="text-2xl font-semibold">Starting local runtime</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          {name} · registers as <code className="font-mono text-xs">{microVmClusterId(name)}</code>
+          Sandboxed in a virtual machine · {name} · registers as{' '}
+          <code className="font-mono text-xs">{microVmClusterId(name)}</code>
         </p>
       </div>
 
@@ -622,17 +623,17 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
 
       {phase === 'running' ? (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ microVM ready</div>
+          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ Local runtime ready</div>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt className="text-[var(--color-muted-foreground)]">VM</dt>
-            <dd className="font-mono">{name}</dd>
+            <dt className="text-[var(--color-muted-foreground)]">Sandbox</dt>
+            <dd>virtual machine ({name})</dd>
             <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
             <dd className="font-mono">{microVmClusterId(name)}</dd>
           </dl>
           <div className="flex gap-2">
             <Button onClick={() => navigate('/')}>Open dashboard</Button>
             <Button variant="outline" onClick={() => navigate('/local-runtime')}>
-              Manage engines
+              Manage runtimes
             </Button>
           </div>
         </div>

@@ -93,6 +93,23 @@ export function registerManifestOptions(program: Command): Command {
     .option('--variant <name>', 'variant to load from a programmatic (.ts/.js) manifest');
 }
 
+/**
+ * Directory the appliance lives in — the docker build context for
+ * container builds (and the base for relative paths in the manifest).
+ * Mirrors resolveManifestPath's location logic: an explicit --file's
+ * dirname, else --directory, else cwd. So `appliance deploy -d app/`
+ * builds `app/`'s Dockerfile, not the one (or none) in cwd. With no
+ * --file/--directory this is exactly cwd, preserving today's behavior.
+ */
+export function resolveApplianceDir(cmd: Command): string {
+  const fileOpt = cmd.getOptionValue('file') as string | undefined;
+  const dirOpt = cmd.getOptionValue('directory') as string | undefined;
+  if (fileOpt && fileOpt !== 'appliance.json') {
+    return path.dirname(path.resolve(process.cwd(), fileOpt));
+  }
+  return dirOpt ? path.resolve(process.cwd(), dirOpt) : process.cwd();
+}
+
 function resolveManifestPath(cmd: Command): string | null {
   const fileOpt = cmd.getOptionValue('file') as string | undefined;
   const dirOpt = cmd.getOptionValue('directory') as string | undefined;

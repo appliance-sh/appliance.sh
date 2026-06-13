@@ -40,6 +40,11 @@ const DEFAULT_VM_NAME = 'appliance';
 // allocated block, read per-VM from their persisted spec (vmPorts).
 const DEFAULT_VM_PORTS = { hostPort: 8081, apiPort: 6443, registryPort: 5052, egressPort: 5053 } as const;
 
+// The microVM runs the host's CPU architecture — Virtualization.framework
+// doesn't emulate — so the api-server image we push must carry a matching
+// `linux/<arch>` variant or it crashloops with `exec format error`.
+const VM_HOST_ARCH: 'arm64' | 'amd64' = process.arch === 'arm64' ? 'arm64' : 'amd64';
+
 /** The credentials profile a VM owns. The default VM keeps the plain
  *  `microvm` profile (back-compat + parity with the desktop); each
  *  additional VM gets its own `microvm-<name>` profile so multiple VMs
@@ -149,17 +154,22 @@ async function runUp(name: string, imageOverride: string | undefined, timeout: n
   console.log(chalk.cyan('» waiting for the in-VM registry'));
   await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
 
-  // 3. Deliver the api-server image. The image must be present in the
-  //    local docker daemon (built via packages/api-server's
-  //    docker-prep.sh); docker is needed for image *builds* anyway —
-  //    the cluster itself no longer depends on it.
-  const image = imageOverride ?? (await resolveApiServerImage());
+  // 3. Deliver the api-server image into the VM's registry. The image
+  //    must be present in the local docker daemon (built via
+  //    packages/api-server's docker-prep.sh); docker is needed for
+  //    image *builds* anyway — the cluster itself no longer depends on
+  //    it. `docker save --platform` selects the VM's architecture from
+  //    a single-arch *or* multi-arch image, so a multi-arch build is
+  //    delivered correctly and a pure cross-arch image fails fast with
+  //    an actionable message rather than an `exec format error`.
   await ensureDockerRunning({ onProgress: printProgress });
-  console.log(chalk.cyan(`» pushing ${image} into the VM registry`));
   // Deploy by digest: pushing a different image under a reused tag
   // would leave the Deployment spec unchanged (no rollout) and
   // IfNotPresent would keep serving the stale cached image.
-  const vmImage = await pushImageHostSide(image, `localhost:${ports.registryPort}/appliance-api-server:latest`);
+  const vmImage = await deliverApiServerImage(
+    imageOverride,
+    `localhost:${ports.registryPort}/appliance-api-server:latest`
+  );
 
   // 4. In-VM api-server: same shared bootstrap as the k3d engine,
   //    pointed at the VM's kubeconfig and registry.
@@ -230,74 +240,120 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
 }
 
 /**
- * Pick a locally built api-server image whose architecture matches
- * the VM (= the host: Virtualization.framework doesn't emulate, so an
- * amd64 image on Apple Silicon crashloops with `exec format error`).
- * Tries the arch-suffixed tag first, then validates :latest.
+ * Deliver the api-server image into the VM's host-loopback registry,
+ * extracting the VM's architecture (= the host's). The delivery is
+ * host-side — `docker save` + `crane push` — because a plain `docker
+ * push` executes inside the docker VM (colima/Docker Desktop), where
+ * the host's 127.0.0.1 (and therefore the microVM's forwarded
+ * registry) doesn't exist.
+ *
+ * `docker save --platform linux/<arch>` is the source of truth for
+ * architecture: it pulls exactly that platform out of a single-arch
+ * *or* multi-arch image, and fails cleanly when the image carries no
+ * matching variant — so a multi-arch build "just works" and a pure
+ * cross-arch image is rejected with guidance instead of crashlooping.
+ * Returns the digest-qualified ref crane pushes (deploy by digest so a
+ * reused tag still triggers a rollout).
  */
-async function resolveApiServerImage(): Promise<string> {
-  await ensureDockerRunning({ onProgress: printProgress });
-  const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  for (const candidate of [`appliance-api-server:${hostArch}`, 'appliance-api-server:latest']) {
-    const r = spawnSync('docker', ['image', 'inspect', '--format', '{{.Architecture}}', candidate], {
-      encoding: 'utf8',
-    });
-    if (r.status !== 0) continue;
-    const arch = r.stdout.trim();
-    if (arch === hostArch) return candidate;
-    console.log(
-      chalk.dim(
-        `${candidate} is ${arch}, VM needs ${hostArch} — ${candidate === 'appliance-api-server:latest' ? 'skipping' : 'trying next'}`
-      )
-    );
-  }
-  throw new Error(
-    `no ${hostArch} appliance-api-server image found. Build one with:\n` +
-      `  cd packages/api-server && docker build --platform linux/${hostArch} -t appliance-api-server:${hostArch} .\n` +
-      '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
-  );
-}
+async function deliverApiServerImage(imageOverride: string | undefined, targetRef: string): Promise<string> {
+  const candidates = imageOverride
+    ? [imageOverride]
+    : [`appliance-api-server:${VM_HOST_ARCH}`, 'appliance-api-server:latest'];
+  // Keep only refs that actually exist locally, remembering each one's
+  // host-resolved architecture for diagnostics + ordering.
+  const present = candidates
+    .map((ref) => ({ ref, arch: inspectArch(ref) }))
+    .filter((c): c is { ref: string; arch: string } => c.arch !== null);
+  if (present.length === 0) throw new Error(missingImageMessage(imageOverride));
 
-function dockerOrThrow(args: string[]): void {
-  const r = spawnSync('docker', args, { stdio: 'inherit' });
-  if (r.status !== 0) {
-    throw new Error(`docker ${args.join(' ')} failed`);
-  }
-}
+  // Try a ref whose host-resolved arch already matches first (a
+  // properly-loaded multi-arch image resolves to the host platform),
+  // then any other present ref. `docker save --platform` decides
+  // success either way; this only affects which tar we attempt first.
+  const ordered = [
+    ...present.filter((c) => c.arch === VM_HOST_ARCH),
+    ...present.filter((c) => c.arch !== VM_HOST_ARCH),
+  ];
 
-/**
- * Deliver a daemon-held image to a host-loopback registry from the
- * host process: `docker save` + `crane push`. A plain `docker push`
- * executes inside the docker VM (colima/Docker Desktop), where the
- * host's 127.0.0.1 — and therefore the microVM's forwarded registry —
- * doesn't exist.
- */
-async function pushImageHostSide(image: string, targetRef: string): Promise<string> {
   const crane = await ensureCrane();
   const tarPath = path.join(os.tmpdir(), `appliance-image-${process.pid}.tar`);
   try {
-    dockerOrThrow(['save', '-o', tarPath, image]);
-    const r = spawnSync(crane, ['push', '--insecure', tarPath, targetRef], {
-      stdio: ['ignore', 'pipe', 'inherit'],
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    if (r.status !== 0) throw new Error(`crane push to ${targetRef} failed`);
-    // crane prints the digest-qualified reference as its final stdout
-    // line — the immutable ref we hand to the deployment.
-    const lines = r.stdout
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const digestRef = lines[lines.length - 1];
-    if (!digestRef || !digestRef.includes('@sha256:')) {
-      throw new Error(`could not parse digest from crane push output: ${r.stdout.slice(-300)}`);
+    let lastSaveErr = '';
+    for (const { ref, arch } of ordered) {
+      console.log(chalk.cyan(`» delivering ${ref} (linux/${VM_HOST_ARCH}) into the VM registry`));
+      let save = spawnSync('docker', ['save', '--platform', `linux/${VM_HOST_ARCH}`, '-o', tarPath, ref], {
+        encoding: 'utf8',
+      });
+      // Fallback for docker builds without `save --platform`: when the
+      // image already resolves to the host arch, a plain save delivers
+      // the right variant.
+      if (save.status !== 0 && arch === VM_HOST_ARCH) {
+        save = spawnSync('docker', ['save', '-o', tarPath, ref], { encoding: 'utf8' });
+      }
+      if (save.status === 0) return cranePush(crane, tarPath, targetRef);
+      lastSaveErr = (save.stderr ?? '').trim();
+      // The ref exists but doesn't carry our arch — try the next
+      // candidate; the throw below explains the fix if none do.
     }
-    console.log(chalk.dim(`pushed ${digestRef}`));
-    return digestRef;
+    throw new Error(wrongArchMessage(present, lastSaveErr));
   } finally {
     fs.rmSync(tarPath, { force: true });
   }
+}
+
+/** Host-resolved architecture of a local image, or null when it isn't
+ *  in the docker daemon. With the containerd image store a multi-arch
+ *  image resolves to the host platform whenever it carries one. */
+function inspectArch(ref: string): string | null {
+  const r = spawnSync('docker', ['image', 'inspect', '--format', '{{.Architecture}}', ref], { encoding: 'utf8' });
+  if (r.status !== 0) return null;
+  return r.stdout.trim() || null;
+}
+
+/** `crane push` an already-saved image tar to the host-loopback
+ *  registry, returning the digest-qualified ref crane prints last. */
+function cranePush(crane: string, tarPath: string, targetRef: string): string {
+  const r = spawnSync(crane, ['push', '--insecure', tarPath, targetRef], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (r.status !== 0) throw new Error(`crane push to ${targetRef} failed`);
+  const lines = r.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const digestRef = lines[lines.length - 1];
+  if (!digestRef || !digestRef.includes('@sha256:')) {
+    throw new Error(`could not parse digest from crane push output: ${r.stdout.slice(-300)}`);
+  }
+  console.log(chalk.dim(`pushed ${digestRef}`));
+  return digestRef;
+}
+
+function missingImageMessage(imageOverride: string | undefined): string {
+  if (imageOverride) {
+    return `image ${imageOverride} not found in the local docker daemon — build or pull it first, or pass a different --image.`;
+  }
+  return (
+    'no appliance-api-server image found in the local docker daemon.\n' +
+    `Build one for the VM's architecture (linux/${VM_HOST_ARCH}):\n` +
+    `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
+    '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
+  );
+}
+
+function wrongArchMessage(present: { ref: string; arch: string }[], saveErr: string): string {
+  const found = present.map((c) => `${c.ref} (${c.arch})`).join(', ');
+  return (
+    `no appliance-api-server image provides the VM's architecture (linux/${VM_HOST_ARCH}).\n` +
+    `Found: ${found}.\n` +
+    `The microVM runs ${VM_HOST_ARCH} (Virtualization.framework doesn't emulate), so the image must carry a linux/${VM_HOST_ARCH} variant.\n` +
+    'Build one:\n' +
+    `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
+    'A multi-arch build only counts when loaded into the docker image store (buildx --load with the containerd image store), not just the build cache. Or pass --image <ref>.' +
+    (saveErr ? `\n(docker save: ${saveErr})` : '')
+  );
 }
 
 async function ensureCrane(): Promise<string> {

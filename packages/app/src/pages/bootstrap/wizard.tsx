@@ -1,9 +1,11 @@
 import * as React from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
-import { Cloud, ChevronLeft, Laptop, Server } from 'lucide-react';
+import { Cloud, ChevronLeft, Laptop } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
+import { cn } from '@/lib/utils';
+import { localRuntimeCapabilities, defaultSandbox, type LocalRuntimeCapabilities } from '@/lib/local-runtime';
 
 const REGIONS = [
   'us-east-1',
@@ -21,21 +23,24 @@ const REGIONS = [
 ];
 
 /**
- * Discriminator for the two bootstrap paths the wizard now drives.
+ * Discriminator on the WizardValues the run page dispatches on.
  *
  *   - 'aws'     : the existing 3-phase Pulumi flow (installer stack +
  *                 api-server + state promotion). Targets a cloud
  *                 install reachable from anywhere.
- *   - 'local'   : a single-step setup that spins up the desktop's k3d
- *                 cluster and in-process api-server. Targets a dev
- *                 loop on the operator's own machine.
- *   - 'microvm' : boots an isolated VM Appliance owns (appliance-vm) —
- *                 no docker provider for the cluster — and registers it.
- *                 The same local dev loop, a different engine.
+ *   - 'local'   : a single-step setup that spins up host-side k3d and
+ *                 an in-process api-server. The local runtime, *not*
+ *                 sandboxed.
+ *   - 'microvm' : the local runtime sandboxed in an isolated VM
+ *                 Appliance boots itself (appliance-vm) — no docker
+ *                 provider for the cluster.
  *
- * All modes funnel through `/bootstrap/run` which dispatches on this
- * field. The mode can be pre-selected via `?mode=local` (the
- * dashboard's engine cards use this to skip the picker).
+ * 'local' and 'microvm' are two engines behind ONE choice the operator
+ * makes — "sandbox with a virtual machine?" — surfaced by the unified
+ * Local Runtime form rather than as separate modes. All values funnel
+ * through `/bootstrap/run`, which dispatches on this field. The Local
+ * Runtime form is reachable via `?mode=local` (the dashboard uses
+ * this); `?mode=microvm` is accepted as an alias for back-compat.
  */
 export type WizardMode = 'aws' | 'local' | 'microvm';
 
@@ -77,24 +82,28 @@ export interface MicroVmWizardValues {
 
 export type WizardValues = AwsWizardValues | LocalWizardValues | MicroVmWizardValues;
 
+/** Top-level target the operator picks. The sandbox decision lives
+ *  *inside* the Local Runtime form, not here — local k3d and the
+ *  microVM are one choice, not two. */
+type PickerChoice = 'aws' | 'local';
+
 export function BootstrapWizardPage() {
   const host = useHost();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const caps = localRuntimeCapabilities(host);
   const bootstrapAvailable = Boolean(host.bootstrap);
-  const localAvailable = Boolean(host.local?.startRuntime);
-  const microVmAvailable = Boolean(host.vm);
+  const localAvailable = caps.any;
 
   // Read `?mode=` once so deep-linking from the dashboard (e.g.
   // `/bootstrap?mode=local`) skips the picker. Default to the picker.
-  const presetMode = parseMode(searchParams.get('mode'), {
+  const presetChoice = parseChoice(searchParams.get('mode'), {
     aws: bootstrapAvailable,
     local: localAvailable,
-    microvm: microVmAvailable,
   });
-  const [mode, setMode] = React.useState<WizardMode | null>(presetMode);
+  const [choice, setChoice] = React.useState<PickerChoice | null>(presetChoice);
 
-  if (!bootstrapAvailable && !localAvailable && !microVmAvailable) {
+  if (!bootstrapAvailable && !localAvailable) {
     return (
       <div className="mx-auto max-w-md space-y-4 pt-16">
         <h1 className="text-2xl font-semibold">Bootstrap unavailable</h1>
@@ -107,39 +116,31 @@ export function BootstrapWizardPage() {
     );
   }
 
-  if (!mode) {
+  if (!choice) {
     return (
       <ModePicker
         awsAvailable={bootstrapAvailable}
         localAvailable={localAvailable}
-        microVmAvailable={microVmAvailable}
-        onPick={(m) => setMode(m)}
+        sandboxDefault={caps.canSandbox}
+        onPick={(c) => setChoice(c)}
         onCancel={() => navigate('/')}
       />
     );
   }
 
-  if (mode === 'aws') {
+  if (choice === 'aws') {
     return (
       <AwsForm
-        onBack={presetMode ? null : () => setMode(null)}
-        onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
-      />
-    );
-  }
-
-  if (mode === 'microvm') {
-    return (
-      <MicroVmForm
-        onBack={presetMode ? null : () => setMode(null)}
+        onBack={presetChoice ? null : () => setChoice(null)}
         onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
       />
     );
   }
 
   return (
-    <LocalForm
-      onBack={presetMode ? null : () => setMode(null)}
+    <LocalRuntimeForm
+      caps={caps}
+      onBack={presetChoice ? null : () => setChoice(null)}
       onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
     />
   );
@@ -150,52 +151,40 @@ export function BootstrapWizardPage() {
 function ModePicker({
   awsAvailable,
   localAvailable,
-  microVmAvailable,
+  sandboxDefault,
   onPick,
   onCancel,
 }: {
   awsAvailable: boolean;
   localAvailable: boolean;
-  microVmAvailable: boolean;
-  onPick: (mode: WizardMode) => void;
+  sandboxDefault: boolean;
+  onPick: (choice: PickerChoice) => void;
   onCancel: () => void;
 }) {
   return (
-    <div className="mx-auto max-w-3xl space-y-6 pt-12">
+    <div className="mx-auto max-w-2xl space-y-6 pt-12">
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">New installation</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Pick a target. The two local engines run entirely on this machine — perfect for development. AWS provisions a
+          Pick a target. The local runtime runs entirely on this machine — perfect for development. AWS provisions a
           cloud-resident installation reachable from anywhere.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2">
         <ModeCard
           icon={Laptop}
           title="Local Runtime"
           body={
             <>
-              A k3d cluster + in-process api-server on this device. Requires Docker. Apps publish at{' '}
+              A cluster + api-server on this machine
+              {sandboxDefault ? ', sandboxed in a virtual machine by default' : ''}. Apps publish at{' '}
               <code className="text-[11px]">&lt;project&gt;-&lt;env&gt;.appliance.localhost</code>.
             </>
           }
           available={localAvailable}
-          disabledReason="Local Runtime needs the desktop app — the web shell can't drive k3d."
+          disabledReason="The local runtime needs the desktop app — the web shell can't drive it."
           onClick={() => onPick('local')}
-        />
-        <ModeCard
-          icon={Server}
-          title="MicroVM"
-          body={
-            <>
-              An isolated VM Appliance boots itself — no docker provider for the cluster. Same{' '}
-              <code className="text-[11px]">*.appliance.localhost</code> dev loop, stronger isolation.
-            </>
-          }
-          available={microVmAvailable}
-          disabledReason="The microVM engine needs the desktop app."
-          onClick={() => onPick('microvm')}
         />
         <ModeCard
           icon={Cloud}
@@ -245,95 +234,57 @@ function ModeCard({
   );
 }
 
-function parseMode(
-  raw: string | null,
-  capability: { aws: boolean; local: boolean; microvm: boolean }
-): WizardMode | null {
+function parseChoice(raw: string | null, capability: { aws: boolean; local: boolean }): PickerChoice | null {
   if (raw === 'aws' && capability.aws) return 'aws';
-  if (raw === 'local' && capability.local) return 'local';
-  if (raw === 'microvm' && capability.microvm) return 'microvm';
+  // `microvm` is an alias for the unified Local Runtime form (the
+  // sandbox toggle there decides the engine), kept for old deep links.
+  if ((raw === 'local' || raw === 'microvm') && capability.local) return 'local';
   return null;
 }
 
-// ---- microVM form -----------------------------------------------------
+// ---- local runtime form ------------------------------------------------
+//
+// One form for the local runtime. The single decision that matters —
+// "sandbox with a virtual machine?" — is a checkbox, defaulted on
+// (microVM engine). Sandboxed emits microVM values; unsandboxed emits
+// host-side k3d values. Either way it's submittable immediately with
+// defaults, so setup → connect is two clicks (open form → Set up).
 
-function MicroVmForm({
+function LocalRuntimeForm({
+  caps,
   onBack,
   onSubmit,
 }: {
+  caps: LocalRuntimeCapabilities;
   onBack: (() => void) | null;
-  onSubmit: (values: MicroVmWizardValues) => void;
+  onSubmit: (values: WizardValues) => void;
 }) {
-  const [name, setName] = React.useState('');
-  const [err, setErr] = React.useState<string | null>(null);
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const n = name.trim();
-    if (n && !/^[a-z0-9][a-z0-9-]*$/.test(n)) {
-      setErr('Use lowercase letters, digits, and dashes (e.g. "traffic").');
-      return;
-    }
-    onSubmit({ mode: 'microvm', name: n || undefined });
-  };
-
-  return (
-    <div className="mx-auto max-w-md space-y-6 pt-12">
-      {onBack ? (
-        <Button variant="ghost" size="sm" className="-ml-2" onClick={onBack}>
-          <ChevronLeft className="h-4 w-4" /> Back
-        </Button>
-      ) : null}
-
-      <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">MicroVM</h1>
-        <p className="text-sm text-[var(--color-muted-foreground)]">
-          Start brings up an isolated VM, bootstraps its api-server, and registers it as a cluster. The engine binary
-          installs automatically if needed; host ports are allocated for you. Run several VMs side by side — one for
-          development, one for traffic testing.
-        </p>
-      </div>
-
-      <form className="space-y-4" onSubmit={handleSubmit}>
-        <Field label="VM name" hint="default: appliance — name a second VM (e.g. traffic) to run it alongside">
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => {
-              setName(e.target.value);
-              setErr(null);
-            }}
-            placeholder="appliance"
-            className={inputCls}
-          />
-        </Field>
-
-        {err ? <p className="text-xs text-red-300">{err}</p> : null}
-
-        <Button type="submit" className="w-full">
-          Start
-        </Button>
-      </form>
-    </div>
-  );
-}
-
-// ---- local form -------------------------------------------------------
-
-function LocalForm({
-  onBack,
-  onSubmit,
-}: {
-  onBack: (() => void) | null;
-  onSubmit: (values: LocalWizardValues) => void;
-}) {
+  const [sandbox, setSandbox] = React.useState(defaultSandbox(caps));
+  // Sandboxed (microVM): an optional VM name.
+  const [vmName, setVmName] = React.useState('');
+  const [vmErr, setVmErr] = React.useState<string | null>(null);
+  // Host (k3d): optional overrides, tucked behind a disclosure.
   const [clusterName, setClusterName] = React.useState('');
   const [hostPort, setHostPort] = React.useState('');
   const [namespace, setNamespace] = React.useState('');
   const [hostnameSuffix, setHostnameSuffix] = React.useState('');
+  const [showAdvanced, setShowAdvanced] = React.useState(false);
+
+  // Lock the toggle when only one engine exists — there's no choice to
+  // make, and a checkbox the operator can't change is just noise.
+  const sandboxLocked = !(caps.canSandbox && caps.canHost);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (sandbox) {
+      const n = vmName.trim();
+      if (n && !/^[a-z0-9][a-z0-9-]*$/.test(n)) {
+        setVmErr('Use lowercase letters, digits, and dashes (e.g. "traffic").');
+        return;
+      }
+      onSubmit({ mode: 'microvm', name: n || undefined });
+      return;
+    }
     const parsedPort = hostPort ? Number.parseInt(hostPort, 10) : NaN;
     onSubmit({
       mode: 'local',
@@ -355,56 +306,121 @@ function LocalForm({
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">Local Runtime</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Defaults are fine for most setups — Start brings up a k3d cluster, launches the api-server, and registers it
-          with the Console. Override any field if you already use the defaults for something else.
+          Set up brings up a cluster + api-server on this machine and connects the Console to it. Defaults are fine for
+          most setups.
         </p>
       </div>
 
-      <form className="space-y-4" onSubmit={handleSubmit}>
-        <Field label="Cluster name" hint="default: appliance-local">
-          <input
-            type="text"
-            value={clusterName}
-            onChange={(e) => setClusterName(e.target.value)}
-            placeholder="appliance-local"
-            className={inputCls}
-          />
-        </Field>
+      <form className="space-y-5" onSubmit={handleSubmit}>
+        {/* The one decision: sandbox or not. Recommended + default on. */}
+        <div className="rounded-md border border-[var(--color-border)] p-3">
+          <label className={cn('flex items-start gap-3', sandboxLocked && 'opacity-70')}>
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={sandbox}
+              disabled={sandboxLocked}
+              onChange={(e) => setSandbox(e.target.checked)}
+            />
+            <span className="space-y-1">
+              <span className="flex items-center gap-2 text-sm font-medium">
+                Sandbox with a virtual machine
+                <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                  recommended
+                </span>
+              </span>
+              <span className="block text-xs text-[var(--color-muted-foreground)]">
+                Run the cluster inside an isolated VM Appliance boots itself — stronger isolation, no docker provider
+                for the cluster. Turn off to run k3d directly on this host (needs Docker).
+              </span>
+            </span>
+          </label>
+          {sandboxLocked ? (
+            <p className="mt-2 pl-7 text-[10px] text-[var(--color-muted-foreground)]">
+              {caps.canSandbox
+                ? 'Only the sandboxed engine is available on this machine.'
+                : 'The microVM engine isn’t available here — running on the host.'}
+            </p>
+          ) : null}
+        </div>
 
-        <Field label="Host port" hint="default: 8081 — the k3d loadbalancer publishes Traefik here">
-          <input
-            type="number"
-            value={hostPort}
-            onChange={(e) => setHostPort(e.target.value)}
-            placeholder="8081"
-            min="1"
-            max="65535"
-            className={inputCls}
-          />
-        </Field>
+        {sandbox ? (
+          <Field
+            label="VM name"
+            hint="optional, default: appliance — name a second VM (e.g. traffic) to run it alongside"
+          >
+            <input
+              type="text"
+              value={vmName}
+              onChange={(e) => {
+                setVmName(e.target.value);
+                setVmErr(null);
+              }}
+              placeholder="appliance"
+              className={inputCls}
+            />
+          </Field>
+        ) : (
+          <div className="space-y-4">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((v) => !v)}
+              className="text-xs text-[var(--color-muted-foreground)] underline-offset-4 hover:underline"
+            >
+              {showAdvanced ? 'Hide advanced options' : 'Advanced options'}
+            </button>
+            {showAdvanced ? (
+              <>
+                <Field label="Cluster name" hint="default: appliance-local">
+                  <input
+                    type="text"
+                    value={clusterName}
+                    onChange={(e) => setClusterName(e.target.value)}
+                    placeholder="appliance-local"
+                    className={inputCls}
+                  />
+                </Field>
 
-        <Field label="Namespace" hint="default: appliance">
-          <input
-            type="text"
-            value={namespace}
-            onChange={(e) => setNamespace(e.target.value)}
-            placeholder="appliance"
-            className={inputCls}
-          />
-        </Field>
+                <Field label="Host port" hint="default: 8081 — the k3d loadbalancer publishes Traefik here">
+                  <input
+                    type="number"
+                    value={hostPort}
+                    onChange={(e) => setHostPort(e.target.value)}
+                    placeholder="8081"
+                    min="1"
+                    max="65535"
+                    className={inputCls}
+                  />
+                </Field>
 
-        <Field label="Hostname suffix" hint="default: appliance.localhost — must auto-resolve to 127.0.0.1">
-          <input
-            type="text"
-            value={hostnameSuffix}
-            onChange={(e) => setHostnameSuffix(e.target.value)}
-            placeholder="appliance.localhost"
-            className={inputCls}
-          />
-        </Field>
+                <Field label="Namespace" hint="default: appliance">
+                  <input
+                    type="text"
+                    value={namespace}
+                    onChange={(e) => setNamespace(e.target.value)}
+                    placeholder="appliance"
+                    className={inputCls}
+                  />
+                </Field>
+
+                <Field label="Hostname suffix" hint="default: appliance.localhost — must auto-resolve to 127.0.0.1">
+                  <input
+                    type="text"
+                    value={hostnameSuffix}
+                    onChange={(e) => setHostnameSuffix(e.target.value)}
+                    placeholder="appliance.localhost"
+                    className={inputCls}
+                  />
+                </Field>
+              </>
+            ) : null}
+          </div>
+        )}
+
+        {vmErr ? <p className="text-xs text-red-300">{vmErr}</p> : null}
 
         <Button type="submit" className="w-full">
-          Start
+          Set up
         </Button>
       </form>
     </div>

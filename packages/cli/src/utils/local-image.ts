@@ -30,6 +30,10 @@ export interface PublishLocalImageOptions {
   registryUrl: string | null;
   /** k3d cluster to import into as a fallback. */
   clusterName?: string;
+  /** Docker build context (the appliance directory). Defaults to cwd,
+   *  so `appliance deploy -d app/` builds `app/`'s Dockerfile rather
+   *  than looking in the current directory. */
+  context?: string;
 }
 
 /**
@@ -49,7 +53,7 @@ export async function publishLocalApplianceImage(opts: PublishLocalImageOptions)
   } else {
     const args = ['build', '--provenance=false', '-t', imageRef];
     if (opts.platform) args.push('--platform', opts.platform);
-    args.push('.');
+    args.push(opts.context ?? '.');
     console.log(chalk.dim(`Building container: docker ${args.join(' ')}`));
     try {
       execFileSync('docker', args, { stdio: 'inherit' });

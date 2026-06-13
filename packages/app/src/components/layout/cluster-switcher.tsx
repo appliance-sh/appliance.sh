@@ -7,12 +7,13 @@ import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
 import { LOCAL_RUNTIME_CLUSTER_ID, isMicroVmClusterId } from '@/lib/host';
 
-/** Engine tag for the local clusters, so they're tellable apart at a
- *  glance (the default k3d and microVM clusters even share host port
- *  8081). Every microVM — there can be several — gets the microVM tag. */
+/** How a local cluster is hosted, so they're tellable apart at a glance
+ *  (the host-side k3d and a sandboxed microVM even share host port
+ *  8081). Mirrors the management page's EngineTag wording — one local
+ *  runtime, sandboxed or on the host, not two separate engines. */
 function engineLabel(clusterId: string): string | null {
-  if (clusterId === LOCAL_RUNTIME_CLUSTER_ID) return 'k3d';
-  if (isMicroVmClusterId(clusterId)) return 'microVM';
+  if (clusterId === LOCAL_RUNTIME_CLUSTER_ID) return 'on host';
+  if (isMicroVmClusterId(clusterId)) return 'sandboxed';
   return null;
 }
 

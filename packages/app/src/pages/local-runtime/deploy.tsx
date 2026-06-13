@@ -360,19 +360,15 @@ export function LocalRuntimeDeployPage() {
           <span>
             {!targetUp ? (
               <>
-                {isMicroVmTarget ? (
-                  <>The microVM engine isn&apos;t running</>
-                ) : (
-                  <>The local runtime isn&apos;t running</>
-                )}{' '}
-                — builds deploy into its cluster, so the final step needs it up.{' '}
+                The {isMicroVmTarget ? 'sandboxed ' : ''}local runtime isn&apos;t running — builds deploy into its
+                cluster, so the final step needs it up.{' '}
                 <Link to="/local-runtime" className="underline">
-                  Start it from the Runtimes page
+                  Start it from the Local runtime page
                 </Link>{' '}
                 first. You can still pick a folder and configure in the meantime.
               </>
             ) : (
-              <>No cluster is selected. Starting a local engine registers its cluster automatically.</>
+              <>No cluster is selected. Starting the local runtime registers its cluster automatically.</>
             )}
           </span>
         </div>

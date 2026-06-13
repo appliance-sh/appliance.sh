@@ -237,8 +237,20 @@ registry, and host-side TCP forwards that preserve the exact
 bootstraps the in-VM api-server, and registers the `microvm` profile;
 `appliance deploy --profile microvm` then works verbatim. The k3d
 engine below remains supported — the two coexist (one at a time on
-host port 8081; the bind error names the fix) and the desktop's
-Runtimes page manages both.
+host port 8081; the bind error names the fix). The CLI keeps them as
+separate commands (`appliance vm` / `appliance local`), but the desktop
+presents them as a single **Local runtime** with one choice — "sandbox
+with a virtual machine (recommended)", default on (microVM); off runs
+host-side k3d — and a one-press first-run prompt sets up the sandboxed
+default and connects.
+
+Because local clusters run the host's architecture and can't emulate
+(no binfmt in the microVM; k3d runs in the host-arch docker VM), every
+host-side image delivery targets the host arch: the api-server image is
+extracted with `docker save --platform linux/<host>` (works for single-
+or multi-arch images, fails fast otherwise), and app-image builds are
+pinned to the host arch regardless of the manifest's `platform` — a
+cross-arch image would otherwise crashloop with `exec format error`.
 
 #### Local cluster lifecycle (k3d)
 

@@ -176,22 +176,27 @@ list` reports every VM with its ports and running state.
    waits for the in-VM registry (registry:2 via k3s's auto-applying
    manifests dir, NodePort 30500, host forward on 5052 — clear of
    k3d's 5050 so both engines coexist), pushes the api-server image
-   host-side (`docker save` + `crane push` — a plain `docker push`
-   executes inside the docker provider's VM where the host's loopback
-   registries don't exist), bootstraps the api-server in-VM by digest
-   ref (reused tags don't roll deployments), and registers the
-   `microvm` profile. `appliance deploy` then works verbatim: the
-   pipeline reads the registry from `/cluster-info`, falls back to
-   crane when `docker push` can't reach it, and the resulting app
-   serves at `<project>-<env>.appliance.localhost:8081` exactly as on
-   k3d. State persists across `vm stop`/`vm up` on the data disk
-   (projects, credentials, images, running workloads all survive).
-   Note: images must match the VM's architecture — there is no binfmt
-   emulation in the guest (Lambda-targeted amd64 images need an arm64
-   rebuild on Apple Silicon).
-4. **KVM backend**, then **WSL backend**; desktop Local Runtime page
-   grows a runtime-engine selector (k3d ⇄ microVM); guest exec
-   channel (vsock) for logs/debugging without the console.
+   host-side (`docker save --platform linux/<host>` + `crane push` —
+   a plain `docker push` executes inside the docker provider's VM
+   where the host's loopback registries don't exist), bootstraps the
+   api-server in-VM by digest ref (reused tags don't roll deployments),
+   and registers the `microvm` profile. `appliance deploy` then works
+   verbatim: the pipeline reads the registry from `/cluster-info`,
+   falls back to crane when `docker push` can't reach it, and the
+   resulting app serves at `<project>-<env>.appliance.localhost:8081`
+   exactly as on k3d. State persists across `vm stop`/`vm up` on the
+   data disk (projects, credentials, images, running workloads all
+   survive). Architecture: there is no binfmt emulation in the guest,
+   so images must match the VM (= the host). `docker save --platform`
+   extracts the host variant from a single- _or_ multi-arch image (and
+   fails fast with guidance otherwise), and `appliance deploy` pins
+   app-image builds to the host arch for local targets regardless of
+   the manifest's `platform` — so a Lambda-targeted amd64 manifest
+   still runs on Apple Silicon instead of crashlooping.
+4. **KVM backend**, then **WSL backend**; the desktop presents the two
+   engines as one **Local runtime** with a "sandbox with a virtual
+   machine" toggle (default on) rather than an engine selector _(done)_;
+   guest exec channel (vsock) for logs/debugging without the console.
 
 ## Egress control (outbound-traffic policy + TLS interception)
 

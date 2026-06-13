@@ -4285,7 +4285,9 @@ struct BuildAndImportInput {
     path: String,
     /// Image tag to build with, e.g. "demo-node-container:latest".
     image_tag: String,
-    /// Optional `--platform` (e.g. "linux/amd64"). Defaults to host arch.
+    /// Requested `--platform` (e.g. "linux/amd64"). Overridden to the
+    /// host arch for these local-cluster builds — the cluster can't run
+    /// anything else — so a cross-arch manifest value never crashloops.
     #[serde(default)]
     platform: Option<String>,
     /// k3d cluster to import into. Defaults to the runtime's cluster name.
@@ -4389,11 +4391,38 @@ async fn build_and_import_image(
         .map(|reg| format!("{}/{}", reg, input.image_tag));
     let build_tag = pushable_tag.clone().unwrap_or_else(|| input.image_tag.clone());
 
-    let mut build_args: Vec<String> = vec!["build".into(), "-t".into(), build_tag.clone()];
+    // This command only ever targets a local cluster, which runs this
+    // machine's architecture and can't emulate (the microVM has no
+    // binfmt; k3d runs in the host-arch docker VM). Build for the host
+    // arch regardless of any requested platform — a cross-arch image
+    // would just crashloop with `exec format error` after an opaque
+    // rollout timeout.
+    let host_platform = format!(
+        "linux/{}",
+        if std::env::consts::ARCH == "aarch64" {
+            "arm64"
+        } else {
+            "amd64"
+        }
+    );
     if let Some(p) = input.platform.as_deref() {
-        build_args.push("--platform".into());
-        build_args.push(p.into());
+        if p != host_platform.as_str() {
+            let _ = on_event.send(serde_json::json!({
+                "type": "log",
+                "stream": "meta",
+                "message": format!(
+                    "requested platform {p} can't run on this local cluster ({host_platform}) — building {host_platform} instead"
+                ),
+            }));
+        }
     }
+    let mut build_args: Vec<String> = vec![
+        "build".into(),
+        "-t".into(),
+        build_tag.clone(),
+        "--platform".into(),
+        host_platform,
+    ];
     build_args.push(input.path.clone());
     stream_child_to_channel("docker", &build_args, &on_event).await?;
 

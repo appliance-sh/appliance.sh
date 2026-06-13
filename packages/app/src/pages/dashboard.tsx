@@ -1,7 +1,7 @@
 import * as React from 'react';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { useQuery, useQueries } from '@tanstack/react-query';
-import { Plug, Wand, Laptop, Plus, Search, Server } from 'lucide-react';
+import { Plug, Wand, Laptop, Plus, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -14,24 +14,43 @@ import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 import { extractDeploymentUrl } from '@/lib/deployment';
+import {
+  localRuntimeCapabilities,
+  defaultSandbox,
+  onboardingDismissed,
+  dismissOnboarding,
+  type LocalRuntimeCapabilities,
+} from '@/lib/local-runtime';
+import type { WizardValues } from '@/pages/bootstrap/wizard';
 import type { Environment, Project } from '@appliance.sh/sdk/models';
 
 export function DashboardPage() {
   const host = useHost();
+  const caps = localRuntimeCapabilities(host);
   const canBootstrap = Boolean(host.bootstrap);
-  const canBootstrapLocal = Boolean(host.local?.startRuntime);
-  const canBootstrapMicroVm = Boolean(host.vm);
   const { cluster, isLoading } = useSelectedCluster();
+  // "More options" reveals the full first-run menu without dismissing
+  // the simple welcome — that's what "Set up later" does (and persists).
+  const [showAll, setShowAll] = React.useState(false);
 
   if (isLoading) return null;
-  if (!cluster)
-    return (
-      <GetStarted
-        canBootstrap={canBootstrap}
-        canBootstrapLocal={canBootstrapLocal}
-        canBootstrapMicroVm={canBootstrapMicroVm}
-      />
-    );
+  if (!cluster) {
+    // First launch on a shell that can run a local runtime: a single,
+    // friendly setup step (Set up / Set up later) — no menu to parse.
+    if (caps.any && !showAll && !onboardingDismissed()) {
+      return (
+        <FirstRunWelcome
+          caps={caps}
+          onLater={() => {
+            dismissOnboarding();
+            setShowAll(true);
+          }}
+          onMore={() => setShowAll(true)}
+        />
+      );
+    }
+    return <GetStarted caps={caps} canBootstrap={canBootstrap} />;
+  }
 
   return <Overview clusterName={cluster.name} serverUrl={cluster.apiServerUrl} />;
 }
@@ -276,49 +295,91 @@ function RecentActivity({
 
 // ---- first-run (no cluster) ----------------------------------------------
 
-function GetStarted({
-  canBootstrap,
-  canBootstrapLocal,
-  canBootstrapMicroVm,
+// The very first launch: one decision, one button. "Set up local
+// runtime" provisions + connects in a single press (sandboxed in a
+// microVM by default), so a new operator is running in seconds without
+// reading a menu. "Set up later" and "More options" fall back to the
+// full GetStarted menu for everything else.
+function FirstRunWelcome({
+  caps,
+  onLater,
+  onMore,
 }: {
-  canBootstrap: boolean;
-  canBootstrapLocal: boolean;
-  canBootstrapMicroVm: boolean;
+  caps: LocalRuntimeCapabilities;
+  onLater: () => void;
+  onMore: () => void;
 }) {
-  // Local engines are the recommended starting point — zero cloud cost,
-  // no AWS credentials, run on the operator's own machine. When
-  // available we promote them to primary and let AWS / Connect sit
-  // alongside as alternatives. k3d and the microVM are peers.
-  const anyLocal = canBootstrapLocal || canBootstrapMicroVm;
+  const navigate = useNavigate();
+  const sandbox = defaultSandbox(caps);
+  const setup = () => {
+    // Sandboxed by default; fall back to host-side k3d only when no
+    // microVM engine is available. /bootstrap/run boots it and connects
+    // automatically — no further clicks.
+    const values: WizardValues = sandbox ? { mode: 'microvm' } : { mode: 'local' };
+    navigate('/bootstrap/run', { state: values });
+  };
+  return (
+    <div className="mx-auto flex min-h-[60vh] max-w-lg flex-col justify-center space-y-7 text-center">
+      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)]">
+        <Laptop className="h-6 w-6 text-[var(--color-foreground)]" />
+      </div>
+      <div className="space-y-2">
+        <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
+        <p className="text-sm text-[var(--color-muted-foreground)]">
+          Run apps on a local cluster on this machine.{' '}
+          {sandbox
+            ? 'We’ll set up a local runtime sandboxed in its own virtual machine — the recommended, isolated default.'
+            : 'We’ll set up a local runtime on this host.'}{' '}
+          It connects automatically once it’s ready.
+        </p>
+      </div>
+      <div className="flex flex-col items-center gap-3">
+        <Button size="lg" className="w-full sm:w-auto sm:min-w-56" onClick={setup}>
+          Set up local runtime
+        </Button>
+        <Button variant="ghost" onClick={onLater}>
+          Set up later
+        </Button>
+      </div>
+      <button
+        type="button"
+        onClick={onMore}
+        className="mx-auto text-xs text-[var(--color-muted-foreground)] underline-offset-4 hover:underline"
+      >
+        More options
+      </button>
+    </div>
+  );
+}
+
+function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; canBootstrap: boolean }) {
+  // The local runtime is the recommended starting point — zero cloud
+  // cost, no AWS credentials, runs on the operator's own machine. It's
+  // one option (sandboxed-by-default); AWS / Connect sit alongside as
+  // alternatives.
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Install and run applications on a cluster. Start a local engine on this device, provision an AWS cluster, or
+          Install and run applications on a cluster. Set up a local runtime on this device, provision an AWS cluster, or
           connect to one you already have.
         </p>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {canBootstrapLocal ? (
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {caps.any ? (
           <ActionCard
             icon={Laptop}
-            title="Start a local runtime"
-            body="A k3d cluster + api-server on this device. Apps publish at *.appliance.localhost. No cloud account needed."
-            cta="Start"
+            title="Local runtime"
+            body={
+              caps.canSandbox
+                ? 'A cluster + api-server on this machine, sandboxed in a virtual machine by default. Apps publish at *.appliance.localhost. No cloud account needed.'
+                : 'A k3d cluster + api-server on this machine. Apps publish at *.appliance.localhost. No cloud account needed.'
+            }
+            cta="Set up"
             to="/bootstrap?mode=local"
             primary
-          />
-        ) : null}
-        {canBootstrapMicroVm ? (
-          <ActionCard
-            icon={Server}
-            title="Start a microVM"
-            body="An isolated VM Appliance boots itself — stronger isolation, no docker provider for the cluster. Same local dev loop."
-            cta="Start"
-            to="/bootstrap?mode=microvm"
-            primary={!canBootstrapLocal}
           />
         ) : null}
         {canBootstrap ? (
@@ -328,7 +389,7 @@ function GetStarted({
             body="Provision the base AWS infrastructure from this machine using your current credentials."
             cta="Start wizard"
             to="/bootstrap?mode=aws"
-            primary={!anyLocal}
+            primary={!caps.any}
           />
         ) : null}
         <ActionCard
@@ -337,7 +398,7 @@ function GetStarted({
           body="Point this console at an api-server you already have by entering its URL and an API key."
           cta="Connect"
           to="/connect"
-          primary={!canBootstrap && !anyLocal}
+          primary={!canBootstrap && !caps.any}
         />
       </div>
     </div>

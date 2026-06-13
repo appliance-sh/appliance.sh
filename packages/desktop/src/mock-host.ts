@@ -109,6 +109,41 @@ function unregisterMockCluster(): void {
   writeState(state);
 }
 
+// Mirror the desktop's sync_microvm_cluster (lib.rs): a `vm up` registers
+// the VM as a regular cluster and auto-selects it when nothing else is
+// selected. Without this the mock host streams the boot but leaves the
+// dashboard on "no cluster", so browser QA of the one-click onboarding
+// would dead-end where the real desktop connects.
+function mockMicroVmClusterId(name: string): string {
+  return name === 'appliance' ? 'microvm' : `microvm-${name}`;
+}
+
+function registerMockMicroVmCluster(vm: MockVm): void {
+  const clusterId = mockMicroVmClusterId(vm.name);
+  const state = readState();
+  if (!state.clusters.some((c) => c.id === clusterId)) {
+    state.clusters.push({
+      id: clusterId,
+      name: vm.name === 'appliance' ? 'MicroVM Runtime' : `MicroVM Runtime (${vm.name})`,
+      apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
+      createdAt: new Date().toISOString(),
+      apiKey: { id: 'apikey_mock', secret: 'sk_mock' },
+    });
+  }
+  if (!state.selectedClusterId) state.selectedClusterId = clusterId;
+  writeState(state);
+}
+
+function unregisterMockMicroVmCluster(name: string): void {
+  const clusterId = mockMicroVmClusterId(name);
+  const state = readState();
+  state.clusters = state.clusters.filter((c) => c.id !== clusterId);
+  if (state.selectedClusterId === clusterId) {
+    state.selectedClusterId = state.clusters[0]?.id ?? null;
+  }
+  writeState(state);
+}
+
 function initialRuntime(): RuntimeState {
   const s = scenario();
   return {
@@ -540,6 +575,8 @@ export function createMockHost(): ConsoleHost {
             }
             vm.exists = true;
             vm.running = true;
+            // Register + auto-select the VM's cluster, like the real engine.
+            registerMockMicroVmCluster(vm);
           },
           async stop() {
             await sleep(800);
@@ -550,6 +587,7 @@ export function createMockHost(): ConsoleHost {
             vm.running = false;
             vm.exists = false;
             delete microVms[vm.name];
+            unregisterMockMicroVmCluster(vm.name);
           },
           egress: {
             async get() {

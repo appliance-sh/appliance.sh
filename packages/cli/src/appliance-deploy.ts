@@ -7,7 +7,7 @@ import type { ApplianceBaseConfig, Project, Environment, Deployment } from '@app
 import { loadCredentials } from './utils/credentials.js';
 import { getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
-import { extractApplianceFile, registerManifestOptions } from './utils/common.js';
+import { extractApplianceFile, registerManifestOptions, resolveApplianceDir } from './utils/common.js';
 import { buildApplianceZip } from './utils/build-package.js';
 import { publishLocalApplianceImage } from './utils/local-image.js';
 import { readLink, writeLink } from './utils/link.js';
@@ -275,28 +275,40 @@ async function resolveKubernetesBuildId(
     );
   }
 
-  // Loopback registries mean the cluster runs on this machine — and
-  // the microVM has no binfmt emulation, so a cross-arch image
-  // crashloops with `exec format error` after an opaque rollout
-  // timeout. Warn up front while the build platform is still cheap to
-  // change.
+  // Loopback registries mean the cluster runs on this machine, and it
+  // can't emulate — the microVM has no binfmt, and k3d runs in the
+  // host-arch docker VM. A cross-arch image just crashloops with `exec
+  // format error` after an opaque rollout timeout, so pin the build to
+  // the host arch for local targets regardless of the manifest's
+  // `platform` (which typically targets a cloud runtime). The override
+  // doesn't touch a user `scripts.build` — that script owns its arch.
   const registryUrl = baseConfig.kubernetes?.registry?.url ?? null;
   const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  if (registryUrl?.startsWith('localhost') && appliance.platform && !appliance.platform.endsWith(hostArch)) {
-    console.log(
-      chalk.yellow(
-        `Warning: manifest platform "${appliance.platform}" does not match this machine (linux/${hostArch}). ` +
-          'The local cluster may not be able to run the image — consider removing "platform" from appliance.json for local deploys.'
-      )
-    );
+  const isLocalTarget = registryUrl?.startsWith('localhost') ?? false;
+  // Widen to string: a local override produces a plain `linux/<arch>`
+  // ref, and publishLocalApplianceImage takes a string platform.
+  let platform: string | undefined = appliance.platform;
+  if (isLocalTarget) {
+    if (!appliance.scripts?.build && appliance.platform && !appliance.platform.endsWith(hostArch)) {
+      console.log(
+        chalk.yellow(
+          `Manifest platform "${appliance.platform}" can't run on this local cluster (linux/${hostArch}) — ` +
+            `building linux/${hostArch} instead.`
+        )
+      );
+    }
+    platform = `linux/${hostArch}`;
   }
   const clusterName = baseConfig.local?.cluster?.clusterName;
   const imageRef = await publishLocalApplianceImage({
     name: appliance.name,
-    platform: appliance.platform,
+    platform,
     buildScript: appliance.scripts?.build,
     registryUrl,
     clusterName,
+    // Build the appliance's own directory (honors -d/-f), not whatever
+    // cwd the deploy was invoked from.
+    context: resolveApplianceDir(program),
   });
 
   const createResult = await client.createBuild({ uploadUrl: imageRef, port: appliance.port });

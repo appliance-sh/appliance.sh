@@ -148,14 +148,14 @@ export function LocalRuntimePage() {
     deleteMutation.mutate();
   };
 
-  // The k3d runtime, presented as one engine card — a peer of every
-  // microVM card below it, not a privileged "primary runtime".
+  // The host-side k3d runtime — the unsandboxed option, a peer of every
+  // sandboxed microVM card below it, not a privileged "primary runtime".
   const k3dCard = (
     <EngineCard
       name={status?.config.clusterName ?? 'appliance-local'}
       engine="k3d"
       statusPill={<PhaseBadge phase={phase} />}
-      description="Kubernetes-in-Docker — rents the docker provider's VM. Registers as a regular cluster."
+      description="Runs k3d directly on this host via the docker provider — not sandboxed. Registers as a regular cluster."
     >
       <div className="flex flex-wrap items-center gap-2">
         <Button
@@ -210,10 +210,10 @@ export function LocalRuntimePage() {
     <div className="max-w-4xl space-y-6">
       <header className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold">Runtimes</h1>
+          <h1 className="text-xl font-semibold">Local runtime</h1>
           <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Local engines for running appliances on this machine. Each registers as a regular cluster you can deploy to
-            and switch between.
+            Run appliances on this machine — sandboxed in a virtual machine (recommended) or directly on the host. Each
+            registers as a regular cluster you can deploy to and switch between.
           </p>
         </div>
         {canDeploy ? (
@@ -226,7 +226,7 @@ export function LocalRuntimePage() {
           // `disabled` on an asChild Button renders an anchor, and
           // anchors ignore it — the wizard stayed reachable with the
           // runtime down. A real <button> actually gates.
-          <Button variant="outline" disabled title="Start an engine to deploy applications">
+          <Button variant="outline" disabled title="Start the local runtime to deploy applications">
             <Rocket className="h-4 w-4" /> Deploy application
           </Button>
         )}
@@ -291,10 +291,13 @@ function EngineCard({
   );
 }
 
-// Engine-type tag, identical styling for every engine — the type is
-// informational, never a hierarchy.
+// How the runtime is hosted — sandboxed in a VM vs directly on the
+// host. Informational framing of the one choice (sandbox or not),
+// never a hierarchy. The prop stays engine-keyed so callers don't have
+// to translate; only the label reflects the sandbox framing.
 function EngineTag({ engine }: { engine: 'k3d' | 'microVM' }) {
-  return <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{engine}</span>;
+  const label = engine === 'microVM' ? 'sandboxed' : 'on host';
+  return <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{label}</span>;
 }
 
 // ---- engines (k3d + microVMs, presented as peers) -----------------------
@@ -339,7 +342,7 @@ function EnginesSection({
   return (
     <section className="space-y-3">
       <header className="flex items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Engines</h2>
+        <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Runtimes</h2>
         {showMicroVm ? <NewVmButton existing={names} onAdd={(n) => setPending((p) => [...p, n])} /> : null}
       </header>
 
