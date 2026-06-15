@@ -4,13 +4,13 @@ import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from '@/lib/utils';
 
 const buttonVariants = cva(
-  'inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)] disabled:pointer-events-none disabled:opacity-50',
+  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-[color,background-color,border-color,box-shadow,transform] duration-150 active:translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-background)] disabled:pointer-events-none disabled:opacity-50',
   {
     variants: {
       variant: {
-        // Vercel-style: primary is white-on-black; secondary borders
-        // brighten on hover instead of filling.
-        default: 'bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:bg-white',
+        // Vercel-style: primary is white-on-black with a hairline lift;
+        // secondary borders brighten on hover instead of filling.
+        default: 'bg-[var(--color-primary)] text-[var(--color-primary-foreground)] shadow-sm hover:bg-white',
         outline:
           'border border-[var(--color-border)] bg-transparent text-[var(--color-foreground)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-accent)]',
         ghost:
