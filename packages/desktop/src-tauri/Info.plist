@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    App Transport Security exception for the local microVM runtime.
+
+    The desktop app's API client talks to the in-VM api-server over
+    cleartext HTTP at http://api.appliance.localhost:8081 (and to
+    deployed apps at http://<name>.appliance.localhost:8081). macOS ATS
+    exempts the literal "localhost" / loopback IPs from its
+    block-cleartext default, but it does NOT exempt *.localhost
+    subdomains — so inside the release build's WKWebView every fetch to
+    api.appliance.localhost fails with "TypeError: Load failed", which
+    surfaces as "Load failed" on every screen.
+
+    The ingress is host-routed (it requires the api.appliance.localhost
+    Host header), so we cannot sidestep this by pointing the client at a
+    bare 127.0.0.1. Instead we grant a scoped cleartext exception for
+    the appliance.localhost domain and its subdomains. Tauri v2 merges
+    this file into the generated macOS Info.plist at bundle time.
+  -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>appliance.localhost</key>
+      <dict>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key>
+        <true/>
+        <key>NSIncludesSubdomains</key>
+        <true/>
+      </dict>
+    </dict>
+  </dict>
+</dict>
+</plist>
