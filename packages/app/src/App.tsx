@@ -5,6 +5,8 @@ import { ToastProvider } from '@/components/ui/toast';
 import { ConfirmProvider } from '@/components/ui/confirm-dialog';
 import { routes } from '@/router/routes';
 import type { ConsoleHost } from '@/lib/host';
+import '@fontsource-variable/geist';
+import '@fontsource-variable/geist-mono';
 import '@/styles.css';
 
 const queryClient = new QueryClient({

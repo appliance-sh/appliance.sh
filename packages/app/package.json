@@ -27,6 +27,8 @@
   },
   "dependencies": {
     "@appliance.sh/sdk": "workspace:*",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/geist-mono": "^5.2.8",
     "@radix-ui/react-slot": "^1.1.1",
     "@tanstack/react-query": "^5.60.0",
     "@xterm/addon-fit": "^0.11.0",

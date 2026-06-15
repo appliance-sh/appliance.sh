@@ -26,6 +26,7 @@ import archiver from 'archiver';
 import chalk from 'chalk';
 import { ApplianceType } from '@appliance.sh/sdk';
 import type { ApplianceFullInput } from '@appliance.sh/sdk';
+import { provenanceArgs } from './docker.js';
 
 export interface BuildResult {
   outputPath: string;
@@ -97,9 +98,10 @@ async function packageContainer(archive: archiver.Archiver, appliance: Container
   const { name, platform, port } = appliance;
 
   if (!appliance.scripts?.build) {
-    console.log(chalk.dim(`Building container: docker build --platform ${platform} --provenance=false -t ${name} .`));
+    const buildArgs = ['build', '--platform', platform, ...provenanceArgs(), '-t', name, '.'];
+    console.log(chalk.dim(`Building container: docker ${buildArgs.join(' ')}`));
     try {
-      execFileSync('docker', ['build', '--platform', platform, '--provenance=false', '-t', name, '.'], {
+      execFileSync('docker', buildArgs, {
         stdio: 'inherit',
       });
     } catch {
@@ -124,7 +126,7 @@ async function packageContainer(archive: archiver.Archiver, appliance: Container
     );
     execFileSync(
       'docker',
-      ['build', '--platform', platform, '--provenance=false', '-f', wrapperDockerfile, '-t', lambdaImageName, tmpDir],
+      ['build', '--platform', platform, ...provenanceArgs(), '-f', wrapperDockerfile, '-t', lambdaImageName, tmpDir],
       { stdio: 'inherit' }
     );
   } catch {

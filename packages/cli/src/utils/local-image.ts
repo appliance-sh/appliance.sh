@@ -15,6 +15,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import chalk from 'chalk';
 import { DEFAULT_LOCAL_CLUSTER_NAME, helperBinDir, importImageToCluster, runInstall } from '@appliance.sh/helper';
+import { provenanceArgs } from './docker.js';
 
 export interface PublishLocalImageOptions {
   /** Appliance name — becomes the image repository name. */
@@ -51,7 +52,7 @@ export async function publishLocalApplianceImage(opts: PublishLocalImageOptions)
       execFileSync('docker', ['tag', opts.name, imageRef], { stdio: 'inherit' });
     }
   } else {
-    const args = ['build', '--provenance=false', '-t', imageRef];
+    const args = ['build', ...provenanceArgs(), '-t', imageRef];
     if (opts.platform) args.push('--platform', opts.platform);
     args.push(opts.context ?? '.');
     console.log(chalk.dim(`Building container: docker ${args.join(' ')}`));

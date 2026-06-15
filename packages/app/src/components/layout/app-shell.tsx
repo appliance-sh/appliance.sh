@@ -36,13 +36,18 @@ export function AppShell() {
     // Below `sm` the sidebar collapses to an icon rail so narrow
     // windows (small desktop panes, phones) keep a usable content
     // column instead of a crushed two-column squeeze.
-    <div className="grid h-full grid-cols-[56px_1fr] grid-rows-[auto_1fr_auto] sm:grid-cols-[220px_1fr]">
-      <aside className="row-span-3 border-r border-[var(--color-border)] bg-[var(--color-muted)]">
-        <div className="hidden px-4 py-4 text-sm font-semibold tracking-tight sm:block">Appliance</div>
-        <div className="px-4 py-4 text-sm font-semibold tracking-tight sm:hidden" aria-hidden>
-          A
+    <div className="grid h-full grid-cols-[56px_1fr] grid-rows-[auto_1fr] sm:grid-cols-[220px_1fr]">
+      <aside className="row-span-2 flex flex-col border-r border-[var(--color-border)] bg-[var(--color-muted)]">
+        {/* Brand — height + divider align with the content header so the
+            top-left corner reads as one clean grid, not two strips. */}
+        <div className="flex h-[57px] items-center gap-2.5 border-b border-[var(--color-border)] px-4">
+          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[var(--color-foreground)] text-[var(--color-background)]">
+            <Server className="h-3.5 w-3.5" />
+          </div>
+          <span className="hidden text-sm font-semibold tracking-tight sm:block">Appliance</span>
         </div>
-        <nav className="flex flex-col gap-1 px-2">
+
+        <nav className="flex flex-1 flex-col gap-0.5 px-2 py-3">
           {nav.map((item) => (
             <NavLink
               key={item.to}
@@ -54,8 +59,8 @@ export function AppShell() {
               // read the same while the pointer rests on the sidebar.
               className={({ isActive }) =>
                 cn(
-                  'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-accent-foreground)]',
-                  isActive && 'bg-[var(--color-accent)] text-[var(--color-accent-foreground)]'
+                  'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]',
+                  isActive && 'bg-[var(--color-accent)] text-[var(--color-foreground)]'
                 )
               }
             >
@@ -74,10 +79,6 @@ export function AppShell() {
       <main className="col-start-2 overflow-auto p-6">
         <Outlet />
       </main>
-
-      <footer className="col-start-2 border-t border-[var(--color-border)] px-4 py-2 text-xs text-[var(--color-muted-foreground)]">
-        {/* health / region / active deployments slot */}
-      </footer>
     </div>
   );
 }

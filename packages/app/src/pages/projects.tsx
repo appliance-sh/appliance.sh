@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link } from 'react-router';
 import { useQueries, useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
-import { ExternalLink, Plus, Trash2 } from 'lucide-react';
+import { ExternalLink, Plus, Trash2, Folder } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ListSkeleton } from '@/components/ui/skeleton';
@@ -210,6 +210,7 @@ function ConnectedProjects() {
         <ListSkeleton />
       ) : !projectsQuery.data || projectsQuery.data.length === 0 ? (
         <EmptyState
+          icon={Folder}
           title="No projects yet"
           description={
             <>
@@ -283,9 +284,7 @@ function Disconnected() {
           Logical groupings of environments and deployments.
         </p>
       </div>
-      <div className="rounded-md border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
-        Connect to a cluster to see projects.
-      </div>
+      <EmptyState icon={Folder} title="No cluster connected" description="Connect to a cluster to see projects." />
     </div>
   );
 }

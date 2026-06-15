@@ -351,9 +351,12 @@ function LocalRuntimeForm({
           >
             <input
               type="text"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               value={vmName}
               onChange={(e) => {
-                setVmName(e.target.value);
+                setVmName(e.target.value.toLowerCase());
                 setVmErr(null);
               }}
               placeholder="appliance"
