@@ -401,9 +401,12 @@ function NewVmButton({ existing, onAdd }: { existing: string[]; onAdd: (name: st
         <input
           autoFocus
           type="text"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
           value={name}
           onChange={(e) => {
-            setName(e.target.value);
+            setName(e.target.value.toLowerCase());
             setErr(null);
           }}
           placeholder="vm name, e.g. traffic"
