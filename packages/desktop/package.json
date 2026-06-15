@@ -35,7 +35,7 @@
     "@appliance.sh/app": "workspace:*",
     "@appliance.sh/bootstrap": "workspace:*",
     "@appliance.sh/helper": "workspace:*",
-    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.2.0",
     "@tauri-apps/plugin-notification": "^2.2.0",
     "@tauri-apps/plugin-shell": "^2.2.0",
