@@ -57,4 +57,7 @@ export type {
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
+  UpdaterHost,
+  AvailableUpdate,
+  UpdateProgress,
 } from './lib/host';

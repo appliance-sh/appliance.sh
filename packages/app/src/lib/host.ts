@@ -141,6 +141,61 @@ export interface AwsProfile {
   source: 'config' | 'credentials';
 }
 
+/** A pending self-update the updater feed advertised — the running app
+ *  is behind `version`. Mirrors the fields the Tauri updater plugin's
+ *  `check()` resolves with that the UI actually renders. */
+export interface AvailableUpdate {
+  /** Version on the feed (e.g. "1.49.0"). Always newer than the
+   *  running app — the host only returns this when an update exists. */
+  version: string;
+  /** The currently-running app version, for a before/after display. */
+  currentVersion: string;
+  /** Release notes pulled from the update manifest, if the publisher
+   *  included them. */
+  notes?: string;
+  /** ISO-8601 publish date from the manifest, if present. */
+  date?: string;
+}
+
+/** Progress of an in-flight download+install, surfaced so the UI can
+ *  render a determinate bar when the manifest carried a content length
+ *  and a spinner otherwise. */
+export interface UpdateProgress {
+  /** Total bytes to download, if the server sent a Content-Length.
+   *  Undefined → render indeterminate. */
+  contentLength?: number;
+  /** Bytes downloaded so far across the whole transfer. */
+  downloaded: number;
+}
+
+/**
+ * Self-update driver. Desktop-only: the web shell auto-updates by
+ * virtue of being a page reload, so it omits this capability entirely
+ * (the UI hides the "Check for updates" panel when it's absent). The
+ * Tauri host implements it against `@tauri-apps/plugin-updater` +
+ * `@tauri-apps/plugin-process`, gated on the signed update feed
+ * configured in `tauri.conf.json`'s `plugins.updater`.
+ */
+export interface UpdaterHost {
+  /**
+   * Ask the update feed whether a newer signed build exists. Resolves
+   * with the update when one is available, or `null` when the running
+   * app is current. Rejects only on a genuine failure to reach/verify
+   * the feed (offline, signature mismatch, malformed manifest).
+   */
+  check(): Promise<AvailableUpdate | null>;
+  /**
+   * Download the pending update and install it in place, reporting
+   * byte-level progress through `onProgress`. The update must come
+   * from a prior `check()` in the same session (the plugin caches the
+   * resolved Update handle). Resolves once the bundle is installed;
+   * the caller then invokes `relaunch()` to boot into it.
+   */
+  downloadAndInstall(onProgress: (progress: UpdateProgress) => void): Promise<void>;
+  /** Restart the app into the freshly-installed version. */
+  relaunch(): Promise<void>;
+}
+
 // Capabilities the surrounding shell (web PWA, future Tauri/Electron)
 // must provide to the shared app. Kept minimal: anything a browser
 // tab can do on its own isn't here. Desktop-only hooks (OS keychain,
@@ -187,6 +242,12 @@ export interface ConsoleHost {
    * shell can't provide.
    */
   terminal?: TerminalHost;
+  /**
+   * Self-update from the signed update feed. Optional — desktop-only;
+   * the web shell ships continuously and has nothing to self-update.
+   * When present, Settings exposes a "Check for updates" panel.
+   */
+  updater?: UpdaterHost;
 }
 
 export type TerminalEvent = { type: 'data'; data: string } | { type: 'exit'; code?: number };

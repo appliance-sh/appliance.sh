@@ -71,6 +71,9 @@ jobs:
             CLI_VERSION=$(node -p "require('./packages/cli/package.json').version")
             echo "Dispatching CLI binaries build for v${CLI_VERSION}"
             gh workflow run release-cli-binaries.yml --ref main -f tag="v${CLI_VERSION}"
+            DESKTOP_VERSION=$(node -p "require('./packages/desktop/package.json').version")
+            echo "Dispatching desktop bundle build for v${DESKTOP_VERSION}"
+            gh workflow run release-desktop.yml --ref main -f tag="v${DESKTOP_VERSION}"
           else
             echo "HEAD ('${msg}') is not a release commit; skipping artifact dispatches."
           fi
