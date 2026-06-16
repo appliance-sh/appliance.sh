@@ -10,6 +10,7 @@ import {
 } from '@appliance.sh/sdk';
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
+import { envVarService } from './env-var.service';
 import { projectService } from './project.service';
 import { executeDeployment, type WorkerEvent } from './deployment-executor.service';
 import { logger } from '../logger';
@@ -57,8 +58,22 @@ export class DeploymentService {
       throw new Error(`Project not found: ${environment.projectId}`);
     }
 
+    // Inject the environment's stored variables (set via `appliance env
+    // set`) so they reach every deploy without the client resending
+    // them. Only on Deploy — Destroy/Refresh don't run the workload.
+    // Per-deploy values (input.environment, populated from the
+    // manifest / --env-file) win over stored ones: the stored set is
+    // the persistent baseline, the per-deploy map is the local override.
+    let effectiveInput = input;
+    if (input.action === DeploymentAction.Deploy) {
+      const stored = await envVarService.get(environment.id);
+      if (Object.keys(stored).length > 0) {
+        effectiveInput = { ...input, environment: { ...stored, ...(input.environment ?? {}) } };
+      }
+    }
+
     const now = new Date().toISOString();
-    const { environment: _env, ...inputWithoutEnv } = input;
+    const { environment: _env, ...inputWithoutEnv } = effectiveInput;
     const deployment: Deployment = {
       ...inputWithoutEnv,
       id: generateId('deployment'),
@@ -84,7 +99,7 @@ export class DeploymentService {
 
     const workerEvent: WorkerEvent = {
       deploymentId: deployment.id,
-      input,
+      input: effectiveInput,
       metadata: {
         projectId: project.id,
         projectName: project.name,

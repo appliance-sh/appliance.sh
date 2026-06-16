@@ -67,9 +67,17 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'run first-run preflight checks (use --fix to auto-resolve the safe ones)',
     load: () => import('./appliance-doctor.js'),
   },
+  env: {
+    description: 'manage per-environment variables (set/list/unset)',
+    load: () => import('./appliance-env.js'),
+  },
   init: {
     description: 'initialise the CLI with the appliance server',
     load: () => import('./appliance-init.js'),
+  },
+  keys: {
+    description: 'manage the cluster API key lifecycle (rotate)',
+    load: () => import('./appliance-keys.js'),
   },
   link: {
     description: 'link this folder to a project/environment',
