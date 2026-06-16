@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -412,28 +413,69 @@ for (const [cmd, desc] of [
     });
 }
 
-// `delete` is not a plain passthrough. The Rust engine removes the VM
-// and its on-disk state, but the credential profile that `vm up` minted
-// (`microvm` for the default VM, `microvm-<name>` otherwise) lives in
-// the CLI profile store — which the engine knows nothing about. Without
-// pruning it here, a deleted VM leaves an orphan cluster behind in both
-// the CLI and the desktop (both read ~/.appliance/profiles.json), which
-// is exactly the lingering-profile bug this command exists to fix.
+// `delete`/`prune` are not plain passthroughs. The Rust engine removes
+// the VM and its on-disk state, but the credential profile that `vm up`
+// minted (`microvm` for the default VM, `microvm-<name>` otherwise)
+// lives in the CLI profile store — which the engine knows nothing about.
+// Without pruning it, a deleted VM leaves an orphan cluster behind in
+// both the CLI and the desktop (both read ~/.appliance/profiles.json).
+
+/** Delete a microVM via the engine, then prune its CLI credential
+ *  profile. The profile is only removed once the engine confirms the VM
+ *  is gone (exit 0), so a failed delete never strips a usable profile.
+ *  Returns the engine's exit code. */
+function deleteVmAndProfile(name: string): number {
+  const code = runVm(['delete', name]);
+  if (code === 0) {
+    const profile = profileForVm(name);
+    if (removeProfile(profile)) {
+      console.log(chalk.dim(`removed credential profile '${profile}'`));
+    }
+  }
+  return code;
+}
+
 program
   .command('delete')
   .description('delete the microVM, its state, and its credential profile')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .action((opts: { name: string }) => {
-    const code = runVm(['delete', opts.name]);
-    // Only prune credentials once the engine confirms the VM is gone, so
-    // a failed delete never strips a still-usable profile.
-    if (code === 0) {
-      const profile = profileForVm(opts.name);
-      if (removeProfile(profile)) {
-        console.log(chalk.dim(`removed credential profile '${profile}'`));
+    process.exit(deleteVmAndProfile(opts.name));
+  });
+
+program
+  .command('prune')
+  .description('delete every stopped microVM and its credential profile')
+  .option('-f, --force', 'skip the confirmation prompt', false)
+  .action(async (opts: { force: boolean }) => {
+    const bin = vmBinary();
+    const r = spawnSync(bin, ['list'], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      process.stderr.write(r.stderr ?? '');
+      process.exit(r.status ?? 1);
+    }
+    const stopped = (JSON.parse(r.stdout) as { name: string; running: boolean }[]).filter((e) => !e.running);
+    if (stopped.length === 0) {
+      console.log(chalk.dim('no stopped microVMs to prune'));
+      return;
+    }
+    if (!opts.force) {
+      const names = stopped.map((e) => e.name).join(', ');
+      const ok = await confirm({
+        message: `Delete ${stopped.length} stopped microVM(s) (${names}) and their credential profiles?`,
+        default: false,
+      });
+      if (!ok) {
+        console.log(chalk.yellow('aborted'));
+        return;
       }
     }
-    process.exit(code);
+    let deleted = 0;
+    for (const e of stopped) {
+      if (deleteVmAndProfile(e.name) === 0) deleted++;
+      else console.error(chalk.red(`failed to delete '${e.name}'`));
+    }
+    console.log(`pruned ${deleted}/${stopped.length} stopped microVM(s)`);
   });
 
 program
