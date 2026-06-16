@@ -1,7 +1,11 @@
 import { Command } from 'commander';
+import { spawnSync } from 'node:child_process';
 import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
-import { loadCredentials } from './utils/credentials.js';
+import { loadCredentials, getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
+import { resolveEnvironment } from './utils/deployment-target.js';
+import { ClusterTargetError, kubectlBaseArgs, resolveClusterTarget, stackSelector } from './utils/cluster-target.js';
+import { summarizeDeploymentHealth, type DeploymentHealth, type PodHealth, type RawPod } from './utils/pod-health.js';
 import chalk from 'chalk';
 
 const CANCEL_POLL_INTERVAL_MS = 2000;
@@ -271,5 +275,142 @@ program
     console.error(chalk.red(`Timed out waiting for refresh to settle.`));
     process.exit(1);
   });
+
+// --- appliance deployment health <project> <environment> ---
+// Pod-level readiness + restart state for a running deployment on a
+// local engine. The api-server tracks Pulumi-op status (succeeded /
+// failed), but not the *runtime* health of the workload it scheduled —
+// a deploy can succeed and then crashloop. We read that straight from
+// the cluster via kubectl, selecting the deployment's pods by their
+// stack-name label.
+program
+  .command('health')
+  .description("show a deployment's pod readiness and restart state (local engines)")
+  .argument('<project>', 'project name')
+  .argument('<environment>', 'environment name')
+  .option('-n, --namespace <ns>', 'kubernetes namespace (defaults to the appliance namespace)')
+  .option('--kubeconfig <path>', 'explicit kubeconfig (overrides the profile-derived cluster)')
+  .option('--context <name>', 'explicit kubectl context (overrides the profile-derived cluster)')
+  .option('--json', 'print the raw health summary as JSON', false)
+  .action(
+    async (
+      projectName: string,
+      environmentName: string,
+      opts: { namespace?: string; kubeconfig?: string; context?: string; json: boolean }
+    ) => {
+      const client = requireClient();
+
+      let stackName: string;
+      try {
+        const env = await resolveEnvironment(client, projectName, environmentName);
+        stackName = env.stackName;
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
+
+      let target;
+      try {
+        target = resolveClusterTarget({
+          profile: getActiveProfileOverride() ?? process.env.APPLIANCE_PROFILE,
+          kubeconfig: opts.kubeconfig,
+          context: opts.context,
+          namespace: opts.namespace,
+        });
+      } catch (err) {
+        if (err instanceof ClusterTargetError) {
+          console.error(chalk.red(err.message));
+          console.error(
+            chalk.dim('Pod health reads from a local engine. For a remote/cloud deployment, use the Appliance Console.')
+          );
+          process.exit(1);
+        }
+        throw err;
+      }
+
+      const r = spawnSync(
+        'kubectl',
+        [...kubectlBaseArgs(target), 'get', 'pods', '--selector', stackSelector(stackName), '-o', 'json'],
+        { encoding: 'utf8' }
+      );
+      if (r.error) {
+        const code = (r.error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') {
+          console.error(chalk.red('kubectl not found on PATH. Install it (e.g. `appliance local install kubectl`).'));
+          process.exit(1);
+        }
+        console.error(chalk.red(`Failed to run kubectl: ${r.error.message}`));
+        process.exit(1);
+      }
+      if (r.status !== 0) {
+        console.error(chalk.red(`kubectl get pods failed: ${(r.stderr ?? '').trim() || `exit ${r.status}`}`));
+        process.exit(1);
+      }
+
+      let items: RawPod[];
+      try {
+        const parsed = JSON.parse(r.stdout) as { items?: RawPod[] };
+        items = parsed.items ?? [];
+      } catch (err) {
+        console.error(chalk.red(`Failed to parse kubectl output: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+      }
+
+      const health = summarizeDeploymentHealth(items);
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify({ project: projectName, environment: environmentName, stackName, ...health }, null, 2)
+        );
+        process.exit(health.healthy ? 0 : 1);
+      }
+
+      printHealth(projectName, environmentName, stackName, target.source, health);
+      // Non-zero exit when unhealthy so the command is usable as a CI
+      // readiness gate.
+      process.exit(health.healthy ? 0 : 1);
+    }
+  );
+
+function printHealth(
+  projectName: string,
+  environmentName: string,
+  stackName: string,
+  source: string,
+  health: DeploymentHealth
+): void {
+  console.log(chalk.bold(`${projectName}/${environmentName}`) + chalk.dim(` (stack ${stackName}, ${source})`));
+  if (health.total === 0) {
+    console.log(chalk.yellow('  No pods found.'));
+    console.log(
+      chalk.dim(
+        '  The deployment may not be running, or this profile may point at a different cluster ' +
+          '(use --profile, --kubeconfig, or --context).'
+      )
+    );
+    return;
+  }
+
+  const overall = health.healthy ? chalk.green('healthy') : chalk.yellow('degraded');
+  console.log(
+    `  Overall:   ${overall} ${chalk.dim(`(${health.ready}/${health.total} pods ready, ${health.restarts} restarts)`)}`
+  );
+  console.log(chalk.bold('  Pods'));
+  for (const pod of health.pods) {
+    console.log(`    ${podMarker(pod)} ${chalk.bold(pod.name)} ${chalk.dim(`${pod.phase} · ${pod.readyRatio} ready`)}`);
+    for (const c of pod.containers) {
+      const cMarker = c.ready ? chalk.green('●') : chalk.red('●');
+      const restartNote = c.restarts > 0 ? chalk.yellow(` · ${c.restarts} restart${c.restarts === 1 ? '' : 's'}`) : '';
+      const reasonNote = c.reason ? chalk.red(` · ${c.reason}`) : '';
+      console.log(`      ${cMarker} ${c.name}${restartNote}${reasonNote}`);
+    }
+  }
+}
+
+function podMarker(pod: PodHealth): string {
+  if (pod.ready) return chalk.green('●');
+  if (pod.restarts > 0 || pod.containers.some((c) => c.reason)) return chalk.red('●');
+  return chalk.yellow('●');
+}
 
 program.parse(process.argv);
