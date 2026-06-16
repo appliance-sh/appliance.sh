@@ -63,9 +63,17 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     aliases: ['remove'],
     load: () => import('./appliance-destroy.js'),
   },
+  env: {
+    description: 'manage per-environment variables (set/list/unset)',
+    load: () => import('./appliance-env.js'),
+  },
   init: {
     description: 'initialise the CLI with the appliance server',
     load: () => import('./appliance-init.js'),
+  },
+  keys: {
+    description: 'manage the cluster API key lifecycle (rotate)',
+    load: () => import('./appliance-keys.js'),
   },
   link: {
     description: 'link this folder to a project/environment',

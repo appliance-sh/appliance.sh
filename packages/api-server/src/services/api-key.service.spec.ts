@@ -77,4 +77,38 @@ describe('ApiKeyService', () => {
     const stored = await service.getByKeyId(created.id);
     expect(stored!.lastUsedAt).toBeDefined();
   });
+
+  it('should delete a key', async () => {
+    const created = await service.create('test-key');
+    await service.delete(created.id);
+    const stored = await service.getByKeyId(created.id);
+    expect(stored).toBeNull();
+  });
+
+  it('delete is a no-op for unknown ids', async () => {
+    await expect(service.delete('apikey_unknown')).resolves.toBeUndefined();
+  });
+
+  it('rotate mints a new key, revokes the old one, and inherits the name', async () => {
+    const created = await service.create('cli');
+    const rotated = await service.rotate(created.id);
+
+    expect(rotated).not.toBeNull();
+    expect(rotated!.id).not.toBe(created.id);
+    expect(rotated!.id).toMatch(/^apikey_/);
+    expect(rotated!.secret).toMatch(/^sk_/);
+    expect(rotated!.secret).not.toBe(created.secret);
+    // Name is inherited so the key keeps its human label across rotations.
+    expect(rotated!.name).toBe('cli');
+
+    // Old key is revoked; new key is usable.
+    expect(await service.getByKeyId(created.id)).toBeNull();
+    const stored = await service.getByKeyId(rotated!.id);
+    expect(stored!.secret).toBe(rotated!.secret);
+  });
+
+  it('rotate returns null for an unknown key id', async () => {
+    const result = await service.rotate('apikey_unknown');
+    expect(result).toBeNull();
+  });
 });
