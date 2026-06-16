@@ -15,7 +15,7 @@ import {
 import type { ProgressEvent } from '@appliance.sh/helper';
 import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
-import { readProfiles } from './utils/profile-store.js';
+import { readProfiles, removeProfile } from './utils/profile-store.js';
 
 // `appliance vm` — the microVM runtime engine (appliance-vm). Same
 // developer surface as `appliance local` (the k3d engine), but the
@@ -402,7 +402,6 @@ async function ensureCrane(): Promise<string> {
 for (const [cmd, desc] of [
   ['stop', 'stop the microVM (state is preserved)'],
   ['status', 'report microVM state as JSON'],
-  ['delete', 'delete the microVM and its state'],
 ] as const) {
   program
     .command(cmd)
@@ -412,6 +411,30 @@ for (const [cmd, desc] of [
       process.exit(runVm([cmd, opts.name]));
     });
 }
+
+// `delete` is not a plain passthrough. The Rust engine removes the VM
+// and its on-disk state, but the credential profile that `vm up` minted
+// (`microvm` for the default VM, `microvm-<name>` otherwise) lives in
+// the CLI profile store — which the engine knows nothing about. Without
+// pruning it here, a deleted VM leaves an orphan cluster behind in both
+// the CLI and the desktop (both read ~/.appliance/profiles.json), which
+// is exactly the lingering-profile bug this command exists to fix.
+program
+  .command('delete')
+  .description('delete the microVM, its state, and its credential profile')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    const code = runVm(['delete', opts.name]);
+    // Only prune credentials once the engine confirms the VM is gone, so
+    // a failed delete never strips a still-usable profile.
+    if (code === 0) {
+      const profile = profileForVm(opts.name);
+      if (removeProfile(profile)) {
+        console.log(chalk.dim(`removed credential profile '${profile}'`));
+      }
+    }
+    process.exit(code);
+  });
 
 program
   .command('console')
