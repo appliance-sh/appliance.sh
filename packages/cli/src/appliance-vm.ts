@@ -13,7 +13,7 @@ import {
   DEFAULT_LOCAL_NAMESPACE,
 } from '@appliance.sh/helper';
 import type { ProgressEvent } from '@appliance.sh/helper';
-import { createApplianceClient } from '@appliance.sh/sdk';
+import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
 import { readProfiles } from './utils/profile-store.js';
 
@@ -261,9 +261,19 @@ async function deliverApiServerImage(imageOverride: string | undefined, targetRe
     : [`appliance-api-server:${VM_HOST_ARCH}`, 'appliance-api-server:latest'];
   // Keep only refs that actually exist locally, remembering each one's
   // host-resolved architecture for diagnostics + ordering.
-  const present = candidates
+  let present = candidates
     .map((ref) => ({ ref, arch: inspectArch(ref) }))
     .filter((c): c is { ref: string; arch: string } => c.arch !== null);
+
+  // Nothing local and no explicit --image: pull the pinned published
+  // image so a fresh machine boots a VM without a manual build or
+  // `docker tag`. Mirrors the bootstrap default (phases/phase2.ts) — the
+  // same versioned ghcr ref every surface uses.
+  if (present.length === 0 && !imageOverride) {
+    const pulled = pullPublishedApiServer();
+    if (pulled) present = [pulled];
+  }
+
   if (present.length === 0) throw new Error(missingImageMessage(imageOverride));
 
   // Try a ref whose host-resolved arch already matches first (a
@@ -301,6 +311,27 @@ async function deliverApiServerImage(imageOverride: string | undefined, targetRe
   }
 }
 
+/** The published api-server image for this CLI's release. Pinned to the
+ *  SDK VERSION exactly like the cloud bootstrap default
+ *  (packages/bootstrap/src/phases/phase2.ts) so every surface seeds the
+ *  same versioned image. */
+const PUBLISHED_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.replace(/^v/, '')}`;
+
+/** Pull the pinned published api-server image into the local docker
+ *  daemon as a last resort when nothing matching is present, selecting
+ *  the VM's arch out of the multi-arch manifest. Returns the ref + its
+ *  host-resolved arch on success, or null when the pull fails (offline,
+ *  no ghcr access, or an unreleased VERSION with no matching tag) — the
+ *  caller then surfaces the build/--image guidance. */
+function pullPublishedApiServer(): { ref: string; arch: string } | null {
+  const ref = PUBLISHED_API_SERVER_IMAGE;
+  console.log(chalk.cyan(`» no local api-server image — pulling ${ref}`));
+  const pull = spawnSync('docker', ['pull', '--platform', `linux/${VM_HOST_ARCH}`, ref], { stdio: 'inherit' });
+  if (pull.status !== 0) return null;
+  const arch = inspectArch(ref);
+  return arch ? { ref, arch } : null;
+}
+
 /** Host-resolved architecture of a local image, or null when it isn't
  *  in the docker daemon. With the containerd image store a multi-arch
  *  image resolves to the host platform whenever it carries one. */
@@ -336,7 +367,8 @@ function missingImageMessage(imageOverride: string | undefined): string {
     return `image ${imageOverride} not found in the local docker daemon — build or pull it first, or pass a different --image.`;
   }
   return (
-    'no appliance-api-server image found in the local docker daemon.\n' +
+    `no local appliance-api-server image, and pulling ${PUBLISHED_API_SERVER_IMAGE} failed\n` +
+    '(check network / ghcr access, or that this CLI version has a published image).\n' +
     `Build one for the VM's architecture (linux/${VM_HOST_ARCH}):\n` +
     `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
     '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
