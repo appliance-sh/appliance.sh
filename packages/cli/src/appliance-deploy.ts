@@ -379,7 +379,13 @@ registerManifestOptions(program)
 
     const credentials = loadCredentials();
     if (!credentials) {
-      console.error(chalk.red('Not logged in. Run `appliance login` first.'));
+      console.error(chalk.red('Not logged in — no credentials for the active profile.'));
+      console.error(
+        chalk.dim(
+          'Run `appliance login` to authenticate, or start a local runtime with `appliance local up` / `appliance vm up` ' +
+            '(which save a profile for you). `appliance whoami` shows the active profile; `appliance doctor` checks the host prerequisites.'
+        )
+      );
       process.exit(1);
     }
 

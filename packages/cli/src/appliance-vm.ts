@@ -234,7 +234,11 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
       // keep polling
     }
     if (Date.now() >= deadline) {
-      throw new Error(`in-VM registry not reachable at ${url} — check \`appliance vm console\``);
+      throw new Error(
+        `in-VM registry not reachable at ${url} after ${Math.round(timeoutMs / 1000)}s.\n` +
+          'The VM booted but its registry forward never came up. Inspect the boot log with `appliance vm console`, ' +
+          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.'
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
@@ -369,7 +373,7 @@ function missingImageMessage(imageOverride: string | undefined): string {
   }
   return (
     `no local appliance-api-server image, and pulling ${PUBLISHED_API_SERVER_IMAGE} failed\n` +
-    '(check network / ghcr access, or that this CLI version has a published image).\n' +
+    '(check network / ghcr access, or that this CLI version has a published image — `appliance doctor` diagnoses these).\n' +
     `Build one for the VM's architecture (linux/${VM_HOST_ARCH}):\n` +
     `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
     '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
