@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, Trash2, Check } from 'lucide-react';
+import { Plus, Trash2, Check, RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
@@ -9,7 +9,7 @@ import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
-import type { BootstrapEvent, Cluster, ConsoleHost } from '@/lib/host';
+import type { AvailableUpdate, BootstrapEvent, Cluster, ConsoleHost, UpdateProgress } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
 export function SettingsPage() {
@@ -18,6 +18,7 @@ export function SettingsPage() {
   const confirm = useConfirm();
   const { toast } = useToast();
   const canBootstrap = Boolean(host.bootstrap);
+  const canSelfUpdate = Boolean(host.updater);
   const { config, isLoading } = useSelectedCluster();
   const clusters = config?.clusters ?? [];
   const selectedId = config?.selectedClusterId ?? null;
@@ -109,6 +110,8 @@ export function SettingsPage() {
           </>
         )}
       </Section>
+
+      {canSelfUpdate ? <UpdatesSection /> : null}
 
       <Section title="About">
         <Row label="Version" value={<code className="font-mono text-xs">{__APPLIANCE_VERSION__}</code>} />
@@ -856,6 +859,157 @@ async function setClusterStateBackendIfPossible(
     // Best-effort: caching the URL is convenience, not correctness.
     // Failure here doesn't affect the state migration that succeeded.
   }
+}
+
+type UpdatePhase = 'idle' | 'checking' | 'available' | 'up-to-date' | 'downloading' | 'ready' | 'failed';
+
+/**
+ * Self-update panel for the desktop shell. Drives the Tauri updater
+ * through `host.updater`: check the signed feed, download+install the
+ * new bundle with a progress bar, then offer a relaunch into it. Only
+ * rendered when `host.updater` exists (desktop-only).
+ */
+function UpdatesSection() {
+  const host = useHost();
+  const { toast } = useToast();
+  const [phase, setPhase] = React.useState<UpdatePhase>('idle');
+  const [update, setUpdate] = React.useState<AvailableUpdate | null>(null);
+  const [progress, setProgress] = React.useState<UpdateProgress | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const onCheck = async () => {
+    if (!host.updater) return;
+    setPhase('checking');
+    setError(null);
+    setProgress(null);
+    try {
+      const found = await host.updater.check();
+      if (found) {
+        setUpdate(found);
+        setPhase('available');
+      } else {
+        setUpdate(null);
+        setPhase('up-to-date');
+      }
+    } catch (err) {
+      setPhase('failed');
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const onInstall = async () => {
+    if (!host.updater) return;
+    setPhase('downloading');
+    setError(null);
+    setProgress({ downloaded: 0 });
+    try {
+      await host.updater.downloadAndInstall((p) => setProgress(p));
+      setPhase('ready');
+      toast(`Update ${update?.version ?? ''} installed — restart to apply`.trim());
+    } catch (err) {
+      setPhase('failed');
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const onRelaunch = async () => {
+    if (!host.updater) return;
+    try {
+      await host.updater.relaunch();
+    } catch (err) {
+      // A failed relaunch isn't fatal — the update is already installed
+      // and will apply on the next manual restart. Surface it but keep
+      // the "ready" state so the user can retry or quit themselves.
+      setError(err instanceof Error ? err.message : String(err));
+      toast('Could not restart automatically — quit and reopen to finish updating', { variant: 'error' });
+    }
+  };
+
+  const pct =
+    progress && progress.contentLength
+      ? Math.min(100, Math.round((progress.downloaded / progress.contentLength) * 100))
+      : null;
+
+  return (
+    <Section title="Updates" description="Check for a newer signed build and install it in place.">
+      <div className="space-y-3">
+        <div className="grid grid-cols-[auto_1fr] items-baseline gap-4">
+          <dt className="text-xs text-[var(--color-muted-foreground)]">Installed</dt>
+          <dd className="text-sm">
+            <code className="font-mono text-xs">{__APPLIANCE_VERSION__}</code>
+          </dd>
+        </div>
+
+        {phase === 'available' && update ? (
+          <div className="grid grid-cols-[auto_1fr] items-baseline gap-4">
+            <dt className="text-xs text-[var(--color-muted-foreground)]">Available</dt>
+            <dd className="text-sm">
+              <code className="font-mono text-xs text-[var(--color-accent)]">{update.version}</code>
+              {update.date ? (
+                <span className="ml-2 text-xs text-[var(--color-muted-foreground)]">
+                  {new Date(update.date).toLocaleDateString()}
+                </span>
+              ) : null}
+            </dd>
+          </div>
+        ) : null}
+
+        {phase === 'available' && update?.notes ? (
+          <div className="rounded-md border border-[var(--color-border)] bg-black/20 px-3 py-2 text-xs whitespace-pre-wrap text-[var(--color-muted-foreground)]">
+            {update.notes}
+          </div>
+        ) : null}
+
+        {phase === 'downloading' ? (
+          <div className="space-y-1">
+            <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--color-border)]">
+              <div
+                className={cn('h-full bg-[var(--color-accent)] transition-all', pct === null && 'animate-pulse w-1/3')}
+                style={pct === null ? undefined : { width: `${pct}%` }}
+              />
+            </div>
+            <div className="text-xs text-[var(--color-muted-foreground)]">
+              {pct === null ? 'Downloading…' : `Downloading ${pct}%`}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="flex items-center gap-2">
+          {phase === 'available' ? (
+            <Button size="sm" onClick={onInstall}>
+              <Download className="h-4 w-4" /> Download &amp; install {update?.version}
+            </Button>
+          ) : phase === 'ready' ? (
+            <Button size="sm" onClick={onRelaunch}>
+              <ArrowUpCircle className="h-4 w-4" /> Restart to update
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onCheck}
+              disabled={phase === 'checking' || phase === 'downloading'}
+            >
+              <RefreshCw className={cn('h-4 w-4', phase === 'checking' && 'animate-spin')} />
+              {phase === 'checking' ? 'Checking…' : 'Check for updates'}
+            </Button>
+          )}
+
+          {phase === 'up-to-date' ? (
+            <span className="text-xs text-green-400">✓ You&apos;re on the latest version</span>
+          ) : null}
+          {phase === 'ready' ? <span className="text-xs text-green-400">✓ Installed</span> : null}
+          {phase === 'failed' ? <span className="text-xs text-red-400">Update failed</span> : null}
+        </div>
+
+        {error ? (
+          <div className="rounded-md border border-[var(--color-border)] bg-black/30 px-3 py-2 font-mono text-xs whitespace-pre-wrap text-red-400">
+            {error}
+          </div>
+        ) : null}
+      </div>
+    </Section>
+  );
 }
 
 function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {

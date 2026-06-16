@@ -1,6 +1,6 @@
 [package]
 name = "appliance-desktop"
-version = "1.27.3"
+version = "1.48.0"
 description = "Appliance Desktop — Tauri shell"
 authors = ["Eliot Lim"]
 edition = "2021"
@@ -18,6 +18,16 @@ tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
+# Self-update from a signed update feed. The frontend's Settings page
+# drives check/download/install through the JS guest bindings
+# (@tauri-apps/plugin-updater); the public key + endpoints live in
+# tauri.conf.json's `plugins.updater`. Desktop-only and macOS/Windows/
+# Linux-AppImage capable — see the README's "Auto-update" section.
+tauri-plugin-updater = "2"
+# The updater installs the downloaded bundle via the OS; on macOS the
+# process is restarted with the new app, which needs the process
+# plugin's `relaunch`.
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

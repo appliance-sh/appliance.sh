@@ -2,7 +2,11 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { open as openShell } from '@tauri-apps/plugin-shell';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { check as checkForUpdate, type Update } from '@tauri-apps/plugin-updater';
+import { relaunch as relaunchApp } from '@tauri-apps/plugin-process';
 import type {
+  AvailableUpdate,
+  UpdateProgress,
   MicroVmStatus,
   MicroVmSummary,
   AddClusterInput,
@@ -317,4 +321,69 @@ export const tauriHost: ConsoleHost = {
       };
     },
   },
+
+  updater: {
+    async check(): Promise<AvailableUpdate | null> {
+      // `check()` pulls + verifies the signed manifest from the
+      // `plugins.updater.endpoints` feed. It resolves to null when the
+      // running build is already current, and to an Update handle (which
+      // we stash for downloadAndInstall) when a newer signed bundle
+      // exists. A bad pubkey / unreachable feed throws — surfaced to the
+      // Settings panel verbatim.
+      const update = await checkForUpdate();
+      pendingUpdate = update;
+      if (!update) return null;
+      return {
+        version: update.version,
+        currentVersion: update.currentVersion,
+        // The plugin exposes the manifest's release notes as `body`.
+        notes: update.body || undefined,
+        date: update.date || undefined,
+      };
+    },
+    async downloadAndInstall(onProgress: (progress: UpdateProgress) => void): Promise<void> {
+      if (!pendingUpdate) {
+        // Defensive: the UI only enables install after a successful
+        // check, but a stale render could call through. Re-resolve so
+        // we never install an unverified bundle.
+        pendingUpdate = await checkForUpdate();
+      }
+      if (!pendingUpdate) {
+        throw new Error('No pending update — run a check first.');
+      }
+      let downloaded = 0;
+      let contentLength: number | undefined;
+      // The plugin streams typed progress events: Started carries the
+      // (optional) Content-Length, Progress carries each chunk's size,
+      // Finished closes the transfer. Accumulate into the host's
+      // UpdateProgress shape the React panel renders.
+      await pendingUpdate.downloadAndInstall((event) => {
+        switch (event.event) {
+          case 'Started':
+            contentLength = event.data.contentLength;
+            downloaded = 0;
+            onProgress({ contentLength, downloaded });
+            break;
+          case 'Progress':
+            downloaded += event.data.chunkLength;
+            onProgress({ contentLength, downloaded });
+            break;
+          case 'Finished':
+            onProgress({ contentLength, downloaded: contentLength ?? downloaded });
+            break;
+          default:
+            break;
+        }
+      });
+    },
+    async relaunch(): Promise<void> {
+      await relaunchApp();
+    },
+  },
 };
+
+// The Update handle resolved by the most recent `updater.check()`.
+// downloadAndInstall needs the same handle check() produced (it carries
+// the verified download URL + signature), so we keep it module-scoped
+// between the two calls rather than round-tripping it through React.
+let pendingUpdate: Update | null = null;

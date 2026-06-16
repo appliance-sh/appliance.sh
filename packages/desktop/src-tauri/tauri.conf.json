@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Appliance",
-  "version": "1.27.3",
+  "version": "1.48.0",
   "identifier": "sh.appliance.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -30,6 +30,15 @@
     "copyright": "Copyright © Appliance",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"],
     "externalBin": ["binaries/appliance"],
-    "resources": ["vm-bin/*"]
+    "resources": ["vm-bin/*"],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/appliance-sh/appliance.sh/releases/latest/download/latest.json"],
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+    }
   }
 }

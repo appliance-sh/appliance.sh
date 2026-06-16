@@ -4638,10 +4638,25 @@ pub fn run() {
     // copy, which keeps versioning predictable.
     ensure_user_paths_on_path();
     ensure_helper_bin_on_path();
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    // Self-update is a desktop-only capability: the updater plugin pulls
+    // a signed bundle from the feed in tauri.conf.json and swaps the app
+    // in place, and `process::relaunch` restarts into the new version.
+    // Mobile targets have no equivalent (app-store managed), so gate
+    // both plugins behind `#[cfg(desktop)]` to keep the mobile build
+    // compiling.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+
+    builder
         .setup(|app| {
             // Adopt CLI-registered microVM clusters at launch —
             // `appliance vm up` may have run (for any VM) while the

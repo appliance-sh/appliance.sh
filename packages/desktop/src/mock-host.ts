@@ -54,6 +54,19 @@ function scenario(): Scenario {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+// Toggle to QA the "you're up to date" branch of the updater panel.
+const MOCK_UPDATE_AVAILABLE = true;
+// Fixed running version for the mock update feed (the real running
+// version isn't available to desktop-package source — see check()).
+const MOCK_CURRENT_VERSION = '1.48.0';
+
+/** Bump the minor of a semver string for the mock update feed. */
+function bumpMinor(version: string): string {
+  const [major, minor] = version.split('.');
+  const nextMinor = Number.isFinite(Number(minor)) ? Number(minor) + 1 : 1;
+  return `${major ?? '0'}.${nextMinor}.0`;
+}
+
 // ---- persisted clusters (sessionStorage, console-host style) ----------
 
 interface PersistedState {
@@ -344,6 +357,45 @@ export function createMockHost(): ConsoleHost {
 
     async openExternal(url: string): Promise<void> {
       window.open(url, '_blank', 'noreferrer');
+    },
+
+    // Simulated self-update so the Settings "Check for updates" panel can
+    // be developed in a browser. Advertises a bump over the bundled
+    // version, then streams a fake download with byte-level progress so
+    // the determinate progress bar and "Restart" CTA are exercised.
+    // `?scenario=` doesn't gate this — it always offers an update so the
+    // happy path is reachable; flip `MOCK_UPDATE_AVAILABLE` to false to
+    // QA the "you're up to date" branch.
+    updater: {
+      async check() {
+        await sleep(700);
+        if (!MOCK_UPDATE_AVAILABLE) return null;
+        // The desktop Vite build doesn't inline __APPLIANCE_VERSION__
+        // (that define lives in @appliance.sh/app's build), so the mock
+        // uses a fixed pair rather than reading the real running
+        // version — only the panel's rendering matters here.
+        const current = MOCK_CURRENT_VERSION;
+        return {
+          version: bumpMinor(current),
+          currentVersion: current,
+          notes: 'mock: faster cluster switcher, microVM egress log fixes, and this very updater panel.',
+          date: new Date().toISOString(),
+        };
+      },
+      async downloadAndInstall(onProgress) {
+        const total = 48 * 1024 * 1024; // ~48 MB, like a real DMG
+        let downloaded = 0;
+        onProgress({ contentLength: total, downloaded });
+        while (downloaded < total) {
+          await sleep(120);
+          downloaded = Math.min(total, downloaded + total / 20);
+          onProgress({ contentLength: total, downloaded });
+        }
+      },
+      async relaunch() {
+        // A real relaunch swaps the process; in the browser, just reload.
+        window.location.reload();
+      },
     },
 
     bootstrap: {
