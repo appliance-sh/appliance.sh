@@ -63,6 +63,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     aliases: ['remove'],
     load: () => import('./appliance-destroy.js'),
   },
+  doctor: {
+    description: 'run first-run preflight checks (use --fix to auto-resolve the safe ones)',
+    load: () => import('./appliance-doctor.js'),
+  },
   init: {
     description: 'initialise the CLI with the appliance server',
     load: () => import('./appliance-init.js'),
