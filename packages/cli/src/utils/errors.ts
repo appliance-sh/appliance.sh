@@ -7,15 +7,32 @@ export function isPromptCancel(error: unknown): boolean {
 }
 
 /** One-line remediation hint for the most common API/network failure
- *  shapes, or null when the raw message has to speak for itself. */
+ *  shapes, or null when the raw message has to speak for itself. Order
+ *  matters: more specific shapes are matched before the broad network
+ *  catch-all so each failure points at the exact fix. */
 export function remediationHint(message: string, apiUrl?: string): string | null {
+  if (/not logged in|no credentials|no active profile|credentials not found/i.test(message)) {
+    return 'Not logged in — run `appliance login` (or `appliance local up` / `appliance vm up` for a local runtime), then retry.';
+  }
   if (/\b401\b|unauthoriz|signature|invalid key/i.test(message)) {
     return 'Authentication failed — run `appliance login` to refresh credentials, or check the active profile with `appliance whoami`.';
   }
   if (/\b403\b|forbidden/i.test(message)) {
     return 'This API key is not allowed to do that — check which profile is active with `appliance whoami`.';
   }
-  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|fetch failed|socket hang up|abort/i.test(message)) {
+  if (/kubeconfig/i.test(message)) {
+    return 'No kubeconfig for this runtime — bring it up with `appliance local up` (or `appliance vm up`), which writes the kubeconfig.';
+  }
+  if (/no such (host|cluster)|cluster .*not (found|exist|running)|k3d|does not exist/i.test(message)) {
+    return 'The local cluster is not running — start it with `appliance local up` (`appliance local status` shows what is missing).';
+  }
+  if (/docker|container runtime|daemon|colima/i.test(message)) {
+    return 'The container runtime is not reachable — start it with `appliance local runtime start`, then re-run (`appliance local status` to verify).';
+  }
+  if (/\b5\d\d\b|bad gateway|gateway timeout|service unavailable/i.test(message)) {
+    return `The api-server${apiUrl ? ` at ${apiUrl}` : ''} returned a server error — it may still be starting; wait a moment and retry, or check it with \`appliance test\`.`;
+  }
+  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|fetch failed|socket hang up|abort|not reachable/i.test(message)) {
     return `Could not reach the api-server${apiUrl ? ` at ${apiUrl}` : ''} — is it running? \`appliance test\` runs connection diagnostics.`;
   }
   return null;

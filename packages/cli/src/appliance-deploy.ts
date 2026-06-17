@@ -442,8 +442,9 @@ registerManifestOptions(program)
         storage: manifestRuntime?.storage,
       });
       if (!result.success) {
-        console.error(chalk.red(`Deploy failed: ${result.error.message}`));
-        process.exit(1);
+        // Throw rather than print-and-exit so the shared handler below
+        // attaches a remediation line (auth/cluster/network shapes).
+        throw new Error(`Deploy failed: ${result.error.message}`);
       }
 
       // Persist the link so the next `appliance deploy` (no args)
