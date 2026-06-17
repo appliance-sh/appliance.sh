@@ -149,7 +149,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
 const SHARED_PROFILES_DIR: &str = ".appliance";
 const SHARED_PROFILES_FILE: &str = "profiles.json";
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct SharedProfileEntry {
     api_url: String,
@@ -286,6 +286,153 @@ fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
     write_shared_profiles(&file)
 }
 
+// ============================================================
+// Single-source-of-truth migration (stage 1: non-destructive seed)
+//
+// GOAL: make ~/.appliance/profiles.json the authoritative store for
+// every desktop cluster's secret and turn the macOS keychain into a
+// one-way derived cache (read FROM profiles.json, written TO keychain).
+//
+// Before we can flip the read direction, every secret that currently
+// lives ONLY in the keychain (desktop-managed clusters created before
+// this change, where mirror_to_shared_profiles wrote the metadata but
+// an older build never copied the secret, or where the shared entry's
+// secret was cleared) must be copied into profiles.json. Otherwise
+// flipping the read to source from profiles.json would surface an
+// empty secret and silently break the cluster.
+//
+// This is the SEED step. It is:
+//   * non-destructive — it only ever WRITES into profiles.json; it
+//     never deletes or overwrites a keychain entry, and never clears
+//     a secret;
+//   * authoritative-preserving — it refuses to overwrite a non-empty
+//     secret already in profiles.json (that copy is, by definition,
+//     the authoritative one once this lands);
+//   * idempotent — re-running it once everything is seeded is a no-op.
+// ============================================================
+
+/// Outcome of evaluating one cluster for the keychain→profiles.json
+/// seed. Pure data so the decision can be unit-tested without touching
+/// the real keychain.
+#[derive(Debug, PartialEq)]
+enum SeedDecision {
+    /// profiles.json already holds a non-empty secret for this id (it
+    /// is authoritative) — leave it untouched.
+    AlreadySeeded,
+    /// No secret anywhere we can see (keychain miss and no shared
+    /// secret) — nothing to copy; metadata, if any, stays as-is.
+    NothingToSeed,
+    /// The keychain held the only copy — fold it into profiles.json.
+    /// Carries the entry that should be written for `cluster_id`.
+    Seed {
+        cluster_id: String,
+        entry: SharedProfileEntry,
+    },
+}
+
+/// Decide whether a single desktop cluster's keychain secret needs
+/// seeding into profiles.json. Pure: all IO (keychain + file reads) is
+/// resolved by the caller and passed in.
+///
+/// * `cluster` — the desktop's in-memory record (metadata source).
+/// * `keychain_key` — what `read_api_key(cluster:<id>)` returned, or
+///   `None` if the keychain has no entry / it was unreadable.
+/// * `existing` — the current profiles.json entry for this id, if any.
+fn decide_seed(
+    cluster: &Cluster,
+    keychain_key: Option<&ApiKey>,
+    existing: Option<&SharedProfileEntry>,
+) -> SeedDecision {
+    // An existing non-empty shared secret is authoritative — never
+    // clobber it from the (now derived) keychain. This is the
+    // idempotency guard: once seeded, every later run lands here.
+    if let Some(entry) = existing {
+        if !entry.secret.is_empty() && !entry.key_id.is_empty() {
+            return SeedDecision::AlreadySeeded;
+        }
+    }
+
+    let Some(key) = keychain_key else {
+        // Secret lives nowhere we can read it. Don't fabricate an
+        // empty entry; leave whatever metadata exists alone.
+        return SeedDecision::NothingToSeed;
+    };
+    if key.secret.is_empty() || key.id.is_empty() {
+        return SeedDecision::NothingToSeed;
+    }
+
+    // Carry forward any metadata the shared entry already had (e.g. a
+    // CLI-written `managed`/`name`) so the seed only fills in the
+    // missing secret without rewriting unrelated fields. Default the
+    // surface marker to "desktop" since that's the only producer that
+    // stored a secret solely in the keychain.
+    let prev = existing.cloned().unwrap_or_default();
+    SeedDecision::Seed {
+        cluster_id: cluster.id.clone(),
+        entry: SharedProfileEntry {
+            api_url: if prev.api_url.is_empty() {
+                cluster.api_server_url.clone()
+            } else {
+                prev.api_url
+            },
+            key_id: key.id.clone(),
+            secret: key.secret.clone(),
+            created_at: prev.created_at.or_else(|| Some(cluster.created_at.clone())),
+            state_backend_url: prev.state_backend_url.or_else(|| cluster.state_backend_url.clone()),
+            last_bootstrap_input: prev
+                .last_bootstrap_input
+                .or_else(|| cluster.last_bootstrap_input.clone()),
+            managed: prev.managed.or_else(|| Some("desktop".to_string())),
+            name: prev.name.or_else(|| Some(cluster.name.clone())),
+        },
+    }
+}
+
+/// Stage-1 seed: for every desktop cluster whose secret currently
+/// exists ONLY in the keychain, copy it into profiles.json once. Reads
+/// each cluster's secret from the keychain and applies `decide_seed`.
+///
+/// Returns the number of entries newly seeded (0 ⇒ nothing changed, so
+/// no write is needed). The shared file is only rewritten when at least
+/// one entry was seeded, keeping the steady-state path write-free.
+///
+/// SAFETY: this only ADDS secrets to profiles.json — it never removes
+/// a keychain entry and never overwrites an existing non-empty shared
+/// secret, so no secret can be lost by running it. Hold `config_lock`
+/// across the call (as the sync path does) so the read-modify-write of
+/// profiles.json doesn't interleave with another desktop write.
+fn seed_profiles_from_keychain(cfg: &PersistedConfig) -> Result<usize, HostError> {
+    let mut file = read_shared_profiles().unwrap_or_default();
+    let mut seeded = 0usize;
+    for cluster in &cfg.clusters {
+        let keychain_key = read_api_key(&cluster_keychain_account(&cluster.id));
+        let existing = file.profiles.get(&cluster.id);
+        match decide_seed(cluster, keychain_key.as_ref(), existing) {
+            SeedDecision::Seed { cluster_id, entry } => {
+                file.profiles.insert(cluster_id, entry);
+                seeded += 1;
+            }
+            SeedDecision::AlreadySeeded | SeedDecision::NothingToSeed => {}
+        }
+    }
+    if seeded > 0 {
+        write_shared_profiles(&file)?;
+    }
+    Ok(seeded)
+}
+
+/// Launch-time entry point for the stage-1 seed. Reads the desktop's
+/// persisted clusters and folds any keychain-only secret into
+/// profiles.json. Takes `config_lock` for the read-modify-write so it
+/// can't interleave with a concurrent desktop write (e.g. the microVM
+/// sync that runs right after). Cross-PROCESS interleaving with the
+/// CLI is still possible — see the concurrency note on `config_lock`.
+fn seed_desktop_profiles(app: &AppHandle) -> Result<usize, HostError> {
+    let _guard = config_lock();
+    let persisted = read_persisted_config(app)?;
+    seed_profiles_from_keychain(&persisted)
+}
+
 /// Convert a SharedProfilesFile into a PersistedConfig (the desktop's
 /// in-memory shape) and write the secrets back into the OS keychain so
 /// subsequent calls see them through the existing keychain path.
@@ -331,9 +478,19 @@ fn ingest_shared_into_legacy(
 /// Serializes every read-modify-write of the persisted config.
 /// Multiple surfaces touch config.json concurrently — frontend
 /// commands (get_config's legacy migration, cluster CRUD) and
-/// background work (the launch-time microVM sync) — and an unguarded
-/// interleaving lets a later write clobber an earlier one with stale
-/// state. Take this for the full read→mutate→write span.
+/// background work (the launch-time seed + microVM sync) — and an
+/// unguarded interleaving lets a later write clobber an earlier one
+/// with stale state. Take this for the full read→mutate→write span.
+///
+/// SCOPE: this guards in-PROCESS races only (it's a process-global
+/// Mutex). It does NOT serialize against the CLI, which is a separate
+/// process that performs its own read-modify-write of profiles.json
+/// (e.g. `appliance keys rotate`). A cross-process advisory file lock
+/// around profiles.json is the remaining piece of stage-3 concurrency
+/// safety — see docs/credentials.md. Until then the window is small
+/// (both sides do atomic temp-file renames, so neither can read a
+/// half-written file; the risk is purely last-writer-wins on
+/// interleaved full read→write cycles).
 fn config_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4666,6 +4823,14 @@ pub fn run() {
             // shouldn't block.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Stage-1 single-source-of-truth seed: fold any
+                // keychain-only secret into profiles.json before
+                // anything else reads it, so the shared store is the
+                // complete, authoritative copy. Non-destructive and
+                // idempotent — see seed_profiles_from_keychain.
+                if let Err(e) = seed_desktop_profiles(&handle) {
+                    eprintln!("warn: credential seed at launch failed: {e}");
+                }
                 let names = match microvm_list().await {
                     Ok(vms) => vms.into_iter().map(|v| v.name).collect::<Vec<_>>(),
                     Err(_) => vec![MICROVM_NAME.to_string()],
@@ -4757,5 +4922,138 @@ mod tests {
             "FATA[0000] failed to start cluster: Bind for 0.0.0.0:8081 failed: port is already allocated"
         ));
         assert!(!is_wedged_start_failure(""));
+    }
+
+    // ---- stage-1 credential seed (decide_seed) -------------------
+
+    fn test_cluster(id: &str) -> Cluster {
+        Cluster {
+            id: id.to_string(),
+            name: "Prod".to_string(),
+            api_server_url: "https://api.example.com".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            state_backend_url: None,
+            last_bootstrap_input: None,
+            synced_key_id: None,
+        }
+    }
+
+    fn key(id: &str, secret: &str) -> ApiKey {
+        ApiKey {
+            id: id.to_string(),
+            secret: secret.to_string(),
+        }
+    }
+
+    #[test]
+    fn seeds_keychain_only_secret_into_profiles() {
+        // The core case: secret lives only in the keychain, no shared
+        // entry yet. It must be folded into profiles.json with the
+        // cluster's metadata and a "desktop" surface marker.
+        let cluster = test_cluster("prod");
+        let k = key("key-1", "s3cr3t");
+        match decide_seed(&cluster, Some(&k), None) {
+            SeedDecision::Seed { cluster_id, entry } => {
+                assert_eq!(cluster_id, "prod");
+                assert_eq!(entry.key_id, "key-1");
+                assert_eq!(entry.secret, "s3cr3t");
+                assert_eq!(entry.api_url, "https://api.example.com");
+                assert_eq!(entry.managed.as_deref(), Some("desktop"));
+                assert_eq!(entry.name.as_deref(), Some("Prod"));
+                assert_eq!(entry.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+            }
+            other => panic!("expected Seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_authoritative_secret() {
+        // profiles.json already holds a non-empty secret — it is the
+        // source of truth and must NOT be clobbered by the keychain
+        // (which may be a stale derived copy after a CLI re-key).
+        let cluster = test_cluster("prod");
+        let keychain = key("old-key", "stale");
+        let existing = SharedProfileEntry {
+            api_url: "https://api.example.com".to_string(),
+            key_id: "new-key".to_string(),
+            secret: "fresh".to_string(),
+            managed: Some("cli".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_seed(&cluster, Some(&keychain), Some(&existing)),
+            SeedDecision::AlreadySeeded
+        );
+    }
+
+    #[test]
+    fn is_idempotent_on_already_seeded_entry() {
+        // Re-running after a successful seed (keychain and shared agree)
+        // is a no-op — guards against repeated writes on every launch.
+        let cluster = test_cluster("prod");
+        let k = key("key-1", "s3cr3t");
+        let existing = SharedProfileEntry {
+            api_url: "https://api.example.com".to_string(),
+            key_id: "key-1".to_string(),
+            secret: "s3cr3t".to_string(),
+            managed: Some("desktop".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_seed(&cluster, Some(&k), Some(&existing)),
+            SeedDecision::AlreadySeeded
+        );
+    }
+
+    #[test]
+    fn seeds_when_shared_entry_has_empty_secret() {
+        // mirror_to_shared_profiles' placeholder path could write an
+        // entry with metadata but an empty secret. That is NOT
+        // authoritative, so a keychain secret should still seed it —
+        // and preserve the placeholder's metadata.
+        let cluster = test_cluster("prod");
+        let k = key("key-1", "s3cr3t");
+        let existing = SharedProfileEntry {
+            api_url: "https://api.example.com".to_string(),
+            key_id: String::new(),
+            secret: String::new(),
+            name: Some("Renamed Prod".to_string()),
+            managed: Some("desktop".to_string()),
+            ..Default::default()
+        };
+        match decide_seed(&cluster, Some(&k), Some(&existing)) {
+            SeedDecision::Seed { entry, .. } => {
+                assert_eq!(entry.secret, "s3cr3t");
+                assert_eq!(entry.key_id, "key-1");
+                // Existing metadata wins over the cluster's copy.
+                assert_eq!(entry.name.as_deref(), Some("Renamed Prod"));
+            }
+            other => panic!("expected Seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_to_seed_without_keychain_secret() {
+        // No keychain entry and no shared secret: don't fabricate an
+        // empty profile. Leave the (meta-only or absent) state alone.
+        let cluster = test_cluster("prod");
+        assert_eq!(decide_seed(&cluster, None, None), SeedDecision::NothingToSeed);
+    }
+
+    #[test]
+    fn nothing_to_seed_on_blank_keychain_secret() {
+        // A malformed/blank keychain payload must not produce an empty
+        // authoritative secret — that's worse than leaving it unset.
+        let cluster = test_cluster("prod");
+        let blank = key("", "");
+        assert_eq!(
+            decide_seed(&cluster, Some(&blank), None),
+            SeedDecision::NothingToSeed
+        );
+        let no_id = key("", "secret");
+        assert_eq!(
+            decide_seed(&cluster, Some(&no_id), None),
+            SeedDecision::NothingToSeed
+        );
     }
 }
