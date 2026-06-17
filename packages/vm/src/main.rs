@@ -38,11 +38,11 @@ enum Cmd {
     Create {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = spec::DEFAULT_CPUS)]
         cpus: usize,
-        #[arg(long, default_value_t = 2048)]
+        #[arg(long, default_value_t = spec::DEFAULT_MEMORY_MIB)]
         memory: u64,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = spec::DEFAULT_DISK_GIB)]
         disk: u64,
     },
     /// Start a VM in the background (creates it with defaults first if needed).
@@ -58,6 +58,14 @@ enum Cmd {
         /// Seconds to wait for readiness before giving up.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Virtual CPUs (persisted; defaults to the VM's current value,
+        /// or 2 for a new VM). Takes effect on the next boot.
+        #[arg(long)]
+        cpus: Option<usize>,
+        /// Guest memory in MiB (persisted; defaults to the VM's current
+        /// value, or 4096 for a new VM). Takes effect on the next boot.
+        #[arg(long)]
+        memory: Option<u64>,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -303,9 +311,28 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        Cmd::Up { name, timeout } => {
+        Cmd::Up {
+            name,
+            timeout,
+            cpus,
+            memory,
+        } => {
             backend.availability()?;
-            let spec = ensure_spec(&name)?;
+            let mut spec = ensure_spec(&name)?;
+            // Persist resource overrides into the spec *before* spawning
+            // the host process — `run` reads sizing from disk, and a
+            // persisted spec is what makes the new sizing survive a
+            // restart. A running VM keeps its current sizing until the
+            // next boot, so warn rather than silently mislead.
+            if spec.apply_resource_overrides(cpus, memory)? {
+                store::save_spec(&spec)?;
+                if store::read_live_pid(&name).is_some() {
+                    println!(
+                        "note: VM '{name}' is already running — new sizing ({} cpus, {} MiB) applies on its next boot",
+                        spec.cpus, spec.memory_mib
+                    );
+                }
+            }
             let paths = VmPaths::for_name(&name);
             if store::read_live_pid(&name).is_none() {
                 // Clear stale readiness markers from a previous boot

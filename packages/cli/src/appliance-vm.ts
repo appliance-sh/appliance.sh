@@ -122,20 +122,46 @@ program
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
   .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
-  .action(async (opts: { name: string; image?: string; timeout: string }) => {
+  .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
+  .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
+  .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
     try {
-      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10));
+      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10), {
+        cpus: opts.cpus,
+        memory: opts.memory,
+      });
     } catch (err) {
       console.error(chalk.red(err instanceof Error ? err.message : String(err)));
       process.exit(1);
     }
   });
 
-async function runUp(name: string, imageOverride: string | undefined, timeout: number): Promise<void> {
+/** Commander option parser: a positive integer, or a clear failure.
+ *  Used for --cpus / --memory so a bad value is rejected host-side
+ *  before the engine ever sees it. */
+function parsePositiveInt(value: string): number {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`expected a positive integer, got '${value}'`);
+  }
+  return n;
+}
+
+async function runUp(
+  name: string,
+  imageOverride: string | undefined,
+  timeout: number,
+  resources: { cpus?: number; memory?: number } = {}
+): Promise<void> {
   const profile = profileForVm(name);
   const ports = vmPorts(name);
-  // 1. Boot the VM + wait for its kubernetes endpoint.
-  const status = runVm(['up', name, '--timeout', String(timeout)]);
+  // 1. Boot the VM + wait for its kubernetes endpoint. Per-VM resource
+  //    overrides are persisted into the spec by the engine, so they
+  //    survive restarts; omitting them keeps the VM's current sizing.
+  const upArgs = ['up', name, '--timeout', String(timeout)];
+  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
+  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
+  const status = runVm(upArgs);
   if (status !== 0) process.exit(status);
   // Re-read ports: `vm up` creates the spec (with allocated ports) if
   // it didn't exist, so the canonical-fallback above may be stale now.
