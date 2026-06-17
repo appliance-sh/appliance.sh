@@ -21,6 +21,14 @@ vi.mock('../../services/project.service', () => ({
   projectService: mockProjectService,
 }));
 
+const mockEnvironmentHealthService = vi.hoisted(() => ({
+  getForEnvironment: vi.fn(),
+}));
+
+vi.mock('../../services/environment-health.service', () => ({
+  environmentHealthService: mockEnvironmentHealthService,
+}));
+
 import { environmentRoutes } from './index';
 
 function createTestApp() {
@@ -131,6 +139,49 @@ describe('Environment routes', () => {
 
       expect(res.status).toBe(404);
       expect(res.body.error).toBe('Environment not found');
+    });
+  });
+
+  describe('GET /api/v1/projects/:projectId/environments/:id/health', () => {
+    it('returns health for an environment in the project', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-1' });
+      mockEnvironmentHealthService.getForEnvironment.mockResolvedValue({
+        environmentId: 'env-1',
+        status: 'healthy',
+        desiredReplicas: 1,
+        readyReplicas: 1,
+        restarts: 0,
+        pods: [{ name: 'env-1-abc', phase: 'Running', ready: true, restarts: 0 }],
+        usage: { cpuMillicores: 12, memoryBytes: 67108864 },
+      });
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/health');
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('healthy');
+      expect(res.body.usage.cpuMillicores).toBe(12);
+      expect(mockEnvironmentHealthService.getForEnvironment).toHaveBeenCalledWith('env-1');
+    });
+
+    it('returns 404 when the environment does not exist', async () => {
+      mockEnvironmentService.get.mockResolvedValue(null);
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-999/health');
+
+      expect(res.status).toBe(404);
+      expect(mockEnvironmentHealthService.getForEnvironment).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when the environment belongs to a different project', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-2' });
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/health');
+
+      expect(res.status).toBe(404);
+      expect(mockEnvironmentHealthService.getForEnvironment).not.toHaveBeenCalled();
     });
   });
 
