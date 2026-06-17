@@ -2,6 +2,7 @@ import { Result } from '../result';
 import { ClientConfig, ListOptions } from './types';
 import { Project, ProjectInput } from '../models/project';
 import { Environment, EnvironmentInput } from '../models/environment';
+import { EnvironmentHealth } from '../models/environment-health';
 import { Deployment } from '../models/deployment';
 import { ApiKeyCreateResponse } from '../models/api-key';
 import { ApplianceBaseConfig } from '../models/appliance-base';
@@ -190,6 +191,27 @@ export class ApplianceClient {
 
   async deleteEnvironment(projectId: string, id: string): Promise<Result<void>> {
     return this.request<void>('DELETE', `/api/v1/projects/${projectId}/environments/${id}`);
+  }
+
+  /**
+   * Read the live health of an environment's running workload:
+   * readiness (desired vs. ready replicas), pod restart state, and —
+   * when the cluster's metrics-server is installed — aggregate
+   * CPU/memory usage.
+   *
+   * Only Kubernetes-driven bases (local k3d + generic Kubernetes)
+   * expose pod-level health. On AWS/Lambda bases, or when the cluster
+   * is unreachable, the server returns `status: 'unknown'` with a
+   * `message` rather than an error — callers should render that as
+   * "no data" instead of a failure. `usage` is omitted entirely when
+   * metrics-server is absent, so consumers must tolerate it being
+   * undefined.
+   *
+   * Older api-server images that predate this route surface a 404 —
+   * callers should treat that as "health unknown".
+   */
+  async getEnvironmentHealth(projectId: string, id: string): Promise<Result<EnvironmentHealth>> {
+    return this.request<EnvironmentHealth>('GET', `/api/v1/projects/${projectId}/environments/${id}/health`);
   }
 
   // Deployment methods
