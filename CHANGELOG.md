@@ -1,3 +1,17 @@
+## 1.49.0 (2026-06-17)
+
+### Features
+
+- microvm fleet lifecycle ([#45](https://github.com/appliance-sh/appliance.sh/pull/45))
+
+### Bug Fixes
+
+- dev env and microvm ux ([#44](https://github.com/appliance-sh/appliance.sh/pull/44))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.48.0 (2026-06-13)
 
 ### Features
