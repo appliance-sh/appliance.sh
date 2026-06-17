@@ -2,6 +2,7 @@ import { Result } from '../result';
 import { ClientConfig, ListOptions } from './types';
 import { Project, ProjectInput } from '../models/project';
 import { Environment, EnvironmentInput } from '../models/environment';
+import { EnvironmentHealth } from '../models/environment-health';
 import { Deployment } from '../models/deployment';
 import { ApiKeyCreateResponse } from '../models/api-key';
 import { ApplianceBaseConfig } from '../models/appliance-base';
@@ -150,6 +151,25 @@ export class ApplianceClient {
     }
   }
 
+  // API key methods
+
+  /**
+   * Rotate the *calling* credential. The server mints a replacement key
+   * (inheriting this key's name) and revokes the current one, returning
+   * the new id + secret. After this resolves the credentials this client
+   * was constructed with stop working — callers must persist the new
+   * key and rebuild any client they intend to keep using.
+   *
+   * Authenticated via the same signature path as every other data-plane
+   * call, so a caller can only rotate the key it already holds.
+   */
+  async rotateKey(): Promise<Result<ApiKeyCreateResponse>> {
+    // POST with an empty body still gets signed (the signing path
+    // covers credential-only requests), so the server can identify the
+    // calling key and rotate exactly it.
+    return this.request<ApiKeyCreateResponse>('POST', '/api/v1/keys/rotate');
+  }
+
   // Project methods
   async createProject(input: ProjectInput): Promise<Result<Project>> {
     return this.request<Project>('POST', '/api/v1/projects', input);
@@ -190,6 +210,59 @@ export class ApplianceClient {
 
   async deleteEnvironment(projectId: string, id: string): Promise<Result<void>> {
     return this.request<void>('DELETE', `/api/v1/projects/${projectId}/environments/${id}`);
+  }
+
+  // Per-environment variables ("environment secrets")
+  //
+  // Stored server-side on the environment and injected into every
+  // deploy. Listing returns key names only — values are write-only from
+  // the client's perspective, so they can't be read back out.
+
+  /** List the key names of variables stored for an environment. */
+  async listEnvVars(projectId: string, environmentId: string): Promise<Result<{ keys: string[] }>> {
+    return this.request<{ keys: string[] }>('GET', `/api/v1/projects/${projectId}/environments/${environmentId}/env`);
+  }
+
+  /** Set (merge) one or more variables on an environment. Returns the
+   *  resulting key names. */
+  async setEnvVars(
+    projectId: string,
+    environmentId: string,
+    variables: Record<string, string>
+  ): Promise<Result<{ keys: string[] }>> {
+    return this.request<{ keys: string[] }>('PUT', `/api/v1/projects/${projectId}/environments/${environmentId}/env`, {
+      variables,
+    });
+  }
+
+  /** Remove one variable from an environment. Returns the remaining
+   *  key names. Idempotent — unknown keys are a no-op. */
+  async unsetEnvVar(projectId: string, environmentId: string, key: string): Promise<Result<{ keys: string[] }>> {
+    return this.request<{ keys: string[] }>(
+      'DELETE',
+      `/api/v1/projects/${projectId}/environments/${environmentId}/env/${encodeURIComponent(key)}`
+    );
+  }
+
+  /**
+   * Read the live health of an environment's running workload:
+   * readiness (desired vs. ready replicas), pod restart state, and —
+   * when the cluster's metrics-server is installed — aggregate
+   * CPU/memory usage.
+   *
+   * Only Kubernetes-driven bases (local k3d + generic Kubernetes)
+   * expose pod-level health. On AWS/Lambda bases, or when the cluster
+   * is unreachable, the server returns `status: 'unknown'` with a
+   * `message` rather than an error — callers should render that as
+   * "no data" instead of a failure. `usage` is omitted entirely when
+   * metrics-server is absent, so consumers must tolerate it being
+   * undefined.
+   *
+   * Older api-server images that predate this route surface a 404 —
+   * callers should treat that as "health unknown".
+   */
+  async getEnvironmentHealth(projectId: string, id: string): Promise<Result<EnvironmentHealth>> {
+    return this.request<EnvironmentHealth>('GET', `/api/v1/projects/${projectId}/environments/${id}/health`);
   }
 
   // Deployment methods

@@ -6,6 +6,7 @@ import { environmentRoutes } from './routes/environments';
 import { deploymentRoutes } from './routes/deployments';
 import { buildRoutes } from './routes/builds';
 import { bootstrapRoutes } from './routes/bootstrap';
+import { keyRoutes } from './routes/keys';
 import { clusterInfoRoutes } from './routes/cluster-info';
 import { internalRoutes } from './routes/internal';
 import { signatureAuth } from './middleware/auth';
@@ -48,6 +49,7 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
     app.use('/api/v1/projects', signatureAuth, projectRoutes);
     app.use('/api/v1/projects/:projectId/environments', signatureAuth, environmentRoutes);
     app.use('/api/v1/deployments', signatureAuth, deploymentRoutes);
+    app.use('/api/v1/keys', signatureAuth, keyRoutes);
     app.use('/api/v1/builds', signatureAuth, buildRoutes);
     app.use('/api/v1/cluster-info', signatureAuth, clusterInfoRoutes);
   } else {

@@ -63,9 +63,21 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     aliases: ['remove'],
     load: () => import('./appliance-destroy.js'),
   },
+  doctor: {
+    description: 'run first-run preflight checks (use --fix to auto-resolve the safe ones)',
+    load: () => import('./appliance-doctor.js'),
+  },
+  env: {
+    description: 'manage per-environment variables (set/list/unset)',
+    load: () => import('./appliance-env.js'),
+  },
   init: {
     description: 'initialise the CLI with the appliance server',
     load: () => import('./appliance-init.js'),
+  },
+  keys: {
+    description: 'manage the cluster API key lifecycle (rotate)',
+    load: () => import('./appliance-keys.js'),
   },
   link: {
     description: 'link this folder to a project/environment',
@@ -74,6 +86,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
   local: {
     description: 'manage the local k3d-backed runtime',
     load: () => import('./appliance-local.js'),
+  },
+  logs: {
+    description: "stream a deployment's container logs (local engines)",
+    load: () => import('./appliance-logs.js'),
   },
   vm: {
     description: 'manage the microVM runtime (isolated VM engine)',

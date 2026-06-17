@@ -25,6 +25,7 @@ import type { LocalClusterStatus, ProgressEvent, StatusEntry } from '@appliance.
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
 import { readProfiles } from './utils/profile-store.js';
+import { printCliError } from './utils/errors.js';
 
 ensureHelperBinOnPath();
 
@@ -135,8 +136,10 @@ attachClusterFlags(
     try {
       await runUp(opts);
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      // Route through the shared handler so cluster/runtime/network
+      // failures get a one-line remediation pointing at the exact fix.
+      printCliError(err, { apiUrl: apiServerUrlForHostPort(opts.hostPort ?? DEFAULT_LOCAL_HOST_PORT) });
+      process.exit(process.exitCode ?? 1);
     }
   });
 
@@ -260,8 +263,8 @@ attachClusterFlags(program.command('stop').description('stop the local cluster w
       const status = await stopLocalCluster({ clusterName: opts.clusterName });
       printClusterStatus(status);
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
+      process.exit(process.exitCode ?? 1);
     }
   }
 );
@@ -288,8 +291,8 @@ program
         )
       );
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
+      process.exit(process.exitCode ?? 1);
     }
   });
 
@@ -355,8 +358,8 @@ runtime
       await ensureDockerRunning({ onProgress: printProgress });
       console.log(chalk.green('Docker daemon is running.'));
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
+      process.exit(process.exitCode ?? 1);
     }
   });
 

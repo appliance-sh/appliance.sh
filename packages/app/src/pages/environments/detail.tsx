@@ -8,10 +8,12 @@ import { CommandSnippet } from '@/components/ui/command-snippet';
 import { StatusDot } from '@/components/ui/status-dot';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
+import { useEnvironmentHealth } from '@/hooks/use-environment-health';
 import { useHost } from '@/providers/host-provider';
 import { relativeTime } from '@/lib/time';
 import { urlForEnvironment } from '@/lib/deployment';
-import type { Environment } from '@appliance.sh/sdk/models';
+import { formatCpu, formatMemory, healthDotStatus, healthLabel } from '@/lib/health';
+import { EnvironmentHealthStatus, type Environment, type EnvironmentHealth } from '@appliance.sh/sdk/models';
 
 // "pending" looks like in-flight but is also the initial status a
 // freshly-created environment has before any deployment runs, so we
@@ -66,6 +68,12 @@ export function EnvironmentDetailPage() {
     refetchInterval: 5_000,
   });
 
+  // Only poll health once the env has deployed at least once — a
+  // brand-new env has no workload, so health would just read "not
+  // deployed". The server still degrades gracefully if we're wrong.
+  const env = envQuery.data;
+  const healthQuery = useEnvironmentHealth(projectId, id, Boolean(env?.lastDeployedAt));
+
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const invalidateAll = React.useCallback(() => {
@@ -104,7 +112,6 @@ export function EnvironmentDetailPage() {
 
   if (!projectId || !id) return <Navigate to="/environments" replace />;
 
-  const env = envQuery.data;
   const inFlight = env ? ENV_IN_FLIGHT.has(env.status) : false;
   const busy = deployMutation.isPending || destroyMutation.isPending || inFlight;
 
@@ -242,6 +249,8 @@ export function EnvironmentDetailPage() {
             <Row label="Created" value={<span title={env.createdAt}>{relativeTime(env.createdAt)}</span>} />
           </section>
 
+          {env.lastDeployedAt ? <HealthSection health={healthQuery.data} loading={healthQuery.isLoading} /> : null}
+
           <section className="rounded-md border border-[var(--color-border)]">
             <div className="border-b border-[var(--color-border)] px-4 py-3">
               <h2 className="text-sm font-semibold">Recent deployments</h2>
@@ -277,6 +286,65 @@ export function EnvironmentDetailPage() {
         </>
       )}
     </div>
+  );
+}
+
+function HealthSection({ health, loading }: { health: EnvironmentHealth | undefined; loading: boolean }) {
+  return (
+    <section className="rounded-md border border-[var(--color-border)]">
+      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+        <h2 className="text-sm font-semibold">Health</h2>
+        {health ? (
+          <span className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+            <StatusDot status={healthDotStatus(health.status)} />
+            {healthLabel(health.status)}
+          </span>
+        ) : null}
+      </div>
+      {loading && !health ? (
+        <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">Loading…</div>
+      ) : !health || health.status === EnvironmentHealthStatus.Unknown ? (
+        <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">
+          {health?.message ?? 'Health metrics are unavailable for this environment.'}
+        </div>
+      ) : (
+        <div className="space-y-3 px-4 py-3">
+          <div className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+            <Row label="Replicas" value={`${health.readyReplicas} / ${health.desiredReplicas} ready`} />
+            <Row label="Restarts" value={String(health.restarts)} />
+            {health.usage ? (
+              <>
+                <Row label="CPU" value={formatCpu(health.usage.cpuMillicores)} />
+                <Row label="Memory" value={formatMemory(health.usage.memoryBytes)} />
+              </>
+            ) : (
+              <Row
+                label="CPU / Memory"
+                value={<span className="text-[var(--color-muted-foreground)]">metrics-server not available</span>}
+              />
+            )}
+          </div>
+          {health.pods.length > 0 ? (
+            <ul className="divide-y divide-[var(--color-border)] rounded border border-[var(--color-border)]">
+              {health.pods.map((pod) => (
+                <li key={pod.name} className="grid grid-cols-[1fr_auto] items-center gap-3 px-3 py-2 text-xs">
+                  <span className="min-w-0">
+                    <span className="font-mono">{pod.name}</span>
+                    {pod.reason ? <span className="ml-2 text-red-400">{pod.reason}</span> : null}
+                  </span>
+                  <span className="flex items-center gap-3 text-[var(--color-muted-foreground)]">
+                    <span>{pod.ready ? 'Ready' : pod.phase}</span>
+                    <span>
+                      {pod.restarts} restart{pod.restarts === 1 ? '' : 's'}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      )}
+    </section>
   );
 }
 

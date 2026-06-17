@@ -57,6 +57,37 @@ export interface LocalDeploymentResult {
   url?: string;
 }
 
+/** Per-pod readiness + restart snapshot for a workload. Mirrors the
+ *  `kubectl get pods` READY / RESTARTS columns. */
+export interface PodHealth {
+  name: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  /** Waiting-state reason of the first not-ready container, if any
+   *  (e.g. `CrashLoopBackOff`, `ImagePullBackOff`). */
+  reason?: string;
+}
+
+/** Aggregate CPU/mem usage for a workload, summed across its pods.
+ *  Sourced from the metrics-server; absent when it isn't installed. */
+export interface ResourceUsage {
+  cpuMillicores: number;
+  memoryBytes: number;
+}
+
+/** Live health of a deployed workload: readiness, restart state, and
+ *  (when metrics-server is present) CPU/mem usage. `deployed` is false
+ *  when no Deployment exists for the stack (never deployed / destroyed). */
+export interface DeploymentHealth {
+  deployed: boolean;
+  desiredReplicas: number;
+  readyReplicas: number;
+  restarts: number;
+  pods: PodHealth[];
+  usage?: ResourceUsage;
+}
+
 interface ClusterConfig {
   clusterName: string;
   namespace: string;
@@ -111,6 +142,7 @@ export class KubernetesDeploymentService {
   private readonly objects: k8s.KubernetesObjectApi;
   private readonly core: k8s.CoreV1Api;
   private readonly apps: k8s.AppsV1Api;
+  private readonly metrics: k8s.Metrics;
 
   constructor(private readonly baseConfig: ApplianceBaseConfig) {
     if (!isKubernetesBase(baseConfig)) {
@@ -124,6 +156,10 @@ export class KubernetesDeploymentService {
     this.objects = k8s.KubernetesObjectApi.makeApiClient(this.kc);
     this.core = this.kc.makeApiClient(k8s.CoreV1Api);
     this.apps = this.kc.makeApiClient(k8s.AppsV1Api);
+    // Reads `metrics.k8s.io/v1beta1` — only answers when a
+    // metrics-server is installed. getDeploymentHealth() tolerates it
+    // being unreachable so health works on clusters without one.
+    this.metrics = new k8s.Metrics(this.kc);
   }
 
   async deploy(
@@ -316,6 +352,90 @@ export class KubernetesDeploymentService {
       if (isNotFoundError(err)) return undefined;
       throw err;
     }
+  }
+
+  /**
+   * Read the live health of a deployed workload: the Deployment's
+   * desired-vs-ready replica counts, each pod's readiness + restart
+   * state, and — when a metrics-server is installed — aggregate
+   * CPU/memory usage.
+   *
+   * Degrades gracefully throughout:
+   *   - No Deployment for the stack → `deployed: false` (never
+   *     deployed, or destroyed), not an error.
+   *   - metrics-server absent/unreachable → `usage` omitted; the
+   *     readiness/restart half is still returned.
+   *
+   * Pod readiness mirrors `kubectl get pods` semantics (the READY
+   * column = all containers Ready), and restart counts sum the
+   * per-container `restartCount` the kubelet reports — the same shape
+   * waitForRollout() leans on for the deploy-time rollout gate.
+   */
+  async getDeploymentHealth(stackName: string): Promise<DeploymentHealth> {
+    let dep: k8s.V1Deployment | undefined;
+    try {
+      dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        return { deployed: false, desiredReplicas: 0, readyReplicas: 0, restarts: 0, pods: [] };
+      }
+      throw err;
+    }
+
+    const desiredReplicas = dep.spec?.replicas ?? 1;
+    const readyReplicas = dep.status?.readyReplicas ?? 0;
+
+    // Pods carry `app.kubernetes.io/name: <stackName>` (see
+    // renderManifest) — the same selector the Service routes on.
+    const pods = await this.core.listNamespacedPod({
+      namespace: this.cluster.namespace,
+      labelSelector: `app.kubernetes.io/name=${stackName}`,
+    });
+
+    const podHealth: PodHealth[] = (pods.items ?? []).map((pod) => summarizePod(pod));
+    const restarts = podHealth.reduce((acc, p) => acc + p.restarts, 0);
+
+    const usage = await this.collectUsage(podHealth.map((p) => p.name));
+
+    return {
+      deployed: true,
+      desiredReplicas,
+      readyReplicas,
+      restarts,
+      pods: podHealth,
+      ...(usage ? { usage } : {}),
+    };
+  }
+
+  /**
+   * Sum CPU/memory usage across the named pods via the
+   * metrics-server. Returns undefined (rather than throwing) when the
+   * metrics API is absent or unreachable, when no pods were given, or
+   * when none of them have a metrics sample yet — health must work on
+   * clusters without a metrics-server.
+   */
+  private async collectUsage(podNames: string[]): Promise<ResourceUsage | undefined> {
+    if (podNames.length === 0) return undefined;
+    const wanted = new Set(podNames);
+    let list: k8s.PodMetricsList;
+    try {
+      list = await this.metrics.getPodMetrics(this.cluster.namespace);
+    } catch {
+      return undefined; // no metrics-server, or it's not ready yet
+    }
+    let cpuMillicores = 0;
+    let memoryBytes = 0;
+    let matched = false;
+    for (const pod of list.items ?? []) {
+      if (!wanted.has(pod.metadata.name)) continue;
+      matched = true;
+      for (const container of pod.containers ?? []) {
+        cpuMillicores += parseCpuToMillicores(container.usage?.cpu);
+        memoryBytes += parseMemoryToBytes(container.usage?.memory);
+      }
+    }
+    if (!matched) return undefined;
+    return { cpuMillicores, memoryBytes };
   }
 
   private async ensureNamespace(): Promise<void> {
@@ -591,6 +711,84 @@ function isNotFoundError(err: unknown): boolean {
     return /not\s*found/i.test(e.message) || /Error from server \(NotFound\)/i.test(e.message);
   }
   return false;
+}
+
+/**
+ * Collapse a Pod's container statuses into the single readiness +
+ * restart line the console shows. `ready` follows `kubectl`'s READY
+ * column (every container Ready); `restarts` sums per-container
+ * restartCount; `reason` lifts the waiting-state reason of the first
+ * not-ready container (CrashLoopBackOff / ImagePullBackOff / etc.) so
+ * the UI can explain *why* a pod isn't healthy.
+ */
+export function summarizePod(pod: k8s.V1Pod): PodHealth {
+  const statuses = pod.status?.containerStatuses ?? [];
+  const restarts = statuses.reduce((acc, c) => acc + (c.restartCount ?? 0), 0);
+  // A pod with no container statuses yet (just-scheduled) isn't ready.
+  const ready = statuses.length > 0 && statuses.every((c) => c.ready === true);
+  let reason: string | undefined;
+  for (const c of statuses) {
+    if (!c.ready && c.state?.waiting?.reason) {
+      reason = c.state.waiting.reason;
+      break;
+    }
+  }
+  return {
+    name: pod.metadata?.name ?? '',
+    phase: pod.status?.phase ?? 'Unknown',
+    ready,
+    restarts,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+/**
+ * Parse a Kubernetes CPU quantity into millicores. metrics-server
+ * reports CPU as nanocores (`123456789n`) or millicores (`12m`); plain
+ * numbers are whole cores (`0.5`, `2`). Unparseable / missing → 0.
+ */
+export function parseCpuToMillicores(value: string | undefined): number {
+  if (!value) return 0;
+  const v = value.trim();
+  if (v.endsWith('n')) return Number.parseFloat(v.slice(0, -1)) / 1_000_000; // nanocores → millicores
+  if (v.endsWith('u')) return Number.parseFloat(v.slice(0, -1)) / 1_000; // microcores → millicores
+  if (v.endsWith('m')) return Number.parseFloat(v.slice(0, -1)); // already millicores
+  const cores = Number.parseFloat(v);
+  return Number.isFinite(cores) ? cores * 1000 : 0;
+}
+
+/**
+ * Parse a Kubernetes memory quantity into bytes. Handles the binary
+ * (Ki/Mi/Gi/Ti/Pi/Ei) and decimal (k/M/G/T/P/E) SI suffixes the
+ * metrics-server emits, plus bare byte counts. Unparseable / missing → 0.
+ */
+export function parseMemoryToBytes(value: string | undefined): number {
+  if (!value) return 0;
+  const v = value.trim();
+  const binary: Record<string, number> = {
+    Ki: 1024,
+    Mi: 1024 ** 2,
+    Gi: 1024 ** 3,
+    Ti: 1024 ** 4,
+    Pi: 1024 ** 5,
+    Ei: 1024 ** 6,
+  };
+  const decimal: Record<string, number> = {
+    k: 1e3,
+    M: 1e6,
+    G: 1e9,
+    T: 1e12,
+    P: 1e15,
+    E: 1e18,
+  };
+  for (const [suffix, factor] of Object.entries(binary)) {
+    if (v.endsWith(suffix)) return Number.parseFloat(v.slice(0, -suffix.length)) * factor;
+  }
+  for (const [suffix, factor] of Object.entries(decimal)) {
+    if (v.endsWith(suffix)) return Number.parseFloat(v.slice(0, -suffix.length)) * factor;
+  }
+  const bytes = Number.parseFloat(v);
+  return Number.isFinite(bytes) ? bytes : 0;
 }
 
 /**

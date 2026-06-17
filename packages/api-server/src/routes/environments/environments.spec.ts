@@ -21,6 +21,25 @@ vi.mock('../../services/project.service', () => ({
   projectService: mockProjectService,
 }));
 
+const mockEnvVarService = vi.hoisted(() => ({
+  listKeys: vi.fn(),
+  setMany: vi.fn(),
+  unset: vi.fn(),
+  clear: vi.fn(),
+}));
+
+vi.mock('../../services/env-var.service', () => ({
+  envVarService: mockEnvVarService,
+}));
+
+const mockEnvironmentHealthService = vi.hoisted(() => ({
+  getForEnvironment: vi.fn(),
+}));
+
+vi.mock('../../services/environment-health.service', () => ({
+  environmentHealthService: mockEnvironmentHealthService,
+}));
+
 import { environmentRoutes } from './index';
 
 function createTestApp() {
@@ -134,6 +153,49 @@ describe('Environment routes', () => {
     });
   });
 
+  describe('GET /api/v1/projects/:projectId/environments/:id/health', () => {
+    it('returns health for an environment in the project', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-1' });
+      mockEnvironmentHealthService.getForEnvironment.mockResolvedValue({
+        environmentId: 'env-1',
+        status: 'healthy',
+        desiredReplicas: 1,
+        readyReplicas: 1,
+        restarts: 0,
+        pods: [{ name: 'env-1-abc', phase: 'Running', ready: true, restarts: 0 }],
+        usage: { cpuMillicores: 12, memoryBytes: 67108864 },
+      });
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/health');
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('healthy');
+      expect(res.body.usage.cpuMillicores).toBe(12);
+      expect(mockEnvironmentHealthService.getForEnvironment).toHaveBeenCalledWith('env-1');
+    });
+
+    it('returns 404 when the environment does not exist', async () => {
+      mockEnvironmentService.get.mockResolvedValue(null);
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-999/health');
+
+      expect(res.status).toBe(404);
+      expect(mockEnvironmentHealthService.getForEnvironment).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when the environment belongs to a different project', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-2' });
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/health');
+
+      expect(res.status).toBe(404);
+      expect(mockEnvironmentHealthService.getForEnvironment).not.toHaveBeenCalled();
+    });
+  });
+
   describe('DELETE /api/v1/projects/:projectId/environments/:id', () => {
     it('should delete an environment', async () => {
       mockEnvironmentService.get.mockResolvedValue({
@@ -156,6 +218,75 @@ describe('Environment routes', () => {
 
       const app = createTestApp();
       const res = await request(app).delete('/api/v1/projects/proj-1/environments/env-1');
+
+      expect(res.status).toBe(404);
+    });
+
+    it('clears the environment env vars on delete', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-1' });
+      mockEnvironmentService.delete.mockResolvedValue(undefined);
+      mockEnvVarService.clear.mockResolvedValue(undefined);
+
+      const app = createTestApp();
+      await request(app).delete('/api/v1/projects/proj-1/environments/env-1');
+
+      expect(mockEnvVarService.clear).toHaveBeenCalledWith('env-1');
+    });
+  });
+
+  describe('per-environment variables', () => {
+    beforeEach(() => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-1' });
+    });
+
+    it('lists variable key names', async () => {
+      mockEnvVarService.listKeys.mockResolvedValue(['API_KEY', 'DB_URL']);
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/env');
+
+      expect(res.status).toBe(200);
+      expect(res.body.keys).toEqual(['API_KEY', 'DB_URL']);
+    });
+
+    it('sets variables and returns resulting keys', async () => {
+      mockEnvVarService.setMany.mockResolvedValue(['API_KEY']);
+
+      const app = createTestApp();
+      const res = await request(app)
+        .put('/api/v1/projects/proj-1/environments/env-1/env')
+        .send({ variables: { API_KEY: 'sekret' } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.keys).toEqual(['API_KEY']);
+      expect(mockEnvVarService.setMany).toHaveBeenCalledWith('env-1', { API_KEY: 'sekret' });
+    });
+
+    it('rejects invalid variable names', async () => {
+      const app = createTestApp();
+      const res = await request(app)
+        .put('/api/v1/projects/proj-1/environments/env-1/env')
+        .send({ variables: { '1bad-name': 'x' } });
+
+      expect(res.status).toBe(400);
+      expect(mockEnvVarService.setMany).not.toHaveBeenCalled();
+    });
+
+    it('unsets a variable', async () => {
+      mockEnvVarService.unset.mockResolvedValue([]);
+
+      const app = createTestApp();
+      const res = await request(app).delete('/api/v1/projects/proj-1/environments/env-1/env/API_KEY');
+
+      expect(res.status).toBe(200);
+      expect(mockEnvVarService.unset).toHaveBeenCalledWith('env-1', ['API_KEY']);
+    });
+
+    it('404s for an env var op on an environment in the wrong project', async () => {
+      mockEnvironmentService.get.mockResolvedValue({ id: 'env-1', projectId: 'proj-2' });
+
+      const app = createTestApp();
+      const res = await request(app).get('/api/v1/projects/proj-1/environments/env-1/env');
 
       expect(res.status).toBe(404);
     });

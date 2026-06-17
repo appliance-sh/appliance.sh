@@ -1,0 +1,249 @@
+name: Release desktop app
+on:
+  # Dispatched by .github/workflows/release.yml right after nx-release
+  # tags a new version (alongside the api-server image + CLI binary
+  # builds). Also runnable on its own via the Actions UI for hot-fix
+  # re-uploads of the desktop bundles.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag the bundles attach to (e.g. v1.48.0). Defaults to the desktop package.json version with a leading "v".
+        required: false
+        default: ''
+
+permissions:
+  contents: write # to upload DMGs + the updater manifest to the release
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Per-arch macOS bundle build. The matrix mirrors the CLI's per-arch
+  # compile targets (packages/cli/package.json -> compile:darwin-*):
+  # aarch64 (Apple Silicon) and x86_64 (Intel). Each runs on a native
+  # runner so the embedded Bun-compiled `appliance` sidecar matches the
+  # bundle's arch — Tauri can't cross-compile the Rust shell the way Bun
+  # cross-compiles the CLI.
+  # ----------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.arch }} bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            rust_target: aarch64-apple-darwin
+            # Apple-Silicon runner.
+            runs_on: macos-14
+          - arch: x86_64
+            rust_target: x86_64-apple-darwin
+            # Intel runner.
+            runs_on: macos-13
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the SDK postbuild can `git describe` a tag.
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: packages/desktop/src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build the workspace deps the desktop bundle imports at compile
+      # time, topologically. Same order as release-cli-binaries.yml; the
+      # desktop additionally needs @appliance.sh/app (the React console)
+      # built so the Tauri frontendDist has something to bundle.
+      - name: Build desktop prerequisites
+        run: |
+          pnpm --filter @appliance.sh/sdk run build
+          pnpm --filter @appliance.sh/infra run build
+          pnpm --filter @appliance.sh/bootstrap run build
+          pnpm --filter @appliance.sh/helper run build
+          pnpm --filter @appliance.sh/cli run build
+          pnpm --filter @appliance.sh/app run build
+
+      # nx-release bumps the package.json versions but does NOT touch the
+      # Rust-side version sources (tauri.conf.json, Cargo.toml). The
+      # updater compares the RUNNING app's version (from tauri.conf.json)
+      # against the feed, so they must match the released package version
+      # or every client thinks it's perpetually behind/ahead. Sync them
+      # here from the single source of truth.
+      - name: Sync bundle version from package.json
+        run: node packages/desktop/scripts/sync-version.mjs
+
+      # Build, Developer-ID-sign (hardened runtime), notarize + staple,
+      # and emit signed updater artifacts. Every secret below is OPTIONAL
+      # at the script level: tauri.release.conf.json's
+      # createUpdaterArtifacts only signs when TAURI_SIGNING_PRIVATE_KEY
+      # is set, and notarize-macos.mjs no-ops without the APPLE_* creds —
+      # so a fork without secrets still gets unsigned bundles instead of
+      # a hard failure. See packages/desktop/README.md -> Auto-update.
+      - name: Build + sign + notarize bundle
+        working-directory: packages/desktop
+        env:
+          # --- Developer ID cert import (into a temp keychain, below) ---
+          # Base64-encoded .p12 of the "Developer ID Application" cert +
+          # private key, and its export password.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # --- Developer ID signing + notarization (notarize-macos.mjs) ---
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # --- updater artifact signing (Tauri) ---
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Import the Developer ID cert into a temporary keychain when the
+          # secret is present; codesign can't see a cert that isn't in a
+          # keychain. Skipped (with the rest of signing) when absent.
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            KEYCHAIN_PATH="$RUNNER_TEMP/appliance-signing.keychain-db"
+            security create-keychain -p "" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "" "$KEYCHAIN_PATH"
+            echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+            security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN_PATH" >/dev/null
+          else
+            echo "APPLE_CERTIFICATE not set — building an UNSIGNED, un-notarized bundle (expected for forks / dry runs)."
+          fi
+          pnpm run tauri:build:release
+
+      - name: Stage release assets
+        id: stage
+        working-directory: packages/desktop/src-tauri/target/release/bundle
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release-assets"
+          mkdir -p "$OUT"
+          # DMG: rename to an arch-tagged, stable asset name so the
+          # release page is unambiguous and the updater manifest can
+          # point at a predictable URL.
+          DMG=$(find dmg -name '*.dmg' | head -n1 || true)
+          if [ -n "$DMG" ]; then
+            cp "$DMG" "$OUT/Appliance_${ARCH}.dmg"
+          fi
+          # Updater artifacts: Tauri emits a tarball + its detached .sig
+          # next to the .app. These are what the updater downloads +
+          # verifies. Absent when TAURI_SIGNING_PRIVATE_KEY wasn't set.
+          TARBALL=$(find macos -name '*.app.tar.gz' | head -n1 || true)
+          if [ -n "$TARBALL" ]; then
+            cp "$TARBALL" "$OUT/Appliance_${ARCH}.app.tar.gz"
+            cp "$TARBALL.sig" "$OUT/Appliance_${ARCH}.app.tar.gz.sig"
+          fi
+          # Checksums for the DMG so users can verify a manual download.
+          ( cd "$OUT" && shasum -a 256 ./* > "checksums-${ARCH}.txt" )
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"
+
+      - name: Upload per-arch artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.arch }}
+          path: ${{ steps.stage.outputs.out }}
+          if-no-files-found: warn
+
+  # ----------------------------------------------------------------------
+  # Collect both arches, build the single `latest.json` updater manifest
+  # that points at each arch's signed tarball, and publish everything to
+  # the GitHub Release for the tag.
+  # ----------------------------------------------------------------------
+  publish:
+    name: Publish bundles + updater manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all arch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            VERSION=$(node -p "require('./packages/desktop/package.json').version")
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing desktop bundles for ${TAG}"
+
+      # Assemble latest.json from the per-arch .sig files. The updater
+      # keys platforms as `<os>-<arch>`; macOS aarch64 → darwin-aarch64,
+      # x86_64 → darwin-x86_64. The `url` points at the arch tarball on
+      # this release; `signature` is the verbatim .sig content.
+      - name: Build updater manifest (latest.json)
+        id: manifest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: node .github/scripts/build-updater-manifest.mjs
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" --title "${TAG}" --generate-notes
+          fi
+
+      - name: Upload bundles + manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Flatten the downloaded artifacts and upload every DMG, tarball,
+          # .sig, checksum file, plus the assembled latest.json. --clobber
+          # so a re-run updates the release in place.
+          ASSETS=$(find dist-artifacts -type f)
+          # latest.json must be present for the updater endpoint to resolve.
+          gh release upload "${TAG}" --clobber latest.json $ASSETS

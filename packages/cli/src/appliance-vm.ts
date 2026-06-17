@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -13,9 +14,9 @@ import {
   DEFAULT_LOCAL_NAMESPACE,
 } from '@appliance.sh/helper';
 import type { ProgressEvent } from '@appliance.sh/helper';
-import { createApplianceClient } from '@appliance.sh/sdk';
+import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
-import { readProfiles } from './utils/profile-store.js';
+import { readProfiles, removeProfile } from './utils/profile-store.js';
 
 // `appliance vm` — the microVM runtime engine (appliance-vm). Same
 // developer surface as `appliance local` (the k3d engine), but the
@@ -121,20 +122,46 @@ program
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
   .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
-  .action(async (opts: { name: string; image?: string; timeout: string }) => {
+  .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
+  .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
+  .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
     try {
-      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10));
+      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10), {
+        cpus: opts.cpus,
+        memory: opts.memory,
+      });
     } catch (err) {
       console.error(chalk.red(err instanceof Error ? err.message : String(err)));
       process.exit(1);
     }
   });
 
-async function runUp(name: string, imageOverride: string | undefined, timeout: number): Promise<void> {
+/** Commander option parser: a positive integer, or a clear failure.
+ *  Used for --cpus / --memory so a bad value is rejected host-side
+ *  before the engine ever sees it. */
+function parsePositiveInt(value: string): number {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`expected a positive integer, got '${value}'`);
+  }
+  return n;
+}
+
+async function runUp(
+  name: string,
+  imageOverride: string | undefined,
+  timeout: number,
+  resources: { cpus?: number; memory?: number } = {}
+): Promise<void> {
   const profile = profileForVm(name);
   const ports = vmPorts(name);
-  // 1. Boot the VM + wait for its kubernetes endpoint.
-  const status = runVm(['up', name, '--timeout', String(timeout)]);
+  // 1. Boot the VM + wait for its kubernetes endpoint. Per-VM resource
+  //    overrides are persisted into the spec by the engine, so they
+  //    survive restarts; omitting them keeps the VM's current sizing.
+  const upArgs = ['up', name, '--timeout', String(timeout)];
+  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
+  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
+  const status = runVm(upArgs);
   if (status !== 0) process.exit(status);
   // Re-read ports: `vm up` creates the spec (with allocated ports) if
   // it didn't exist, so the canonical-fallback above may be stale now.
@@ -233,7 +260,11 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
       // keep polling
     }
     if (Date.now() >= deadline) {
-      throw new Error(`in-VM registry not reachable at ${url} — check \`appliance vm console\``);
+      throw new Error(
+        `in-VM registry not reachable at ${url} after ${Math.round(timeoutMs / 1000)}s.\n` +
+          'The VM booted but its registry forward never came up. Inspect the boot log with `appliance vm console`, ' +
+          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.'
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
@@ -261,9 +292,19 @@ async function deliverApiServerImage(imageOverride: string | undefined, targetRe
     : [`appliance-api-server:${VM_HOST_ARCH}`, 'appliance-api-server:latest'];
   // Keep only refs that actually exist locally, remembering each one's
   // host-resolved architecture for diagnostics + ordering.
-  const present = candidates
+  let present = candidates
     .map((ref) => ({ ref, arch: inspectArch(ref) }))
     .filter((c): c is { ref: string; arch: string } => c.arch !== null);
+
+  // Nothing local and no explicit --image: pull the pinned published
+  // image so a fresh machine boots a VM without a manual build or
+  // `docker tag`. Mirrors the bootstrap default (phases/phase2.ts) — the
+  // same versioned ghcr ref every surface uses.
+  if (present.length === 0 && !imageOverride) {
+    const pulled = pullPublishedApiServer();
+    if (pulled) present = [pulled];
+  }
+
   if (present.length === 0) throw new Error(missingImageMessage(imageOverride));
 
   // Try a ref whose host-resolved arch already matches first (a
@@ -301,6 +342,27 @@ async function deliverApiServerImage(imageOverride: string | undefined, targetRe
   }
 }
 
+/** The published api-server image for this CLI's release. Pinned to the
+ *  SDK VERSION exactly like the cloud bootstrap default
+ *  (packages/bootstrap/src/phases/phase2.ts) so every surface seeds the
+ *  same versioned image. */
+const PUBLISHED_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.replace(/^v/, '')}`;
+
+/** Pull the pinned published api-server image into the local docker
+ *  daemon as a last resort when nothing matching is present, selecting
+ *  the VM's arch out of the multi-arch manifest. Returns the ref + its
+ *  host-resolved arch on success, or null when the pull fails (offline,
+ *  no ghcr access, or an unreleased VERSION with no matching tag) — the
+ *  caller then surfaces the build/--image guidance. */
+function pullPublishedApiServer(): { ref: string; arch: string } | null {
+  const ref = PUBLISHED_API_SERVER_IMAGE;
+  console.log(chalk.cyan(`» no local api-server image — pulling ${ref}`));
+  const pull = spawnSync('docker', ['pull', '--platform', `linux/${VM_HOST_ARCH}`, ref], { stdio: 'inherit' });
+  if (pull.status !== 0) return null;
+  const arch = inspectArch(ref);
+  return arch ? { ref, arch } : null;
+}
+
 /** Host-resolved architecture of a local image, or null when it isn't
  *  in the docker daemon. With the containerd image store a multi-arch
  *  image resolves to the host platform whenever it carries one. */
@@ -336,7 +398,8 @@ function missingImageMessage(imageOverride: string | undefined): string {
     return `image ${imageOverride} not found in the local docker daemon — build or pull it first, or pass a different --image.`;
   }
   return (
-    'no appliance-api-server image found in the local docker daemon.\n' +
+    `no local appliance-api-server image, and pulling ${PUBLISHED_API_SERVER_IMAGE} failed\n` +
+    '(check network / ghcr access, or that this CLI version has a published image — `appliance doctor` diagnoses these).\n' +
     `Build one for the VM's architecture (linux/${VM_HOST_ARCH}):\n` +
     `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
     '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
@@ -370,7 +433,6 @@ async function ensureCrane(): Promise<string> {
 for (const [cmd, desc] of [
   ['stop', 'stop the microVM (state is preserved)'],
   ['status', 'report microVM state as JSON'],
-  ['delete', 'delete the microVM and its state'],
 ] as const) {
   program
     .command(cmd)
@@ -380,6 +442,71 @@ for (const [cmd, desc] of [
       process.exit(runVm([cmd, opts.name]));
     });
 }
+
+// `delete`/`prune` are not plain passthroughs. The Rust engine removes
+// the VM and its on-disk state, but the credential profile that `vm up`
+// minted (`microvm` for the default VM, `microvm-<name>` otherwise)
+// lives in the CLI profile store — which the engine knows nothing about.
+// Without pruning it, a deleted VM leaves an orphan cluster behind in
+// both the CLI and the desktop (both read ~/.appliance/profiles.json).
+
+/** Delete a microVM via the engine, then prune its CLI credential
+ *  profile. The profile is only removed once the engine confirms the VM
+ *  is gone (exit 0), so a failed delete never strips a usable profile.
+ *  Returns the engine's exit code. */
+function deleteVmAndProfile(name: string): number {
+  const code = runVm(['delete', name]);
+  if (code === 0) {
+    const profile = profileForVm(name);
+    if (removeProfile(profile)) {
+      console.log(chalk.dim(`removed credential profile '${profile}'`));
+    }
+  }
+  return code;
+}
+
+program
+  .command('delete')
+  .description('delete the microVM, its state, and its credential profile')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(deleteVmAndProfile(opts.name));
+  });
+
+program
+  .command('prune')
+  .description('delete every stopped microVM and its credential profile')
+  .option('-f, --force', 'skip the confirmation prompt', false)
+  .action(async (opts: { force: boolean }) => {
+    const bin = vmBinary();
+    const r = spawnSync(bin, ['list'], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      process.stderr.write(r.stderr ?? '');
+      process.exit(r.status ?? 1);
+    }
+    const stopped = (JSON.parse(r.stdout) as { name: string; running: boolean }[]).filter((e) => !e.running);
+    if (stopped.length === 0) {
+      console.log(chalk.dim('no stopped microVMs to prune'));
+      return;
+    }
+    if (!opts.force) {
+      const names = stopped.map((e) => e.name).join(', ');
+      const ok = await confirm({
+        message: `Delete ${stopped.length} stopped microVM(s) (${names}) and their credential profiles?`,
+        default: false,
+      });
+      if (!ok) {
+        console.log(chalk.yellow('aborted'));
+        return;
+      }
+    }
+    let deleted = 0;
+    for (const e of stopped) {
+      if (deleteVmAndProfile(e.name) === 0) deleted++;
+      else console.error(chalk.red(`failed to delete '${e.name}'`));
+    }
+    console.log(`pruned ${deleted}/${stopped.length} stopped microVM(s)`);
+  });
 
 program
   .command('console')

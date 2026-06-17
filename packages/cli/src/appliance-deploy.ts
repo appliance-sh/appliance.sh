@@ -379,7 +379,13 @@ registerManifestOptions(program)
 
     const credentials = loadCredentials();
     if (!credentials) {
-      console.error(chalk.red('Not logged in. Run `appliance login` first.'));
+      console.error(chalk.red('Not logged in — no credentials for the active profile.'));
+      console.error(
+        chalk.dim(
+          'Run `appliance login` to authenticate, or start a local runtime with `appliance local up` / `appliance vm up` ' +
+            '(which save a profile for you). `appliance whoami` shows the active profile; `appliance doctor` checks the host prerequisites.'
+        )
+      );
       process.exit(1);
     }
 
@@ -442,8 +448,9 @@ registerManifestOptions(program)
         storage: manifestRuntime?.storage,
       });
       if (!result.success) {
-        console.error(chalk.red(`Deploy failed: ${result.error.message}`));
-        process.exit(1);
+        // Throw rather than print-and-exit so the shared handler below
+        // attaches a remediation line (auth/cluster/network shapes).
+        throw new Error(`Deploy failed: ${result.error.message}`);
       }
 
       // Persist the link so the next `appliance deploy` (no args)
