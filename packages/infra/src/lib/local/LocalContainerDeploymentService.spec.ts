@@ -10,7 +10,10 @@ import {
   applianceHostname,
   applianceHostnameUrl,
   deterministicNodePort,
+  parseCpuToMillicores,
+  parseMemoryToBytes,
   renderManifest,
+  summarizePod,
 } from './LocalContainerDeploymentService';
 
 describe('LocalContainerDeploymentService', () => {
@@ -214,6 +217,86 @@ describe('applianceHostname / applianceHostnameUrl', () => {
     expect(applianceHostnameUrl('demo-prod.appliance.localhost', 8081)).toBe(
       'http://demo-prod.appliance.localhost:8081'
     );
+  });
+});
+
+describe('summarizePod', () => {
+  it('reports ready when every container is Ready and sums restart counts', () => {
+    const health = summarizePod({
+      metadata: { name: 'demo-prod-abc' },
+      status: {
+        phase: 'Running',
+        containerStatuses: [
+          { name: 'app', ready: true, restartCount: 2, image: 'x', imageID: 'x', state: {} },
+          { name: 'sidecar', ready: true, restartCount: 1, image: 'x', imageID: 'x', state: {} },
+        ],
+      },
+    } as never);
+    expect(health).toEqual({ name: 'demo-prod-abc', phase: 'Running', ready: true, restarts: 3 });
+  });
+
+  it('reports not-ready and lifts the waiting reason of the first unready container', () => {
+    const health = summarizePod({
+      metadata: { name: 'demo-prod-xyz' },
+      status: {
+        phase: 'Running',
+        containerStatuses: [
+          {
+            name: 'app',
+            ready: false,
+            restartCount: 5,
+            image: 'x',
+            imageID: 'x',
+            state: { waiting: { reason: 'CrashLoopBackOff' } },
+          },
+        ],
+      },
+    } as never);
+    expect(health.ready).toBe(false);
+    expect(health.reason).toBe('CrashLoopBackOff');
+    expect(health.restarts).toBe(5);
+  });
+
+  it('treats a just-scheduled pod with no container statuses as not ready', () => {
+    const health = summarizePod({
+      metadata: { name: 'demo-prod-new' },
+      status: { phase: 'Pending' },
+    } as never);
+    expect(health).toEqual({ name: 'demo-prod-new', phase: 'Pending', ready: false, restarts: 0 });
+  });
+});
+
+describe('parseCpuToMillicores', () => {
+  it('parses nanocores, microcores, millicores, and whole cores', () => {
+    expect(parseCpuToMillicores('123456789n')).toBeCloseTo(123.456789);
+    expect(parseCpuToMillicores('500u')).toBe(0.5);
+    expect(parseCpuToMillicores('250m')).toBe(250);
+    expect(parseCpuToMillicores('2')).toBe(2000);
+    expect(parseCpuToMillicores('0.5')).toBe(500);
+  });
+
+  it('returns 0 for missing or unparseable values', () => {
+    expect(parseCpuToMillicores(undefined)).toBe(0);
+    expect(parseCpuToMillicores('')).toBe(0);
+    expect(parseCpuToMillicores('garbage')).toBe(0);
+  });
+});
+
+describe('parseMemoryToBytes', () => {
+  it('parses binary SI suffixes', () => {
+    expect(parseMemoryToBytes('64Mi')).toBe(64 * 1024 * 1024);
+    expect(parseMemoryToBytes('1Gi')).toBe(1024 ** 3);
+    expect(parseMemoryToBytes('512Ki')).toBe(512 * 1024);
+  });
+
+  it('parses decimal SI suffixes and bare byte counts', () => {
+    expect(parseMemoryToBytes('100M')).toBe(100e6);
+    expect(parseMemoryToBytes('1048576')).toBe(1048576);
+  });
+
+  it('returns 0 for missing or unparseable values', () => {
+    expect(parseMemoryToBytes(undefined)).toBe(0);
+    expect(parseMemoryToBytes('garbage')).toBe(0);
   });
 });
 
