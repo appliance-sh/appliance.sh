@@ -42,13 +42,25 @@ pub struct VmSpec {
 /// the k3d runtime; additional VMs get allocated distinct blocks.
 pub const DEFAULT_VM_NAME: &str = "appliance";
 
+/// Default virtual CPU count for a fresh VM.
+pub const DEFAULT_CPUS: usize = 2;
+/// Default guest memory (MiB) for a fresh VM. 4 GiB comfortably runs
+/// k3s plus a couple of small workloads.
+pub const DEFAULT_MEMORY_MIB: u64 = 4096;
+/// Default data disk size (GiB) for a fresh VM.
+pub const DEFAULT_DISK_GIB: u64 = 10;
+/// Floor for guest memory. Virtualization.framework rejects anything
+/// below 1 MiB, and k3s won't survive far above that floor — keep a
+/// usable minimum so a typo can't produce a VM that never boots.
+pub const MIN_MEMORY_MIB: u64 = 512;
+
 impl VmSpec {
     pub fn defaults(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            cpus: 2,
-            memory_mib: 4096,
-            disk_gib: 10,
+            cpus: DEFAULT_CPUS,
+            memory_mib: DEFAULT_MEMORY_MIB,
+            disk_gib: DEFAULT_DISK_GIB,
             image: crate::images::DEFAULT_IMAGE.to_string(),
             // hvc0 is the virtio console the vz/kvm backends attach the
             // log file to. `quiet` is deliberately absent — boot logs are
@@ -87,6 +99,39 @@ impl VmSpec {
             }
             slot += 1;
         }
+    }
+
+    /// Apply optional per-VM resource overrides in place, validating
+    /// them so an absurd value fails fast instead of producing a VM
+    /// that can't boot. `None` leaves the existing value untouched, so
+    /// re-running `up` without the flags preserves a VM's prior sizing.
+    /// Returns whether anything actually changed (the caller persists
+    /// only on a change to avoid needless spec rewrites).
+    pub fn apply_resource_overrides(
+        &mut self,
+        cpus: Option<usize>,
+        memory_mib: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let mut changed = false;
+        if let Some(cpus) = cpus {
+            if cpus == 0 {
+                anyhow::bail!("--cpus must be at least 1");
+            }
+            if cpus != self.cpus {
+                self.cpus = cpus;
+                changed = true;
+            }
+        }
+        if let Some(memory_mib) = memory_mib {
+            if memory_mib < MIN_MEMORY_MIB {
+                anyhow::bail!("--memory must be at least {MIN_MEMORY_MIB} MiB");
+            }
+            if memory_mib != self.memory_mib {
+                self.memory_mib = memory_mib;
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 }
 
@@ -187,6 +232,29 @@ mod tests {
         assert_eq!(first & 0x01, 0, "must be unicast");
         assert_eq!(first & 0x02, 0x02, "must be locally administered");
         assert_eq!(mac.split(':').count(), 6);
+    }
+
+    #[test]
+    fn resource_overrides_apply_validate_and_preserve() {
+        let mut spec = VmSpec::defaults("x");
+        // None leaves both values untouched and reports no change.
+        assert!(!spec.apply_resource_overrides(None, None).unwrap());
+        assert_eq!(spec.cpus, DEFAULT_CPUS);
+        assert_eq!(spec.memory_mib, DEFAULT_MEMORY_MIB);
+
+        // A real override mutates the spec and reports the change.
+        assert!(spec.apply_resource_overrides(Some(4), Some(8192)).unwrap());
+        assert_eq!(spec.cpus, 4);
+        assert_eq!(spec.memory_mib, 8192);
+
+        // Re-applying the same values is a no-op (no needless rewrite).
+        assert!(!spec.apply_resource_overrides(Some(4), Some(8192)).unwrap());
+
+        // Out-of-range values fail fast and don't mutate the spec.
+        assert!(spec.apply_resource_overrides(Some(0), None).is_err());
+        assert!(spec.apply_resource_overrides(None, Some(0)).is_err());
+        assert_eq!(spec.cpus, 4);
+        assert_eq!(spec.memory_mib, 8192);
     }
 
     #[test]
