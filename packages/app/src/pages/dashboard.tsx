@@ -14,6 +14,8 @@ import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useEnvironmentsMap, useProjectsMap } from '@/hooks/use-lookups';
 import { relativeTime } from '@/lib/time';
 import { extractDeploymentUrl } from '@/lib/deployment';
+import { formatCpu, formatMemory, hasHealthSignal, healthDotStatus, healthLabel } from '@/lib/health';
+import { EnvironmentHealthStatus, type EnvironmentHealth } from '@appliance.sh/sdk/models';
 import {
   localRuntimeCapabilities,
   defaultSandbox,
@@ -174,6 +176,7 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
 }
 
 function ProjectCard({ project, environments }: { project: Project; environments: Environment[] }) {
+  const client = useApplianceClient();
   // Card status mirrors the "worst interesting" environment state:
   // anything failed wins, else in-flight, else deployed.
   const status = environments.some((e) => e.status === 'failed')
@@ -189,6 +192,25 @@ function ProjectCard({ project, environments }: { project: Project; environments
     .filter((v): v is string => Boolean(v))
     .sort();
   const lastDeployed = deployedAts[deployedAts.length - 1];
+
+  // Fetch health only for environments that have actually deployed —
+  // the server returns `unknown` on non-Kubernetes bases / unreachable
+  // clusters, so the card hides the badge unless there's real signal.
+  const deployedEnvs = environments.filter((e) => Boolean(e.lastDeployedAt));
+  const healthQueries = useQueries({
+    queries: deployedEnvs.map((e) => ({
+      queryKey: ['environment-health', project.id, e.id],
+      enabled: !!client,
+      queryFn: async () => {
+        const r = await client!.getEnvironmentHealth(project.id, e.id);
+        if (!r.success) throw r.error;
+        return r.data;
+      },
+      refetchInterval: 10_000,
+      retry: false,
+    })),
+  });
+  const summary = summarizeHealth(healthQueries.map((q) => q.data));
 
   return (
     <Link
@@ -206,6 +228,17 @@ function ProjectCard({ project, environments }: { project: Project; environments
           <span className="text-[var(--color-muted-foreground)]">No live deployment</span>
         )}
       </div>
+      {summary ? (
+        <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+          <StatusDot status={healthDotStatus(summary.status)} />
+          <span>{healthLabel(summary.status)}</span>
+          {summary.usage ? (
+            <span className="font-mono">
+              · {formatCpu(summary.usage.cpuMillicores)} · {formatMemory(summary.usage.memoryBytes)}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       <div className="mt-auto flex items-center justify-between text-xs text-[var(--color-muted-foreground)]">
         <span>
           {environments.length} environment{environments.length === 1 ? '' : 's'}
@@ -214,6 +247,41 @@ function ProjectCard({ project, environments }: { project: Project; environments
       </div>
     </Link>
   );
+}
+
+// Roll a project's per-environment health into one card-level verdict:
+// the worst status wins (unhealthy > degraded > healthy), and CPU/mem
+// are summed across environments that reported usage. Returns null when
+// no environment carries actionable health signal (so the card stays
+// uncluttered for non-Kubernetes bases / not-yet-deployed projects).
+function summarizeHealth(
+  healths: (EnvironmentHealth | undefined)[]
+): { status: EnvironmentHealthStatus; usage?: { cpuMillicores: number; memoryBytes: number } } | null {
+  const meaningful = healths.filter(hasHealthSignal) as EnvironmentHealth[];
+  if (meaningful.length === 0) return null;
+
+  const rank: Record<string, number> = {
+    [EnvironmentHealthStatus.Unhealthy]: 3,
+    [EnvironmentHealthStatus.Degraded]: 2,
+    [EnvironmentHealthStatus.Healthy]: 1,
+  };
+  let status = EnvironmentHealthStatus.Healthy;
+  for (const h of meaningful) {
+    if ((rank[h.status] ?? 0) > (rank[status] ?? 0)) status = h.status;
+  }
+
+  let cpuMillicores = 0;
+  let memoryBytes = 0;
+  let hasUsage = false;
+  for (const h of meaningful) {
+    if (h.usage) {
+      hasUsage = true;
+      cpuMillicores += h.usage.cpuMillicores;
+      memoryBytes += h.usage.memoryBytes;
+    }
+  }
+
+  return { status, ...(hasUsage ? { usage: { cpuMillicores, memoryBytes } } : {}) };
 }
 
 function EmptyProjects() {

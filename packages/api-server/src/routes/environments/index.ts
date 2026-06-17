@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { environmentInput, envVarsInput } from '@appliance.sh/sdk';
 import { environmentService } from '../../services/environment.service';
 import { envVarService } from '../../services/env-var.service';
+import { environmentHealthService } from '../../services/environment-health.service';
 import { projectService } from '../../services/project.service';
 import { logger } from '../../logger';
 
@@ -75,6 +76,34 @@ environmentRoutes.get('/:id', async (req, res) => {
       environmentId: (req.params as EnvironmentParams).id,
     });
     res.status(500).json({ error: 'Failed to get environment', message: String(error) });
+  }
+});
+
+// Live workload health (readiness + restart state, and CPU/mem when a
+// metrics-server is present). Read-only. Degrades to `status: unknown`
+// for non-Kubernetes bases / unreachable clusters rather than erroring,
+// so the console can render "no data" instead of a failure.
+environmentRoutes.get('/:id/health', async (req, res) => {
+  try {
+    const params = req.params as EnvironmentParams;
+    const environment = await environmentService.get(params.id!);
+    if (!environment || environment.projectId !== params.projectId) {
+      res.status(404).json({ error: 'Environment not found' });
+      return;
+    }
+    const health = await environmentHealthService.getForEnvironment(params.id!);
+    if (!health) {
+      res.status(404).json({ error: 'Environment not found' });
+      return;
+    }
+    res.json(health);
+  } catch (error) {
+    logger.error('get environment health failed', error, {
+      requestId: req.requestId,
+      projectId: (req.params as EnvironmentParams).projectId,
+      environmentId: (req.params as EnvironmentParams).id,
+    });
+    res.status(500).json({ error: 'Failed to get environment health', message: String(error) });
   }
 });
 
