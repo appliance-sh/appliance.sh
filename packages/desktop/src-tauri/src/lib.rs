@@ -239,35 +239,43 @@ fn write_shared_profiles(file: &SharedProfilesFile) -> Result<(), HostError> {
     Ok(())
 }
 
-/// Reflect the current desktop-side state into the shared file. Reads
-/// each cluster's secret out of the keychain; clusters without a
-/// keychain secret get the entry left as-is from any prior write
-/// (defensive — partial state is more useful than a missing entry).
-/// CLI-managed entries (managed != "desktop") are preserved untouched.
+/// Reflect the current desktop-side state into the shared file.
+///
+/// profiles.json is authoritative for secrets (stage 2): for each
+/// desktop cluster this PRESERVES the secret the shared store already
+/// holds — so a CLI re-key written there is never overwritten by a
+/// now-stale keychain copy — and reads the keychain only to *seed* a
+/// cluster the shared store doesn't yet carry a usable secret for.
+/// Metadata (url, name, …) is synced every time. CLI-managed entries
+/// (managed != "desktop") are owned by the CLI and left untouched;
+/// desktop entries for clusters that no longer exist are dropped.
 fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
     let mut file = read_shared_profiles().unwrap_or_default();
-    file.profiles.retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
+    let live: std::collections::HashSet<&str> = cfg.clusters.iter().map(|c| c.id.as_str()).collect();
+    // Drop desktop-managed entries whose cluster is gone (removal); keep
+    // CLI-managed entries and still-live desktop ones.
+    file.profiles
+        .retain(|id, entry| entry.managed.as_deref() != Some("desktop") || live.contains(id.as_str()));
     for cluster in &cfg.clusters {
-        // An entry that survived the retain above is CLI-owned (e.g.
-        // the microVM engine's profile, written by `appliance vm up`).
-        // The desktop adopts such clusters via sync, never the other
-        // way: writing here would clobber a CLI re-key with whatever
-        // stale copy the keychain holds.
-        if file.profiles.contains_key(&cluster.id) {
+        let existing = file.profiles.get(&cluster.id).cloned();
+        // Leave CLI-owned entries alone — the desktop adopts them via
+        // sync (profiles.json -> keychain), never the reverse.
+        if existing
+            .as_ref()
+            .map(|e| e.managed.as_deref() != Some("desktop"))
+            .unwrap_or(false)
+        {
             continue;
         }
-        let secret = read_api_key(&cluster_keychain_account(&cluster.id));
-        let (key_id, secret_value) = match secret {
-            Some(k) => (k.id, k.secret),
-            None => {
-                // No key on the keychain yet — keep whatever the
-                // shared file already had for this id, or write a
-                // placeholder if absent so the metadata survives.
-                let existing = file.profiles.get(&cluster.id).cloned();
-                let prev = existing.unwrap_or_default();
-                (prev.key_id, prev.secret)
-            }
-        };
+        // Prefer the authoritative secret already in profiles.json; fall
+        // back to the keychain only to seed a not-yet-seeded cluster;
+        // failing both, carry the prior (possibly placeholder) entry so
+        // the metadata still survives.
+        let prev = existing.clone().unwrap_or_default();
+        let (key_id, secret_value) = shared_entry_api_key(existing.as_ref())
+            .map(|k| (k.id, k.secret))
+            .or_else(|| read_api_key(&cluster_keychain_account(&cluster.id)).map(|k| (k.id, k.secret)))
+            .unwrap_or((prev.key_id, prev.secret));
         file.profiles.insert(
             cluster.id.clone(),
             SharedProfileEntry {
@@ -431,6 +439,53 @@ fn seed_desktop_profiles(app: &AppHandle) -> Result<usize, HostError> {
     let _guard = config_lock();
     let persisted = read_persisted_config(app)?;
     seed_profiles_from_keychain(&persisted)
+}
+
+/// Whether the keychain copy for a cluster needs refreshing from the
+/// authoritative shared entry: true when the entry carries a usable
+/// secret whose key id differs from what we last synced to the keychain
+/// (`synced_key_id`). Pure — gating on the id means an unchanged poll
+/// does no keychain IO (and so triggers no macOS access prompt).
+fn needs_keychain_refresh(synced_key_id: Option<&str>, entry: &SharedProfileEntry) -> bool {
+    !entry.key_id.is_empty() && !entry.secret.is_empty() && synced_key_id != Some(entry.key_id.as_str())
+}
+
+/// Reconcile every desktop cluster's keychain copy from the authoritative
+/// shared store (profiles.json -> keychain), one way, gated by
+/// `synced_key_id`. Generalises `sync_microvm_cluster`'s refresh to ALL
+/// clusters: it pushes an externally-changed secret (e.g. a CLI
+/// `keys rotate`, or a rotate from another device) into the derived
+/// keychain cache so that cache stays consistent for downgrade safety,
+/// even though `get_config` now reads profiles.json first. Returns the
+/// number of clusters whose keychain copy was refreshed.
+fn reconcile_keychains_from_profiles(app: &AppHandle) -> Result<usize, HostError> {
+    let _guard = config_lock();
+    let Some(shared) = read_shared_profiles() else {
+        return Ok(0);
+    };
+    let mut persisted = read_persisted_config(app)?;
+    migrate_legacy(app, &mut persisted)?;
+    let mut refreshed = 0usize;
+    for cluster in &mut persisted.clusters {
+        let Some(entry) = shared.profiles.get(&cluster.id) else {
+            continue;
+        };
+        if needs_keychain_refresh(cluster.synced_key_id.as_deref(), entry) {
+            write_api_key(
+                &cluster_keychain_account(&cluster.id),
+                &ApiKey {
+                    id: entry.key_id.clone(),
+                    secret: entry.secret.clone(),
+                },
+            )?;
+            cluster.synced_key_id = Some(entry.key_id.clone());
+            refreshed += 1;
+        }
+    }
+    if refreshed > 0 {
+        write_persisted_config(app, &persisted)?;
+    }
+    Ok(refreshed)
 }
 
 /// Convert a SharedProfilesFile into a PersistedConfig (the desktop's
@@ -4865,6 +4920,14 @@ pub fn run() {
                 if let Err(e) = seed_desktop_profiles(&handle) {
                     eprintln!("warn: credential seed at launch failed: {e}");
                 }
+                // Stage-2 write half: push any externally-changed secret
+                // (e.g. a CLI `keys rotate`) from the authoritative
+                // profiles.json into the derived keychain cache, for every
+                // cluster — one way, gated by synced_key_id so an
+                // unchanged launch does no keychain IO.
+                if let Err(e) = reconcile_keychains_from_profiles(&handle) {
+                    eprintln!("warn: keychain reconcile at launch failed: {e}");
+                }
                 let names = match microvm_list().await {
                     Ok(vms) => vms.into_iter().map(|v| v.name).collect::<Vec<_>>(),
                     Err(_) => vec![MICROVM_NAME.to_string()],
@@ -5072,6 +5135,38 @@ mod tests {
     #[test]
     fn missing_shared_entry_is_none() {
         assert!(shared_entry_api_key(None).is_none());
+    }
+
+    #[test]
+    fn keychain_refresh_only_when_key_id_changed() {
+        let entry = SharedProfileEntry {
+            key_id: "new".to_string(),
+            secret: "s3cr3t".to_string(),
+            ..Default::default()
+        };
+        // Never synced, or synced to an older key id -> refresh needed.
+        assert!(needs_keychain_refresh(None, &entry));
+        assert!(needs_keychain_refresh(Some("old"), &entry));
+        // Already synced to this key id -> no keychain IO (no prompt).
+        assert!(!needs_keychain_refresh(Some("new"), &entry));
+    }
+
+    #[test]
+    fn no_keychain_refresh_for_placeholder_entry() {
+        // A metadata-only placeholder (blank secret or id) is not
+        // authoritative and must never be pushed to the keychain.
+        let blank_secret = SharedProfileEntry {
+            key_id: "k".to_string(),
+            secret: String::new(),
+            ..Default::default()
+        };
+        assert!(!needs_keychain_refresh(None, &blank_secret));
+        let blank_id = SharedProfileEntry {
+            key_id: String::new(),
+            secret: "s3cr3t".to_string(),
+            ..Default::default()
+        };
+        assert!(!needs_keychain_refresh(None, &blank_id));
     }
 
     #[test]
