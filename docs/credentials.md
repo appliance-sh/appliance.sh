@@ -165,6 +165,14 @@ second source of truth.
 
 Non-destructive, staged — every step leaves an older binary working:
 
+> **Implemented so far:** the one-time seed migration (`seed_desktop_profiles`,
+> mitigating the Keychain-only-secret risk below) and the desktop **read flip**
+> (`read_cluster_api_key` — `get_config` now sources the selected cluster's
+> secret from profiles.json, with the Keychain only as a fallback) have landed
+> in `src-tauri/src/lib.rs`. Still open: generalising the `synced_key_id` write
+> reconciliation to every desktop cluster (the write half of Step 2), Steps 3–4,
+> and the cross-process lock vs the CLI (see Concurrent writers).
+
 1. **Today (this epic):** profiles.json is already the CLI's primary and
    the desktop's mirror; CLI-managed entries are already one-way
    (CLI → Keychain). `appliance keys rotate` proves the

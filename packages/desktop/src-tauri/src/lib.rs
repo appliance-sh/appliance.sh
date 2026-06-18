@@ -545,6 +545,37 @@ fn read_api_key(account: &str) -> Option<ApiKey> {
         .and_then(|raw| serde_json::from_str::<ApiKey>(&raw).ok())
 }
 
+/// The API key carried by a shared-store entry, when it has a usable
+/// id+secret. `None` when the entry is absent or its secret/id is blank
+/// (e.g. a metadata-only placeholder seeded for a CLI cluster). Pure so
+/// it's unit-testable without touching the keychain or the filesystem.
+fn shared_entry_api_key(entry: Option<&SharedProfileEntry>) -> Option<ApiKey> {
+    let entry = entry?;
+    if entry.key_id.is_empty() || entry.secret.is_empty() {
+        return None;
+    }
+    Some(ApiKey {
+        id: entry.key_id.clone(),
+        secret: entry.secret.clone(),
+    })
+}
+
+/// Resolve a cluster's API key, preferring the authoritative shared
+/// store (`~/.appliance/profiles.json`) and only falling back to the
+/// macOS Keychain when the shared store lacks a usable secret.
+///
+/// This is the stage-2 read flip (see docs/credentials.md): profiles.json
+/// is the source of truth and the Keychain is a derived cache that the
+/// sync paths write. Reading the shared file first also sidesteps the
+/// Keychain's macOS access prompt in the common case. The startup seed
+/// migration backfills any Keychain-only secret into the shared store,
+/// so the fallback only matters for a cluster added since the last seed.
+fn read_cluster_api_key(cluster_id: &str) -> Option<ApiKey> {
+    let from_shared =
+        read_shared_profiles().and_then(|shared| shared_entry_api_key(shared.profiles.get(cluster_id)));
+    from_shared.or_else(|| read_api_key(&cluster_keychain_account(cluster_id)))
+}
+
 fn write_api_key(account: &str, key: &ApiKey) -> Result<(), HostError> {
     let entry = keychain_entry(account)?;
     let payload = serde_json::to_string(key)?;
@@ -660,10 +691,13 @@ fn get_config(app: AppHandle) -> Result<HostConfig, HostError> {
     let mut persisted = read_persisted_config(&app)?;
     migrate_legacy(&app, &mut persisted)?;
 
+    // Stage-2 read flip: source the selected cluster's secret from the
+    // authoritative shared store (profiles.json), with the Keychain as a
+    // fallback. See `read_cluster_api_key`.
     let api_key = persisted
         .selected_cluster_id
         .as_deref()
-        .and_then(|id| read_api_key(&cluster_keychain_account(id)));
+        .and_then(|id| read_cluster_api_key(id));
 
     Ok(HostConfig {
         clusters: persisted.clusters,
@@ -5003,6 +5037,41 @@ mod tests {
             decide_seed(&cluster, Some(&k), Some(&existing)),
             SeedDecision::AlreadySeeded
         );
+    }
+
+    #[test]
+    fn shared_entry_with_secret_is_authoritative() {
+        // Stage-2 read flip: an entry carrying a usable id+secret is
+        // returned directly, so get_config sources the secret from
+        // profiles.json and never touches the keychain (or its prompt).
+        let entry = SharedProfileEntry {
+            api_url: "https://api.example.com".to_string(),
+            key_id: "key-1".to_string(),
+            secret: "s3cr3t".to_string(),
+            ..Default::default()
+        };
+        let got = shared_entry_api_key(Some(&entry)).expect("usable secret resolves");
+        assert_eq!(got.id, "key-1");
+        assert_eq!(got.secret, "s3cr3t");
+    }
+
+    #[test]
+    fn blank_shared_secret_falls_back_to_keychain() {
+        // A metadata-only placeholder (empty secret) is NOT authoritative;
+        // shared_entry_api_key yields None so the caller falls back to the
+        // keychain rather than handing back a blank credential.
+        let entry = SharedProfileEntry {
+            api_url: "https://api.example.com".to_string(),
+            key_id: "key-1".to_string(),
+            secret: String::new(),
+            ..Default::default()
+        };
+        assert!(shared_entry_api_key(Some(&entry)).is_none());
+    }
+
+    #[test]
+    fn missing_shared_entry_is_none() {
+        assert!(shared_entry_api_key(None).is_none());
     }
 
     #[test]
