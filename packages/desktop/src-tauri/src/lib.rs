@@ -530,25 +530,112 @@ fn ingest_shared_into_legacy(
     Ok(cfg)
 }
 
-/// Serializes every read-modify-write of the persisted config.
-/// Multiple surfaces touch config.json concurrently — frontend
-/// commands (get_config's legacy migration, cluster CRUD) and
-/// background work (the launch-time seed + microVM sync) — and an
-/// unguarded interleaving lets a later write clobber an earlier one
-/// with stale state. Take this for the full read→mutate→write span.
-///
-/// SCOPE: this guards in-PROCESS races only (it's a process-global
-/// Mutex). It does NOT serialize against the CLI, which is a separate
-/// process that performs its own read-modify-write of profiles.json
-/// (e.g. `appliance keys rotate`). A cross-process advisory file lock
-/// around profiles.json is the remaining piece of stage-3 concurrency
-/// safety — see docs/credentials.md. Until then the window is small
-/// (both sides do atomic temp-file renames, so neither can read a
-/// half-written file; the risk is purely last-writer-wins on
-/// interleaved full read→write cycles).
-fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+// ---- profiles.json locking ---------------------------------------------
+//
+// config_lock() guards both in-PROCESS races (a process-global Mutex)
+// and cross-PROCESS ones: the desktop and the `appliance` CLI both
+// read-modify-write profiles.json (e.g. CLI `keys rotate` while the
+// desktop reconciles at launch). Both take the same lockfile
+// (<profiles.json>.lock) with the same O_EXCL-create + bounded-spin +
+// stale-cleanup protocol, mirrored in
+// packages/cli/src/utils/profile-lock.ts — so neither side needs the
+// other's language or any extra dependency.
+//
+// Best-effort: if the lock can't be taken within the timeout (or there's
+// no home dir), the op proceeds unlocked rather than wedge the app — no
+// worse than before, since both sides still write via atomic temp-file
+// rename (no torn reads). The residual last-writer-wins window is what
+// the lock closes in the common case.
+
+const PROFILES_LOCK_STALE: Duration = Duration::from_secs(30);
+const PROFILES_LOCK_TIMEOUT: Duration = Duration::from_millis(2_000);
+const PROFILES_LOCK_SPIN: Duration = Duration::from_millis(25);
+
+fn shared_profiles_lock_path() -> Option<PathBuf> {
+    shared_profiles_path().map(|p| p.with_extension("json.lock"))
+}
+
+/// A lockfile older than the stale threshold is assumed abandoned by a
+/// crashed holder — real holds are well under a second. An unreadable
+/// mtime is treated as stale so a broken lock can never wedge us.
+fn lock_is_stale(path: &std::path::Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+        .map(|age| age > PROFILES_LOCK_STALE)
+        .unwrap_or(true)
+}
+
+/// Cross-process advisory lock on profiles.json, released on drop.
+/// `path: None` means best-effort fell through (no home dir, or timeout)
+/// and the caller proceeds without cross-process exclusion.
+struct SharedProfilesLock {
+    path: Option<PathBuf>,
+}
+
+impl SharedProfilesLock {
+    fn acquire() -> Self {
+        match shared_profiles_lock_path() {
+            Some(path) => Self::acquire_at(path),
+            None => Self { path: None },
+        }
+    }
+
+    fn acquire_at(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let deadline = std::time::Instant::now() + PROFILES_LOCK_TIMEOUT;
+        loop {
+            // create_new => O_EXCL: success iff we created the file, so
+            // exactly one contender (across processes) wins.
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_file) => return Self { path: Some(path) },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Self { path: None }; // best-effort: proceed unlocked
+                    }
+                    std::thread::sleep(PROFILES_LOCK_SPIN);
+                }
+                Err(_) => return Self { path: None },
+            }
+        }
+    }
+}
+
+impl Drop for SharedProfilesLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Serializes every read-modify-write of the persisted config + shared
+/// profiles, both in-process (a global Mutex) and cross-process (the
+/// lockfile above, shared with the CLI). Take it for the full
+/// read→mutate→write span. Released on drop; the file lock releases
+/// before the mutex.
+struct ConfigGuard {
+    _file: SharedProfilesLock,
+    _mutex: std::sync::MutexGuard<'static, ()>,
+}
+
+fn config_lock() -> ConfigGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    // Mutex first, so there is only ever one in-process contender for the
+    // cross-process file lock; file lock second. Drop is the reverse.
+    let mutex = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = SharedProfilesLock::acquire();
+    ConfigGuard {
+        _file: file,
+        _mutex: mutex,
+    }
 }
 
 fn read_persisted_config(app: &AppHandle) -> Result<PersistedConfig, HostError> {
@@ -5167,6 +5254,30 @@ mod tests {
             ..Default::default()
         };
         assert!(!needs_keychain_refresh(None, &blank_id));
+    }
+
+    #[test]
+    fn lock_acquire_creates_and_release_removes() {
+        let path = std::env::temp_dir().join(format!("appliance-lock-acq-{}.lock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        {
+            let g = SharedProfilesLock::acquire_at(path.clone());
+            assert!(g.path.is_some(), "lock acquired");
+            assert!(path.exists(), "lockfile present while held");
+        }
+        assert!(!path.exists(), "lockfile removed on drop");
+    }
+
+    #[test]
+    fn absent_lockfile_reads_stale_fresh_does_not() {
+        let path = std::env::temp_dir().join(format!("appliance-lock-stale-{}.lock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        // An unreadable mtime (absent file) is treated as stale so a
+        // broken lock can never wedge acquisition.
+        assert!(lock_is_stale(&path));
+        fs::write(&path, b"").unwrap();
+        assert!(!lock_is_stale(&path), "a just-created lock is not stale");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -165,13 +165,25 @@ second source of truth.
 
 Non-destructive, staged — every step leaves an older binary working:
 
-> **Implemented so far:** the one-time seed migration (`seed_desktop_profiles`,
-> mitigating the Keychain-only-secret risk below) and the desktop **read flip**
-> (`read_cluster_api_key` — `get_config` now sources the selected cluster's
-> secret from profiles.json, with the Keychain only as a fallback) have landed
-> in `src-tauri/src/lib.rs`. Still open: generalising the `synced_key_id` write
-> reconciliation to every desktop cluster (the write half of Step 2), Steps 3–4,
-> and the cross-process lock vs the CLI (see Concurrent writers).
+> **Implemented so far:**
+>
+> - **Stage 1 — seed migration** (`seed_desktop_profiles`): folds any
+>   keychain-only secret into profiles.json at launch (non-destructive, idempotent).
+> - **Stage 2 — read flip** (`read_cluster_api_key`): `get_config` sources the
+>   selected cluster's secret from profiles.json, with the keychain only as a
+>   fallback (and so usually no macOS access prompt).
+> - **Stage 2 — write half:** `mirror_to_shared_profiles` now _preserves_ the
+>   authoritative profiles.json secret (it no longer clobbers a CLI re-key with a
+>   stale keychain copy), and `reconcile_keychains_from_profiles` pushes
+>   profiles.json → keychain one-way for _every_ cluster, gated by
+>   `synced_key_id`.
+> - **Stage 3 — cross-process lock:** `config_lock()` (desktop) and `withFileLock`
+>   (`packages/cli/src/utils/profile-lock.ts`) share one `<profiles.json>.lock`
+>   advisory lock — see Concurrent writers.
+>
+> Still open: Steps 3–4 below — stop writing the legacy `config.json` /
+> `credentials.json` mirrors on new installs, then drop the ingest-from-keychain
+> fallback so the keychain is a pure cache.
 
 1. **Today (this epic):** profiles.json is already the CLI's primary and
    the desktop's mirror; CLI-managed entries are already one-way
@@ -199,11 +211,13 @@ Non-destructive, staged — every step leaves an older binary working:
   Keychain. Step 2 must seed profiles.json from the Keychain **once**
   (guarded so it runs only when profiles.json lacks the entry) before
   flipping the direction one-way, or those credentials are stranded.
-- **Concurrent writers:** the desktop already serialises config writes
-  with `config_lock()`; the CLI writes atomically but has no
-  cross-process lock with the desktop. A profiles.json file-lock (e.g.
-  `flock`) is worth adding before Step 3 so a CLI rotate and a desktop
-  sync can't interleave a read-modify-write.
+- **Concurrent writers:** _addressed._ `config_lock()` (desktop) and
+  `withFileLock` (`packages/cli/src/utils/profile-lock.ts`) now take the
+  same `<profiles.json>.lock` advisory lock — an `O_EXCL`-create lockfile
+  with bounded spin, stale-lock cleanup, and a best-effort timeout — so a
+  CLI rotate and a desktop sync can't interleave a read-modify-write.
+  Both still write via atomic temp-file rename (torn reads were never
+  possible); the lock closes the last-writer-wins window.
 - **At-rest encryption:** profiles.json stores secrets in cleartext
   (`0600`). Consolidating _more_ secrets there (env vars are server-side,
   but credential secrets are local) raises the value of encrypting the

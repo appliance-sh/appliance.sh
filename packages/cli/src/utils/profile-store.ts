@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { withFileLock } from './profile-lock.js';
 
 // Unified credentials store shared between the desktop and the CLI.
 //
@@ -165,17 +166,22 @@ export function resolveProfile(file: ProfilesFile, opts: ResolveOptions = {}): R
  * is updated if the saved profile is now active.
  */
 export function upsertProfile(name: string, profile: Profile, opts: { makeActive?: boolean } = {}): void {
-  const file = readProfiles();
-  const existing = file.profiles[name];
-  file.profiles[name] = {
-    ...existing,
-    ...profile,
-    createdAt: existing?.createdAt ?? profile.createdAt ?? new Date().toISOString(),
-  };
-  if (opts.makeActive || file.activeProfile === null) {
-    file.activeProfile = name;
-  }
-  writeProfiles(file);
+  // Hold the cross-process lock for the whole read-modify-write so a
+  // concurrent desktop reconcile (or another CLI invocation) can't
+  // interleave and clobber this update.
+  withFileLock(PROFILES_PATH, () => {
+    const file = readProfiles();
+    const existing = file.profiles[name];
+    file.profiles[name] = {
+      ...existing,
+      ...profile,
+      createdAt: existing?.createdAt ?? profile.createdAt ?? new Date().toISOString(),
+    };
+    if (opts.makeActive || file.activeProfile === null) {
+      file.activeProfile = name;
+    }
+    writeProfiles(file);
+  });
 }
 
 /**
@@ -183,24 +189,28 @@ export function upsertProfile(name: string, profile: Profile, opts: { makeActive
  * profile (or null when the store is now empty).
  */
 export function removeProfile(name: string): boolean {
-  const file = readProfiles();
-  if (!file.profiles[name]) return false;
-  delete file.profiles[name];
-  if (file.activeProfile === name) {
-    const next = Object.keys(file.profiles)[0] ?? null;
-    file.activeProfile = next;
-  }
-  writeProfiles(file);
-  return true;
+  return withFileLock(PROFILES_PATH, () => {
+    const file = readProfiles();
+    if (!file.profiles[name]) return false;
+    delete file.profiles[name];
+    if (file.activeProfile === name) {
+      const next = Object.keys(file.profiles)[0] ?? null;
+      file.activeProfile = next;
+    }
+    writeProfiles(file);
+    return true;
+  });
 }
 
 /** Switch the active profile. Returns false if the name doesn't exist. */
 export function setActiveProfile(name: string): boolean {
-  const file = readProfiles();
-  if (!file.profiles[name]) return false;
-  file.activeProfile = name;
-  writeProfiles(file);
-  return true;
+  return withFileLock(PROFILES_PATH, () => {
+    const file = readProfiles();
+    if (!file.profiles[name]) return false;
+    file.activeProfile = name;
+    writeProfiles(file);
+    return true;
+  });
 }
 
 export const PROFILES_FILE = PROFILES_PATH;
