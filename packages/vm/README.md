@@ -102,9 +102,14 @@ the VM. It implies `--dev`, is persisted (re-shared on every boot until
 workspace lives on the VM's persistent data disk.
 
 Mechanics: `dev` is persisted on the VM spec (`vm.json`, one-way — a later
-plain `vm up` keeps it a dev VM). The shell rides the same `kubectl debug
-node/` + chroot path as `vm shell`; it needs no SSH or guest agent. A future
-phase replaces it with a vsock agent (see `docs/microvm.md`).
+plain `vm up` keeps it a dev VM). An interactive shell rides a **vsock**
+channel: every VM runs a `socat` PTY agent on a fixed vsock port, the resident
+host process bridges a per-VM Unix socket to it, and `appliance-vm shell`
+drives that — no SSH, no TCP exposure, no k3s dependency, and no debugger pod
+left behind. `appliance vm shell` / `vm dev shell` use it when the relay
+socket is up and fall back to `kubectl debug node/` + chroot otherwise (older
+VMs, or while the agent is still starting); one-shot `-- <cmd>` runs stay on
+the kubectl path for clean output + an exit code.
 
 ## Egress control (outbound traffic)
 

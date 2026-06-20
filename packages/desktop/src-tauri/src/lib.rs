@@ -4248,6 +4248,26 @@ const DEV_SHELL_LOGIN: &str = "export HOME=/persist/home; cd /persist/workspace 
 /// the VM's single node name first (async kubectl), so this lives
 /// outside the sync `terminal_exec_argv`.
 async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result<Vec<String>, String> {
+    // Prefer the fast vsock shell when the relay socket is up: it needs
+    // no k3s and leaves no debugger pod behind. Falls through to
+    // kubectl-debug for older VMs or before the guest agent is ready.
+    let cluster = input.cluster_name.as_deref().unwrap_or("");
+    let vm = if cluster.is_empty() || cluster == DEFAULT_LOCAL_CLUSTER_NAME {
+        MICROVM_NAME
+    } else {
+        cluster
+    };
+    if let (Some(bin), Some(home)) = (vm_binary(), home_dir()) {
+        let sock = home
+            .join(SHARED_PROFILES_DIR)
+            .join("vm")
+            .join(vm)
+            .join("shell.sock");
+        if sock.exists() {
+            return Ok(vec![bin.to_string_lossy().into_owned(), "shell".to_string(), vm.to_string()]);
+        }
+    }
+
     let target = kube_target_args(input.engine.as_deref(), input.cluster_name.as_deref().unwrap_or(""))?;
     // target is ["--kubeconfig", <path>]; reuse the path for the node lookup.
     let mut node_args: Vec<&str> = vec!["kubectl"];

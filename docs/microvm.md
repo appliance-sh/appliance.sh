@@ -157,11 +157,18 @@ data disk mounts:
   kubeconfig handoff that `up` waits on.
 
 You shell in with `appliance vm dev shell` (or the desktop **Open
-shell**), which lands in the workspace with the toolchain on `PATH`. Like
-`vm shell`, it rides `kubectl debug node/` + chroot — no SSH, no guest
-agent, the same kubeconfig channel as everything else (so it does depend
-on k3s being up). The egress proxy + credential injection confine the dev
-environment exactly as they confine deployed workloads.
+shell**), which lands in the workspace with the toolchain on `PATH`. The
+interactive shell rides a **vsock** channel: every VM runs a `socat` PTY
+agent on a fixed vsock port (`SHELL_VSOCK_PORT`), the resident host
+process bridges a per-VM Unix socket to a fresh guest connection
+(`backend/vz/shell.rs`), and `appliance-vm shell` drives that Unix socket
+in raw mode — no SSH, no TCP exposure, and no dependency on k3s, so it
+works before the cluster is ready and leaves no debugger pod behind. It
+falls back to `kubectl debug node/` + chroot for older VMs or while the
+agent is still starting, and one-shot `-- <cmd>` runs stay on the kubectl
+path for clean output + an exit code. The egress proxy + credential
+injection confine the dev environment exactly as they confine deployed
+workloads.
 
 **Sharing a host folder** (`appliance vm dev up --mount <path>`, desktop:
 **Share a folder…**) presents the folder to the guest over VirtioFS — a
@@ -173,11 +180,11 @@ shadows the data-disk workspace while active. The shared path is resolved
 
 - validated host-side so a bad path fails fast.
 
-One follow-on is designed but not built: a **k3s-independent shell over
-vsock** (a guest agent the host connects to via the VM's
-`VZVirtioSocketDevice`, replacing the kubectl-debug path and removing the
-debugger-pod sweep), which also unlocks running a workspace
-`devcontainer.json` as a container inside the VM.
+One follow-on is designed but not built: honouring a workspace
+**`devcontainer.json`** — building/running the referenced image as a
+container inside the VM (on k3s/containerd) and shelling into that
+container instead of the host, so a repo's declared toolchain comes up
+verbatim. The vsock channel above already gives it a clean way in.
 
 ### Packaging — one executable
 

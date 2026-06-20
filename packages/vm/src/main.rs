@@ -5,6 +5,7 @@ mod guest;
 mod images;
 mod mitm;
 mod net;
+mod shell;
 mod spec;
 mod store;
 mod traffic;
@@ -105,6 +106,15 @@ enum Cmd {
     Status {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+    },
+    /// Open an interactive shell in the guest over vsock (no SSH, no
+    /// k3s) — or run a single command with `-- <cmd>`.
+    Shell {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// Command to run instead of an interactive shell.
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
     /// Print the VM's console log (boot log, kernel messages).
     Console {
@@ -553,6 +563,12 @@ fn run() -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&entries)?);
             Ok(())
+        }
+
+        Cmd::Shell { name, command } => {
+            let cmd = (!command.is_empty()).then(|| command.join(" "));
+            let code = shell::run_client(&name, cmd.as_deref())?;
+            std::process::exit(code);
         }
 
         Cmd::Console { name, follow } => {

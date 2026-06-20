@@ -645,6 +645,26 @@ function runHostShell(name: string, entry: string[]): number {
   return r.status ?? 1;
 }
 
+/** The resident VM process serves this Unix socket while the VM runs
+ *  (and was booted with a vsock-capable engine); `appliance-vm shell`
+ *  rides it for a fast, k3s-independent shell. */
+function shellSock(name: string): string {
+  return path.join(vmDir(name), 'shell.sock');
+}
+
+/** Open an interactive shell, preferring the fast vsock channel
+ *  (`appliance-vm shell`, no k3s, no debugger pod) when its relay socket
+ *  is up, and falling back to the kubectl-debug host shell otherwise
+ *  (older VMs, or while the guest agent is still starting). `fallback`
+ *  is the chroot argv used on the kubectl path. */
+function runInteractiveShell(name: string, fallback: string[]): number {
+  if (fs.existsSync(shellSock(name))) {
+    const r = spawnSync(vmBinary(), ['shell', name], { stdio: 'inherit' });
+    return r.status ?? 1;
+  }
+  return runHostShell(name, fallback);
+}
+
 /** Run one command in the VM host and capture its stdout (no TTY) — the
  *  quiet probe behind `vm dev status`. Debugger-session chatter goes to
  *  the inherited stderr's /dev/null, so the returned stdout is clean. */
@@ -681,10 +701,12 @@ program
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .argument('[command...]', 'command to run instead of an interactive shell')
   .action((command: string[], opts: { name: string }) => {
-    // One-shot commands go through `sh -c` (attach streams reliably);
-    // no command means an interactive shell.
-    const entry = command.length ? ['/bin/sh', '-c', command.join(' ')] : ['/bin/sh'];
-    process.exit(runHostShell(opts.name, entry));
+    // One-shot commands go through kubectl-debug `sh -c` (clean output +
+    // an exit code); an interactive shell prefers the fast vsock path.
+    if (command.length) {
+      process.exit(runHostShell(opts.name, ['/bin/sh', '-c', command.join(' ')]));
+    }
+    process.exit(runInteractiveShell(opts.name, ['/bin/sh']));
   });
 
 function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
@@ -755,10 +777,14 @@ dev
       );
       process.exit(1);
     }
-    const script = command.length
-      ? `export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ${command.join(' ')}`
-      : DEV_SHELL_LOGIN;
-    process.exit(runHostShell(opts.name, ['/bin/sh', '-c', script]));
+    // One-shot commands run on kubectl-debug (clean output + exit code);
+    // an interactive dev shell prefers the fast vsock path, which lands
+    // in /persist/workspace via the guest agent.
+    if (command.length) {
+      const script = `export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ${command.join(' ')}`;
+      process.exit(runHostShell(opts.name, ['/bin/sh', '-c', script]));
+    }
+    process.exit(runInteractiveShell(opts.name, ['/bin/sh', '-c', DEV_SHELL_LOGIN]));
   });
 
 dev

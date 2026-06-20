@@ -42,6 +42,11 @@ pub const REGISTRY_NODEPORT: u16 = 30500;
 /// test asserts the bootstrap references this exact value).
 pub const WORKSPACE_VIRTIOFS_TAG: &str = "workspace";
 
+/// Guest vsock port the shell agent listens on. The host's resident
+/// process connects to it via the VM's VZVirtioSocketDevice and bridges
+/// it to a per-VM Unix socket that `appliance-vm shell` drives.
+pub const SHELL_VSOCK_PORT: u32 = 1024;
+
 pub struct BootMedia {
     pub image: PathBuf,
 }
@@ -117,6 +122,19 @@ if [ -z "$(blkid /dev/vda 2>/dev/null)" ]; then
 fi
 if ! mount -t ext4 /dev/vda "$PERSIST"; then
   echo "WARNING: data disk mount failed — falling back to tmpfs (no persistence, limited space)"
+fi
+
+# --- vsock shell agent (appliance-vm shell) -------------------------
+# A PTY login shell served per connection on a fixed vsock port. The
+# host's resident process bridges a local Unix socket to this; no SSH,
+# no TCP exposure, and it works before k3s is up. Runs on every VM.
+if command -v socat >/dev/null 2>&1; then
+  socat VSOCK-LISTEN:__SHELL_VSOCK_PORT__,reuseaddr,fork \
+    EXEC:/usr/local/bin/appliance-shell-agent,pty,setsid,ctty,stderr \
+    >/var/log/appliance-shell.log 2>&1 &
+  echo "appliance-shell: vsock shell agent listening on port __SHELL_VSOCK_PORT__"
+else
+  echo "appliance-shell: socat not installed — vsock shell unavailable"
 fi
 
 # --- dev environment (appliance vm dev) ------------------------------
@@ -284,6 +302,22 @@ else
   echo "appliance-dev: WARNING virtiofs mount of the host folder failed"
 fi"#;
 
+/// Per-connection shell run by the vsock agent (socat EXEC target). The
+/// host `appliance-vm shell` client sends an initial "rows R cols C"
+/// line; we apply it as the PTY size (echo off so it isn't painted into
+/// the session), then exec a login shell — landing in the dev workspace
+/// when there is one. bash if the dev toolchain installed it, else sh.
+const SHELL_AGENT: &str = r#"#!/bin/sh
+# appliance-vm shell agent — one login shell per vsock connection.
+stty -echo 2>/dev/null
+IFS= read -r __SZ
+[ -n "$__SZ" ] && stty $__SZ 2>/dev/null
+stty echo 2>/dev/null
+[ -d /persist/home ] && export HOME=/persist/home
+cd /persist/workspace 2>/dev/null || cd "$HOME" 2>/dev/null || cd / || true
+if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi
+"#;
+
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
@@ -316,10 +350,12 @@ fn build_apkovl(
     // building the root. alpine-base brings openrc + busybox userland;
     // e2fsprogs provides mkfs.ext4 for the data disk; ca-certificates
     // lets containerd pull from TLS registries.
+    // socat backs the vsock shell agent (appliance-vm shell); it's tiny
+    // and gives every VM a k3s-independent host shell.
     file(
         "etc/apk/world",
         0o644,
-        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\n",
+        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\n",
     )?;
     file(
         "etc/apk/repositories",
@@ -342,10 +378,14 @@ fn build_apkovl(
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
+            .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
             .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
             .as_bytes(),
     )?;
+    // The vsock shell agent (socat EXEC target). Always present — every
+    // VM gets a k3s-independent host shell.
+    file("usr/local/bin/appliance-shell-agent", 0o755, SHELL_AGENT.as_bytes())?;
 
     // The per-VM egress CA, trusted node-wide by appliance.start's
     // update-ca-certificates step. Placed even when interception is
@@ -590,6 +630,23 @@ mod tests {
         assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
         assert!(start.contains("apk add"));
         assert!(start.contains("/persist/.dev-ready"));
+    }
+
+    #[test]
+    fn vsock_shell_agent_is_baked_into_every_vm() {
+        let ovl = build_apkovl(5052, None, false, false).unwrap();
+        // socat backs the agent and is in the base package set.
+        let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
+        assert!(world.lines().any(|l| l == "socat"));
+        // The bootstrap starts the agent on the shared vsock port.
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__SHELL_VSOCK_PORT__"), "port marker must be substituted");
+        assert!(start.contains(&format!("VSOCK-LISTEN:{SHELL_VSOCK_PORT}")));
+        assert!(start.contains("/usr/local/bin/appliance-shell-agent"));
+        // The agent script is present and execs a login shell.
+        let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
+        assert!(agent.contains("read"));
+        assert!(agent.contains("exec bash -l") || agent.contains("exec sh -l"));
     }
 
     #[test]

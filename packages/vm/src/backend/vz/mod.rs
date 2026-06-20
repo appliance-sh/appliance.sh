@@ -14,6 +14,8 @@
 //! Requires the `com.apple.security.virtualization` entitlement —
 //! `scripts/sign-dev.sh` applies it ad-hoc for local builds.
 
+mod shell;
+
 use super::VmBackend;
 use crate::spec::{VmPaths, VmSpec};
 use anyhow::{anyhow, bail, Result};
@@ -25,10 +27,11 @@ use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment, VZFileSerialPortAttachment,
     VZLinuxBootLoader, VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
-    VZSharedDirectory, VZSerialPortConfiguration, VZSingleDirectoryShare, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZSharedDirectory, VZSerialPortConfiguration, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineState,
 };
 use std::path::Path;
@@ -100,6 +103,11 @@ impl VmBackend for VzBackend {
 
         start_vm(&queue, &vm)?;
         eprintln!("VM '{}' started", spec.name);
+
+        // Serve the per-VM shell socket: each `appliance-vm shell`
+        // connection bridges to a fresh guest vsock PTY. Best-effort and
+        // independent of k3s.
+        shell::spawn_relay(&queue, &vm, paths.shell_sock());
 
         // Guest-facing host services (IP discovery, port forwards,
         // kubeconfig handoff) run on a side thread so the parking loop
@@ -197,6 +205,11 @@ fn build_configuration(
 
         let entropy = VZVirtioEntropyDeviceConfiguration::new();
 
+        // virtio-vsock: the host↔guest control channel the shell agent
+        // rides (no SSH, no TCP exposure). The resident process opens
+        // connections to it on demand via `shell::spawn_relay`.
+        let vsock = VZVirtioSocketDeviceConfiguration::new();
+
         let config = VZVirtualMachineConfiguration::new();
         config.setBootLoader(Some(&boot_loader));
         config.setCPUCount(spec.cpus);
@@ -214,6 +227,8 @@ fn build_configuration(
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             entropy,
         )]));
+        config.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(vsock)
+            as Retained<VZSocketDeviceConfiguration>]));
 
         // Optional VirtioFS share: a host folder presented to the guest
         // under a fixed tag, which the bootstrap mounts at

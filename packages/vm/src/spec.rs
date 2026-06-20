@@ -203,6 +203,12 @@ impl VmPaths {
     pub fn host_log(&self) -> PathBuf {
         self.dir.join("host.log")
     }
+    /// Per-VM Unix socket the resident host process serves: it bridges
+    /// each connection to a fresh guest vsock shell. `appliance-vm
+    /// shell` connects here.
+    pub fn shell_sock(&self) -> PathBuf {
+        self.dir.join("shell.sock")
+    }
 }
 
 /// Runtime status reported by `status`.
