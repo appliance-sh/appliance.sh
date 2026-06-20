@@ -1,4 +1,5 @@
 mod backend;
+mod bringup;
 mod creds;
 mod egress;
 mod guest;
@@ -424,23 +425,50 @@ fn run() -> Result<()> {
                 // observe files written by this boot.
                 let _ = std::fs::remove_file(paths.kubeconfig());
                 let _ = std::fs::remove_file(paths.guest_ip());
+                bringup::clear(&paths.dir);
                 let child = spawn_host_process(&name)?;
                 println!("starting VM '{name}' (host pid {})", child.id());
             }
 
-            // The resident host process writes guest-ip then
-            // kubeconfig.yaml as the guest comes up — poll those, then
-            // confirm the forwarded API endpoint actually answers.
+            // The resident host process publishes its bring-up phase as it
+            // goes (boot media → booting → network → k3s → ready) and writes
+            // kubeconfig.yaml once the cluster answers. Render the phases as
+            // live progress, surface a failed stage immediately rather than
+            // waiting out the timeout, and confirm the forwarded API endpoint.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-            print!("waiting for kubernetes endpoint");
-            std::io::Write::flush(&mut std::io::stdout())?;
+            println!("bringing up VM '{name}'…");
             // The spawned host process needs a beat to write its
             // pidfile — only treat "no live pid" as fatal after the
             // grace period, or `up` races its own child.
             let liveness_grace = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut shown: Option<bringup::Phase> = None;
             loop {
                 if paths.kubeconfig().exists() {
                     break;
+                }
+                // Reflect the current phase: a new stage starts a fresh
+                // line; staying in one appends dots so progress is visible.
+                if let Some(b) = bringup::read(&paths.dir) {
+                    if shown != Some(b.phase) {
+                        if shown.is_some() {
+                            println!();
+                        }
+                        let detail = b
+                            .detail
+                            .as_deref()
+                            .map(|d| format!(" ({d})"))
+                            .unwrap_or_default();
+                        print!("  {}{}", b.phase.label(), detail);
+                        std::io::Write::flush(&mut std::io::stdout())?;
+                        shown = Some(b.phase);
+                    }
+                    if b.phase == bringup::Phase::Failed {
+                        println!();
+                        bail!(
+                            "VM bring-up failed: {}\n(boot log: `appliance-vm console {name}`)",
+                            b.detail.as_deref().unwrap_or("see host log"),
+                        );
+                    }
                 }
                 if std::time::Instant::now() > liveness_grace && store::read_live_pid(&name).is_none() {
                     println!();
@@ -451,8 +479,9 @@ fn run() -> Result<()> {
                 }
                 if std::time::Instant::now() >= deadline {
                     println!();
+                    let stuck = shown.map(|p| p.label()).unwrap_or("starting up");
                     bail!(
-                        "timed out waiting for the kubeconfig. Host log tail:\n{}\n(boot log: `appliance-vm console {name}`)",
+                        "timed out after {timeout}s — still {stuck}.\nHost log tail:\n{}\n(boot log: `appliance-vm console {name}`)",
                         tail_of(&paths.host_log(), 8)
                     );
                 }
@@ -514,12 +543,24 @@ fn run() -> Result<()> {
         Cmd::Status { name } => {
             let spec = store::load_spec(&name)?;
             let pid = store::read_live_pid(&name);
+            let paths = VmPaths::for_name(&name);
+            // Cluster readiness is gated on the host process being alive:
+            // the kubeconfig file lingers on disk after a stop, so the
+            // file alone would falsely report a stopped VM as "ready".
+            let cluster_ready = pid.is_some() && paths.kubeconfig().exists();
+            let phase = if pid.is_some() {
+                bringup::read(&paths.dir).map(|b| b.phase)
+            } else {
+                None
+            };
             let status = VmStatus {
                 name: name.clone(),
                 exists: spec.is_some(),
                 running: pid.is_some(),
                 pid,
                 backend: backend.name(),
+                cluster_ready,
+                phase,
                 message: backend.availability().err().map(|e| format!("{e:#}")),
                 host_port: spec.as_ref().map(|s| s.host_port),
                 api_port: spec.as_ref().map(|s| s.api_port),
@@ -537,6 +578,11 @@ fn run() -> Result<()> {
             struct VmEntry {
                 name: String,
                 running: bool,
+                /// Cluster answers (kubeconfig present) while running —
+                /// lets the switcher show "starting" vs "ready" per VM.
+                cluster_ready: bool,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                phase: Option<bringup::Phase>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 pid: Option<i32>,
                 host_port: u16,
@@ -549,8 +595,17 @@ fn run() -> Result<()> {
                 .into_iter()
                 .map(|spec| {
                     let pid = store::read_live_pid(&spec.name);
+                    let paths = VmPaths::for_name(&spec.name);
+                    let cluster_ready = pid.is_some() && paths.kubeconfig().exists();
+                    let phase = if pid.is_some() {
+                        bringup::read(&paths.dir).map(|b| b.phase)
+                    } else {
+                        None
+                    };
                     VmEntry {
                         running: pid.is_some(),
+                        cluster_ready,
+                        phase,
                         pid,
                         host_port: spec.host_port,
                         api_port: spec.api_port,

@@ -70,6 +70,10 @@ impl VmBackend for VzBackend {
     fn run_foreground(&self, spec: &VmSpec) -> Result<()> {
         self.availability()?;
         let paths = VmPaths::for_name(&spec.name);
+        // First observable stage: any boot-media download happens here.
+        // Clear any phase left by a previous boot before publishing ours.
+        crate::bringup::clear(&paths.dir);
+        crate::bringup::set(&paths.dir, crate::bringup::Phase::Media, None);
         let image = crate::images::ensure_image(&spec.image)?;
         eprintln!("assembling boot media");
         let boot_media = crate::guest::build_boot_media(
@@ -103,6 +107,8 @@ impl VmBackend for VzBackend {
 
         start_vm(&queue, &vm)?;
         eprintln!("VM '{}' started", spec.name);
+        // Guest is launching; host_services drives the rest of the phases.
+        crate::bringup::set(&paths.dir, crate::bringup::Phase::Booting, None);
 
         // Serve the per-VM shell socket: each `appliance-vm shell`
         // connection bridges to a fresh guest vsock PTY. Best-effort and
@@ -118,6 +124,13 @@ impl VmBackend for VzBackend {
             std::thread::spawn(move || {
                 if let Err(err) = crate::guest::host_services(&spec, &paths_dir) {
                     eprintln!("host services: {err:#}");
+                    // Record the failure so `up` can stop waiting and
+                    // report what broke instead of timing out blind.
+                    crate::bringup::set(
+                        &paths_dir,
+                        crate::bringup::Phase::Failed,
+                        Some(format!("{err:#}")),
+                    );
                 }
             });
         }
