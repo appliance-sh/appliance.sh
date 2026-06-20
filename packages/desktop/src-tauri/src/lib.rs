@@ -3207,6 +3207,42 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// Ensure the managed engine binary in ~/.appliance/bin matches the one
+/// this build bundles, (re)installing when it's **missing or stale**.
+/// The engine reports a fixed `--version`, so a version string can't
+/// tell builds apart; we compare bytes against the bundled source
+/// instead — `microvm_install` copies that source and re-signs it with
+/// the same ad-hoc entitlement it already carries, so an up-to-date
+/// install is byte-identical. A no-op when the build ships no
+/// installable source (we then use whatever is already on PATH/managed).
+///
+/// This is what keeps `appliance vm dev up` (spawned via the bundled CLI,
+/// which resolves the managed binary) from running a stale engine that
+/// predates flags like `--dev`.
+async fn ensure_vm_installed(app: &AppHandle, on_event: &Channel<serde_json::Value>) -> Result<(), String> {
+    let Some(source) = vm_install_source(app) else {
+        return Ok(());
+    };
+    let dest = home_dir()
+        .map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm"));
+    let up_to_date = dest.as_ref().is_some_and(|dest| {
+        dest.is_file()
+            // Cheap length gate before reading both binaries in full.
+            && fs::metadata(&source).map(|m| m.len()).ok() == fs::metadata(dest).map(|m| m.len()).ok()
+            && fs::read(&source).ok() == fs::read(dest).ok()
+    });
+    if up_to_date {
+        return Ok(());
+    }
+    let _ = on_event.send(serde_json::json!({
+        "type": "log",
+        "level": "info",
+        "message": "installing the microVM engine (appliance-vm) into ~/.appliance/bin",
+    }));
+    microvm_install(app.clone()).await?;
+    Ok(())
+}
+
 /// Adopt the CLI-managed microVM profile (~/.appliance/profiles.json,
 /// written by `appliance vm up`) as a desktop cluster, so the deploy
 /// wizard and cluster switcher target the engine like any other
@@ -3555,16 +3591,10 @@ async fn run_microvm_up(
     mount: Option<String>,
     on_event: Channel<serde_json::Value>,
 ) -> Result<(), String> {
-    // Self-heal: install the engine binary first when it's missing —
-    // the CLI spawned below resolves the same ~/.appliance/bin path.
-    if vm_binary().is_none() && vm_install_source(&app).is_some() {
-        let _ = on_event.send(serde_json::json!({
-            "type": "log",
-            "level": "info",
-            "message": "installing the microVM engine (appliance-vm) into ~/.appliance/bin",
-        }));
-        microvm_install(app.clone()).await?;
-    }
+    // Self-heal: refresh the managed engine binary the bundled CLI below
+    // resolves (~/.appliance/bin) when it's missing OR stale, so a freshly
+    // bundled engine always wins over a leftover older install.
+    ensure_vm_installed(&app, &on_event).await?;
     // `vm dev up` and `vm up` share the same bring-up; the dev variant
     // additionally provisions the toolchain + workspace, and may share a
     // host folder into it.
