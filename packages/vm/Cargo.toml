@@ -52,6 +52,20 @@ objc2-virtualization = { version = "0.3", features = [
   "VZVirtioBlockDeviceConfiguration",
   "VZEntropyDeviceConfiguration",
   "VZVirtioEntropyDeviceConfiguration",
+  # VirtioFS host-folder sharing (dev bind-mount).
+  "VZDirectoryShare",
+  "VZDirectorySharingDevice",
+  "VZDirectorySharingDeviceConfiguration",
+  "VZSharedDirectory",
+  "VZSingleDirectoryShare",
+  "VZVirtioFileSystemDeviceConfiguration",
+  # virtio-vsock host↔guest channel (dev shell agent).
+  "VZSocketDeviceConfiguration",
+  "VZSocketDevice",
+  "VZVirtioSocketConnection",
+  "VZVirtioSocketDevice",
+  "VZVirtioSocketDeviceConfiguration",
+  "VZVirtioSocketListener",
 ] }
 dispatch2 = "0.3"
 block2 = "0.6"

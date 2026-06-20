@@ -42,6 +42,12 @@ pub struct VmSpec {
     /// `vm up` leaves it false, and it is never silently turned back off.
     #[serde(default)]
     pub dev: bool,
+    /// Absolute host path shared into the guest over VirtioFS and
+    /// mounted at `/persist/workspace` — "edit on the host, run in the
+    /// VM". `None` keeps the workspace on the persistent data disk.
+    /// Set by `appliance vm dev up --mount <path>`; implies `dev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_mount: Option<String>,
 }
 
 /// The default VM name. The default VM keeps the canonical host ports
@@ -79,6 +85,7 @@ impl VmSpec {
             registry_port: 5052,
             egress_port: 5053,
             dev: false,
+            dev_mount: None,
         }
     }
 

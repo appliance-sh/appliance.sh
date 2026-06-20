@@ -3458,6 +3458,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
                 exists: false,
                 running: false,
                 kubeconfig_ready: false,
+                dev: false,
                 api_server_url,
                 message: Some(e),
             }
@@ -3525,7 +3526,7 @@ async fn microvm_up(
     on_event: Channel<serde_json::Value>,
 ) -> Result<(), String> {
     let name = vm_name(name);
-    run_microvm_up(app, name, false, on_event).await
+    run_microvm_up(app, name, false, None, on_event).await
 }
 
 /// Boot a microVM as a development environment (`appliance vm dev up`):
@@ -3535,20 +3536,23 @@ async fn microvm_up(
 async fn microvm_dev_up(
     app: AppHandle,
     name: Option<String>,
+    mount: Option<String>,
     on_event: Channel<serde_json::Value>,
 ) -> Result<(), String> {
     let name = vm_name(name);
-    run_microvm_up(app, name, true, on_event).await
+    run_microvm_up(app, name, true, mount, on_event).await
 }
 
 /// Shared bring-up for `microvm_up` / `microvm_dev_up`. `dev` selects
 /// the `vm dev up` subcommand (provisioned dev environment) over the
-/// plain `vm up`; everything else — engine self-heal, log streaming,
+/// plain `vm up`; `mount` (dev only) shares a host folder into the
+/// workspace. Everything else — engine self-heal, log streaming,
 /// cluster registration — is identical.
 async fn run_microvm_up(
     app: AppHandle,
     name: String,
     dev: bool,
+    mount: Option<String>,
     on_event: Channel<serde_json::Value>,
 ) -> Result<(), String> {
     // Self-heal: install the engine binary first when it's missing —
@@ -3562,12 +3566,17 @@ async fn run_microvm_up(
         microvm_install(app.clone()).await?;
     }
     // `vm dev up` and `vm up` share the same bring-up; the dev variant
-    // additionally provisions the toolchain + workspace.
-    let argv: Vec<&str> = if dev {
+    // additionally provisions the toolchain + workspace, and may share a
+    // host folder into it.
+    let mount = mount.filter(|m| !m.trim().is_empty());
+    let mut argv: Vec<&str> = if dev {
         vec!["vm", "dev", "up", "--name", &name]
     } else {
         vec!["vm", "up", "--name", &name]
     };
+    if let Some(m) = mount.as_deref() {
+        argv.extend(["--mount", m]);
+    }
     let sidecar = app
         .shell()
         .sidecar("appliance")

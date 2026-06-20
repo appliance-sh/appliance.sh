@@ -162,7 +162,7 @@ async function runUp(
   name: string,
   imageOverride: string | undefined,
   timeout: number,
-  resources: { cpus?: number; memory?: number; dev?: boolean } = {}
+  resources: { cpus?: number; memory?: number; dev?: boolean; mount?: string } = {}
 ): Promise<void> {
   const profile = profileForVm(name);
   const ports = vmPorts(name);
@@ -175,6 +175,9 @@ async function runUp(
   if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
   if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
   if (resources.dev) upArgs.push('--dev');
+  // Resolve --mount to an absolute path so it's unambiguous to the
+  // engine regardless of its working directory (it canonicalizes too).
+  if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
   const status = runVm(upArgs);
   if (status !== 0) process.exit(status);
   // Re-read ports: `vm up` creates the spec (with allocated ports) if
@@ -264,7 +267,10 @@ async function runUp(
   console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${profile}`);
   if (resources.dev) {
     const nameFlag = name === DEFAULT_VM_NAME ? '' : ` --name ${name}`;
-    console.log(`  Workspace:   /persist/workspace (persists across stop/up)`);
+    const workspace = resources.mount
+      ? `/persist/workspace ← ${path.resolve(resources.mount)} (shared from the host)`
+      : '/persist/workspace (persists across stop/up)';
+    console.log(`  Workspace:   ${workspace}`);
     console.log(`  Shell:       appliance vm dev shell${nameFlag}`);
     console.log(chalk.dim('  (the dev toolchain finishes installing in the background on first boot)'));
   }
@@ -716,18 +722,22 @@ dev
   .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
   .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
-  .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
-    try {
-      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10), {
-        cpus: opts.cpus,
-        memory: opts.memory,
-        dev: true,
-      });
-    } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+  .option('--mount <path>', 'share a host folder into /persist/workspace (edit on host, run in VM)')
+  .action(
+    async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number; mount?: string }) => {
+      try {
+        await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10), {
+          cpus: opts.cpus,
+          memory: opts.memory,
+          dev: true,
+          mount: opts.mount,
+        });
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exit(1);
+      }
     }
-  });
+  );
 
 dev
   .command('shell')

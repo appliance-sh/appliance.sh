@@ -430,8 +430,9 @@ export interface MicroVmInstanceHost {
   /** Full `appliance vm up` orchestration, streaming progress lines. */
   up(onEvent: (event: { message: string }) => void): Promise<void>;
   /** Like `up`, but provisions the VM as a development environment
-   *  (`appliance vm dev up`): dev toolchain + persistent workspace. */
-  devUp(onEvent: (event: { message: string }) => void): Promise<void>;
+   *  (`appliance vm dev up`): dev toolchain + persistent workspace.
+   *  `opts.mount` shares a host folder into /persist/workspace. */
+  devUp(onEvent: (event: { message: string }) => void, opts?: { mount?: string }): Promise<void>;
   /** Sweep the debugger pods a dev/host shell leaves behind. Called
    *  when a shell terminal closes; best-effort. */
   cleanupShell(): Promise<void>;

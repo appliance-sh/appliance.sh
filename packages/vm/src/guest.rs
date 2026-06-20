@@ -36,6 +36,12 @@ pub const KUBECONFIG_PORT: u16 = 9991;
 /// range k3s allows by default).
 pub const REGISTRY_NODEPORT: u16 = 30500;
 
+/// VirtioFS tag the host-folder share is presented under. The VZ
+/// backend tags the device with this; the guest bootstrap mounts the
+/// same tag at /persist/workspace. Keep both sides in sync (a guest
+/// test asserts the bootstrap references this exact value).
+pub const WORKSPACE_VIRTIOFS_TAG: &str = "workspace";
+
 pub struct BootMedia {
     pub image: PathBuf,
 }
@@ -235,6 +241,7 @@ mkdir -p /persist/workspace /persist/home /persist/apk-cache
 # boot is fast and works offline once primed (the network repo is only
 # hit the first time, or for packages added later).
 ln -sfn /persist/apk-cache /etc/apk/cache
+__DEV_MOUNT__
 # Every login shell gets a stable HOME on the persistent disk; the
 # `dev shell` entry cd's into the workspace itself.
 mkdir -p /etc/profile.d
@@ -262,10 +269,30 @@ PROFILE
 ) &
 "#;
 
+/// Substituted into the dev provisioning block (`__DEV_MOUNT__`) when a
+/// host folder is shared in (`appliance vm dev up --mount`). Mounts the
+/// VirtioFS `workspace` tag (declared by the VZ backend) over
+/// /persist/workspace so host edits and in-VM work share one tree. The
+/// tag literal must match `WORKSPACE_VIRTIOFS_TAG`.
+const DEV_MOUNT: &str = r#"# Host folder shared in over virtiofs (appliance vm dev up --mount),
+# mounted as the workspace so edits flow both ways. The data-disk
+# workspace dir created above stays underneath, shadowed by the mount.
+modprobe virtiofs 2>/dev/null || true
+if mount -t virtiofs workspace /persist/workspace; then
+  echo "appliance-dev: mounted shared host folder at /persist/workspace"
+else
+  echo "appliance-dev: WARNING virtiofs mount of the host folder failed"
+fi"#;
+
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
-fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>, dev: bool) -> Result<Vec<u8>> {
+fn build_apkovl(
+    registry_host_port: u16,
+    egress_ca_pem: Option<&str>,
+    dev: bool,
+    mount: bool,
+) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -316,6 +343,7 @@ fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>, dev: bool)
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
+            .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
             .as_bytes(),
     )?;
 
@@ -361,7 +389,12 @@ fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>, dev: bool)
 /// change is overkill for now — we rebuild on every `up`/`run`; it
 /// takes well under a second and guarantees the media matches the
 /// code that produced it.
-pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16, dev: bool) -> Result<BootMedia> {
+pub fn build_boot_media(
+    vm_dir: &Path,
+    registry_host_port: u16,
+    dev: bool,
+    mount: bool,
+) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
     // Generate (once) and bake the per-VM egress CA into the overlay so
     // the guest's system trust store includes it. Best-effort: a CA
@@ -371,7 +404,7 @@ pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16, dev: bool) -> Re
         .and_then(|n| n.to_str())
         .filter(|name| crate::mitm::ensure_ca(name).is_ok())
         .and_then(|name| fs::read_to_string(crate::mitm::ca_cert_path(name)).ok());
-    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref(), dev)?;
+    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref(), dev, mount)?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
@@ -512,7 +545,7 @@ mod tests {
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -522,7 +555,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -530,7 +563,7 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false).unwrap();
         assert_eq!(
             apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
             Some(pem)
@@ -541,7 +574,7 @@ mod tests {
     fn dev_provisioning_present_only_for_dev_vms() {
         // Non-dev: the marker is substituted to empty and no dev wiring
         // leaks into the bootstrap.
-        let plain = build_apkovl(5052, None, false).unwrap();
+        let plain = build_apkovl(5052, None, false, false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("/persist/workspace"));
@@ -549,7 +582,7 @@ mod tests {
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
-        let dev = build_apkovl(5052, None, true).unwrap();
+        let dev = build_apkovl(5052, None, true, false).unwrap();
         let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"));
         assert!(start.contains("mkdir -p /persist/workspace"));
@@ -557,5 +590,25 @@ mod tests {
         assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
         assert!(start.contains("apk add"));
         assert!(start.contains("/persist/.dev-ready"));
+    }
+
+    #[test]
+    fn virtiofs_mount_present_only_with_a_share() {
+        // Both markers must always be substituted away.
+        for (dev, mount) in [(false, false), (true, false), (true, true)] {
+            let start =
+                apkovl_file(&build_apkovl(5052, None, dev, mount).unwrap(), "etc/local.d/appliance.start").unwrap();
+            assert!(!start.contains("__DEV_MOUNT__"), "marker must be substituted (dev={dev} mount={mount})");
+        }
+
+        // Dev without a share: no virtiofs mount.
+        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false).unwrap(), "etc/local.d/appliance.start").unwrap();
+        assert!(!dev_only.contains("mount -t virtiofs"));
+
+        // Dev + share: the bootstrap mounts the workspace tag, and the
+        // tag literal matches the constant the VZ backend tags with.
+        let shared = apkovl_file(&build_apkovl(5052, None, true, true).unwrap(), "etc/local.d/appliance.start").unwrap();
+        assert!(shared.contains(&format!("mount -t virtiofs {WORKSPACE_VIRTIOFS_TAG} /persist/workspace")));
+        assert!(DEV_MOUNT.contains(WORKSPACE_VIRTIOFS_TAG));
     }
 }

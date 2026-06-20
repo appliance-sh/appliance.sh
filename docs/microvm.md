@@ -163,10 +163,19 @@ agent, the same kubeconfig channel as everything else (so it does depend
 on k3s being up). The egress proxy + credential injection confine the dev
 environment exactly as they confine deployed workloads.
 
-This is phase 1. Two follow-ons are designed but not built: an **optional
-host-folder bind-mount** (a VirtioFS share into the workspace — new VZ
-device work) and a **k3s-independent shell over vsock** (the planned
-guest agent, replacing the kubectl-debug path and removing the
+**Sharing a host folder** (`appliance vm dev up --mount <path>`, desktop:
+**Share a folder…**) presents the folder to the guest over VirtioFS — a
+`VZVirtioFileSystemDeviceConfiguration` tagged `workspace` on the VZ
+backend — and the bootstrap mounts that tag at `/persist/workspace`, so
+host edits and in-VM work share one tree. It implies `--dev`, is persisted
+on the spec (re-shared every boot until `appliance vm up --no-mount`), and
+shadows the data-disk workspace while active. The shared path is resolved
+
+- validated host-side so a bad path fails fast.
+
+One follow-on is designed but not built: a **k3s-independent shell over
+vsock** (a guest agent the host connects to via the VM's
+`VZVirtioSocketDevice`, replacing the kubectl-debug path and removing the
 debugger-pod sweep), which also unlocks running a workspace
 `devcontainer.json` as a container inside the VM.
 

@@ -23,10 +23,11 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileSerialPortAttachment, VZLinuxBootLoader,
-    VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZSerialPortConfiguration,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment, VZFileSerialPortAttachment,
+    VZLinuxBootLoader, VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
+    VZSharedDirectory, VZSerialPortConfiguration, VZSingleDirectoryShare, VZStorageDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineState,
 };
@@ -68,7 +69,12 @@ impl VmBackend for VzBackend {
         let paths = VmPaths::for_name(&spec.name);
         let image = crate::images::ensure_image(&spec.image)?;
         eprintln!("assembling boot media");
-        let boot_media = crate::guest::build_boot_media(&paths.dir, spec.registry_port, spec.dev)?;
+        let boot_media = crate::guest::build_boot_media(
+            &paths.dir,
+            spec.registry_port,
+            spec.dev,
+            spec.dev_mount.is_some(),
+        )?;
 
         // The console log is the VM's primary observable output —
         // truncate per boot so `console` shows the current boot, not
@@ -208,6 +214,33 @@ fn build_configuration(
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             entropy,
         )]));
+
+        // Optional VirtioFS share: a host folder presented to the guest
+        // under a fixed tag, which the bootstrap mounts at
+        // /persist/workspace (dev bind-mount). Read-write — the whole
+        // point is editing on the host and running in the VM.
+        if let Some(mount) = spec.dev_mount.as_deref() {
+            let shared = VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &file_url(Path::new(mount)),
+                false,
+            );
+            let share =
+                VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
+            let tag = NSString::from_str(crate::guest::WORKSPACE_VIRTIOFS_TAG);
+            // The tag is a fixed short literal; validating it only guards
+            // a future rename against the framework's <36-byte rule.
+            VZVirtioFileSystemDeviceConfiguration::validateTag_error(&tag)
+                .map_err(|e| anyhow!("invalid virtiofs tag: {}", error_text(&e)))?;
+            let fs_device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &tag,
+            );
+            fs_device.setShare(Some(&share));
+            config.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
+                Retained::into_super(fs_device) as Retained<VZDirectorySharingDeviceConfiguration>,
+            ]));
+        }
 
         Ok(config)
     }

@@ -83,6 +83,7 @@ egress controls confine it. Run several side by side with `--name`.
 ```bash
 appliance vm dev up                 # boot the default VM as a dev environment
 appliance vm dev up --name scratch  # a second, independent dev VM
+appliance vm dev up --mount ./app   # share a host folder into the workspace
 appliance vm dev shell              # interactive shell in /persist/workspace
 appliance vm dev shell -- npm test  # or run one command
 appliance vm dev status             # dev flag + workspace/toolchain readiness
@@ -91,8 +92,14 @@ appliance vm dev status             # dev flag + workspace/toolchain readiness
 The toolchain installs on first boot (from the network, then cached on the
 data disk so later boots are fast/offline) in the background, so `dev up`
 returns as soon as the cluster is ready. The desktop's Runtimes page mirrors
-this: tick **dev environment** before Start to provision one, then **Open
-shell** opens an xterm into the workspace.
+this: tick **dev environment** before Start to provision one (with an optional
+**Share a folder…**), then **Open shell** opens an xterm into the workspace.
+
+**Sharing a host folder** (`--mount <path>`) presents the folder to the guest
+over VirtioFS and mounts it at `/persist/workspace` — edit on the host, run in
+the VM. It implies `--dev`, is persisted (re-shared on every boot until
+`appliance vm up --no-mount`), and applies on the next boot. Without it the
+workspace lives on the VM's persistent data disk.
 
 Mechanics: `dev` is persisted on the VM spec (`vm.json`, one-way — a later
 plain `vm up` keeps it a dev VM). The shell rides the same `kubectl debug

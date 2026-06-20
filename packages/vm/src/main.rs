@@ -48,6 +48,10 @@ enum Cmd {
         /// + persistent /persist/workspace you shell into).
         #[arg(long, default_value_t = false)]
         dev: bool,
+        /// Share a host folder into the guest over VirtioFS, mounted at
+        /// /persist/workspace (implies --dev).
+        #[arg(long)]
+        mount: Option<String>,
     },
     /// Start a VM in the background (creates it with defaults first if needed).
     Start {
@@ -76,6 +80,15 @@ enum Cmd {
         /// turned back off.
         #[arg(long, default_value_t = false)]
         dev: bool,
+        /// Share a host folder into the guest over VirtioFS, mounted at
+        /// /persist/workspace ("edit on the host, run in the VM").
+        /// Implies --dev. Persisted; applies on the next boot.
+        #[arg(long)]
+        mount: Option<String>,
+        /// Stop sharing a previously-set host folder; the workspace
+        /// reverts to the data disk on the next boot.
+        #[arg(long, default_value_t = false)]
+        no_mount: bool,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -278,7 +291,15 @@ fn run() -> Result<()> {
             memory,
             disk,
             dev,
+            mount,
         } => {
+            // A shared host folder only makes sense in a dev environment,
+            // so --mount implies --dev.
+            let dev_mount = match mount.as_deref() {
+                Some(path) => Some(resolve_mount(path)?),
+                None => None,
+            };
+            let dev = dev || dev_mount.is_some();
             // Allocate a non-colliding port block so this VM can run
             // alongside others (the default VM keeps the canonical
             // 8081/6443/5052/5053; an existing VM keeps its ports).
@@ -292,6 +313,7 @@ fn run() -> Result<()> {
                 registry_port,
                 egress_port,
                 dev,
+                dev_mount,
                 ..VmSpec::defaults(&name)
             };
             store::save_spec(&spec)?;
@@ -332,6 +354,8 @@ fn run() -> Result<()> {
             cpus,
             memory,
             dev,
+            mount,
+            no_mount,
         } => {
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
@@ -344,11 +368,25 @@ fn run() -> Result<()> {
             // `--dev` is a one-way toggle: it promotes a VM to a dev
             // environment but its absence never demotes one, mirroring
             // the "None preserves" semantics of the resource overrides.
-            let dev_enabled = dev && !spec.dev;
-            if dev_enabled {
+            let was_dev = spec.dev;
+            if dev {
                 spec.dev = true;
             }
-            if resized || dev_enabled {
+            // Mount override: --no-mount stops sharing; --mount sets or
+            // replaces the shared host folder (and implies a dev env).
+            let mount_changed = if no_mount {
+                spec.dev_mount.take().is_some()
+            } else if let Some(path) = mount.as_deref() {
+                let abs = resolve_mount(path)?;
+                let changed = spec.dev_mount.as_deref() != Some(abs.as_str());
+                spec.dev_mount = Some(abs);
+                spec.dev = true;
+                changed
+            } else {
+                false
+            };
+            let dev_enabled = spec.dev && !was_dev;
+            if resized || dev_enabled || mount_changed {
                 store::save_spec(&spec)?;
                 if store::read_live_pid(&name).is_some() {
                     if resized {
@@ -360,6 +398,11 @@ fn run() -> Result<()> {
                     if dev_enabled {
                         println!(
                             "note: VM '{name}' is already running — dev provisioning applies on its next boot"
+                        );
+                    }
+                    if mount_changed {
+                        println!(
+                            "note: VM '{name}' is already running — the shared folder applies on its next boot"
                         );
                     }
                 }
@@ -719,6 +762,19 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Canonicalize + validate a host path for `--mount`: it must exist and
+/// be a directory. Returns the absolute path persisted into the spec —
+/// the VirtioFS share needs a real, stable path, and resolving it
+/// host-side fails fast with a clear message instead of a cryptic boot
+/// error.
+fn resolve_mount(path: &str) -> Result<String> {
+    let abs = std::fs::canonicalize(path).with_context(|| format!("--mount path '{path}' not found"))?;
+    if !abs.is_dir() {
+        bail!("--mount path '{}' is not a directory", abs.display());
+    }
+    Ok(abs.to_string_lossy().into_owned())
 }
 
 fn ensure_spec(name: &str) -> Result<VmSpec> {

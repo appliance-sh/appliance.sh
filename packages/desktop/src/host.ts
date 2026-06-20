@@ -258,12 +258,12 @@ export const tauriHost: ConsoleHost = {
           };
           await invoke('microvm_up', { name: vm, onEvent: channel });
         },
-        async devUp(onEvent: (event: { message: string }) => void) {
+        async devUp(onEvent: (event: { message: string }) => void, opts?: { mount?: string }) {
           const channel = new Channel<{ type: string; message?: string }>();
           channel.onmessage = (event) => {
             if (event?.message) onEvent({ message: event.message });
           };
-          await invoke('microvm_dev_up', { name: vm, onEvent: channel });
+          await invoke('microvm_dev_up', { name: vm, mount: opts?.mount ?? null, onEvent: channel });
         },
         async cleanupShell() {
           await invoke('microvm_dev_cleanup', { name: vm });

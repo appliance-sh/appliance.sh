@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   FileText,
+  FolderOpen,
   Play,
   Plus,
   RefreshCw,
@@ -474,6 +475,8 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
   // Whether the next Start should provision a dev environment. Forced on
   // once the VM is already a dev VM (the engine flag is one-way).
   const [devMode, setDevMode] = React.useState(false);
+  // Host folder to share into /persist/workspace on the next dev boot.
+  const [mountPath, setMountPath] = React.useState<string | null>(null);
   const [shellOpen, setShellOpen] = React.useState(false);
   const logRef = React.useRef<HTMLPreElement | null>(null);
 
@@ -627,7 +630,7 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
               // Dev once dev: the engine flag is one-way, so a dev VM
               // always re-provisions through `dev up`.
               const wantDev = devMode || status?.dev === true;
-              void run('up', () => (wantDev ? vm.devUp(onLog) : vm.up(onLog)));
+              void run('up', () => (wantDev ? vm.devUp(onLog, { mount: mountPath ?? undefined }) : vm.up(onLog)));
             }}
             disabled={busy !== null || status?.running === true || (k3dHoldsPort && !status?.running)}
             title={
@@ -672,6 +675,35 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
               />
               dev environment
             </label>
+          ) : null}
+          {(devMode || status?.dev) && !status?.running && host.local?.pickDirectory ? (
+            <div className="inline-flex items-center gap-1.5 text-xs">
+              <button
+                type="button"
+                onClick={async () => {
+                  const picked = await host.local?.pickDirectory();
+                  if (picked) setMountPath(picked);
+                }}
+                disabled={busy !== null}
+                className="inline-flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-1 hover:bg-[var(--color-muted)]"
+                title="Share a host folder into /persist/workspace (edit on host, run in VM)"
+              >
+                <FolderOpen className="h-3.5 w-3.5" /> {mountPath ? 'Change folder' : 'Share a folder…'}
+              </button>
+              {mountPath ? (
+                <span className="inline-flex items-center gap-1 text-[var(--color-muted-foreground)]" title={mountPath}>
+                  <span className="max-w-[14rem] truncate font-mono">{mountPath}</span>
+                  <button
+                    type="button"
+                    onClick={() => setMountPath(null)}
+                    className="hover:text-[var(--color-foreground)]"
+                    title="Stop sharing this folder"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              ) : null}
+            </div>
           ) : null}
         </div>
       )}
