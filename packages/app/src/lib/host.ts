@@ -259,6 +259,11 @@ export interface TerminalOpenOptions {
   clusterName?: string;
   /** 'microvm' routes through the microVM kubeconfig; omitted → k3d. */
   engine?: 'microvm';
+  /** Shell target. Absent → `kubectl exec` into the `target` pod. 'dev'
+   *  → a shell in the microVM's dev workspace; 'host' → a raw root
+   *  shell on the microVM host. Both ride `kubectl debug node/` +
+   *  chroot (microVM engine only). */
+  mode?: 'dev' | 'host';
   /** Command to run; defaults to an interactive `/bin/sh`. */
   command?: string[];
   container?: string;
@@ -322,6 +327,9 @@ export interface MicroVmStatus {
   running: boolean;
   /** kubeconfig fetched — the kubernetes endpoint is (or was) ready. */
   kubeconfigReady: boolean;
+  /** Whether this VM is provisioned as a development environment
+   *  (`appliance vm dev up`) — drives the dev-shell affordance. */
+  dev: boolean;
   apiServerUrl: string;
   message?: string;
 }
@@ -421,6 +429,12 @@ export interface MicroVmInstanceHost {
   status(): Promise<MicroVmStatus>;
   /** Full `appliance vm up` orchestration, streaming progress lines. */
   up(onEvent: (event: { message: string }) => void): Promise<void>;
+  /** Like `up`, but provisions the VM as a development environment
+   *  (`appliance vm dev up`): dev toolchain + persistent workspace. */
+  devUp(onEvent: (event: { message: string }) => void): Promise<void>;
+  /** Sweep the debugger pods a dev/host shell leaves behind. Called
+   *  when a shell terminal closes; best-effort. */
+  cleanupShell(): Promise<void>;
   stop(): Promise<void>;
   /** Delete the VM and its state (stops first if needed). */
   remove(): Promise<void>;

@@ -14,12 +14,16 @@ export function TerminalDrawer({
   target,
   engine,
   clusterName,
+  mode,
   onClose,
 }: {
   target: string;
   engine?: 'microvm';
   /** For the microVM engine, the VM name (routes to its kubeconfig). */
   clusterName?: string;
+  /** 'dev'/'host' open a shell into the microVM host itself (kubectl
+   *  debug + chroot) instead of `kubectl exec` into a pod. */
+  mode?: 'dev' | 'host';
   onClose: () => void;
 }) {
   const host = useHost();
@@ -51,7 +55,7 @@ export function TerminalDrawer({
     let disposed = false;
 
     host.terminal
-      .open({ target, engine, clusterName, cols: term.cols, rows: term.rows }, (event) => {
+      .open({ target, engine, clusterName, mode, cols: term.cols, rows: term.rows }, (event) => {
         if (event.type === 'data') {
           term.write(event.data);
         } else if (event.type === 'exit') {
@@ -93,8 +97,16 @@ export function TerminalDrawer({
       ro.disconnect();
       void session?.close();
       term.dispose();
+      // A host/dev shell rides `kubectl debug node/`, which leaves a
+      // debugger pod behind — sweep it when the drawer closes.
+      if (mode && engine === 'microvm') {
+        void host.vm
+          ?.instance(clusterName)
+          .cleanupShell()
+          .catch(() => {});
+      }
     };
-  }, [host, target, engine, clusterName]);
+  }, [host, target, engine, clusterName, mode]);
 
   return (
     <div
@@ -110,7 +122,10 @@ export function TerminalDrawer({
       >
         <header className="flex items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2">
           <div>
-            <div className="text-sm font-semibold">Terminal{engine === 'microvm' ? ' · microVM' : ''}</div>
+            <div className="text-sm font-semibold">
+              Terminal{engine === 'microvm' ? ' · microVM' : ''}
+              {mode === 'dev' ? ' · dev workspace' : mode === 'host' ? ' · host' : ''}
+            </div>
             <div className="font-mono text-xs text-[var(--color-muted-foreground)]">{target}</div>
           </div>
           <div className="flex items-center gap-3">

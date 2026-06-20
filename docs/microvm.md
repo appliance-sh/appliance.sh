@@ -140,6 +140,36 @@ the same string as its CLI credentials profile), so the deploy wizard,
 cluster switcher, and kubectl reads target the right VM. `appliance vm
 list` reports every VM with its ports and running state.
 
+### Development environments
+
+A microVM can double as an isolated **dev environment** — the VM host
+itself, provisioned to work in, not just to deploy into. `appliance vm
+dev up` (desktop: the **dev environment** tick before Start) sets a
+one-way `dev` flag on the VM spec; the guest bootstrap then, after the
+data disk mounts:
+
+- creates a persistent `/persist/workspace` and home (survive
+  `stop`/`up` like all `/persist` state),
+- symlinks apk's cache onto `/persist` and installs a toolchain (bash,
+  git, build-base, python3, node, editors, …) **in the background** —
+  first boot pulls from the network, later boots hit the cache
+  (fast/offline) — so dev provisioning never delays k3s readiness or the
+  kubeconfig handoff that `up` waits on.
+
+You shell in with `appliance vm dev shell` (or the desktop **Open
+shell**), which lands in the workspace with the toolchain on `PATH`. Like
+`vm shell`, it rides `kubectl debug node/` + chroot — no SSH, no guest
+agent, the same kubeconfig channel as everything else (so it does depend
+on k3s being up). The egress proxy + credential injection confine the dev
+environment exactly as they confine deployed workloads.
+
+This is phase 1. Two follow-ons are designed but not built: an **optional
+host-folder bind-mount** (a VirtioFS share into the workspace — new VZ
+device work) and a **k3s-independent shell over vsock** (the planned
+guest agent, replacing the kubectl-debug path and removing the
+debugger-pod sweep), which also unlocks running a workspace
+`devcontainer.json` as a container inside the VM.
+
 ### Packaging — one executable
 
 `appliance-vm` builds as a single static-ish binary per platform:

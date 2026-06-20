@@ -71,6 +71,17 @@ function vmPorts(name: string): { hostPort: number; apiPort: number; registryPor
   }
 }
 
+/** Whether a VM was provisioned as a development environment, read from
+ *  its persisted spec (the engine sets `dev` on `vm dev up`). */
+function isDevVm(name: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(vmDir(name), 'vm.json'), 'utf8');
+    return (JSON.parse(raw) as { dev?: boolean }).dev === true;
+  } catch {
+    return false;
+  }
+}
+
 const program = new Command();
 program.description('manage the microVM runtime (isolated VM engine, no docker required)');
 
@@ -151,16 +162,19 @@ async function runUp(
   name: string,
   imageOverride: string | undefined,
   timeout: number,
-  resources: { cpus?: number; memory?: number } = {}
+  resources: { cpus?: number; memory?: number; dev?: boolean } = {}
 ): Promise<void> {
   const profile = profileForVm(name);
   const ports = vmPorts(name);
   // 1. Boot the VM + wait for its kubernetes endpoint. Per-VM resource
   //    overrides are persisted into the spec by the engine, so they
   //    survive restarts; omitting them keeps the VM's current sizing.
+  //    `--dev` provisions the VM as a development environment (persisted
+  //    one-way, so a later plain `up` keeps it a dev VM).
   const upArgs = ['up', name, '--timeout', String(timeout)];
   if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
   if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
+  if (resources.dev) upArgs.push('--dev');
   const status = runVm(upArgs);
   if (status !== 0) process.exit(status);
   // Re-read ports: `vm up` creates the spec (with allocated ports) if
@@ -248,6 +262,12 @@ async function runUp(
   console.log(`  Ingress:     http://*.appliance.localhost:${ports.hostPort}`);
   console.log(`  Profile:     ${profile}`);
   console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${profile}`);
+  if (resources.dev) {
+    const nameFlag = name === DEFAULT_VM_NAME ? '' : ` --name ${name}`;
+    console.log(`  Workspace:   /persist/workspace (persists across stop/up)`);
+    console.log(`  Shell:       appliance vm dev shell${nameFlag}`);
+    console.log(chalk.dim('  (the dev toolchain finishes installing in the background on first boot)'));
+  }
 }
 
 async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
@@ -571,51 +591,94 @@ program
     process.exit(r.status ?? 1);
   });
 
+/** Resolve the VM's single k3s node name from its kubeconfig, or '' if
+ *  it can't be read (VM down / kubeconfig missing). The host shell and
+ *  dev commands all target `node/<name>` via `kubectl debug`. */
+function resolveNodeName(kubeconfig: string): string {
+  const node = spawnSync(
+    'kubectl',
+    ['--kubeconfig', kubeconfig, 'get', 'nodes', '-o', 'jsonpath={.items[0].metadata.name}'],
+    { encoding: 'utf8' }
+  );
+  return node.status === 0 ? node.stdout.trim() : '';
+}
+
+/** Open a shell into the VM host itself. `kubectl debug node/` attaches
+ *  a pod with the VM's root fs at /host; chroot turns it into a real VM
+ *  shell — no SSH or guest agent needed, it rides the same kubeconfig as
+ *  everything else, and --profile=sysadmin grants privileged +
+ *  hostPID/hostNetwork. `entry` is the argv run under the chroot.
+ *  Returns the child's exit code (caller decides whether to exit). */
+function runHostShell(name: string, entry: string[]): number {
+  const kubeconfig = kubeconfigOrExit(name);
+  const nodeName = resolveNodeName(kubeconfig);
+  if (!nodeName) {
+    console.error(chalk.red('could not resolve the VM node — is the VM up? (appliance vm up)'));
+    return 1;
+  }
+  const r = spawnSync(
+    'kubectl',
+    [
+      '--kubeconfig',
+      kubeconfig,
+      'debug',
+      `node/${nodeName}`,
+      ttyFlag(),
+      '--image=busybox:1.36',
+      '--profile=sysadmin',
+      '--',
+      'chroot',
+      '/host',
+      ...entry,
+    ],
+    { stdio: 'inherit' }
+  );
+  // kubectl debug leaves its debugger pod behind by design; sweep ours
+  // so repeated shells don't accumulate Completed pods.
+  cleanupNodeDebuggerPods(kubeconfig, nodeName);
+  return r.status ?? 1;
+}
+
+/** Run one command in the VM host and capture its stdout (no TTY) — the
+ *  quiet probe behind `vm dev status`. Debugger-session chatter goes to
+ *  the inherited stderr's /dev/null, so the returned stdout is clean. */
+function hostExec(name: string, command: string): { status: number; stdout: string } {
+  const kubeconfig = kubeconfigOrExit(name);
+  const nodeName = resolveNodeName(kubeconfig);
+  if (!nodeName) return { status: 1, stdout: '' };
+  const r = spawnSync(
+    'kubectl',
+    [
+      '--kubeconfig',
+      kubeconfig,
+      'debug',
+      `node/${nodeName}`,
+      '-i',
+      '--image=busybox:1.36',
+      '--profile=sysadmin',
+      '--',
+      'chroot',
+      '/host',
+      '/bin/sh',
+      '-c',
+      command,
+    ],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  cleanupNodeDebuggerPods(kubeconfig, nodeName);
+  return { status: r.status ?? 1, stdout: (r.stdout ?? '').trim() };
+}
+
 program
   .command('shell')
   .description('open a root shell inside the VM itself (or run one command: appliance vm shell -- uname -a)')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .argument('[command...]', 'command to run instead of an interactive shell')
   .action((command: string[], opts: { name: string }) => {
-    const kubeconfig = kubeconfigOrExit(opts.name);
-    const node = spawnSync(
-      'kubectl',
-      ['--kubeconfig', kubeconfig, 'get', 'nodes', '-o', 'jsonpath={.items[0].metadata.name}'],
-      { encoding: 'utf8' }
-    );
-    const nodeName = node.status === 0 ? node.stdout.trim() : '';
-    if (!nodeName) {
-      console.error(chalk.red('could not resolve the VM node — is the VM up? (appliance vm up)'));
-      process.exit(1);
-    }
-    // `kubectl debug node/` attaches a pod with the VM's root fs at
-    // /host; chroot turns it into a real VM shell. No SSH or guest
-    // agent needed — it rides the same kubeconfig as everything else.
-    // --profile=sysadmin grants privileged + hostPID/hostNetwork.
     // One-shot commands go through `sh -c` (attach streams reliably);
     // no command means an interactive shell.
     const entry = command.length ? ['/bin/sh', '-c', command.join(' ')] : ['/bin/sh'];
-    const r = spawnSync(
-      'kubectl',
-      [
-        '--kubeconfig',
-        kubeconfig,
-        'debug',
-        `node/${nodeName}`,
-        ttyFlag(),
-        '--image=busybox:1.36',
-        '--profile=sysadmin',
-        '--',
-        'chroot',
-        '/host',
-        ...entry,
-      ],
-      { stdio: 'inherit' }
-    );
-    // kubectl debug leaves its debugger pod behind by design; sweep
-    // ours so repeated shells don't accumulate Completed pods.
-    cleanupNodeDebuggerPods(kubeconfig, nodeName);
-    process.exit(r.status ?? 1);
+    process.exit(runHostShell(opts.name, entry));
   });
 
 function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
@@ -631,6 +694,111 @@ function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
     stdio: 'ignore',
   });
 }
+
+// ---- dev (development environment) -------------------------------------
+
+// Interactive login into the dev workspace: a stable HOME on the
+// persistent disk, cd into the workspace, and bash when the toolchain
+// has installed it (falling back to sh while it's still provisioning).
+const DEV_SHELL_LOGIN =
+  'export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ' +
+  'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi';
+
+const dev = program
+  .command('dev')
+  .description('run the microVM as a development environment (provisioned host + persistent workspace)');
+
+dev
+  .command('up')
+  .description('boot a microVM as a dev environment (toolchain + persistent /persist/workspace)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
+  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
+  .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
+  .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
+    try {
+      await runUp(opts.name, opts.image, Number.parseInt(opts.timeout, 10), {
+        cpus: opts.cpus,
+        memory: opts.memory,
+        dev: true,
+      });
+    } catch (err) {
+      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+      process.exit(1);
+    }
+  });
+
+dev
+  .command('shell')
+  .description('open a shell in the dev workspace (or run one command: appliance vm dev shell -- npm test)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .argument('[command...]', 'command to run instead of an interactive shell')
+  .action((command: string[], opts: { name: string }) => {
+    if (!isDevVm(opts.name)) {
+      console.error(
+        chalk.red(
+          `VM '${opts.name}' is not a dev environment — create one with \`appliance vm dev up${
+            opts.name === DEFAULT_VM_NAME ? '' : ` --name ${opts.name}`
+          }\`.`
+        )
+      );
+      process.exit(1);
+    }
+    const script = command.length
+      ? `export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ${command.join(' ')}`
+      : DEV_SHELL_LOGIN;
+    process.exit(runHostShell(opts.name, ['/bin/sh', '-c', script]));
+  });
+
+dev
+  .command('status')
+  .description('report whether the VM is a dev environment and if its workspace + toolchain are ready')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    const isDev = isDevVm(opts.name);
+    const bin = vmBinary();
+    const s = spawnSync(bin, ['status', opts.name], { encoding: 'utf8' });
+    let exists = false;
+    let running = false;
+    try {
+      const j = JSON.parse(s.stdout) as { exists?: boolean; running?: boolean };
+      exists = !!j.exists;
+      running = !!j.running;
+    } catch {
+      // status JSON unparseable — treat as not-defined below.
+    }
+    if (!exists) {
+      console.log(chalk.dim(`no microVM named '${opts.name}' — create one with \`appliance vm dev up\``));
+      process.exit(1);
+    }
+    const nameFlag = opts.name === DEFAULT_VM_NAME ? '' : ` --name ${opts.name}`;
+    console.log(`VM:          ${opts.name}`);
+    console.log(`Dev env:     ${isDev ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`State:       ${running ? chalk.green('running') : chalk.dim('stopped')}`);
+    if (!isDev) {
+      console.log(chalk.dim(`  promote it with: appliance vm dev up${nameFlag}`));
+      return;
+    }
+    if (!running) {
+      console.log(chalk.dim(`  start it with: appliance vm dev up${nameFlag}`));
+      return;
+    }
+    // Quiet in-guest probe for the workspace + the toolchain marker the
+    // background apk install drops on completion.
+    const probe = hostExec(
+      opts.name,
+      'test -d /persist/workspace && echo workspace; test -f /persist/.dev-ready && echo ready'
+    );
+    const hasWorkspace = probe.stdout.includes('workspace');
+    const toolchainReady = probe.stdout.includes('ready');
+    console.log(`Workspace:   ${hasWorkspace ? chalk.green('/persist/workspace') : chalk.yellow('not created yet')}`);
+    console.log(
+      `Toolchain:   ${
+        toolchainReady ? chalk.green('ready') : chalk.yellow('installing… (first boot pulls packages from the network)')
+      }`
+    );
+  });
 
 program
   .command('list')

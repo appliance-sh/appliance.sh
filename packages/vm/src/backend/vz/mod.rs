@@ -68,7 +68,7 @@ impl VmBackend for VzBackend {
         let paths = VmPaths::for_name(&spec.name);
         let image = crate::images::ensure_image(&spec.image)?;
         eprintln!("assembling boot media");
-        let boot_media = crate::guest::build_boot_media(&paths.dir, spec.registry_port)?;
+        let boot_media = crate::guest::build_boot_media(&paths.dir, spec.registry_port, spec.dev)?;
 
         // The console log is the VM's primary observable output —
         // truncate per boot so `console` shows the current boot, not

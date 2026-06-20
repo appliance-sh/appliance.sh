@@ -73,6 +73,32 @@ appliance vm kubeconfig            # path for `export KUBECONFIG=$(...)`
 The desktop surfaces the same thing: a **Shell** button on running pods
 in the Runtimes page opens an xterm terminal over a real PTY.
 
+## Development environments
+
+A microVM can run as an isolated **dev environment**: the VM host itself,
+provisioned with a toolchain (bash, git, build-base, python3, node, …) and a
+persistent `/persist/workspace` + home that survive `stop`/`up`. The same
+egress controls confine it. Run several side by side with `--name`.
+
+```bash
+appliance vm dev up                 # boot the default VM as a dev environment
+appliance vm dev up --name scratch  # a second, independent dev VM
+appliance vm dev shell              # interactive shell in /persist/workspace
+appliance vm dev shell -- npm test  # or run one command
+appliance vm dev status             # dev flag + workspace/toolchain readiness
+```
+
+The toolchain installs on first boot (from the network, then cached on the
+data disk so later boots are fast/offline) in the background, so `dev up`
+returns as soon as the cluster is ready. The desktop's Runtimes page mirrors
+this: tick **dev environment** before Start to provision one, then **Open
+shell** opens an xterm into the workspace.
+
+Mechanics: `dev` is persisted on the VM spec (`vm.json`, one-way — a later
+plain `vm up` keeps it a dev VM). The shell rides the same `kubectl debug
+node/` + chroot path as `vm shell`; it needs no SSH or guest agent. A future
+phase replaces it with a vsock agent (see `docs/microvm.md`).
+
 ## Egress control (outbound traffic)
 
 The VM routes workload egress through a proxy Appliance runs and the

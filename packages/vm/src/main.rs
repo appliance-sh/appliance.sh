@@ -44,6 +44,10 @@ enum Cmd {
         memory: u64,
         #[arg(long, default_value_t = spec::DEFAULT_DISK_GIB)]
         disk: u64,
+        /// Provision this VM as a development environment (dev toolchain
+        /// + persistent /persist/workspace you shell into).
+        #[arg(long, default_value_t = false)]
+        dev: bool,
     },
     /// Start a VM in the background (creates it with defaults first if needed).
     Start {
@@ -66,6 +70,12 @@ enum Cmd {
         /// value, or 4096 for a new VM). Takes effect on the next boot.
         #[arg(long)]
         memory: Option<u64>,
+        /// Provision this VM as a development environment (persisted):
+        /// installs a dev toolchain and a persistent /persist/workspace
+        /// you shell into. Takes effect on the next boot; never silently
+        /// turned back off.
+        #[arg(long, default_value_t = false)]
+        dev: bool,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -267,6 +277,7 @@ fn run() -> Result<()> {
             cpus,
             memory,
             disk,
+            dev,
         } => {
             // Allocate a non-colliding port block so this VM can run
             // alongside others (the default VM keeps the canonical
@@ -280,12 +291,16 @@ fn run() -> Result<()> {
                 api_port,
                 registry_port,
                 egress_port,
+                dev,
                 ..VmSpec::defaults(&name)
             };
             store::save_spec(&spec)?;
             store::ensure_disk(&spec)?;
             images::ensure_image(&spec.image)?;
-            println!("created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk)");
+            println!(
+                "created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk{})",
+                if dev { ", dev environment" } else { "" }
+            );
             println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}");
             Ok(())
         }
@@ -316,6 +331,7 @@ fn run() -> Result<()> {
             timeout,
             cpus,
             memory,
+            dev,
         } => {
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
@@ -324,13 +340,28 @@ fn run() -> Result<()> {
             // persisted spec is what makes the new sizing survive a
             // restart. A running VM keeps its current sizing until the
             // next boot, so warn rather than silently mislead.
-            if spec.apply_resource_overrides(cpus, memory)? {
+            let resized = spec.apply_resource_overrides(cpus, memory)?;
+            // `--dev` is a one-way toggle: it promotes a VM to a dev
+            // environment but its absence never demotes one, mirroring
+            // the "None preserves" semantics of the resource overrides.
+            let dev_enabled = dev && !spec.dev;
+            if dev_enabled {
+                spec.dev = true;
+            }
+            if resized || dev_enabled {
                 store::save_spec(&spec)?;
                 if store::read_live_pid(&name).is_some() {
-                    println!(
-                        "note: VM '{name}' is already running — new sizing ({} cpus, {} MiB) applies on its next boot",
-                        spec.cpus, spec.memory_mib
-                    );
+                    if resized {
+                        println!(
+                            "note: VM '{name}' is already running — new sizing ({} cpus, {} MiB) applies on its next boot",
+                            spec.cpus, spec.memory_mib
+                        );
+                    }
+                    if dev_enabled {
+                        println!(
+                            "note: VM '{name}' is already running — dev provisioning applies on its next boot"
+                        );
+                    }
                 }
             }
             let paths = VmPaths::for_name(&name);
@@ -441,6 +472,7 @@ fn run() -> Result<()> {
                 api_port: spec.as_ref().map(|s| s.api_port),
                 registry_port: spec.as_ref().map(|s| s.registry_port),
                 egress_port: spec.as_ref().map(|s| s.egress_port),
+                dev: spec.as_ref().map(|s| s.dev).unwrap_or(false),
             };
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(())
@@ -458,6 +490,7 @@ fn run() -> Result<()> {
                 api_port: u16,
                 registry_port: u16,
                 egress_port: u16,
+                dev: bool,
             }
             let entries: Vec<VmEntry> = store::list_specs()
                 .into_iter()
@@ -470,6 +503,7 @@ fn run() -> Result<()> {
                         api_port: spec.api_port,
                         registry_port: spec.registry_port,
                         egress_port: spec.egress_port,
+                        dev: spec.dev,
                         name: spec.name,
                     }
                 })

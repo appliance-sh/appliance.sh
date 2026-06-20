@@ -35,6 +35,13 @@ pub struct VmSpec {
     /// Host port the egress proxy binds for this VM (default 5053).
     #[serde(default = "default_egress_port")]
     pub egress_port: u16,
+    /// When set, this VM is provisioned as a development environment:
+    /// the guest bootstrap installs a dev toolchain (cached on the data
+    /// disk) and creates a persistent `/persist/workspace` + home you
+    /// shell into. Toggled on by `appliance vm dev up`; a plain
+    /// `vm up` leaves it false, and it is never silently turned back off.
+    #[serde(default)]
+    pub dev: bool,
 }
 
 /// The default VM name. The default VM keeps the canonical host ports
@@ -71,6 +78,7 @@ impl VmSpec {
             api_port: 6443,
             registry_port: 5052,
             egress_port: 5053,
+            dev: false,
         }
     }
 
@@ -211,6 +219,8 @@ pub struct VmStatus {
     pub registry_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_port: Option<u16>,
+    /// Whether this VM is provisioned as a development environment.
+    pub dev: bool,
 }
 
 fn default_registry_port() -> u16 {
@@ -263,5 +273,7 @@ mod tests {
         let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
         let spec: VmSpec = serde_json::from_str(legacy).unwrap();
         assert_eq!(spec.registry_port, 5052);
+        // Old specs predate the dev flag — it must default to off.
+        assert!(!spec.dev);
     }
 }

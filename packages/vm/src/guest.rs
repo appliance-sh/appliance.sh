@@ -113,6 +113,11 @@ if ! mount -t ext4 /dev/vda "$PERSIST"; then
   echo "WARNING: data disk mount failed — falling back to tmpfs (no persistence, limited space)"
 fi
 
+# --- dev environment (appliance vm dev) ------------------------------
+# Substituted with the provisioning block below for dev VMs, empty
+# otherwise. Runs after /persist is mounted so the workspace, home, and
+# apk cache all land on the persistent disk.
+__DEV_PROVISION__
 # --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
 # runs without noexec/permission concerns.
@@ -209,10 +214,58 @@ mkdir -p /srv/handoff
 ) &
 "#;
 
+/// Dev-environment provisioning, substituted into `APPLIANCE_START`
+/// (the `__DEV_PROVISION__` marker) only for VMs created with
+/// `appliance vm dev`. Two halves:
+///
+///   • synchronous + fast — persistent `/persist/workspace` + home, an
+///     apk cache symlinked onto the data disk, and a login profile that
+///     gives every shell a stable HOME. Ready the instant the VM boots,
+///     so `vm dev shell` always lands somewhere sane.
+///   • backgrounded + slow — the apk toolchain install. Diskless Alpine
+///     reinstalls these into the tmpfs root every boot, but the cache on
+///     /persist makes the second boot onward fast and offline. Run in
+///     the background so it never delays k3s readiness (what `vm up`
+///     waits on); a `.dev-ready` marker records completion for
+///     `vm dev status`.
+const DEV_PROVISION: &str = r#"
+echo "appliance-dev: provisioning development environment"
+mkdir -p /persist/workspace /persist/home /persist/apk-cache
+# Persist apk's download cache on the data disk so reprovisioning each
+# boot is fast and works offline once primed (the network repo is only
+# hit the first time, or for packages added later).
+ln -sfn /persist/apk-cache /etc/apk/cache
+# Every login shell gets a stable HOME on the persistent disk; the
+# `dev shell` entry cd's into the workspace itself.
+mkdir -p /etc/profile.d
+cat > /etc/profile.d/appliance-dev.sh <<'PROFILE'
+export APPLIANCE_DEV=1
+export HOME=/persist/home
+export PATH="$HOME/.local/bin:$PATH"
+PROFILE
+# Install the toolchain in the background: first boot pulls from the
+# network (slow), later boots hit the persistent cache (fast/offline).
+# Backgrounded so the kubeconfig handoff — and `vm dev up` — never wait
+# on apk.
+(
+  rm -f /persist/.dev-ready
+  apk update --no-progress >/dev/null 2>&1 || true
+  if apk add --no-progress \
+      bash bash-completion git git-lfs curl wget vim nano less tmux htop \
+      jq ripgrep tar gzip coreutils findutils grep sed gawk procps \
+      openssh-client ca-certificates build-base python3 py3-pip nodejs npm; then
+    echo "appliance-dev: toolchain ready"
+    : > /persist/.dev-ready
+  else
+    echo "appliance-dev: toolchain install failed (will retry on next boot)"
+  fi
+) &
+"#;
+
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
-fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>) -> Result<Vec<u8>> {
+fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>, dev: bool) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -262,6 +315,7 @@ fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>) -> Result<
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
+            .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
             .as_bytes(),
     )?;
 
@@ -307,7 +361,7 @@ fn build_apkovl(registry_host_port: u16, egress_ca_pem: Option<&str>) -> Result<
 /// change is overkill for now — we rebuild on every `up`/`run`; it
 /// takes well under a second and guarantees the media matches the
 /// code that produced it.
-pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16) -> Result<BootMedia> {
+pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16, dev: bool) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
     // Generate (once) and bake the per-VM egress CA into the overlay so
     // the guest's system trust store includes it. Best-effort: a CA
@@ -317,7 +371,7 @@ pub fn build_boot_media(vm_dir: &Path, registry_host_port: u16) -> Result<BootMe
         .and_then(|n| n.to_str())
         .filter(|name| crate::mitm::ensure_ca(name).is_ok())
         .and_then(|name| fs::read_to_string(crate::mitm::ca_cert_path(name)).ok());
-    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref())?;
+    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref(), dev)?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
@@ -440,10 +494,25 @@ mod tests {
         paths
     }
 
+    /// Read one file's contents out of an apkovl tarball.
+    fn apkovl_file(ovl: &[u8], want: &str) -> Option<String> {
+        let gz = flate2::read::GzDecoder::new(ovl);
+        let mut ar = tar::Archive::new(gz);
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == want {
+                let mut s = String::new();
+                entry.read_to_string(&mut s).unwrap();
+                return Some(s);
+            }
+        }
+        None
+    }
+
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem)).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -453,7 +522,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None).unwrap();
+        let ovl = build_apkovl(5052, None, false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -461,18 +530,32 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem)).unwrap();
-        let gz = flate2::read::GzDecoder::new(&ovl[..]);
-        let mut ar = tar::Archive::new(gz);
-        let mut got = None;
-        for entry in ar.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            if entry.path().unwrap().to_string_lossy() == "usr/local/share/ca-certificates/appliance-egress.crt" {
-                let mut s = String::new();
-                entry.read_to_string(&mut s).unwrap();
-                got = Some(s);
-            }
-        }
-        assert_eq!(got.as_deref(), Some(pem));
+        let ovl = build_apkovl(5052, Some(pem), false).unwrap();
+        assert_eq!(
+            apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
+            Some(pem)
+        );
+    }
+
+    #[test]
+    fn dev_provisioning_present_only_for_dev_vms() {
+        // Non-dev: the marker is substituted to empty and no dev wiring
+        // leaks into the bootstrap.
+        let plain = build_apkovl(5052, None, false).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("/persist/workspace"));
+        assert!(!start.contains("apk add"));
+
+        // Dev: the workspace, persistent apk cache, login profile, and
+        // backgrounded toolchain install are all present.
+        let dev = build_apkovl(5052, None, true).unwrap();
+        let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__DEV_PROVISION__"));
+        assert!(start.contains("mkdir -p /persist/workspace"));
+        assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
+        assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
+        assert!(start.contains("apk add"));
+        assert!(start.contains("/persist/.dev-ready"));
     }
 }

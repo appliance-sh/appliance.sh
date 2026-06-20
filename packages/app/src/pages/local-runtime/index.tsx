@@ -471,6 +471,10 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
   const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
+  // Whether the next Start should provision a dev environment. Forced on
+  // once the VM is already a dev VM (the engine flag is one-way).
+  const [devMode, setDevMode] = React.useState(false);
+  const [shellOpen, setShellOpen] = React.useState(false);
   const logRef = React.useRef<HTMLPreElement | null>(null);
 
   React.useEffect(() => {
@@ -618,7 +622,13 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       ) : (
         <div className="flex flex-wrap items-center gap-2">
           <Button
-            onClick={() => run('up', () => vm.up((e) => setLog((prev) => [...prev.slice(-199), e.message])))}
+            onClick={() => {
+              const onLog = (e: { message: string }) => setLog((prev) => [...prev.slice(-199), e.message]);
+              // Dev once dev: the engine flag is one-way, so a dev VM
+              // always re-provisions through `dev up`.
+              const wantDev = devMode || status?.dev === true;
+              void run('up', () => (wantDev ? vm.devUp(onLog) : vm.up(onLog)));
+            }}
             disabled={busy !== null || status?.running === true || (k3dHoldsPort && !status?.running)}
             title={
               k3dHoldsPort && !status?.running
@@ -626,7 +636,14 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
                 : undefined
             }
           >
-            <Play className="h-4 w-4" /> {busy === 'up' ? 'Starting…' : status?.running ? 'Running' : 'Start'}
+            <Play className="h-4 w-4" />{' '}
+            {busy === 'up'
+              ? 'Starting…'
+              : status?.running
+                ? 'Running'
+                : devMode || status?.dev
+                  ? 'Start dev env'
+                  : 'Start'}
           </Button>
           <Button
             variant="outline"
@@ -638,6 +655,24 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
           <Button variant="destructive" onClick={onDelete} disabled={busy !== null || !status?.exists}>
             <Trash2 className="h-4 w-4" /> {busy === 'delete' ? 'Deleting…' : 'Delete'}
           </Button>
+          {status?.dev ? (
+            <span className="inline-flex items-center gap-1 rounded bg-violet-500/15 px-2 py-1 text-xs text-violet-300">
+              <TerminalIcon className="h-3.5 w-3.5" /> dev environment
+            </span>
+          ) : !status?.running ? (
+            <label
+              className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]"
+              title="Provision a dev toolchain + a persistent /persist/workspace you can shell into"
+            >
+              <input
+                type="checkbox"
+                checked={devMode}
+                onChange={(e) => setDevMode(e.target.checked)}
+                disabled={busy !== null}
+              />
+              dev environment
+            </label>
+          ) : null}
         </div>
       )}
 
@@ -663,9 +698,26 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
               Registered as the{' '}
               <span className="font-medium text-[var(--color-foreground)]">{microVmClusterLabel(name)}</span> cluster
             </p>
-            <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
-              <Rocket className="h-4 w-4" /> Deploy application
-            </Button>
+            <div className="flex items-center gap-2">
+              {host.terminal ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShellOpen(true)}
+                  disabled={busy !== null}
+                  title={
+                    status.dev
+                      ? 'Open a shell in the dev workspace (/persist/workspace)'
+                      : 'Open a root shell on the microVM host'
+                  }
+                >
+                  <TerminalIcon className="h-4 w-4" /> {status.dev ? 'Open dev shell' : 'Open shell'}
+                </Button>
+              ) : null}
+              <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
+                <Rocket className="h-4 w-4" /> Deploy application
+              </Button>
+            </div>
           </div>
           <MicroVmFacts apiServerUrl={status.apiServerUrl} clusterId={clusterId} summary={summary} />
         </>
@@ -674,6 +726,16 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <WorkloadsPanel engine="microvm" vmName={name} /> : null}
+
+      {shellOpen ? (
+        <TerminalDrawer
+          target={name}
+          engine="microvm"
+          clusterName={name}
+          mode={status?.dev ? 'dev' : 'host'}
+          onClose={() => setShellOpen(false)}
+        />
+      ) : null}
     </EngineCard>
   );
 }

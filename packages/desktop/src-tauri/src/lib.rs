@@ -3339,6 +3339,9 @@ struct MicroVmStatus {
     running: bool,
     /// kubeconfig fetched — the kubernetes endpoint is (or was) ready.
     kubeconfig_ready: bool,
+    /// Whether this VM is provisioned as a development environment
+    /// (`appliance vm dev up`). Drives the dev-shell affordance.
+    dev: bool,
     api_server_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
@@ -3433,6 +3436,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             exists: false,
             running: false,
             kubeconfig_ready: false,
+            dev: false,
             api_server_url,
             message: Some(if installable {
                 "The microVM engine isn't installed yet.".into()
@@ -3466,6 +3470,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             exists: false,
             running: false,
             kubeconfig_ready: false,
+            dev: false,
             api_server_url,
             message: Some(stderr.trim().to_string()),
         };
@@ -3501,6 +3506,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
         running,
         kubeconfig_ready,
+        dev: parsed.get("dev").and_then(|v| v.as_bool()).unwrap_or(false),
         api_server_url,
         message: parsed
             .get("message")
@@ -3519,6 +3525,32 @@ async fn microvm_up(
     on_event: Channel<serde_json::Value>,
 ) -> Result<(), String> {
     let name = vm_name(name);
+    run_microvm_up(app, name, false, on_event).await
+}
+
+/// Boot a microVM as a development environment (`appliance vm dev up`):
+/// same full bring-up as `microvm_up`, plus the dev toolchain +
+/// persistent `/persist/workspace` you shell into.
+#[tauri::command]
+async fn microvm_dev_up(
+    app: AppHandle,
+    name: Option<String>,
+    on_event: Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let name = vm_name(name);
+    run_microvm_up(app, name, true, on_event).await
+}
+
+/// Shared bring-up for `microvm_up` / `microvm_dev_up`. `dev` selects
+/// the `vm dev up` subcommand (provisioned dev environment) over the
+/// plain `vm up`; everything else — engine self-heal, log streaming,
+/// cluster registration — is identical.
+async fn run_microvm_up(
+    app: AppHandle,
+    name: String,
+    dev: bool,
+    on_event: Channel<serde_json::Value>,
+) -> Result<(), String> {
     // Self-heal: install the engine binary first when it's missing —
     // the CLI spawned below resolves the same ~/.appliance/bin path.
     if vm_binary().is_none() && vm_install_source(&app).is_some() {
@@ -3529,11 +3561,18 @@ async fn microvm_up(
         }));
         microvm_install(app.clone()).await?;
     }
+    // `vm dev up` and `vm up` share the same bring-up; the dev variant
+    // additionally provisions the toolchain + workspace.
+    let argv: Vec<&str> = if dev {
+        vec!["vm", "dev", "up", "--name", &name]
+    } else {
+        vec!["vm", "up", "--name", &name]
+    };
     let sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
-        .args(["vm", "up", "--name", &name]);
+        .args(argv);
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -4171,6 +4210,12 @@ struct TerminalOpenInput {
     /// "microvm" routes through the microVM kubeconfig; omitted → k3d.
     #[serde(default)]
     engine: Option<String>,
+    /// Shell target. Absent → `kubectl exec` into the pod named by
+    /// `target` (the default). "dev" → a shell in the microVM's dev
+    /// workspace; "host" → a raw root shell on the microVM host. Both
+    /// ride `kubectl debug node/` + chroot (microVM engine only).
+    #[serde(default)]
+    mode: Option<String>,
     /// Command to run; defaults to an interactive `/bin/sh`.
     #[serde(default)]
     command: Option<Vec<String>>,
@@ -4178,6 +4223,56 @@ struct TerminalOpenInput {
     container: Option<String>,
     cols: u16,
     rows: u16,
+}
+
+/// Interactive login for the dev workspace — mirrors DEV_SHELL_LOGIN in
+/// the CLI: a stable HOME on the persistent disk, cd into the
+/// workspace, and bash once the toolchain has installed it (sh until
+/// then).
+const DEV_SHELL_LOGIN: &str = "export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; \
+     if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi";
+
+/// Build the argv for a shell into the microVM host itself, riding
+/// `kubectl debug node/<node>` + chroot (the same mechanism as
+/// `appliance vm shell`). `dev` lands in the persistent workspace with
+/// the provisioned toolchain; otherwise a raw root shell at /. Resolves
+/// the VM's single node name first (async kubectl), so this lives
+/// outside the sync `terminal_exec_argv`.
+async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result<Vec<String>, String> {
+    let target = kube_target_args(input.engine.as_deref(), input.cluster_name.as_deref().unwrap_or(""))?;
+    // target is ["--kubeconfig", <path>]; reuse the path for the node lookup.
+    let mut node_args: Vec<&str> = vec!["kubectl"];
+    node_args.extend(target.iter().map(String::as_str));
+    node_args.extend(["get", "nodes", "-o", "jsonpath={.items[0].metadata.name}"]);
+    let (ok, stdout, stderr) = run_status_command(&node_args).await?;
+    let node = stdout.trim();
+    if !ok || node.is_empty() {
+        return Err(format!(
+            "could not resolve the VM node — is the engine up?{}",
+            if stderr.trim().is_empty() { String::new() } else { format!(" ({})", stderr.trim()) }
+        ));
+    }
+    let entry = if dev { DEV_SHELL_LOGIN } else { "exec /bin/sh -l" };
+    let mut argv = vec!["kubectl".to_string()];
+    argv.extend(target);
+    argv.extend(
+        [
+            "debug",
+            &format!("node/{node}"),
+            "-it",
+            "--image=busybox:1.36",
+            "--profile=sysadmin",
+            "--",
+            "chroot",
+            "/host",
+            "/bin/sh",
+            "-c",
+            entry,
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    Ok(argv)
 }
 
 /// Build the `kubectl exec -it` argv for an interactive terminal.
@@ -4213,7 +4308,13 @@ async fn terminal_open(
     input: TerminalOpenInput,
     on_event: Channel<terminal::TermEvent>,
 ) -> Result<String, String> {
-    let argv = terminal_exec_argv(&app, &input)?;
+    // "dev"/"host" open a shell into the microVM host (kubectl debug +
+    // chroot); anything else is a `kubectl exec` into the pod.
+    let argv = match input.mode.as_deref() {
+        Some("dev") => microvm_host_shell_argv(&input, true).await?,
+        Some("host") => microvm_host_shell_argv(&input, false).await?,
+        _ => terminal_exec_argv(&app, &input)?,
+    };
     let id = uuid::Uuid::new_v4().to_string();
     terminal::open(id.clone(), argv, input.cols, input.rows, on_event)?;
     Ok(id)
@@ -4232,6 +4333,49 @@ async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), String>
 #[tauri::command]
 async fn terminal_close(id: String) -> Result<(), String> {
     terminal::close(&id)
+}
+
+/// Sweep the `node-debugger-*` pods that `kubectl debug node/` leaves
+/// behind, so repeated dev/host shells don't accumulate Completed pods.
+/// The frontend calls this when a dev-shell terminal closes. Best-
+/// effort and cosmetic — mirrors cleanupNodeDebuggerPods in the CLI.
+#[tauri::command]
+async fn microvm_dev_cleanup(name: Option<String>) -> Result<(), String> {
+    let name = vm_name(name);
+    let home = home_dir().ok_or("cannot resolve the home directory")?;
+    let kubeconfig = home
+        .join(SHARED_PROFILES_DIR)
+        .join("vm")
+        .join(&name)
+        .join("kubeconfig.yaml");
+    if !kubeconfig.is_file() {
+        return Ok(()); // VM gone — nothing to sweep.
+    }
+    let kc = kubeconfig.to_string_lossy().to_string();
+    let (ok, stdout, _) = run_status_command(&[
+        "kubectl",
+        "--kubeconfig",
+        &kc,
+        "get",
+        "pods",
+        "-o",
+        "jsonpath={.items[*].metadata.name}",
+    ])
+    .await?;
+    if !ok {
+        return Ok(());
+    }
+    let debuggers: Vec<&str> = stdout
+        .split_whitespace()
+        .filter(|n| n.starts_with("node-debugger-"))
+        .collect();
+    if debuggers.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["kubectl", "--kubeconfig", &kc, "delete", "pod", "--wait=false"];
+    args.extend(debuggers);
+    let _ = run_status_command(&args).await;
+    Ok(())
 }
 
 // ============================================================
@@ -4876,6 +5020,8 @@ pub fn run() {
             microvm_status,
             microvm_install,
             microvm_up,
+            microvm_dev_up,
+            microvm_dev_cleanup,
             microvm_stop,
             microvm_delete,
             microvm_egress_get,
