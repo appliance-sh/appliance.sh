@@ -515,6 +515,7 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
     let guest_ip = crate::net::discover_guest_ip(&spec.mac, Duration::from_secs(120))?;
     eprintln!("guest address: {guest_ip}");
     fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
+    crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
     // Bind failures here are almost always the other engine (k3d's
     // serverlb publishes the same 8081) — name the fix, don't let it
@@ -543,11 +544,13 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
 
     // The guest serves its kubeconfig only after k3s has written it —
     // first boot includes apk installs + image pulls, so be generous.
+    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
     let handoff = format!("http://{guest_ip}:{KUBECONFIG_PORT}/k3s.yaml");
     crate::net::wait_http(&handoff, Duration::from_secs(600))?;
     let kubeconfig = crate::net::fetch_kubeconfig(guest_ip, KUBECONFIG_PORT, spec.api_port)?;
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
     eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
+    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
     Ok(())
 }
 

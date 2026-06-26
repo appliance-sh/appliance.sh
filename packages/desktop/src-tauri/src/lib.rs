@@ -3373,8 +3373,15 @@ struct MicroVmStatus {
     installable: bool,
     exists: bool,
     running: bool,
-    /// kubeconfig fetched — the kubernetes endpoint is (or was) ready.
+    /// kubeconfig fetched and the host process alive — the cluster
+    /// answers. Gated on `running` so a stopped VM (whose kubeconfig
+    /// file lingers on disk) doesn't read as ready.
     kubeconfig_ready: bool,
+    /// Current bring-up stage while starting: media | booting | network |
+    /// cluster | ready | failed. `None` when not running. Lets the UI
+    /// show "starting (k3s)" / "failed" instead of a blunt "running".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
     /// Whether this VM is provisioned as a development environment
     /// (`appliance vm dev up`). Drives the dev-shell affordance.
     dev: bool,
@@ -3421,6 +3428,14 @@ fn microvm_cluster_label(name: &str) -> String {
 struct MicroVmSummary {
     name: String,
     running: bool,
+    /// Cluster answers (kubeconfig fetched) while running — lets the
+    /// switcher show "starting" vs "ready" per VM. `false` for older
+    /// engine binaries that don't report it.
+    cluster_ready: bool,
+    /// Current bring-up stage while starting. `None` when not running or
+    /// when the engine predates phase reporting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
     host_port: u16,
     api_port: u16,
     registry_port: u16,
@@ -3446,6 +3461,8 @@ async fn microvm_list() -> Result<Vec<MicroVmSummary>, String> {
             let cluster_id = microvm_cluster_id(&name);
             MicroVmSummary {
                 running: v.get("running").and_then(|r| r.as_bool()).unwrap_or(false),
+                cluster_ready: v.get("clusterReady").and_then(|r| r.as_bool()).unwrap_or(false),
+                phase: v.get("phase").and_then(|p| p.as_str()).map(|s| s.to_string()),
                 host_port: v.get("hostPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
                 api_port: v.get("apiPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
                 registry_port: v.get("registryPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
@@ -3472,6 +3489,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             exists: false,
             running: false,
             kubeconfig_ready: false,
+            phase: None,
             dev: false,
             api_server_url,
             message: Some(if installable {
@@ -3494,6 +3512,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
                 exists: false,
                 running: false,
                 kubeconfig_ready: false,
+                phase: None,
                 dev: false,
                 api_server_url,
                 message: Some(e),
@@ -3507,6 +3526,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             exists: false,
             running: false,
             kubeconfig_ready: false,
+            phase: None,
             dev: false,
             api_server_url,
             message: Some(stderr.trim().to_string()),
@@ -3519,16 +3539,31 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         Some(port) => format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, port),
         None => api_server_url,
     };
-    let kubeconfig_ready = home_dir()
-        .map(|h| {
-            h.join(SHARED_PROFILES_DIR)
-                .join("vm")
-                .join(&name)
-                .join("kubeconfig.yaml")
-                .exists()
-        })
-        .unwrap_or(false);
     let running = parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The engine now reports `clusterReady` (kubeconfig fetched *and* the
+    // host process alive) directly — prefer it. Fall back to the on-disk
+    // kubeconfig check for older engine binaries that predate the field,
+    // gating on `running` so a stopped VM's lingering kubeconfig doesn't
+    // read as ready.
+    let kubeconfig_ready = match parsed.get("clusterReady").and_then(|v| v.as_bool()) {
+        Some(ready) => ready,
+        None => {
+            running
+                && home_dir()
+                    .map(|h| {
+                        h.join(SHARED_PROFILES_DIR)
+                            .join("vm")
+                            .join(&name)
+                            .join("kubeconfig.yaml")
+                            .exists()
+                    })
+                    .unwrap_or(false)
+        }
+    };
+    let phase = parsed
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if running && kubeconfig_ready {
         // Keep the desktop's cluster registration in step with the
         // CLI-owned profile while the engine is up — this also catches
@@ -3543,6 +3578,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
         running,
         kubeconfig_ready,
+        phase,
         dev: parsed.get("dev").and_then(|v| v.as_bool()).unwrap_or(false),
         api_server_url,
         message: parsed

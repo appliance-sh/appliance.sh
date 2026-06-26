@@ -221,6 +221,16 @@ pub struct VmStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
     pub backend: &'static str,
+    /// True once the cluster answers (kubeconfig fetched *and* the host
+    /// process is alive). Distinct from `running`, which only means the
+    /// host/VM process is up — a VM can be running while k3s is still
+    /// coming up or has failed. Lets the UI tell "VM up, cluster
+    /// starting" from "ready".
+    pub cluster_ready: bool,
+    /// The current bring-up stage while a VM is starting (media, booting,
+    /// network, cluster, ready, failed). `None` when not running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<crate::bringup::Phase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Forwarded host ports (present once the VM is defined).

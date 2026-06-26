@@ -584,6 +584,8 @@ export function createMockHost(): ConsoleHost {
         return Object.values(microVms).map((vm) => ({
           name: vm.name,
           running: vm.running,
+          clusterReady: vm.running,
+          phase: vm.running ? ('ready' as const) : undefined,
           hostPort: vm.hostPort,
           apiPort: vm.apiPort,
           registryPort: vm.registryPort,
@@ -606,6 +608,7 @@ export function createMockHost(): ConsoleHost {
               exists: vm.exists,
               running: vm.running,
               kubeconfigReady: vm.running,
+              phase: vm.running ? ('ready' as const) : undefined,
               apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
             };
           },

@@ -568,7 +568,14 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       : busy === 'up'
         ? 'starting…'
         : status.running
-          ? 'running'
+          ? // The host process being up is not the same as the cluster
+            // being ready: k3s may still be coming up, or bring-up may
+            // have errored. Reflect that instead of a blunt "running".
+            status.phase === 'failed'
+            ? 'failed'
+            : status.kubeconfigReady
+              ? 'running'
+              : 'starting…'
           : status.exists
             ? 'stopped'
             : 'not created';
@@ -581,7 +588,9 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
           ? 'border border-green-500/40 bg-green-500/15 text-green-300'
           : state === 'starting…'
             ? 'border border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
-            : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+            : state === 'failed'
+              ? 'border border-red-500/40 bg-red-500/15 text-red-300'
+              : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
       )}
     >
       {state}

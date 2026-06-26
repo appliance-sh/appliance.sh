@@ -318,6 +318,11 @@ export function isMicroVmClusterId(clusterId: string): boolean {
   return microVmNameFromClusterId(clusterId) !== null;
 }
 
+/** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
+ *  Ordered: media → booting → network → cluster → ready (terminal), or
+ *  failed (terminal). */
+export type MicroVmPhase = 'media' | 'booting' | 'network' | 'cluster' | 'ready' | 'failed';
+
 export interface MicroVmStatus {
   /** appliance-vm binary present on this machine. */
   available: boolean;
@@ -325,8 +330,13 @@ export interface MicroVmStatus {
   installable: boolean;
   exists: boolean;
   running: boolean;
-  /** kubeconfig fetched — the kubernetes endpoint is (or was) ready. */
+  /** kubeconfig fetched and the host process alive — the cluster
+   *  answers. Gated on `running`, so a stopped VM doesn't read ready. */
   kubeconfigReady: boolean;
+  /** Current bring-up stage while starting; absent when not running or
+   *  when the engine predates phase reporting. Lets the badge show
+   *  "starting (k3s)" / "failed" instead of a blunt "running". */
+  phase?: MicroVmPhase;
   /** Whether this VM is provisioned as a development environment
    *  (`appliance vm dev up`) — drives the dev-shell affordance. */
   dev: boolean;
@@ -412,6 +422,11 @@ export interface MicroVmCredsHost {
 export interface MicroVmSummary {
   name: string;
   running: boolean;
+  /** Cluster answers (kubeconfig fetched) while running — lets the
+   *  switcher show "starting" vs "ready" per VM. */
+  clusterReady: boolean;
+  /** Current bring-up stage while starting; absent when not running. */
+  phase?: MicroVmPhase;
   hostPort: number;
   apiPort: number;
   registryPort: number;
