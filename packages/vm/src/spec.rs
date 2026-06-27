@@ -48,6 +48,15 @@ pub struct VmSpec {
     /// Set by `appliance vm dev up --mount <path>`; implies `dev`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_mount: Option<String>,
+    /// When set, the guest bootstrap provisions an in-guest Docker
+    /// engine (`dockerd` on the Alpine `docker` aplet, cached on the
+    /// data disk) alongside k3s, with its data-root, containerd and
+    /// socket all under `/persist/docker`. Decoupled from the bring-up
+    /// phases: `vm up` reaches `Ready` on k3s alone and never waits on
+    /// dockerd. A plain `vm up` leaves it false; it is never silently
+    /// turned back off.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 /// The default VM name. The default VM keeps the canonical host ports
@@ -86,6 +95,7 @@ impl VmSpec {
             egress_port: 5053,
             dev: false,
             dev_mount: None,
+            docker: false,
         }
     }
 
@@ -298,5 +308,23 @@ mod tests {
         assert_eq!(spec.registry_port, 5052);
         // Old specs predate the dev flag — it must default to off.
         assert!(!spec.dev);
+        // Old specs predate the docker flag too — default off.
+        assert!(!spec.docker);
+    }
+
+    #[test]
+    fn docker_flag_round_trips_through_json() {
+        // A docker-enabled spec serializes the flag and reads it back.
+        let mut spec = VmSpec::defaults("x");
+        assert!(!spec.docker, "default must be off");
+        spec.docker = true;
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.docker, "docker flag must survive a JSON round-trip");
+
+        // A serialized default spec carries docker:false explicitly.
+        let default_json = serde_json::to_string(&VmSpec::defaults("x")).unwrap();
+        let back: VmSpec = serde_json::from_str(&default_json).unwrap();
+        assert!(!back.docker);
     }
 }

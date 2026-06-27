@@ -142,6 +142,11 @@ fi
 # otherwise. Runs after /persist is mounted so the workspace, home, and
 # apk cache all land on the persistent disk.
 __DEV_PROVISION__
+# --- docker engine (appliance vm ... --docker) -----------------------
+# Substituted with the provisioning block below for docker VMs, empty
+# otherwise. Backgrounded and fully decoupled from the bring-up phases:
+# k3s readiness below is what `vm up` waits on, never dockerd.
+__DOCKER_PROVISION__
 # --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
 # runs without noexec/permission concerns.
@@ -302,6 +307,77 @@ else
   echo "appliance-dev: WARNING virtiofs mount of the host folder failed"
 fi"#;
 
+/// In-guest Docker engine provisioning, substituted into
+/// `APPLIANCE_START` (the `__DOCKER_PROVISION__` marker) only for VMs
+/// created with the `docker` flag set. Mirrors `DEV_PROVISION`:
+///
+///   • the apk install is backgrounded so it never delays k3s readiness
+///     (what `vm up` waits on) — first boot pulls `docker` +
+///     `docker-cli-compose` from the network, later boots hit the
+///     persistent /persist/apk-cache (fast + offline), identical to the
+///     dev toolchain.
+///   • dockerd runs as its own fully separate engine: `--data-root
+///     /persist/docker` (images/volumes/its bundled containerd state all
+///     survive vm stop/up on the data disk), socket
+///     `/persist/docker/docker.sock`. k3s's embedded containerd at
+///     /persist/k3s is never shared.
+///   • dockerd's egress (registry pulls/builds) is policed cooperatively
+///     by injecting HTTP(S)_PROXY/NO_PROXY pointed at the per-VM forward
+///     proxy on the subnet gateway. This is NOT a hard boundary and does
+///     NOT confine containers (a `docker run` can drop the env, use
+///     --network host, or dial a raw IP) — see docs/sandbox.md §6.
+///   • a `/persist/.docker-ready` marker records completion for status.
+///
+/// The gateway is derived at runtime from the guest's default route
+/// (the host sits on the .1 of the vz NAT subnet) since the leased IP
+/// isn't known when the boot media is built. `__EGRESS_PORT__` is the
+/// per-VM egress proxy port, substituted from the spec at build time.
+const DOCKER_PROVISION: &str = r#"
+echo "appliance-docker: provisioning in-guest Docker engine"
+mkdir -p /persist/docker /persist/apk-cache
+# Share the persistent apk cache (DEV_PROVISION also points it here; the
+# symlink is idempotent so either order is fine) so docker reinstalls
+# from disk on later boots — fast and offline once primed.
+ln -sfn /persist/apk-cache /etc/apk/cache
+# Derive the egress proxy URL from the default-route gateway (host .1 of
+# the vz NAT subnet) so dockerd's own pulls/builds flow through the
+# per-VM forward proxy. Cooperative only — does NOT confine containers.
+APPLIANCE_GW=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+if [ -n "$APPLIANCE_GW" ]; then
+  APPLIANCE_DOCKER_PROXY="http://$APPLIANCE_GW:__EGRESS_PORT__"
+else
+  APPLIANCE_DOCKER_PROXY=""
+fi
+# Install + launch in the background: never blocks the k3s readiness gate
+# (the kubeconfig handoff) that `vm up` waits on.
+(
+  rm -f /persist/.docker-ready
+  apk update --no-progress >/dev/null 2>&1 || true
+  if apk add --no-progress docker docker-cli-compose; then
+    echo "appliance-docker: docker package installed"
+    # Egress env for dockerd's own traffic (registry pulls/builds). The
+    # node-wide egress CA (trusted above via update-ca-certificates) lets
+    # MITM'd TLS validate. NO_PROXY keeps daemon-local/bridge traffic and
+    # the loopback off the proxy.
+    if [ -n "$APPLIANCE_DOCKER_PROXY" ]; then
+      export HTTP_PROXY="$APPLIANCE_DOCKER_PROXY"
+      export HTTPS_PROXY="$APPLIANCE_DOCKER_PROXY"
+      export NO_PROXY="localhost,127.0.0.1,::1,172.17.0.0/16,10.42.0.0/16,10.43.0.0/16"
+    fi
+    # Fully separate engine: own data-root, own bundled containerd, own
+    # socket — k3s keeps its embedded containerd at /persist/k3s.
+    dockerd \
+      --data-root /persist/docker \
+      -H unix:///persist/docker/docker.sock \
+      >/var/log/appliance-docker.log 2>&1 &
+    : > /persist/.docker-ready
+    echo "appliance-docker: dockerd started on /persist/docker/docker.sock"
+  else
+    echo "appliance-docker: docker install failed (will retry on next boot)"
+  fi
+) &
+"#;
+
 /// Per-connection shell run by the vsock agent (socat EXEC target). The
 /// host `appliance-vm shell` client sends an initial "rows R cols C"
 /// line; we apply it as the PTY size (echo off so it isn't painted into
@@ -321,11 +397,14 @@ if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
 /// runlevel wiring, networking config, the world file driving package
 /// installs at boot, and the appliance.start bootstrap.
+#[allow(clippy::too_many_arguments)]
 fn build_apkovl(
     registry_host_port: u16,
     egress_ca_pem: Option<&str>,
     dev: bool,
     mount: bool,
+    docker: bool,
+    egress_port: u16,
 ) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
@@ -381,6 +460,8 @@ fn build_apkovl(
             .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
             .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
+            .replace("__DOCKER_PROVISION__", if docker { DOCKER_PROVISION } else { "" })
+            .replace("__EGRESS_PORT__", &egress_port.to_string())
             .as_bytes(),
     )?;
     // The vsock shell agent (socat EXEC target). Always present — every
@@ -434,6 +515,8 @@ pub fn build_boot_media(
     registry_host_port: u16,
     dev: bool,
     mount: bool,
+    docker: bool,
+    egress_port: u16,
 ) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
     // Generate (once) and bake the per-VM egress CA into the overlay so
@@ -444,7 +527,14 @@ pub fn build_boot_media(
         .and_then(|n| n.to_str())
         .filter(|name| crate::mitm::ensure_ca(name).is_ok())
         .and_then(|name| fs::read_to_string(crate::mitm::ca_cert_path(name)).ok());
-    let apkovl = build_apkovl(registry_host_port, egress_ca_pem.as_deref(), dev, mount)?;
+    let apkovl = build_apkovl(
+        registry_host_port,
+        egress_ca_pem.as_deref(),
+        dev,
+        mount,
+        docker,
+        egress_port,
+    )?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
@@ -588,7 +678,7 @@ mod tests {
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -598,7 +688,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None, false, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -606,7 +696,7 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053).unwrap();
         assert_eq!(
             apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
             Some(pem)
@@ -617,7 +707,7 @@ mod tests {
     fn dev_provisioning_present_only_for_dev_vms() {
         // Non-dev: the marker is substituted to empty and no dev wiring
         // leaks into the bootstrap.
-        let plain = build_apkovl(5052, None, false, false).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("/persist/workspace"));
@@ -625,7 +715,7 @@ mod tests {
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
-        let dev = build_apkovl(5052, None, true, false).unwrap();
+        let dev = build_apkovl(5052, None, true, false, false, 5053).unwrap();
         let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"));
         assert!(start.contains("mkdir -p /persist/workspace"));
@@ -637,7 +727,7 @@ mod tests {
 
     #[test]
     fn vsock_shell_agent_is_baked_into_every_vm() {
-        let ovl = build_apkovl(5052, None, false, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         // socat backs the agent and is in the base package set.
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "socat"));
@@ -657,18 +747,67 @@ mod tests {
         // Both markers must always be substituted away.
         for (dev, mount) in [(false, false), (true, false), (true, true)] {
             let start =
-                apkovl_file(&build_apkovl(5052, None, dev, mount).unwrap(), "etc/local.d/appliance.start").unwrap();
+                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
             assert!(!start.contains("__DEV_MOUNT__"), "marker must be substituted (dev={dev} mount={mount})");
         }
 
         // Dev without a share: no virtiofs mount.
-        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(!dev_only.contains("mount -t virtiofs"));
 
         // Dev + share: the bootstrap mounts the workspace tag, and the
         // tag literal matches the constant the VZ backend tags with.
-        let shared = apkovl_file(&build_apkovl(5052, None, true, true).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(shared.contains(&format!("mount -t virtiofs {WORKSPACE_VIRTIOFS_TAG} /persist/workspace")));
         assert!(DEV_MOUNT.contains(WORKSPACE_VIRTIOFS_TAG));
+    }
+
+    #[test]
+    fn docker_provisioning_present_only_for_docker_vms() {
+        // Non-docker: the marker is substituted to empty and no docker
+        // provisioning leaks into the bootstrap. (The section-header
+        // comment legitimately names dockerd even when off, so assert on
+        // the provisioning strings that only the block emits.)
+        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__DOCKER_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("apk add --no-progress docker docker-cli-compose"));
+        assert!(!start.contains("--data-root /persist/docker"));
+        assert!(!start.contains("/persist/.docker-ready"));
+
+        // Docker: the apk install, the separate dockerd engine, the
+        // egress env injection, and the readiness marker are all present.
+        let docker = build_apkovl(5052, None, false, false, true, 5053).unwrap();
+        let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__DOCKER_PROVISION__"));
+        // Packaged from the Alpine community repo, cached on /persist.
+        assert!(start.contains("apk add --no-progress docker docker-cli-compose"));
+        assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
+        // Fully separate engine: own data-root + socket under /persist.
+        assert!(start.contains("--data-root /persist/docker"));
+        assert!(start.contains("-H unix:///persist/docker/docker.sock"));
+        // dockerd is backgrounded and launched only inside the provision
+        // subshell — it must not gate the k3s readiness handoff. (k3s is
+        // still launched below it.)
+        assert!(start.contains("dockerd \\\n"));
+        assert!(start.contains("k3s server"));
+        // Cooperative egress: dockerd's own traffic is pointed at the
+        // per-VM forward proxy on the subnet gateway.
+        assert!(start.contains("HTTP_PROXY="));
+        assert!(start.contains("HTTPS_PROXY="));
+        assert!(start.contains("NO_PROXY="));
+        // Readiness marker for status.
+        assert!(start.contains("/persist/.docker-ready"));
+    }
+
+    #[test]
+    fn docker_provision_embeds_the_vm_egress_port() {
+        // The egress port is substituted into the proxy URL the guest
+        // builds at boot from its default-route gateway — the marker must
+        // be gone and the actual port present.
+        let docker = build_apkovl(5052, None, false, false, true, 8203).unwrap();
+        let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__EGRESS_PORT__"), "port marker must be substituted");
+        assert!(start.contains(":8203"), "the per-VM egress port must be embedded");
     }
 }

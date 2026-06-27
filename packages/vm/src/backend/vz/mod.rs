@@ -81,6 +81,8 @@ impl VmBackend for VzBackend {
             spec.registry_port,
             spec.dev,
             spec.dev_mount.is_some(),
+            spec.docker,
+            spec.egress_port,
         )?;
 
         // The console log is the VM's primary observable output —
