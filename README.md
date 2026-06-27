@@ -166,6 +166,45 @@ the api-server with an `appliance-base-local` config, deploys both
 demos, and then destroys them. State persists under
 `~/.appliance/local-runtime`.
 
+## Development
+
+Install dependencies with `pnpm install` (pnpm workspaces + Nx). The
+repo is a TypeScript monorepo plus one Rust crate (`packages/vm`, the
+microVM engine).
+
+### Verifying changes — the green bar
+
+`pnpm verify` is **the** green bar. It runs the full verification
+sequence and fails on the first error; nothing should reach review
+without it passing:
+
+```bash
+pnpm verify
+```
+
+It runs, in order (see [`scripts/verify.sh`](scripts/verify.sh)):
+
+1. `pnpm run build` — `nx run-many --target=build --all`
+2. `pnpm exec nx run-many --target=typecheck --all`
+3. `pnpm run lint:check` — ESLint + Prettier `--check`
+4. `pnpm exec nx run-many --target=test --all` — Vitest across packages
+5. `packages/vm`: `cargo build && cargo test && cargo clippy -- -D warnings`
+
+For a change that touches only a few packages, gate on the affected
+ones for a faster loop, e.g.:
+
+```bash
+pnpm --filter @appliance.sh/<pkg> run build
+pnpm --filter @appliance.sh/<pkg> run test
+# Rust only:
+cd packages/vm && cargo build && cargo test && cargo clippy
+```
+
+Note: `@appliance.sh/bootstrap` and `@appliance.sh/install-aws` carry no
+unit tests yet — their `test` scripts are intentional no-ops (they are
+exercised by build/integration), so `pnpm verify` stays a meaningful
+signal. Add specs there when ready.
+
 ## Architecture
 
 For API reference, infrastructure details, and contributor documentation, see [ARCHITECTURE.md](ARCHITECTURE.md).

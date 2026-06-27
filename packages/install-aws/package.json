@@ -15,7 +15,7 @@
     "deploy": "cdk deploy --all",
     "deploy:direct": "cdk deploy --all -- direct",
     "clean": "rm -rf ./dist/",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"@appliance.sh/install-aws: no unit tests yet (CDK synth is exercised by build); add cdk assertion tests here when ready\""
   },
   "dependencies": {
     "@appliance.sh/sdk": "workspace:*",
