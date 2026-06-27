@@ -10,7 +10,7 @@ permissions:
   contents: read # for checkout
 
 jobs:
-  release:
+  verify:
     name: Pull Request
     runs-on: ubuntu-latest
     permissions:
@@ -40,7 +40,37 @@ jobs:
           bun-version: latest
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      # The TypeScript half of the `pnpm verify` green bar. The Rust half
+      # runs on macOS in verify-rust below, where packages/vm is developed
+      # and the Virtualization.framework backend compiles.
       - name: Build
         run: pnpm run build
+      - name: Typecheck
+        run: pnpm exec nx run-many --target=typecheck --all
       - name: Check linting and code style
         run: pnpm run lint:check
+      - name: Test
+        run: pnpm exec nx run-many --target=test --all
+
+  verify-rust:
+    name: Verify (Rust microVM crate)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/vm
+      - name: cargo build / test / clippy
+        working-directory: packages/vm
+        run: |
+          cargo build
+          cargo test
+          cargo clippy -- -D warnings
