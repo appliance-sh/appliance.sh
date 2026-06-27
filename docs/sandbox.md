@@ -36,9 +36,20 @@ Alpine ships a maintained `docker` aplet (dockerd + containerd + runc + CNI plug
 
 ## 6. Security posture
 
-**Recommendation:** **root dockerd** in the guest. The VM _is_ the sandbox; rootless dockerd on diskless Alpine needs subuid/subgid + fuse-overlayfs plumbing that buys little when the blast radius is already a throwaway microVM, and it would complicate cgroup/overlay setup. Keep the socket off the network (vsock, §3) as the actual isolation boundary.
+> Revised per security review (Sasha). The original draft claimed env-var injection was sufficient egress confinement and that "the VM is the sandbox" — both overstated. Corrected below.
 
-**Egress:** dockerd and its containers must honor the existing policy. The egress CA is already trusted node-wide via `update-ca-certificates` (`guest.rs:109-111`), so MITM'd TLS (`mitm.rs`) validates for `docker pull` and builds out of the box. Inject `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY = guest_proxy_url(...)` (`egress.rs:408-417`, `default_no_proxy:451`) into **dockerd's own environment** (so registry pulls are policed) and into **build/run defaults** (so `docker build` and containers inherit it) — mirroring the ConfigMap injection k3s workloads get (`egress.rs:render_configmap:469`). Credential capture/injection (`creds.rs`) then works for registry auth and in-container API calls flowing through the proxy, with secrets staying host-side.
+**Recommendation:** **root dockerd** in the guest. The VM is the primary isolation boundary; rootless dockerd on diskless Alpine needs subuid/subgid + fuse-overlayfs plumbing that buys little when the blast radius is already a throwaway microVM. Keep the socket off the network (vsock, §3).
+
+**Accepted risks to call out:**
+
+- **The vsock docker socket is an unauthenticated, root-equivalent control plane** reachable by any host-local process running as the owning user — the `0600` socket perm is the only gate (same trust model as the existing shell relay, `backend/vz/shell.rs:43`). Harden: create the per-VM state dir `0o700` (it currently relies on the default umask, `store.rs:43`) and consider a `getpeereid`/`SO_PEERCRED` owner-UID check in the relay. Treat socket access as equivalent to root-in-VM.
+- **The VirtioFS host-folder share punches through "the VM is the sandbox."** On a `--mount`/dev VM the host folder is shared **read-write** at `/persist/workspace` (`guest.rs:295-300`); a root container with `-v /persist/workspace:/host` can read/write the user's host files — an escape back onto the host. Mitigation: mount the share **read-only** for docker-enabled dev VMs, or explicitly document that holding the docker socket grants host-FS write. Task B must note that bind-mounting the shared tree into a container is a host-write primitive.
+
+**Egress — cooperative, NOT a hard boundary.** Appliance egress confinement today is **100% cooperative env-var injection** — there is no transparent redirect (no iptables/nftables/TPROXY anywhere in the guest). So:
+
+- **dockerd's own traffic** (registry pulls/builds) _is_ policed when we inject `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY = guest_proxy_url(...)` (`egress.rs:408-417`, `default_no_proxy:451`) into the daemon env; the egress CA trusted node-wide (`guest.rs:109-111`) makes MITM'd TLS (`mitm.rs`) validate. Credential capture/injection (`creds.rs`) works for those flows, secrets staying host-side.
+- **Containers are NOT confined by this.** A `docker run` that drops the proxy env, uses `--network host`, dials a raw socket/non-HTTP protocol, or hits a direct IP has **unrestricted egress** — the proxy only sees traffic clients choose to send it. Same cooperative caveat k3s workloads already have; it is not a security boundary.
+- **Hard egress confinement requires a guest-side firewall** (nftables REDIRECT/TPROXY of all outbound to the proxy + default-DROP). Out of scope for the first build, but the only way to enforce the policy on arbitrary containers. Note docker's default bridge subnet (`172.17/16`) is not in `default_no_proxy()` — be deliberate about NO_PROXY for bridge/daemon-local traffic.
 
 ## 7. Task breakdown (downstream)
 
@@ -47,7 +58,7 @@ Alpine ships a maintained `docker` aplet (dockerd + containerd + runc + CNI plug
 - [ ] Add a `DOCKER_PROVISION` block (gated like `DEV_PROVISION`, `guest.rs:382`) that `apk add docker docker-cli-compose`, backgrounded, cache on `/persist/apk-cache`.
 - [ ] Launch `dockerd --data-root /persist/docker -H unix:///persist/docker/docker.sock` after `/persist` mounts; do not gate any bring-up phase on it.
 - [ ] Inject `HTTP(S)_PROXY`/`NO_PROXY` into dockerd's env; write `/persist/.docker-ready`.
-- **Accept:** `vm shell` → `docker run hello-world` succeeds on a warm boot; works offline after first boot; k3s still reaches `Ready`; `docker pull` is blocked when egress default=deny and allowed via the proxy when permitted.
+- **Accept:** `vm shell` → `docker run hello-world` succeeds on a warm boot; works offline after first boot; k3s still reaches `Ready`. **Daemon** `docker pull` is blocked when egress default=deny and allowed via the proxy when permitted; **container** egress is explicitly NOT enforced without the (out-of-scope) guest firewall — document this, do not claim it.
 
 **Task B — In-guest build from a host context**
 
@@ -58,5 +69,5 @@ Alpine ships a maintained `docker` aplet (dockerd + containerd + runc + CNI plug
 **Task C — Host↔guest socket + published-port plumbing**
 
 - [ ] Add `DOCKER_VSOCK_PORT` + guest socat bridge; add a `docker.sock` relay (clone `shell::spawn_relay`, `0600`) and a `VmPaths::docker_sock()`.
-- [ ] Add a per-VM published-port registry + `vm docker publish`; have `host_services` forward registered ports via `spawn_proxy`, drawing host ports from the allocated block and refusing the reserved four.
-- **Accept:** `DOCKER_HOST=unix://…/docker.sock docker ps` works from the host; a published container port is reachable at `127.0.0.1:<allocatedPort>` while `8081/6443/5052/5053` stay owned by ingress/api/registry/egress; a clash prints the `appliance local stop` hint.
+- [ ] Add a per-VM published-port registry + `vm docker publish`; have `host_services` forward registered ports via `spawn_proxy`, drawing host ports from the allocated block and refusing the reserved four **and the auto-forwarded NodePort window `30000-30050`** (`guest.rs:541-542`) — enforce the refusal in code, not just docs.
+- **Accept:** `DOCKER_HOST=unix://…/docker.sock docker ps` works from the host; a published container port is reachable at `127.0.0.1:<allocatedPort>` while `8081/6443/5052/5053` and `30000-30050` stay reserved; a clash prints the `appliance local stop` hint.

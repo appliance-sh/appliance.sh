@@ -6,11 +6,11 @@
 
 The data plane is a strict chain: `Project` → `Environment` → `Deployment` → `Build` → one infra unit.
 
-- An `Environment` carries exactly one `stackName` and one `url` (`packages/sdk/src/models/environment.ts:24-41`). The URL is a property _of the environment_, set per successful deploy.
+- An `Environment` carries exactly one `stackName` (`environment.ts:27`) and one `url` (`environment.ts:37`). The URL is a property _of the environment_, set per successful deploy.
 - A `Deployment` references one optional `buildId` (`deployment.ts:25-53`).
 - A `Build` is one artifact: `upload` (one zip + one `appliance.json`) or `remote-image` (one URI + one `port`) (`build.ts:25-72`).
 - The `Appliance` manifest is a single discriminated-union value, not a list (`appliance.ts:112-120`).
-- The executor resolves one build and produces one infra unit — on k8s, one Deployment + Service + Ingress at `<stackName>.<hostnameSuffix>` (`deployment-executor.service.ts:257-377`; `ARCHITECTURE.md:193-221`; `build.service.ts:65-83`).
+- The executor resolves one build and produces one infra unit — on k8s, one Deployment + Service + Ingress at `<stack>.<hostnameSuffix>` (`deployment-executor.service.ts:247-313` cloud / `:315-384` local; one-build resolve at `:256-257`/`:323`; `ARCHITECTURE.md:193-221`; `build.service.ts:65-83`).
 
 Nothing in the SDK or routes models a relationship _between_ services.
 
@@ -26,13 +26,15 @@ A compose project becomes **N appliances deployed into one Environment**, where 
 
 Keep `Build` as the per-service unit (it maps 1:1 to an image/artifact and a port). Generalize the _deploy_ to reference many builds. Introduce a lightweight **build set**: a deploy carries `services: [{ name, buildId }]` instead of a single `buildId`. Each service still goes through the unchanged `upload`/`remote-image` flow and `BuildService.resolve` per build.
 
-**Rationale.** Builds stay atomic and cacheable; only the deploy fans out. No change to `POST /api/v1/builds`. Rejected: a "composite build" artifact (one zip containing N images) — defeats per-service caching, rebuild-one-service, and the existing port-on-build-record mechanism.
+**Rationale.** Builds stay atomic and cacheable; only the deploy fans out. No change to `POST /api/v1/builds`. Rejected: a "composite build" artifact (one zip containing N images) — defeats per-service caching, rebuild-one-service, and the existing port-on-build-record mechanism. Note: `port` lives on the build record only for `remote-image` builds (`build.ts:37-43`); `upload` builds carry port inside the zipped `appliance.json`. The `services[].port` in §4 is where this normalizes across both build types.
 
 ## 3. Deployments & URLs: one Deployment fans out; per-service URL map — RECOMMEND
 
-A multi-service deploy stays **one Deployment** (one transactional unit, one busy-lock on the environment), but its result reports a **per-service URL map** rather than a single string. On k8s this is N Deployment+Service+Ingress trios at `<service>.<stackName>.<hostnameSuffix>`; on AWS, N Lambdas behind per-service routes.
+A multi-service deploy stays **one Deployment** (one transactional unit, one busy-lock on the environment), but its result reports a **per-service URL map** rather than a single string. On k8s this is N Deployment+Service+Ingress trios at a **proposed** `<service>.<stack>.<hostnameSuffix>` (today's code emits a single-label `<stack>.<hostnameSuffix>`, `ARCHITECTURE.md:221`); on AWS, N Lambdas behind per-service routes.
 
-**Rationale.** The environment's single `url` becomes a `urls: Record<service, url>` (keep `url` as a back-compat alias to the primary/ingress service). One Deployment preserves atomic rollout and the existing cancel/refresh machinery. Rejected: one Deployment per service — loses atomicity and races on the shared stack.
+**Rationale.** The environment's single `url` becomes a `urls: Record<service, url>` (keep `url` as a back-compat alias — define a "primary" service selection rule, e.g. the ingress / first exposed service). One Deployment preserves atomic rollout and the existing cancel/refresh machinery. Rejected: one Deployment per service — loses atomicity and races on the shared stack.
+
+> **Work surface (review):** `url` is read by 6+ consumers (`app/src/lib/deployment.ts:76,94`, `dashboard.tsx:327`, `environments/detail.tsx:217`, `cli/appliance-open.ts:83`, `cli/appliance-app.ts:227,281`), and the **cloud path never sets `env.url`** — the URL is scraped from `deployment.message` via `extractDeploymentUrl` (`deploy-poll.ts:71-78`). The per-service `urls` map must therefore thread through that message-scraping fallback too, not just the `env.url` field.
 
 ## 4. Minimal SDK model shapes (LATER, sketches only)
 
