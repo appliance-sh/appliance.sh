@@ -27,14 +27,11 @@ import type {
   LatestGhcrTagInput,
   LocalApplianceManifest,
   LocalBuildAndImportInput,
-  LocalClusterInput,
-  LocalClusterStatus,
   LocalHelperInstallResult,
   LocalLogEvent,
   LocalPodLogsInput,
   LocalPreflightCheck,
   LocalRuntimeInput,
-  LocalRuntimeStatus,
   LocalWorkloads,
   StateDemotionInput,
   StateDemotionOptions,
@@ -178,30 +175,6 @@ export const tauriHost: ConsoleHost = {
     },
     async startContainerRuntime(): Promise<void> {
       await invoke('start_container_runtime');
-    },
-    async status(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('local_cluster_status', { input: input ?? {} });
-    },
-    async start(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('start_local_cluster', { input: input ?? {} });
-    },
-    async stop(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('stop_local_cluster', { input: input ?? {} });
-    },
-    async delete(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('delete_local_cluster', { input: input ?? {} });
-    },
-    async runtimeStatus(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('local_runtime_status', { input: input ?? null });
-    },
-    async startRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('start_local_runtime', { input: input ?? null });
-    },
-    async stopRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('stop_local_runtime', { input: input ?? null });
-    },
-    async deleteRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('delete_local_runtime', { input: input ?? null });
     },
     async listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads> {
       return invoke<LocalWorkloads>('list_local_workloads', { input: input ?? null });

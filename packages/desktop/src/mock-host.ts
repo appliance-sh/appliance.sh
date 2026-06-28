@@ -5,9 +5,7 @@ import type {
   Cluster,
   ConsoleHost,
   HostConfig,
-  LocalClusterStatus,
   LocalPreflightCheck,
-  LocalRuntimeStatus,
   LocalWorkloads,
 } from '@appliance.sh/app';
 
@@ -20,11 +18,11 @@ import type {
 // (persisted in sessionStorage so SPA navigation keeps it). Pick the
 // preflight/runtime fixture with `?scenario=`:
 //
-//   ready        all tools installed, daemon up, cluster stopped (default)
-//   running      cluster + api-server up, workloads populated
+//   ready        all tools installed, daemon up (default)
+//   running      daemon up, workloads populated
 //   daemon-down  docker installed but VM stopped, auto-startable (colima)
 //   daemon-manual docker installed, VM stopped, NOT auto-startable
-//   missing      k3d/kubectl not installed, docker guidance-only
+//   missing      kubectl not installed, docker guidance-only
 //
 // Transitions are simulated (start ≈2s, stop ≈1s, builds stream log
 // lines) so spinners, disabled states, and progress UI are exercised
@@ -91,35 +89,7 @@ function writeState(state: PersistedState): void {
 // ---- runtime state machine ---------------------------------------------
 
 interface RuntimeState {
-  clusterExists: boolean;
-  clusterRunning: boolean;
-  apiServerRunning: boolean;
-  registeredClusterId: string | null;
   daemonRunning: boolean;
-}
-
-function registerMockCluster(): void {
-  const state = readState();
-  if (!state.clusters.some((c) => c.id === 'local-runtime')) {
-    state.clusters.push({
-      id: 'local-runtime',
-      name: 'Local Runtime',
-      apiServerUrl: 'http://api.appliance.localhost:8081',
-      createdAt: new Date().toISOString(),
-      apiKey: { id: 'apikey_mock', secret: 'sk_mock' },
-    });
-  }
-  state.selectedClusterId = 'local-runtime';
-  writeState(state);
-}
-
-function unregisterMockCluster(): void {
-  const state = readState();
-  state.clusters = state.clusters.filter((c) => c.id !== 'local-runtime');
-  if (state.selectedClusterId === 'local-runtime') {
-    state.selectedClusterId = state.clusters[0]?.id ?? null;
-  }
-  writeState(state);
 }
 
 // Mirror the desktop's sync_microvm_cluster (lib.rs): a `vm up` registers
@@ -160,10 +130,6 @@ function unregisterMockMicroVmCluster(name: string): void {
 function initialRuntime(): RuntimeState {
   const s = scenario();
   return {
-    clusterExists: s !== 'missing',
-    clusterRunning: s === 'running',
-    apiServerRunning: s === 'running',
-    registeredClusterId: s === 'running' ? 'local-runtime' : null,
     daemonRunning: s === 'ready' || s === 'running',
   };
 }
@@ -175,10 +141,6 @@ let runtimeState: RuntimeState | null = null;
 function getRuntime(): RuntimeState {
   if (!runtimeState) {
     runtimeState = initialRuntime();
-    // The real desktop auto-registers the runtime's cluster on start;
-    // mirror that so the `running` scenario doesn't show a running
-    // runtime alongside a "No cluster connected" top bar.
-    if (runtimeState.registeredClusterId) registerMockCluster();
   }
   return runtimeState;
 }
@@ -208,19 +170,10 @@ function preflight(): LocalPreflightCheck[] {
   return [
     docker,
     {
-      tool: 'k3d',
-      installed,
-      version: installed ? 'k3d version v5.8.3' : undefined,
-      purpose: 'Lightweight Kubernetes-in-Docker cluster used as the local runtime.',
-      installHint: 'brew install k3d',
-      autoInstallable: true,
-      error: installed ? undefined : 'not on PATH',
-    },
-    {
       tool: 'kubectl',
       installed,
       version: installed ? 'Client Version: v1.31.4' : undefined,
-      purpose: 'Used to apply Deployments / Services onto the local cluster.',
+      purpose: 'Used to read Deployments / Services / pod logs from the microVM.',
       installHint: 'brew install kubectl',
       autoInstallable: true,
       error: installed ? undefined : 'not on PATH',
@@ -228,44 +181,11 @@ function preflight(): LocalPreflightCheck[] {
   ];
 }
 
-function clusterStatus(): LocalClusterStatus {
-  return {
-    exists: getRuntime().clusterExists,
-    running: getRuntime().clusterRunning,
-    clusterName: 'appliance-local',
-    message: getRuntime().daemonRunning
-      ? undefined
-      : 'Docker isn’t running. Start your container runtime — Docker Desktop, OrbStack, or `colima start` — and retry.',
-  };
-}
-
-function runtimeStatus(): LocalRuntimeStatus {
-  return {
-    cluster: clusterStatus(),
-    apiServer: {
-      running: getRuntime().apiServerRunning,
-      message: getRuntime().apiServerRunning ? undefined : undefined,
-    },
-    config: {
-      clusterName: 'appliance-local',
-      namespace: 'appliance',
-      hostPort: 8081,
-      dataDir: '/Users/dev/.appliance/local-runtime',
-      apiServerUrl: 'http://api.appliance.localhost:8081',
-      nodePortMin: 30000,
-      nodePortMax: 30050,
-      registryUrl: getRuntime().clusterExists ? 'localhost:5050' : undefined,
-      registryPort: 5050,
-    },
-    clusterId: getRuntime().registeredClusterId ?? undefined,
-  };
-}
-
 const WORKLOADS: LocalWorkloads = {
   deployments: [
     {
       name: 'demo-node-dev',
-      image: 'localhost:5050/demo-node-container:latest',
+      image: 'localhost:5052/demo-node-container:latest',
       desired: 1,
       ready: 1,
       available: 1,
@@ -273,7 +193,7 @@ const WORKLOADS: LocalWorkloads = {
     },
     {
       name: 'demo-python-dev',
-      image: 'localhost:5050/demo-python-container:latest',
+      image: 'localhost:5052/demo-python-container:latest',
       desired: 1,
       ready: 0,
       available: 0,
@@ -286,7 +206,7 @@ const WORKLOADS: LocalWorkloads = {
       phase: 'Running',
       ready: true,
       restartCount: 0,
-      containerImage: 'localhost:5050/demo-node-container:latest',
+      containerImage: 'localhost:5052/demo-node-container:latest',
       createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
     },
     {
@@ -294,7 +214,7 @@ const WORKLOADS: LocalWorkloads = {
       phase: 'Pending',
       ready: false,
       restartCount: 2,
-      containerImage: 'localhost:5050/demo-python-container:latest',
+      containerImage: 'localhost:5052/demo-python-container:latest',
       createdAt: new Date(Date.now() - 3 * 60_000).toISOString(),
     },
   ],
@@ -439,7 +359,7 @@ export function createMockHost(): ConsoleHost {
       },
 
       async installPrereq(tools, onEvent) {
-        const targets = tools ?? ['k3d', 'kubectl'];
+        const targets = tools ?? ['kubectl'];
         for (const tool of targets) {
           onEvent({ type: 'progress', stage: tool, message: `Downloading ${tool} (mock)` });
           await sleep(600);
@@ -461,64 +381,6 @@ export function createMockHost(): ConsoleHost {
         }
         await sleep(1_500);
         getRuntime().daemonRunning = true;
-      },
-
-      async status() {
-        return clusterStatus();
-      },
-      async start() {
-        await sleep(1_000);
-        getRuntime().clusterExists = true;
-        getRuntime().clusterRunning = true;
-        return clusterStatus();
-      },
-      async stop() {
-        await sleep(600);
-        getRuntime().clusterRunning = false;
-        return clusterStatus();
-      },
-      async delete() {
-        await sleep(600);
-        getRuntime().clusterExists = false;
-        getRuntime().clusterRunning = false;
-        return clusterStatus();
-      },
-
-      async runtimeStatus() {
-        return runtimeStatus();
-      },
-
-      async startRuntime() {
-        if (!getRuntime().daemonRunning && scenario() === 'daemon-manual') {
-          throw new Error(
-            'Docker isn’t running. Start your container runtime — Docker Desktop, OrbStack, or `colima start` — and retry.'
-          );
-        }
-        await sleep(2_000);
-        getRuntime().daemonRunning = true;
-        getRuntime().clusterExists = true;
-        getRuntime().clusterRunning = true;
-        getRuntime().apiServerRunning = true;
-        getRuntime().registeredClusterId = 'local-runtime';
-        registerMockCluster();
-        return runtimeStatus();
-      },
-
-      async stopRuntime() {
-        await sleep(1_000);
-        getRuntime().clusterRunning = false;
-        getRuntime().apiServerRunning = false;
-        return runtimeStatus();
-      },
-
-      async deleteRuntime() {
-        await sleep(1_000);
-        getRuntime().clusterExists = false;
-        getRuntime().clusterRunning = false;
-        getRuntime().apiServerRunning = false;
-        getRuntime().registeredClusterId = null;
-        unregisterMockCluster();
-        return runtimeStatus();
       },
 
       async listWorkloads() {

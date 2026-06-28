@@ -614,14 +614,12 @@ fn migrate_legacy_top_level_url(cfg: &mut PersistedConfig) -> Result<bool, HostE
 /// Local Runtime cluster with `http://localhost:<api_port>` because
 /// api-server ran as a host-side child process. Phase 4 moves
 /// api-server in-cluster and re-derives the URL as
-/// `http://api.appliance.localhost:<host_port>`. Without this fixup
-/// the post-upgrade `start_local_runtime` would find
-/// `find_local_runtime_cluster` empty against the new URL, mint a
-/// second `local-runtime` cluster id (duplicate-id collision), and
-/// stomp the existing keychain entry. Rewriting in place keeps the
-/// cluster id (so the keychain entry survives) and lets the freshly
-/// in-cluster api-server pick up the existing API key the moment
-/// it's reachable.
+/// `http://api.appliance.localhost:<host_port>`. Without this fixup a
+/// post-upgrade lookup of the legacy `local-runtime` cluster against
+/// the new URL would come up empty and risk a duplicate registration.
+/// Rewriting in place keeps the cluster id (so the keychain entry
+/// survives) and lets the freshly in-cluster api-server pick up the
+/// existing API key the moment it's reachable.
 fn migrate_legacy_local_runtime_urls(cfg: &mut PersistedConfig) -> bool {
     let new_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, DEFAULT_LOCAL_HOST_PORT);
     let mut migrated = false;
@@ -1300,100 +1298,23 @@ async fn latest_api_server_version(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
-// Default k3d cluster name when the desktop manages the local
-// `appliance-base-local` runtime. Must match
-// DEFAULT_LOCAL_CLUSTER_NAME in
+// Default cluster name + namespace the desktop's runtime-config
+// resolution falls back to. `appliance-local` doubles as the
+// "unset cluster name" sentinel kube_target_args maps to the
+// canonical microVM. Must match DEFAULT_LOCAL_CLUSTER_NAME in
 // `packages/infra/src/lib/local/LocalContainerDeploymentService.ts`.
 const DEFAULT_LOCAL_CLUSTER_NAME: &str = "appliance-local";
 const DEFAULT_LOCAL_NAMESPACE: &str = "appliance";
 const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
-// NodePort sub-range published from the k3d agent onto the host.
-// Kept small (51 ports) because publishing the full 30000-32767 window
-// crashes colima/docker on macOS at the docker-proxy layer.
-// LocalContainerDeploymentService.deterministicNodePort() picks within
-// the same range so each deployment's NodePort is reachable here.
-const DEFAULT_LOCAL_NODEPORT_MIN: u16 = 30000;
-const DEFAULT_LOCAL_NODEPORT_MAX: u16 = 30050;
-// Host-side port the k3d-attached registry publishes on. Picked
-// out of the way of common dev tools (5000 is occupied by macOS
-// AirPlay Receiver on Sequoia+, 5001 by some VPN clients). Users
-// can override via `LocalRuntimeInput.registry_port` when 5050
-// conflicts. The api-server's KubernetesDeploymentService doesn't
-// touch this port — image push is a desktop/CLI build-side concern,
-// so api-server can stay running in-cluster without docker access.
-const DEFAULT_LOCAL_REGISTRY_PORT: u16 = 5050;
-const LOCAL_RUNTIME_CLUSTER_NAME: &str = "Local Runtime";
 // Stable cluster id == profile name used by the CLI's `--profile`
-// flag and the shared profiles.json key.
+// flag and the shared profiles.json key. Survives as the id the
+// pre-Phase-4 URL migration rewrites in place.
 const LOCAL_RUNTIME_CLUSTER_ID: &str = "local-runtime";
 const MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
 // Mirrors MICROVM_PROFILE in packages/cli/src/appliance-vm.ts — the
 // CLI's `vm up` writes this profile; the desktop adopts it as a
 // cluster with the same stable id.
 const MICROVM_CLUSTER_ID: &str = "microvm";
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct LocalClusterStatus {
-    /// True when `k3d` is on PATH and the named cluster shows up in
-    /// `k3d cluster list -o json`. The frontend uses this to decide
-    /// whether to expose Start vs. Stop vs. Create buttons.
-    exists: bool,
-    /// True when the cluster's nodes are reporting `running`. Stop
-    /// flips this to false; the cluster still exists and can be
-    /// restarted without recreating state.
-    running: bool,
-    cluster_name: String,
-    /// Reason a status check couldn't be completed (k3d missing,
-    /// docker not running, etc.). Surfaced verbatim to the UI.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct LocalClusterInput {
-    #[serde(default)]
-    cluster_name: Option<String>,
-    /// Host port the cluster's LoadBalancer publishes (forwards onto
-    /// the k3d serverlb container, which then hits NodePorts inside).
-    /// Default 8081 — keeps clear of the desktop's 1420 dev server
-    /// and common 8080.
-    #[serde(default)]
-    host_port: Option<u16>,
-    /// Host-side port the k3d-attached registry publishes on. Falls
-    /// back to DEFAULT_LOCAL_REGISTRY_PORT (5050). Plumbed through
-    /// to `ensure_registry` and `--registry-use` at cluster-create
-    /// time so a user-supplied `LocalRuntimeInput.registryPort` is
-    /// actually honored end-to-end.
-    #[serde(default)]
-    registry_port: Option<u16>,
-    /// Host-side directory bind-mounted into the k3d node container
-    /// so the in-cluster api-server's PersistentVolume (hostPath
-    /// inside the node) actually maps onto durable host storage.
-    /// Without this, `k3d cluster delete` wipes everything the
-    /// FilesystemObjectStore wrote (projects, environments, keys).
-    /// Must be a path the host's Docker daemon can mount.
-    #[serde(default)]
-    data_dir: Option<String>,
-}
-
-fn cluster_name_or_default(input: &LocalClusterInput) -> String {
-    input
-        .cluster_name
-        .clone()
-        .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string())
-}
-
-/// k3d registry name attached to a given cluster. The k3d CLI prefixes
-/// every registry name with `k3d-` once created (so a registry named
-/// `appliance-local-registry` shows up as `k3d-appliance-local-registry`
-/// in `k3d registry list` and as a container of that name). We pass
-/// the unprefixed form to `k3d registry create / delete` and accept
-/// either form when matching against `k3d registry list -o json`.
-fn registry_name_for_cluster(cluster: &str) -> String {
-    format!("{cluster}-registry")
-}
 
 // Tools the local-runtime path shells out to. Centralised so preflight
 // + spawn error mapping stay in sync — if one of these is renamed or a
@@ -1423,14 +1344,8 @@ const LOCAL_PREREQS: &[PrereqTool] = &[
         auto_installable: false,
     },
     PrereqTool {
-        name: "k3d",
-        purpose: "Lightweight Kubernetes-in-Docker cluster used as the local runtime.",
-        version_args: &["--version"],
-        auto_installable: true,
-    },
-    PrereqTool {
         name: "kubectl",
-        purpose: "Used to apply Deployments / Services onto the local cluster.",
+        purpose: "Used to read Deployments / Services / pod logs from the microVM.",
         version_args: &["version", "--client"],
         auto_installable: true,
     },
@@ -1443,21 +1358,18 @@ fn install_hint(tool: &str) -> &'static str {
     if cfg!(target_os = "macos") {
         match tool {
             "docker" => "Install any container runtime (Docker Desktop, OrbStack, Colima, Rancher Desktop). https://www.docker.com/products/docker-desktop/ — https://orbstack.dev — https://github.com/abiosoft/colima",
-            "k3d" => "brew install k3d",
             "kubectl" => "brew install kubectl",
             _ => "",
         }
     } else if cfg!(target_os = "linux") {
         match tool {
             "docker" => "Install any container runtime (Docker Engine, Podman, Rancher Desktop). Docker Engine: curl -fsSL https://get.docker.com | sh",
-            "k3d" => "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash",
             "kubectl" => "curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl && sudo install -m 0755 kubectl /usr/local/bin/kubectl",
             _ => "",
         }
     } else if cfg!(target_os = "windows") {
         match tool {
             "docker" => "Install any container runtime (Docker Desktop, Rancher Desktop, Podman Desktop). https://www.docker.com/products/docker-desktop/",
-            "k3d" => "choco install k3d  # or: scoop install k3d",
             "kubectl" => "winget install Kubernetes.kubectl",
             _ => "",
         }
@@ -1469,12 +1381,12 @@ fn install_hint(tool: &str) -> &'static str {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PreflightCheck {
-    /// Tool name as invoked on the command line (`docker`, `k3d`, …).
+    /// Tool name as invoked on the command line (`docker`, `kubectl`, …).
     tool: String,
     /// True when the tool resolved on PATH and `<tool> --version` exited 0.
     installed: bool,
     /// First non-empty line of stdout from `<tool> --version`. Useful for
-    /// confirming compatibility (e.g. older k3d versions miss flags).
+    /// confirming compatibility (e.g. older tool versions miss flags).
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     /// One-line human description of what this tool is used for.
@@ -1492,7 +1404,7 @@ struct PreflightCheck {
     error: Option<String>,
     /// For docker only: whether a daemon is actually *reachable*, not
     /// just whether the CLI is installed. `None` for tools where daemon
-    /// state is meaningless (k3d, kubectl), so the UI only special-cases
+    /// state is meaningless (kubectl), so the UI only special-cases
     /// docker. A `Some(false)` here is "installed but not running".
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_running: Option<bool>,
@@ -1517,7 +1429,7 @@ async fn local_preflight() -> Vec<PreflightCheck> {
         // that a daemon is reachable. Probe the daemon too so the doctor
         // view can show "installed but not running" (and offer to start
         // it) instead of a misleading green check followed by a failed
-        // Start. k3d/kubectl have no daemon, so leave their fields None.
+        // Start. kubectl has no daemon, so leave its fields None.
         if tool.name == "docker" && check.installed {
             let reachable = docker_daemon_reachable().await;
             check.daemon_running = Some(reachable);
@@ -1677,68 +1589,6 @@ async fn run_status_command(args: &[&str]) -> Result<(bool, String, String), Str
     Ok((output.status.success(), stdout, stderr))
 }
 
-/// Probe k3d for a cluster by name. Returns existence + running
-/// state; absent k3d / docker reports `exists: false, running: false`
-/// with a populated `message` so the UI can render an actionable
-/// install hint instead of a stack trace.
-#[tauri::command]
-async fn local_cluster_status(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
-    let name = cluster_name_or_default(&input);
-    let result = run_status_command(&["k3d", "cluster", "list", "-o", "json"]).await;
-    let (ok, stdout, stderr) = match result {
-        Ok(t) => t,
-        Err(e) => {
-            return Ok(LocalClusterStatus {
-                exists: false,
-                running: false,
-                cluster_name: name,
-                message: Some(e),
-            });
-        }
-    };
-    if !ok {
-        return Ok(LocalClusterStatus {
-            exists: false,
-            running: false,
-            cluster_name: name,
-            message: Some(stderr),
-        });
-    }
-    // Each entry in `k3d cluster list -o json` reports a name and a
-    // list of nodes; a cluster is "running" iff every node is in
-    // state `running`. We deliberately scan the raw JSON instead of
-    // shelling out to `k3d cluster get <name>` because the latter
-    // exits non-zero when the cluster is stopped, which would force
-    // us to disambiguate "stopped" from "missing" via stderr parsing.
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
-    let clusters = parsed.as_array().cloned().unwrap_or_default();
-    for cluster in clusters {
-        if cluster.get("name").and_then(|n| n.as_str()) == Some(name.as_str()) {
-            let nodes = cluster
-                .get("nodes")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let running = !nodes.is_empty()
-                && nodes
-                    .iter()
-                    .all(|n| n.get("State").and_then(|s| s.get("Running")).and_then(|b| b.as_bool()).unwrap_or(false));
-            return Ok(LocalClusterStatus {
-                exists: true,
-                running,
-                cluster_name: name,
-                message: None,
-            });
-        }
-    }
-    Ok(LocalClusterStatus {
-        exists: false,
-        running: false,
-        cluster_name: name,
-        message: None,
-    })
-}
-
 // A cold colima VM boot (disk allocation, base image pull, network
 // setup) can take well over a minute on first start; bound it
 // generously so a genuinely wedged `colima start` still can't hang the
@@ -1873,8 +1723,8 @@ async fn run_command_with_timeout(
 /// unprivileged, idempotent command — exactly what they'd type by
 /// hand. So when Docker is unreachable *and* the CLI is wired to
 /// colima, we start it for them; every other "daemon down" case
-/// returns an actionable message instead of letting a cryptic k3d
-/// timeout surface downstream.
+/// returns an actionable message instead of letting a cryptic
+/// container-runtime timeout surface downstream.
 async fn ensure_docker_running() -> Result<(), String> {
     if docker_daemon_reachable().await {
         return Ok(());
@@ -1928,249 +1778,19 @@ async fn start_container_runtime() -> Result<(), String> {
     ensure_docker_running().await
 }
 
-/// Symptoms `k3d cluster start` emits when the cluster's containers
-/// came back in a half-initialised state — typically after the Docker
-/// VM was suspended/restarted underneath a stopped cluster. k3d reports
-/// the node `running=true` but stuck `restarting`, then times out
-/// waiting for k3s's startup log line. A clean stop+start of the node
-/// containers almost always clears it.
-fn is_wedged_start_failure(stderr: &str) -> bool {
-    stderr.contains("status=restarting")
-        || stderr.contains("stopped returning log lines")
-        || stderr.contains("error during post-start cluster preparation")
-}
-
-/// Start an existing (stopped) cluster, recovering once from the
-/// wedged-node failure above. On the retry we first force a clean `k3d
-/// cluster stop` so every node container is torn down before the second
-/// `start` — that full teardown is what actually unsticks a frozen
-/// kubelet/agent, which a bare re-`start` would leave wedged.
-async fn start_existing_cluster(name: &str) -> Result<(), String> {
-    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "start", name]).await?;
-    if ok {
-        return Ok(());
-    }
-    if !is_wedged_start_failure(&stderr) {
-        return Err(format!("k3d cluster start failed: {}", stderr.trim()));
-    }
-    // Wedged start — tear the half-up nodes down, then start once more.
-    let _ = run_status_command(&["k3d", "cluster", "stop", name]).await;
-    let (retry_ok, _stdout, retry_stderr) =
-        run_status_command(&["k3d", "cluster", "start", name]).await?;
-    if retry_ok {
-        return Ok(());
-    }
-    Err(format!(
-        "k3d cluster start failed after one recovery attempt: {}\n\
-         The cluster's containers may be in a bad state — try `k3d cluster delete {}` \
-         and recreate it, or inspect `docker logs k3d-{}-server-0`.",
-        retry_stderr.trim(),
-        name,
-        name
-    ))
-}
-
-/// Create-or-start the named k3d cluster. Idempotent: an existing
-/// stopped cluster is started; an existing running cluster is left
-/// alone. Maps the cluster LoadBalancer's :80 onto `host_port` so
-/// services deployed by the api-server are reachable from the host.
-#[tauri::command]
-async fn start_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
-    let name = cluster_name_or_default(&input);
-    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
-    let registry_name = registry_name_for_cluster(&name);
-
-    // Bring the container runtime up first — every k3d / registry call
-    // below needs a reachable Docker daemon, and a stopped colima VM is
-    // the single most common reason "start cluster" fails (with a
-    // cryptic k3d timeout rather than a clear "Docker isn't running").
-    // ensure_docker_running auto-starts colima when it's the active
-    // runtime and returns an actionable message for everything else.
-    ensure_docker_running().await?;
-
-    // Ensure the registry exists regardless of whether we're about to
-    // create or restart the cluster. It's a sibling container, not a
-    // cluster-owned one, so a Docker restart / `docker rm` between
-    // sessions can leave the cluster up but the registry gone — in
-    // which case `ensure_registry` brings it back, idempotently.
-    // (--registry-use only takes effect at cluster create; for
-    // clusters that pre-date Phase 3 the wizard's fallback path
-    // handles the no-mirror case — see bug_012 fix in next commit.)
-    ensure_registry(&registry_name, registry_port).await?;
-
-    let status = local_cluster_status(LocalClusterInput {
-        cluster_name: Some(name.clone()),
-        ..Default::default()
-    })
-    .await?;
-    if status.exists {
-        if status.running {
-            return Ok(status);
-        }
-        // Stopped — start it back up, recovering once if the nodes
-        // come up wedged (the post-suspend `status=restarting` case).
-        start_existing_cluster(&name).await?;
-    } else {
-        // Fresh creation. We publish two port ranges:
-        //   1. host_port -> serverlb:80 for the in-cluster ingress/LB
-        //      path (api-server, ingress-managed apps).
-        //   2. A small NodePort window -> agent:0 so the executor's
-        //      Service NodePorts are directly reachable on the host.
-        //      `LocalContainerDeploymentService.deterministicNodePort`
-        //      hashes inside the same window — must stay in sync.
-        let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
-        let port_arg = format!("{}:80@loadbalancer", host_port);
-        let nodeport_arg = format!(
-            "{}-{}:{}-{}@agent:0",
-            DEFAULT_LOCAL_NODEPORT_MIN,
-            DEFAULT_LOCAL_NODEPORT_MAX,
-            DEFAULT_LOCAL_NODEPORT_MIN,
-            DEFAULT_LOCAL_NODEPORT_MAX,
-        );
-        let agents_arg = "1";
-        let registry_use_arg = format!("{}:{}", registry_name, registry_port);
-        // Bind-mount the host-side data_dir into the k3d node so the
-        // in-cluster api-server's PersistentVolume (`hostPath` inside
-        // the agent container) actually resolves to durable storage
-        // on the operator's host. Without this, k3d's agent overlay
-        // becomes the backing store and `k3d cluster delete` wipes
-        // every project/environment/api-key the FilesystemObjectStore
-        // wrote. Same path on both sides of the colon so manifests
-        // can use one absolute path everywhere.
-        let mut create_args: Vec<String> = vec![
-            "cluster".into(),
-            "create".into(),
-            name.clone(),
-            "--agents".into(),
-            agents_arg.into(),
-            "-p".into(),
-            port_arg,
-            "-p".into(),
-            nodeport_arg,
-            "--registry-use".into(),
-            registry_use_arg,
-        ];
-        let volume_arg;
-        if let Some(data_dir) = input.data_dir.as_deref() {
-            // Ensure the source exists before docker mounts it —
-            // docker auto-creates missing host paths as root-owned
-            // dirs, which then can't be written by the user later.
-            fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
-            volume_arg = format!("{}:{}", data_dir, data_dir);
-            create_args.push("--volume".into());
-            create_args.push(volume_arg.clone());
-        }
-        create_args.push("--wait".into());
-        let create_argv: Vec<&str> = std::iter::once("k3d")
-            .chain(create_args.iter().map(String::as_str))
-            .collect();
-        let (ok, _stdout, stderr) = run_status_command(&create_argv).await?;
-        if !ok {
-            return Err(format!("k3d cluster create failed: {}", stderr));
-        }
-    }
-    local_cluster_status(LocalClusterInput {
-        cluster_name: Some(name),
-        ..Default::default()
-    })
-    .await
-}
-
-/// Stop the cluster without deleting its state. `start_local_cluster`
-/// brings it back; `delete_local_cluster` removes it entirely.
-#[tauri::command]
-async fn stop_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
-    let name = cluster_name_or_default(&input);
-    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "stop", &name]).await?;
-    if !ok && !stderr.contains("not found") {
-        return Err(format!("k3d cluster stop failed: {}", stderr));
-    }
-    local_cluster_status(LocalClusterInput {
-        cluster_name: Some(name),
-        ..Default::default()
-    })
-    .await
-}
-
-/// Permanently delete the named cluster and all of its state.
-/// Separate from `stop_local_cluster` so the UI can offer a low-risk
-/// "stop" alongside a confirm-gated "delete".
-#[tauri::command]
-async fn delete_local_cluster(input: LocalClusterInput) -> Result<LocalClusterStatus, String> {
-    let name = cluster_name_or_default(&input);
-    let (ok, _stdout, stderr) = run_status_command(&["k3d", "cluster", "delete", &name]).await?;
-    if !ok && !stderr.contains("not found") {
-        return Err(format!("k3d cluster delete failed: {}", stderr));
-    }
-    // Best-effort: tear down the matching registry. Detached from
-    // the cluster lifecycle (deleting a registry while another
-    // cluster still uses it would break that cluster), but our
-    // naming convention is 1:1 with cluster name, so it's safe to
-    // remove here. Ignored on "not found" so a re-delete is a no-op.
-    let registry_name = registry_name_for_cluster(&name);
-    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
-    Ok(LocalClusterStatus {
-        exists: false,
-        running: false,
-        cluster_name: name,
-        message: None,
-    })
-}
-
-/// Idempotent registry create: probe `k3d registry list`, create if
-/// missing. The k3d CLI surfaces registries under their `k3d-`-prefixed
-/// container names, so we match both forms. Errors that look like
-/// "already exists" / "port in use" are surfaced verbatim to the
-/// caller — those need user action (rename or free the port), not a
-/// silent retry.
-async fn ensure_registry(name: &str, port: u16) -> Result<(), String> {
-    if let Ok((ok, stdout, _stderr)) = run_status_command(&["k3d", "registry", "list", "-o", "json"]).await {
-        if ok {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                let prefixed = format!("k3d-{}", name);
-                if let Some(list) = parsed.as_array() {
-                    for entry in list {
-                        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        if entry_name == name || entry_name == prefixed.as_str() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Bind only on loopback. The cluster reaches the registry through
-    // Docker's internal bridge network via the registry container's
-    // DNS name (wired by `--registry-use`), not through the host-
-    // published port — so loopback-only binding doesn't break pulls.
-    // It DOES keep the unauthenticated registry off any LAN interface,
-    // which matters on shared networks (cafes, conferences) where a
-    // predictable `localhost:5050/<image>:latest` tag would otherwise
-    // be pre-positionable by anyone on the subnet.
-    let port_arg = format!("127.0.0.1:{}", port);
-    let (ok, _stdout, stderr) =
-        run_status_command(&["k3d", "registry", "create", name, "--port", &port_arg]).await?;
-    if !ok {
-        return Err(format!("k3d registry create failed: {}", stderr));
-    }
-    Ok(())
-}
-
 // ============================================================
-// Local runtime orchestration
+// Local runtime support surface
 //
-// The "local runtime" is a Docker Desktop-style end-to-end stack:
-//   1. A k3d cluster (lifecycle from local_cluster_*).
-//   2. A node `@appliance.sh/api-server` process pointed at an
-//      `appliance-base-local` config + the user's data dir.
-//   3. An auto-registered Cluster entry in the desktop's persisted
-//      config so every existing Console page (Projects, Environments,
-//      Deployments) lights up against the local api-server with zero
-//      additional wiring.
+// What remains after bare k3d's removal: the shared runtime-config
+// resolution that the in-cluster api-server bootstrap and the
+// engine-routed workload/log reads build on. The local runtime itself
+// is the microVM (driven through the `vm`/microVM commands), an
+// `appliance-base-kubernetes` cluster that registers like any other.
 // ============================================================
 
-/// Runtime input shared by status / start / stop / delete. All fields
-/// are optional and fall back to baked-in defaults.
+/// Runtime input shared by the in-cluster bootstrap + the engine-routed
+/// workload/log reads. All fields are optional and fall back to
+/// baked-in defaults.
 #[derive(Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase", default)]
 struct LocalRuntimeInput {
@@ -2178,13 +1798,9 @@ struct LocalRuntimeInput {
     namespace: Option<String>,
     host_port: Option<u16>,
     data_dir: Option<String>,
-    /// Host-side port the k3d-attached registry publishes on. Falls
-    /// back to DEFAULT_LOCAL_REGISTRY_PORT when omitted. Override when
-    /// 5050 collides with another local service.
-    registry_port: Option<u16>,
     /// Which local engine kubectl-level reads (workloads, pod logs)
-    /// address: omitted/k3d → the k3d context, "microvm" → the
-    /// microVM's fetched kubeconfig. Lifecycle commands ignore it.
+    /// address — "microvm" routes through the microVM's fetched
+    /// kubeconfig. The sole local engine now that bare k3d is gone.
     engine: Option<String>,
 }
 
@@ -2196,55 +1812,6 @@ struct ResolvedRuntimeConfig {
     host_port: u16,
     data_dir: String,
     api_server_url: String,
-    node_port_min: u16,
-    node_port_max: u16,
-    /// Host-side URL of the k3d-attached registry (e.g.
-    /// `localhost:5050`). Build-side code (the desktop's
-    /// build_and_import_image, future CLI push paths) tags + pushes
-    /// against this address; the cluster pulls through the
-    /// `--registry-use` mirror configured at create time. **None**
-    /// when no matching registry container exists for the cluster
-    /// (pre-Phase-3 runtimes, or after a manual `k3d registry delete`)
-    /// — the deploy wizard checks for None and falls back to
-    /// `k3d image import`. Populated by local_runtime_status after
-    /// it probes `k3d registry list`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    registry_url: Option<String>,
-    /// Candidate host-side port the registry will be created on
-    /// (or matches an existing one on). Surfaced separately so the
-    /// frontend can show the planned port even when `registry_url`
-    /// is None pre-create.
-    registry_port: u16,
-}
-
-#[derive(Serialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-struct ApiServerStatus {
-    running: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    log_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct LocalRuntimeStatus {
-    cluster: LocalClusterStatus,
-    api_server: ApiServerStatus,
-    config: ResolvedRuntimeConfig,
-    /// Cluster id under which the runtime is registered in the
-    /// desktop's persisted config (so the Console can talk to it via
-    /// the normal cluster-selection flow). None until the runtime has
-    /// been started at least once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cluster_id: Option<String>,
 }
 
 fn resolve_runtime_config(
@@ -2260,13 +1827,12 @@ fn resolve_runtime_config(
         .clone()
         .unwrap_or_else(|| DEFAULT_LOCAL_NAMESPACE.to_string());
     let host_port = input.host_port.unwrap_or(DEFAULT_LOCAL_HOST_PORT);
-    let registry_port = input.registry_port.unwrap_or(DEFAULT_LOCAL_REGISTRY_PORT);
     let data_dir = match &input.data_dir {
         Some(p) => PathBuf::from(p),
         None => default_local_runtime_dir(app)?,
     };
-    // api-server lives in-cluster behind the Ingress, reached via the
-    // k3d serverlb at `host_port`. URL omits the port when it's 80.
+    // api-server lives in-cluster behind the Ingress, reached at
+    // `host_port`. URL omits the port when it's 80.
     let api_server_url = if host_port == 80 {
         format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
     } else {
@@ -2278,42 +1844,7 @@ fn resolve_runtime_config(
         host_port,
         data_dir: data_dir.to_string_lossy().to_string(),
         api_server_url,
-        node_port_min: DEFAULT_LOCAL_NODEPORT_MIN,
-        node_port_max: DEFAULT_LOCAL_NODEPORT_MAX,
-        // resolve_runtime_config is sync and doesn't probe Docker;
-        // local_runtime_status fills this in after probing
-        // `k3d registry list` for the matching container. callers
-        // that bypass local_runtime_status (start_local_runtime uses
-        // registry_port directly) won't observe None during the
-        // create-then-probe window.
-        registry_url: None,
-        registry_port,
     })
-}
-
-/// Probe `k3d registry list` for a registry attached to the named
-/// cluster. Returns `Some(localhost:<port>)` when one exists at the
-/// expected default port. Returns None on probe failure or absence —
-/// callers treat None as "no registry available, fall back to
-/// k3d image import".
-async fn probe_registry_url(cluster_name: &str, candidate_port: u16) -> Option<String> {
-    let (ok, stdout, _stderr) = run_status_command(&["k3d", "registry", "list", "-o", "json"])
-        .await
-        .ok()?;
-    if !ok {
-        return None;
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-    let list = parsed.as_array()?;
-    let registry_name = registry_name_for_cluster(cluster_name);
-    let prefixed = format!("k3d-{}", registry_name);
-    for entry in list {
-        let entry_name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if entry_name == registry_name || entry_name == prefixed {
-            return Some(format!("localhost:{}", candidate_port));
-        }
-    }
-    None
 }
 
 /// Default data dir for the local runtime. Shared with the CLI:
@@ -2359,274 +1890,20 @@ fn random_bootstrap_token() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")
 }
 
-/// Find the persisted "Local Runtime" cluster (if any). Identified by
-/// its loopback api-server URL — name is user-visible and may have
-/// been renamed (legacy registrations also used a random UUID id).
-/// The microVM cluster shares the same URL (both engines publish on
-/// host port 8081, one at a time), so it's excluded explicitly: a URL
-/// match alone would let the k3d engine's register/unregister adopt —
-/// or delete — the other engine's registration.
-fn find_local_runtime_cluster<'a>(
-    persisted: &'a PersistedConfig,
-    api_server_url: &str,
-) -> Option<&'a Cluster> {
-    persisted
-        .clusters
-        .iter()
-        .find(|c| c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID)
-}
-
-/// Register (or refresh) the Local Runtime cluster + key in persisted
-/// config. Returns the cluster id, whether newly created or refreshed.
-fn register_local_runtime_cluster(
-    app: &AppHandle,
-    cfg: &ResolvedRuntimeConfig,
-    api_key: &ApiKey,
-) -> Result<String, HostError> {
-    let _guard = config_lock();
-    let mut persisted = read_persisted_config(app)?;
-    migrate_legacy(app, &mut persisted)?;
-
-    let existing_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
-
-    let cluster_id = match existing_id {
-        Some(id) => {
-            write_api_key(&cluster_keychain_account(&id), api_key)?;
-            id
-        }
-        None => {
-            // Stable, human-friendly id so the CLI can reference the
-            // profile as `appliance --profile local-runtime` instead
-            // of a churning UUID. Safe because we already short-
-            // circuited the existing-cluster case above; if another
-            // cluster happens to use this same id (highly unlikely),
-            // both rows would point at the same NodePort window and
-            // the second's keychain write would simply replace the
-            // first's.
-            let cluster = Cluster {
-                id: LOCAL_RUNTIME_CLUSTER_ID.to_string(),
-                name: LOCAL_RUNTIME_CLUSTER_NAME.to_string(),
-                api_server_url: cfg.api_server_url.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                state_backend_url: None,
-                last_bootstrap_input: None,
-                synced_key_id: None,
-            };
-            write_api_key(&cluster_keychain_account(&cluster.id), api_key)?;
-            let id = cluster.id.clone();
-            persisted.clusters.push(cluster);
-            // Auto-select the local cluster on first start. Users can
-            // switch away in Settings; subsequent starts of the same
-            // runtime won't override an explicit selection.
-            if persisted.selected_cluster_id.is_none() {
-                persisted.selected_cluster_id = Some(id.clone());
-            }
-            id
-        }
-    };
-
-    write_persisted_config(app, &persisted)?;
-    Ok(cluster_id)
-}
-
-/// Remove the persisted cluster entry pointing at a given
-/// api-server URL. Best-effort — silently no-ops if not present.
-fn unregister_local_runtime_cluster(app: &AppHandle, api_server_url: &str) -> Result<(), HostError> {
-    let _guard = config_lock();
-    let mut persisted = read_persisted_config(app)?;
-    migrate_legacy(app, &mut persisted)?;
-
-    let before = persisted.clusters.len();
-    // Same exclusion as find_local_runtime_cluster: the microVM
-    // cluster lives on the identical URL and must survive a k3d
-    // runtime delete.
-    let removed_ids: Vec<String> = persisted
-        .clusters
-        .iter()
-        .filter(|c| c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID)
-        .map(|c| c.id.clone())
-        .collect();
-    persisted
-        .clusters
-        .retain(|c| !(c.api_server_url == api_server_url && c.id != MICROVM_CLUSTER_ID));
-    if persisted.clusters.len() == before {
-        return Ok(());
-    }
-    for id in &removed_ids {
-        delete_api_key(&cluster_keychain_account(id));
-    }
-    if let Some(sel) = persisted.selected_cluster_id.as_deref() {
-        if removed_ids.iter().any(|id| id == sel) {
-            persisted.selected_cluster_id = persisted.clusters.first().map(|c| c.id.clone());
-        }
-    }
-    write_persisted_config(app, &persisted)
-}
-
-/// Probe the in-cluster api-server's `/bootstrap/status` endpoint
-/// through the cluster's Ingress. No PID, no log file — the
-/// in-cluster api-server is a k8s Pod, its liveness is the apiserver's
-/// concern. The UI gets `running: true/false` and uses the URL for
-/// any "see logs" link.
-async fn current_api_server_status(cfg: &ResolvedRuntimeConfig) -> ApiServerStatus {
-    let target = format!("{}/bootstrap/status", cfg.api_server_url.trim_end_matches('/'));
-    let running = match run_status_command(&["curl", "-fsS", "-o", "/dev/null", &target]).await {
-        Ok((ok, _, _)) => ok,
-        Err(_) => false,
-    };
-    ApiServerStatus {
-        running,
-        port: None,
-        pid: None,
-        started_at: None,
-        log_path: None,
-        message: None,
-    }
-}
-
-#[tauri::command]
-async fn local_runtime_status(
-    app: AppHandle,
-    input: Option<LocalRuntimeInput>,
-) -> Result<LocalRuntimeStatus, String> {
-    let input = input.unwrap_or_default();
-    let mut cfg = resolve_runtime_config(&app, &input)?;
-    let cluster = local_cluster_status(LocalClusterInput {
-        cluster_name: Some(cfg.cluster_name.clone()),
-        host_port: Some(cfg.host_port),
-        ..Default::default()
-    })
-    .await?;
-    // Reflect registry presence in cfg.registry_url so the deploy
-    // wizard can fall back to `k3d image import` on pre-Phase-3
-    // clusters (no registry attached) instead of pushing to a port
-    // nobody's listening on.
-    cfg.registry_url = probe_registry_url(&cfg.cluster_name, cfg.registry_port).await;
-    let api_server = current_api_server_status(&cfg).await;
-    let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
-    let cluster_id = find_local_runtime_cluster(&persisted, &cfg.api_server_url).map(|c| c.id.clone());
-    Ok(LocalRuntimeStatus {
-        cluster,
-        api_server,
-        config: cfg,
-        cluster_id,
-    })
-}
-
-#[tauri::command]
-async fn start_local_runtime(
-    app: AppHandle,
-    input: Option<LocalRuntimeInput>,
-) -> Result<LocalRuntimeStatus, String> {
-    let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
-
-    // Phase 1: cluster (k3d + attached registry + data_dir bind-mount)
-    let _ = start_local_cluster(LocalClusterInput {
-        cluster_name: Some(cfg.cluster_name.clone()),
-        host_port: Some(cfg.host_port),
-        registry_port: Some(cfg.registry_port),
-        data_dir: Some(cfg.data_dir.clone()),
-    })
-    .await?;
-
-    // Phase 2: api-server in-cluster. Idempotent at the cluster level
-    // (kubectl apply reconciles in place) — but each call mints a
-    // fresh bootstrap key, which we then write over any prior
-    // registration. Skip if the in-cluster api-server is already
-    // reachable AND we have a registered cluster + working key on
-    // file; the existing key keeps working across desktop restarts.
-    let already_running = current_api_server_status(&cfg).await.running;
-    let already_registered = {
-        let persisted = read_persisted_config(&app).map_err(|e| e.to_string())?;
-        find_local_runtime_cluster(&persisted, &cfg.api_server_url).is_some()
-    };
-
-    if !already_running || !already_registered {
-        let data_dir = PathBuf::from(&cfg.data_dir);
-        fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-
-        let result = bootstrap_in_cluster_api_server(
-            app.clone(),
-            BootstrapInClusterInput {
-                runtime: Some(input.clone()),
-                image: None,
-            },
-        )
-        .await?;
-
-        register_local_runtime_cluster(&app, &cfg, &result.api_key).map_err(|e| e.to_string())?;
-    }
-
-    local_runtime_status(app, Some(input)).await
-}
-
-#[tauri::command]
-async fn stop_local_runtime(
-    app: AppHandle,
-    input: Option<LocalRuntimeInput>,
-) -> Result<LocalRuntimeStatus, String> {
-    let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
-
-    // Stopping the cluster takes the in-cluster api-server pod with
-    // it — no host-side process to kill anymore.
-    let (ok, _stdout, stderr) =
-        run_status_command(&["k3d", "cluster", "stop", &cfg.cluster_name]).await?;
-    if !ok && !stderr.contains("not found") {
-        return Err(format!("k3d cluster stop failed: {}", stderr));
-    }
-
-    local_runtime_status(app, Some(input)).await
-}
-
-#[tauri::command]
-async fn delete_local_runtime(
-    app: AppHandle,
-    input: Option<LocalRuntimeInput>,
-) -> Result<LocalRuntimeStatus, String> {
-    let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
-
-    let (ok, _stdout, stderr) =
-        run_status_command(&["k3d", "cluster", "delete", &cfg.cluster_name]).await?;
-    if !ok && !stderr.contains("not found") {
-        return Err(format!("k3d cluster delete failed: {}", stderr));
-    }
-
-    // Tear down the sibling registry too — `k3d cluster delete`
-    // doesn't touch standalone registries, so without this the
-    // registry container survives "Delete Runtime" and keeps
-    // holding the host port for the next start. Mirrors what
-    // delete_local_cluster already does. Best-effort: ignored on
-    // "not found" so a re-delete is a no-op.
-    let registry_name = registry_name_for_cluster(&cfg.cluster_name);
-    let _ = run_status_command(&["k3d", "registry", "delete", &registry_name]).await;
-
-    // Forget the registered cluster + keychain entry; the data dir is
-    // left alone (the user can wipe it manually if they want to start
-    // fully fresh — we treat it as their data, like Docker volumes).
-    unregister_local_runtime_cluster(&app, &cfg.api_server_url).map_err(|e| e.to_string())?;
-
-    local_runtime_status(app, Some(input)).await
-}
-
 // ============================================================
 // In-cluster api-server bootstrap
 //
 // Generates and applies the manifests that run api-server *inside*
-// the k3d cluster — Deployment + Service + Ingress, plus a
+// the cluster — Deployment + Service + Ingress, plus a
 // ServiceAccount/Role bound to the appliance namespace so the
 // in-cluster api-server can drive deploys against itself via
 // loadFromCluster(). The same image works against any kubernetes
 // cluster; here it's pulled from the cluster-attached registry.
 //
-// This path is the new model for `appliance-base-kubernetes` and
-// the eventual destination for `appliance-base-local` (Phase 5
-// rewires start_local_runtime to call into here instead of spawning
-// api-server as a host-side child process). Phase 4 lands the
-// machinery as an additive Tauri command so it can be exercised
-// independently before the cutover.
+// This is the model for `appliance-base-kubernetes`: a Tauri command
+// the frontend invokes against a reachable cluster (the microVM passes
+// its fetched kubeconfig), independent of any host-side runtime
+// lifecycle.
 // ============================================================
 
 const IN_CLUSTER_API_SERVER_NAMESPACE: &str = "appliance-system";
@@ -2646,8 +1923,8 @@ const IN_CLUSTER_API_SERVER_DEFAULT_IMAGE: &str = "ghcr.io/appliance-sh/api-serv
 #[serde(rename_all = "camelCase", default)]
 struct BootstrapInClusterInput {
     /// Override the runtime input that resolves cluster name, data
-    /// dir, registry port, etc. Defaults to the same resolution
-    /// `local_runtime_status` uses.
+    /// dir, namespace, host port, etc. Defaults to the baked-in
+    /// runtime-config defaults.
     runtime: Option<LocalRuntimeInput>,
     /// Override the api-server image reference. Defaults to
     /// `ghcr.io/appliance-sh/api-server:latest` (cluster pulls from
@@ -2684,26 +1961,19 @@ fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
     // ingressClassName are currently not user-overridable so the
     // defaults match LocalContainerDeploymentService's defaults; lift
     // them onto ResolvedRuntimeConfig if/when an override surface
-    // appears. The registry block is included only when a registry
-    // is actually present — no in-cluster consumer reads it today,
-    // but emitting `null` would be a future footgun.
-    let mut kubernetes = serde_json::json!({
+    // appears. The registry is configured by the engine's own bring-up
+    // (the microVM's in-VM registry), not from here.
+    let kubernetes = serde_json::json!({
         "dataDir": "/data",
         "namespace": cfg.namespace,
         "hostnameSuffix": "appliance.localhost",
         "ingressClassName": "traefik",
-        // The k3d serverlb publishes ingress :80 on this host port —
-        // deploy-result URLs must carry it to be clickable from the
-        // host (KubernetesDeploymentService composes
+        // The ingress publishes :80 on this host port — deploy-result
+        // URLs must carry it to be clickable from the host
+        // (KubernetesDeploymentService composes
         // `http://<stack>.<suffix>[:<hostPort>]` from it).
         "hostPort": cfg.host_port,
     });
-    if let Some(registry_url) = cfg.registry_url.as_deref() {
-        kubernetes["registry"] = serde_json::json!({
-            "url": registry_url,
-            "insecure": true,
-        });
-    }
     serde_json::json!({
         "type": "appliance-base-kubernetes",
         "name": "local-runtime",
@@ -3052,7 +2322,7 @@ async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, S
     serde_json::from_str::<ApiKey>(&stdout).map_err(|e| format!("parse api key: {e}"))
 }
 
-/// Apply the in-cluster api-server manifests to the running k3d
+/// Apply the in-cluster api-server manifests to the running
 /// cluster, wait for the deployment to become reachable, and mint
 /// the first API key. The api-server image must already be present
 /// in the cluster-attached registry (push via the desktop's
@@ -3310,8 +2580,8 @@ fn sync_microvm_cluster(app: &AppHandle, name: &str) -> Result<(), HostError> {
                 last_bootstrap_input: None,
                 synced_key_id: Some(entry.key_id.clone()),
             });
-            // Same first-cluster convenience as the k3d runtime: select
-            // it when nothing else is, never override a user's choice.
+            // First-cluster convenience: select it when nothing else
+            // is, never override a user's choice.
             if persisted.selected_cluster_id.is_none() {
                 persisted.selected_cluster_id = Some(cluster_id.clone());
             }
@@ -4060,40 +3330,34 @@ struct ServiceInfo {
     target_port: Option<i64>,
 }
 
-fn kube_context(cluster_name: &str) -> String {
-    // k3d prefixes contexts with `k3d-`.
-    format!("k3d-{}", cluster_name)
-}
-
-/// kubectl target-selection args per engine: the k3d cluster is
-/// addressed by context, the microVM by the kubeconfig appliance-vm
-/// fetched out of the guest.
+/// kubectl target-selection args for the microVM engine: the
+/// kubeconfig appliance-vm fetched out of the guest. The microVM is
+/// the only local engine, so a missing/other engine is an error rather
+/// than a fallback to a host context.
 fn kube_target_args(engine: Option<&str>, cluster_name: &str) -> Result<Vec<String>, String> {
-    if engine == Some("microvm") {
-        // For the microVM engine `cluster_name` carries the VM name
-        // (the frontend passes it). The k3d default sentinel means
-        // "unset" — fall back to the canonical VM.
-        let vm = if cluster_name.is_empty() || cluster_name == DEFAULT_LOCAL_CLUSTER_NAME {
-            MICROVM_NAME
-        } else {
-            cluster_name
-        };
-        let home = home_dir().ok_or("cannot resolve the home directory")?;
-        let kubeconfig = home
-            .join(SHARED_PROFILES_DIR)
-            .join("vm")
-            .join(vm)
-            .join("kubeconfig.yaml");
-        if !kubeconfig.is_file() {
-            return Err("the microVM kubeconfig is not available — is the engine up?".into());
-        }
-        Ok(vec![
-            "--kubeconfig".to_string(),
-            kubeconfig.to_string_lossy().into_owned(),
-        ])
-    } else {
-        Ok(vec!["--context".to_string(), kube_context(cluster_name)])
+    if engine != Some("microvm") {
+        return Err("a local engine is required — pass engine=\"microvm\"".into());
     }
+    // `cluster_name` carries the VM name (the frontend passes it). The
+    // default sentinel means "unset" — fall back to the canonical VM.
+    let vm = if cluster_name.is_empty() || cluster_name == DEFAULT_LOCAL_CLUSTER_NAME {
+        MICROVM_NAME
+    } else {
+        cluster_name
+    };
+    let home = home_dir().ok_or("cannot resolve the home directory")?;
+    let kubeconfig = home
+        .join(SHARED_PROFILES_DIR)
+        .join("vm")
+        .join(vm)
+        .join("kubeconfig.yaml");
+    if !kubeconfig.is_file() {
+        return Err("the microVM kubeconfig is not available — is the engine up?".into());
+    }
+    Ok(vec![
+        "--kubeconfig".to_string(),
+        kubeconfig.to_string_lossy().into_owned(),
+    ])
 }
 
 #[tauri::command]
@@ -4232,7 +3496,7 @@ struct PodLogsInput {
     #[serde(default)]
     namespace: Option<String>,
     /// See LocalRuntimeInput.engine — "microvm" reads through the
-    /// microVM's kubeconfig instead of the k3d context.
+    /// microVM's kubeconfig.
     #[serde(default)]
     engine: Option<String>,
 }
@@ -4268,9 +3532,8 @@ async fn tail_local_pod_logs(
 //
 // xterm.js in the desktop drives a real PTY (see terminal.rs) so
 // `kubectl exec -it` into a workload behaves like a native shell.
-// Engine-aware target selection (k3d context vs microVM kubeconfig)
-// is resolved here, next to the other kube wiring; terminal.rs only
-// moves bytes.
+// microVM target selection (the VM's fetched kubeconfig) is resolved
+// here, next to the other kube wiring; terminal.rs only moves bytes.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4282,7 +3545,7 @@ struct TerminalOpenInput {
     namespace: Option<String>,
     #[serde(default)]
     cluster_name: Option<String>,
-    /// "microvm" routes through the microVM kubeconfig; omitted → k3d.
+    /// "microvm" routes through the microVM's kubeconfig.
     #[serde(default)]
     engine: Option<String>,
     /// Shell target. Absent → `kubectl exec` into the pod named by
@@ -4478,8 +3741,8 @@ async fn microvm_dev_cleanup(name: Option<String>) -> Result<(), String> {
 //
 // Driven by the desktop's deploy wizard: pick a folder containing an
 // appliance.json manifest, optionally override env/runtime params,
-// then build the image with docker + import into the local k3d
-// cluster. The actual api-server build + deploy calls run from the
+// then build the image with docker + push to the local cluster's
+// registry. The actual api-server build + deploy calls run from the
 // frontend using the existing SDK (it already holds the cluster's
 // signed credentials, so we don't reimplement that in Rust).
 // ============================================================
@@ -4686,16 +3949,13 @@ struct BuildAndImportInput {
     /// anything else — so a cross-arch manifest value never crashloops.
     #[serde(default)]
     platform: Option<String>,
-    /// k3d cluster to import into. Defaults to the runtime's cluster name.
-    #[serde(default)]
-    cluster_name: Option<String>,
-    /// Host-side registry URL to push to (e.g. `localhost:5050`).
-    /// When set, the image is tagged `<registry_url>/<image_tag>` and
-    /// pushed via `docker push` instead of being imported with
-    /// `k3d image import`. The returned image URI then references the
-    /// registry path so the cluster can pull through the mirror —
-    /// works whether api-server runs on the host or in-cluster.
-    /// Omit (or pass null) to keep the legacy import-only flow.
+    /// Host-side registry URL to push to (e.g. the microVM's forwarded
+    /// in-VM registry `localhost:5052`). The image is tagged
+    /// `<registry_url>/<image_tag>` and pushed via `docker push` (with
+    /// a host-side `docker save` + `crane push` fallback). The returned
+    /// image URI references the registry path so the cluster pulls
+    /// through the mirror. Required — local image delivery is
+    /// registry-only.
     #[serde(default)]
     registry_url: Option<String>,
 }
@@ -4757,42 +4017,36 @@ async fn stream_child_to_channel(
     Ok(())
 }
 
-/// Build the image with docker, then either push it to a host-side
-/// registry (when one is configured for the cluster) or import it
-/// into k3d. Streams raw command output to the frontend so the
-/// wizard can show a live terminal-style log pane.
+/// Build the image with docker, then push it to the cluster's
+/// host-side registry. Streams raw command output to the frontend so
+/// the wizard can show a live terminal-style log pane.
 ///
-/// Returns the image reference the cluster should use to pull. For
-/// the registry path that's `<registry_url>/<image_tag>`; for the
-/// import path it's the original `image_tag`. Either way, the caller
-/// (the deploy wizard) hands this URI straight to api-server's
-/// build resolver.
+/// Returns the registry-qualified image reference
+/// (`<registry_url>/<image_tag>`) the cluster pulls through its mirror,
+/// which the caller (the deploy wizard) hands straight to api-server's
+/// build resolver. Local image delivery is registry-only.
 #[tauri::command]
 async fn build_and_import_image(
     input: BuildAndImportInput,
     on_event: Channel<serde_json::Value>,
 ) -> Result<String, String> {
-    let cluster = input
-        .cluster_name
-        .clone()
-        .unwrap_or_else(|| DEFAULT_LOCAL_CLUSTER_NAME.to_string());
-
-    // When a registry is configured, tag the build with the
-    // registry-qualified ref up front so the single `docker build`
-    // produces an image already named the way we'll push it. Avoids
-    // a separate `docker tag` step.
-    let pushable_tag = input
-        .registry_url
-        .as_deref()
-        .map(|reg| format!("{}/{}", reg, input.image_tag));
-    let build_tag = pushable_tag.clone().unwrap_or_else(|| input.image_tag.clone());
+    // Local image delivery is registry-only now that bare k3d (and its
+    // `k3d image import` path) is gone. The deploy wizard resolves the
+    // registry from the cluster's /cluster-info before calling here.
+    let registry_url = input.registry_url.as_deref().ok_or(
+        "no registry configured for this cluster — local image delivery is registry-only \
+         (run \"appliance vm up\" to reconcile the in-VM registry)",
+    )?;
+    // Tag the build with the registry-qualified ref up front so the
+    // single `docker build` produces an image already named the way
+    // we'll push it. Avoids a separate `docker tag` step.
+    let pushable = format!("{}/{}", registry_url, input.image_tag);
 
     // This command only ever targets a local cluster, which runs this
     // machine's architecture and can't emulate (the microVM has no
-    // binfmt; k3d runs in the host-arch docker VM). Build for the host
-    // arch regardless of any requested platform — a cross-arch image
-    // would just crashloop with `exec format error` after an opaque
-    // rollout timeout.
+    // binfmt). Build for the host arch regardless of any requested
+    // platform — a cross-arch image would just crashloop with `exec
+    // format error` after an opaque rollout timeout.
     let host_platform = format!(
         "linux/{}",
         if std::env::consts::ARCH == "aarch64" {
@@ -4812,52 +4066,35 @@ async fn build_and_import_image(
             }));
         }
     }
-    let mut build_args: Vec<String> = vec![
+    let build_args: Vec<String> = vec![
         "build".into(),
         "-t".into(),
-        build_tag.clone(),
+        pushable.clone(),
         "--platform".into(),
         host_platform,
+        input.path.clone(),
     ];
-    build_args.push(input.path.clone());
     stream_child_to_channel("docker", &build_args, &on_event).await?;
 
-    if let Some(pushable) = pushable_tag {
-        // Registry path: push, then return the registry-qualified
-        // reference so the cluster pulls through its mirror. A plain
-        // `docker push` executes inside the docker provider's VM
-        // (colima/Docker Desktop), where host-loopback registries (the
-        // microVM's forwarded 5052) don't exist — fall back to a
-        // host-side `docker save` + `crane push` in that case, exactly
-        // like the CLI deploy pipeline.
-        let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
-        if stream_child_to_channel("docker", &push_args, &on_event)
-            .await
-            .is_ok()
-        {
-            return Ok(pushable);
-        }
-        let _ = on_event.send(serde_json::json!({
-            "type": "log",
-            "stream": "meta",
-            "message": "docker push failed — retrying host-side with crane",
-        }));
-        return crane_push_fallback(&pushable, &on_event).await;
+    // Push, then return the registry-qualified reference so the cluster
+    // pulls through its mirror. A plain `docker push` executes inside
+    // the docker provider's VM (colima/Docker Desktop), where
+    // host-loopback registries (the microVM's forwarded 5052) don't
+    // exist — fall back to a host-side `docker save` + `crane push` in
+    // that case, exactly like the CLI deploy pipeline.
+    let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
+    if stream_child_to_channel("docker", &push_args, &on_event)
+        .await
+        .is_ok()
+    {
+        return Ok(pushable);
     }
-
-    // Legacy path: no registry available — fall back to importing
-    // the image directly into the k3d cluster. Compatible with
-    // clusters that pre-date Phase 3 (no registry attached).
-    let import_args: Vec<String> = vec![
-        "image".into(),
-        "import".into(),
-        "-c".into(),
-        cluster,
-        input.image_tag.clone(),
-    ];
-    stream_child_to_channel("k3d", &import_args, &on_event).await?;
-
-    Ok(input.image_tag)
+    let _ = on_event.send(serde_json::json!({
+        "type": "log",
+        "stream": "meta",
+        "message": "docker push failed — retrying host-side with crane",
+    }));
+    crane_push_fallback(&pushable, &on_event).await
 }
 
 /// Host-side image delivery for registries the docker daemon cannot
@@ -4912,7 +4149,7 @@ async fn crane_push_fallback(
 /// PATH before spawning child processes. Mirrors `helperBinDir()` in
 /// `@appliance.sh/helper` — both sides must agree on the location for
 /// `appliance local install` (Node) to land binaries the desktop's
-/// `Command::new("k3d")` calls then pick up.
+/// `Command::new("kubectl")` calls then pick up.
 fn helper_bin_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -4925,7 +4162,7 @@ fn helper_bin_dir() -> Option<PathBuf> {
 }
 
 /// Prepend the helper bin dir to this process's PATH so every
-/// downstream `Command::new(...)` sees `~/.appliance/bin/k3d` etc.
+/// downstream `Command::new(...)` sees `~/.appliance/bin/kubectl` etc.
 /// without each call site having to manage env vars. Idempotent.
 fn ensure_helper_bin_on_path() {
     let Some(dir) = helper_bin_dir() else {
@@ -4944,7 +4181,7 @@ fn ensure_helper_bin_on_path() {
 /// .bashrc) are NOT sourced for GUI launches.
 ///
 /// We pre-populate PATH with the canonical user-bin dirs so
-/// downstream spawns of docker / kubectl / k3d / git / etc. resolve
+/// downstream spawns of docker / kubectl / git / etc. resolve
 /// the same binaries the user runs from their shell. Existence
 /// filtering avoids littering PATH with non-existent entries.
 fn ensure_user_paths_on_path() {
@@ -5095,17 +4332,9 @@ pub fn run() {
             update_api_server,
             update_baseline,
             latest_api_server_version,
-            local_cluster_status,
             local_helper_install,
             local_preflight,
             start_container_runtime,
-            start_local_cluster,
-            stop_local_cluster,
-            delete_local_cluster,
-            local_runtime_status,
-            start_local_runtime,
-            stop_local_runtime,
-            delete_local_runtime,
             list_local_workloads,
             tail_local_pod_logs,
             read_appliance_manifest,
@@ -5143,27 +4372,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_wedged_start_from_real_k3d_error() {
-        // The verbatim stderr from a post-suspend `k3d cluster start`
-        // failure — the case this recovery exists for.
-        let stderr = "FATA[0040] error during post-start cluster preparation: \
-            error waiting for log line `cluster dns configmap` from node \
-            'k3d-appliance-local-server-0': stopped returning log lines: node \
-            k3d-appliance-local-server-0 is running=true in status=restarting";
-        assert!(is_wedged_start_failure(stderr));
-    }
-
-    #[test]
-    fn ignores_unrelated_start_failures() {
-        // A genuine config/port error must NOT trigger a stop+start
-        // retry — retrying wouldn't help and would mask the real cause.
-        assert!(!is_wedged_start_failure(
-            "FATA[0000] failed to start cluster: Bind for 0.0.0.0:8081 failed: port is already allocated"
-        ));
-        assert!(!is_wedged_start_failure(""));
-    }
 
     // ---- stage-1 credential seed (decide_seed) -------------------
 

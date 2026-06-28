@@ -10,9 +10,8 @@ import type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
-  LocalRuntimeStatus,
 } from '@/lib/host';
-import type { AwsWizardValues, LocalWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
+import type { AwsWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
 import { microVmClusterId } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
@@ -32,13 +31,10 @@ export function BootstrapProgressPage() {
   const { state } = useLocation();
   const values = state as WizardValues | undefined;
 
-  // Local Runtime takes a completely different code path: no Pulumi
-  // phases, no api-server image, just spin up k3d + in-process api
-  // server and register the cluster. We branch at the top so AWS
-  // bootstrap's state machine stays untouched.
-  if (values?.mode === 'local') {
-    return <LocalProgress values={values} />;
-  }
+  // The local runtime (microVM) takes a completely different code path
+  // from AWS: no Pulumi phases, no api-server image — just boot the VM
+  // and register its cluster. We branch at the top so AWS bootstrap's
+  // state machine stays untouched.
   if (values?.mode === 'microvm') {
     return <MicroVmProgress values={values} />;
   }
@@ -350,174 +346,14 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 }
 
 // ============================================================
-// Local Runtime bootstrap
+// Local Runtime (microVM) bootstrap
 //
-// The desktop already has all the lifecycle machinery for the local
-// runtime (`startRuntime` brings up k3d + the api-server sidecar and
-// auto-registers the resulting cluster as a Console cluster, with
-// its API key in the OS keychain). This page renders a tiny version
-// of the AWS progress UI on top of that single call: one "phase"
-// node, an event log fed by start errors, and a "Open dashboard"
-// CTA once the runtime reports both halves up.
+// A tiny version of the AWS progress UI on top of a single `vm.up()`
+// call: one "phase" node, an event log fed by the streamed boot
+// lines, and an "Open dashboard" CTA once the VM is up and its
+// cluster registered.
 // ============================================================
 type LocalPhase = 'starting' | 'running' | 'failed';
-
-function LocalProgress({ values }: { values: LocalWizardValues }) {
-  const host = useHost();
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const localHost = host.local;
-
-  const [phase, setPhase] = React.useState<LocalPhase>('starting');
-  const [logs, setLogs] = React.useState<LogLine[]>([]);
-  const [error, setError] = React.useState<string | null>(null);
-  const [status, setStatus] = React.useState<LocalRuntimeStatus | null>(null);
-  const [retrying, setRetrying] = React.useState(false);
-  const startedRef = React.useRef(false);
-  const logIdRef = React.useRef(0);
-
-  const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
-    logIdRef.current += 1;
-    setLogs((prev) => [...prev, { id: logIdRef.current, level, message }]);
-  }, []);
-
-  const start = React.useCallback(async () => {
-    if (!localHost) {
-      setError('Local Runtime is only available in the desktop app.');
-      setPhase('failed');
-      return;
-    }
-    setError(null);
-    setPhase('starting');
-    setRetrying(true);
-    try {
-      appendLog('info', 'Starting k3d cluster + in-process api-server…');
-      const result = await localHost.startRuntime({
-        clusterName: values.clusterName,
-        namespace: values.namespace,
-        hostPort: values.hostPort,
-      });
-      setStatus(result);
-      const clusterUp = result.cluster.exists && result.cluster.running;
-      const serverUp = result.apiServer.running;
-      if (clusterUp && serverUp) {
-        appendLog('info', `Cluster "${result.cluster.clusterName}" + api-server at ${result.config.apiServerUrl} up.`);
-        if (result.clusterId) appendLog('info', `Registered as Console cluster: ${result.clusterId}`);
-        setPhase('running');
-        await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
-        await queryClient.invalidateQueries({ queryKey: ['local-runtime'] });
-      } else {
-        const partial = `Cluster ${clusterUp ? 'up' : 'down'}, api-server ${serverUp ? 'up' : 'down'}.`;
-        appendLog('warn', partial);
-        if (result.cluster.message) appendLog('warn', `cluster: ${result.cluster.message}`);
-        if (result.apiServer.message) appendLog('warn', `api-server: ${result.apiServer.message}`);
-        setError(partial);
-        setPhase('failed');
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      appendLog('error', message);
-      setError(message);
-      setPhase('failed');
-    } finally {
-      setRetrying(false);
-    }
-  }, [localHost, values.clusterName, values.namespace, values.hostPort, appendLog, queryClient]);
-
-  React.useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-    void start();
-  }, [start]);
-
-  if (!localHost) {
-    return <Navigate to="/bootstrap" replace />;
-  }
-
-  return (
-    <div className="mx-auto max-w-3xl space-y-6 pt-8">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold">Starting local runtime</h1>
-        <p className="text-sm text-[var(--color-muted-foreground)]">
-          On this host (not sandboxed) · {values.clusterName ?? 'appliance-local'} ·{' '}
-          {values.hostnameSuffix ?? 'appliance.localhost'} · host port {values.hostPort ?? 8081}
-        </p>
-      </div>
-
-      <div className="grid grid-cols-1 gap-3">
-        <PhaseCard
-          phase={'phase1' as BootstrapPhase /* glyph reuse — local has only one node */}
-          label="Cluster + api-server"
-          state={phase === 'starting' ? 'running' : phase === 'running' ? 'completed' : 'failed'}
-          canRetry={phase === 'failed' && !retrying}
-          onRetry={() => void start()}
-        />
-      </div>
-
-      <div className="rounded-md border border-[var(--color-border)] bg-black/30">
-        <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
-          Event log
-        </div>
-        <div className="h-80 overflow-auto font-mono text-xs leading-relaxed">
-          {logs.length === 0 ? (
-            <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
-          ) : (
-            logs.map((l) => (
-              <div
-                key={l.id}
-                className={cn(
-                  'whitespace-pre-wrap px-3 py-0.5',
-                  l.level === 'warn' && 'text-yellow-400',
-                  l.level === 'error' && 'text-red-400'
-                )}
-              >
-                {l.message}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      {phase === 'running' && status ? (
-        <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ Local runtime ready</div>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt className="text-[var(--color-muted-foreground)]">Cluster</dt>
-            <dd className="font-mono">{status.cluster.clusterName}</dd>
-            <dt className="text-[var(--color-muted-foreground)]">API server</dt>
-            <dd className="font-mono">{status.config.apiServerUrl}</dd>
-            <dt className="text-[var(--color-muted-foreground)]">Namespace</dt>
-            <dd className="font-mono">{status.config.namespace}</dd>
-            <dt className="text-[var(--color-muted-foreground)]">Host port</dt>
-            <dd className="font-mono">{status.config.hostPort}</dd>
-            {status.clusterId ? (
-              <>
-                <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
-                <dd className="font-mono">{status.clusterId}</dd>
-              </>
-            ) : null}
-          </dl>
-          <Button onClick={() => navigate('/')}>Open dashboard</Button>
-        </div>
-      ) : null}
-
-      {error ? (
-        <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
-          <div className="font-medium text-red-400">Start failed</div>
-          <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div>
-          <div className="mt-3 flex gap-2">
-            <Button onClick={() => void start()} disabled={retrying}>
-              {retrying ? 'Retrying…' : 'Retry'}
-            </Button>
-            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
-              Start over
-            </Button>
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   const host = useHost();

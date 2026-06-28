@@ -27,19 +27,16 @@ const REGIONS = [
  *   - 'aws'     : the existing 3-phase Pulumi flow (installer stack +
  *                 api-server + state promotion). Targets a cloud
  *                 install reachable from anywhere.
- *   - 'local'   : deprecated host-side k3d runtime. No longer emitted by
- *                 the wizard (bare k3d has been removed); the type and
- *                 progress branch linger one release for back-compat.
  *   - 'microvm' : the local runtime sandboxed in an isolated VM
  *                 Appliance boots itself (appliance-vm) — the sole local
  *                 runtime.
  *
- * The unified Local Runtime form always provisions a microVM. All values
- * funnel through `/bootstrap/run`, which dispatches on this field. The
- * Local Runtime form is reachable via `?mode=local` (the dashboard uses
- * this) or its `?mode=microvm` alias.
+ * The Local Runtime form always provisions a microVM. All values funnel
+ * through `/bootstrap/run`, which dispatches on this field. The Local
+ * Runtime form is reachable via `?mode=local` (the dashboard uses this)
+ * or its `?mode=microvm` alias.
  */
-export type WizardMode = 'aws' | 'local' | 'microvm';
+export type WizardMode = 'aws' | 'microvm';
 
 export interface AwsWizardValues {
   mode: 'aws';
@@ -59,29 +56,16 @@ export interface AwsWizardValues {
   awsProfile?: string;
 }
 
-export interface LocalWizardValues {
-  mode: 'local';
-  /** Optional cluster name override. Defaults to `appliance-local`. */
-  clusterName?: string;
-  /** Optional host port override for the k3d loadbalancer; default 8081. */
-  hostPort?: number;
-  /** Optional namespace override for in-cluster appliance workloads. */
-  namespace?: string;
-  /** Optional hostname suffix override; default `appliance.localhost`. */
-  hostnameSuffix?: string;
-}
-
 export interface MicroVmWizardValues {
   mode: 'microvm';
   /** VM name. Defaults to the canonical `appliance` VM. */
   name?: string;
 }
 
-export type WizardValues = AwsWizardValues | LocalWizardValues | MicroVmWizardValues;
+export type WizardValues = AwsWizardValues | MicroVmWizardValues;
 
-/** Top-level target the operator picks. The sandbox decision lives
- *  *inside* the Local Runtime form, not here — local k3d and the
- *  microVM are one choice, not two. */
+/** Top-level target the operator picks: the Local Runtime (a microVM)
+ *  or an AWS cluster. */
 type PickerChoice = 'aws' | 'local';
 
 export function BootstrapWizardPage() {

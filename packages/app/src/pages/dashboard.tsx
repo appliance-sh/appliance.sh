@@ -18,7 +18,6 @@ import { formatCpu, formatMemory, hasHealthSignal, healthDotStatus, healthLabel 
 import { EnvironmentHealthStatus, type EnvironmentHealth } from '@appliance.sh/sdk/models';
 import {
   localRuntimeCapabilities,
-  defaultSandbox,
   onboardingDismissed,
   dismissOnboarding,
   type LocalRuntimeCapabilities,
@@ -42,7 +41,6 @@ export function DashboardPage() {
     if (caps.any && !showAll && !onboardingDismissed()) {
       return (
         <FirstRunWelcome
-          caps={caps}
           onLater={() => {
             dismissOnboarding();
             setShowAll(true);
@@ -368,22 +366,12 @@ function RecentActivity({
 // microVM by default), so a new operator is running in seconds without
 // reading a menu. "Set up later" and "More options" fall back to the
 // full GetStarted menu for everything else.
-function FirstRunWelcome({
-  caps,
-  onLater,
-  onMore,
-}: {
-  caps: LocalRuntimeCapabilities;
-  onLater: () => void;
-  onMore: () => void;
-}) {
+function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () => void }) {
   const navigate = useNavigate();
-  const sandbox = defaultSandbox(caps);
   const setup = () => {
-    // Sandboxed by default; fall back to host-side k3d only when no
-    // microVM engine is available. /bootstrap/run boots it and connects
-    // automatically — no further clicks.
-    const values: WizardValues = sandbox ? { mode: 'microvm' } : { mode: 'local' };
+    // The local runtime is a microVM. /bootstrap/run boots it and
+    // connects automatically — no further clicks.
+    const values: WizardValues = { mode: 'microvm' };
     navigate('/bootstrap/run', { state: values });
   };
   return (
@@ -394,11 +382,8 @@ function FirstRunWelcome({
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Run apps on a local cluster on this machine.{' '}
-          {sandbox
-            ? 'We’ll set up a local runtime sandboxed in its own virtual machine — the recommended, isolated default.'
-            : 'We’ll set up a local runtime on this host.'}{' '}
-          It connects automatically once it’s ready.
+          Run apps on a local cluster on this machine. We’ll set up a local runtime sandboxed in its own virtual machine
+          — the recommended, isolated default. It connects automatically once it’s ready.
         </p>
       </div>
       <div className="flex flex-col items-center gap-3">
@@ -440,11 +425,7 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
           <ActionCard
             icon={Laptop}
             title="Local runtime"
-            body={
-              caps.canSandbox
-                ? 'A cluster + api-server on this machine, sandboxed in a virtual machine by default. Apps publish at *.appliance.localhost. No cloud account needed.'
-                : 'A k3d cluster + api-server on this machine. Apps publish at *.appliance.localhost. No cloud account needed.'
-            }
+            body="A cluster + api-server on this machine, sandboxed in a virtual machine. Apps publish at *.appliance.localhost. No cloud account needed."
             cta="Set up"
             to="/bootstrap?mode=local"
             primary

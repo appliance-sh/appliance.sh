@@ -8,8 +8,7 @@ import type { TerminalSession } from '@/lib/host';
 // Interactive shell into a workload pod, backed by the desktop's PTY
 // (`kubectl exec -it` in a real pseudo-terminal). Output streams from
 // the host over a channel into xterm; keystrokes + resizes go back
-// through the TerminalSession. Engine-aware: routes through the k3d
-// context or the microVM kubeconfig.
+// through the TerminalSession. Routes through the microVM's kubeconfig.
 export function TerminalDrawer({
   target,
   engine,

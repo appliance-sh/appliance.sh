@@ -24,11 +24,12 @@ const tailNav: NavItem[] = [{ to: '/settings', label: 'Settings', icon: Settings
 export function AppShell() {
   const host = useHost();
   // Surface Local Runtime only when the host can actually drive it
-  // (desktop). The web shell omits `local`, so the link would 404 on
-  // first click — better to hide it than disable it.
+  // (desktop, via the microVM engine). The web shell omits `vm`, so
+  // the link would 404 on first click — better to hide it than disable
+  // it.
   const nav: NavItem[] = [
     ...baseNav,
-    ...(host.local?.runtimeStatus ? ([{ to: '/local-runtime', label: 'Runtimes', icon: Server }] as NavItem[]) : []),
+    ...(host.vm ? ([{ to: '/local-runtime', label: 'Runtimes', icon: Server }] as NavItem[]) : []),
     ...tailNav,
   ];
 

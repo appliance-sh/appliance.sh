@@ -5,14 +5,12 @@ import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
-import { LOCAL_RUNTIME_CLUSTER_ID, isMicroVmClusterId } from '@/lib/host';
+import { isMicroVmClusterId } from '@/lib/host';
 
-/** How a local cluster is hosted, so they're tellable apart at a glance
- *  (the host-side k3d and a sandboxed microVM even share host port
- *  8081). Mirrors the management page's EngineTag wording — one local
- *  runtime, sandboxed or on the host, not two separate engines. */
+/** Tag a microVM-backed cluster so it's tellable apart from cloud
+ *  clusters at a glance. Mirrors the management page's EngineTag
+ *  wording — the local runtime is sandboxed in a virtual machine. */
 function engineLabel(clusterId: string): string | null {
-  if (clusterId === LOCAL_RUNTIME_CLUSTER_ID) return 'on host';
   if (isMicroVmClusterId(clusterId)) return 'sandboxed';
   return null;
 }
