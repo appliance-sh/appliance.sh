@@ -55,11 +55,29 @@ program
     }>();
 
     // Route by link.json (docs/up.md §2): an `appliance up` folder logs
-    // its sandbox container via the in-guest docker engine. Only when no
-    // explicit api-server `<project> <environment>` target was passed —
-    // that always means the deployment-logs path below.
+    // its sandbox container(s) via the in-guest docker engine. For a
+    // Dockerfile sandbox no positionals are expected; for a compose
+    // sandbox the first positional is an optional service-name filter.
+    // The deployment-logs path below handles an explicit api-server
+    // `<project> <environment>` target.
     const sandbox = readSandboxLink();
-    if (sandbox && !cliProject && !cliEnvironment) {
+    const isComposeSandbox = sandbox?.type === 'compose';
+    if (sandbox && !cliEnvironment && (!cliProject || isComposeSandbox)) {
+      if (isComposeSandbox) {
+        // `docker compose -p <project> logs [-f] [--tail n] [service]`.
+        const args = ['docker', 'compose', '-p', sandbox.project, 'logs', '--tail', opts.tail];
+        if (opts.follow) args.push('-f');
+        if (cliProject) args.push(cliProject); // service-name filter
+        console.error(
+          chalk.dim(
+            `Streaming logs for sandbox ${chalk.bold(sandbox.project)} ` +
+              `${cliProject ? `service ${chalk.bold(cliProject)} ` : ''}(${sandbox.vm})${
+                opts.follow ? ' — Ctrl-C to stop' : ''
+              }`
+          )
+        );
+        process.exit(vmShell(sandbox.vm, args));
+      }
       const args = ['docker', 'logs', '--tail', opts.tail];
       if (opts.follow) args.push('-f');
       args.push(sandbox.project);

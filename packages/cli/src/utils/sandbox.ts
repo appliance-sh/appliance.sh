@@ -126,8 +126,15 @@ export function guestIp(name: string): string | null {
 
 export type ProjectType = 'dockerfile' | 'compose' | 'devcontainer' | 'none';
 
-const COMPOSE_FILES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
+/** Compose file names in compose's own discovery order (docs/up.md §1). */
+export const COMPOSE_FILES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
 const DEVCONTAINER_FILES = ['.devcontainer/devcontainer.json', '.devcontainer.json'];
+
+/** The first compose file present in `dir` (by COMPOSE_FILES precedence),
+ *  as a bare file name relative to `dir`, or null when none exists. */
+export function findComposeFile(dir: string): string | null {
+  return COMPOSE_FILES.find((f) => fs.existsSync(path.join(dir, f))) ?? null;
+}
 
 /** Resolve the project type in cwd by docs/up.md §1 precedence
  *  (compose → devcontainer → dockerfile). Compose/devcontainer are
@@ -160,6 +167,196 @@ export function parseExposedPort(dockerfilePath: string): number | null {
     if (Number.isInteger(port) && port > 0 && port < 65536) return port;
   }
   return null;
+}
+
+// ---- compose introspection ---------------------------------------------
+
+/** A published-port mapping for one compose service, from `compose ps`. */
+export interface ComposePort {
+  /** Host port published on the guest's 0.0.0.0. */
+  hostPort: number;
+  /** Container port the host port maps to. */
+  containerPort: number;
+}
+
+/** One service's runtime state, as surfaced by `docker compose ps`. */
+export interface ComposePsService {
+  /** Compose service name (the key under `services:`). */
+  service: string;
+  /** Container state, e.g. `running`, `exited`, or null when unknown. */
+  state: string | null;
+  /** Published host:container port mappings (TCP), in declaration order. */
+  ports: ComposePort[];
+}
+
+/**
+ * Parse `docker compose ps --format json` output. Recent compose emits
+ * one JSON object per line (newline-delimited); older builds emit a
+ * single JSON array. Both are handled. Returns one entry per service
+ * row, with its published TCP ports extracted from the `Publishers`
+ * array (preferred) or the `Ports` string (fallback).
+ */
+export function parseComposePsJson(stdout: string): ComposePsService[] {
+  const objects: Record<string, unknown>[] = [];
+  const trimmed = stdout.trim();
+  if (!trimmed) return [];
+
+  // Try a single JSON value first (array or object), then fall back to
+  // newline-delimited objects — the shape varies across compose versions.
+  let parsedWhole: unknown;
+  try {
+    parsedWhole = JSON.parse(trimmed);
+  } catch {
+    parsedWhole = undefined;
+  }
+  if (Array.isArray(parsedWhole)) {
+    for (const v of parsedWhole) if (v && typeof v === 'object') objects.push(v as Record<string, unknown>);
+  } else if (parsedWhole && typeof parsedWhole === 'object') {
+    objects.push(parsedWhole as Record<string, unknown>);
+  } else {
+    for (const line of trimmed.split('\n')) {
+      const l = line.trim();
+      if (!l) continue;
+      try {
+        const obj = JSON.parse(l);
+        if (obj && typeof obj === 'object') objects.push(obj as Record<string, unknown>);
+      } catch {
+        // Skip non-JSON noise rather than failing the whole parse.
+      }
+    }
+  }
+
+  return objects.map((o) => {
+    const service = String(o.Service ?? o.service ?? o.Name ?? '');
+    const stateRaw = o.State ?? o.state ?? null;
+    const state = stateRaw == null ? null : String(stateRaw);
+    return { service, state, ports: composePortsFrom(o) };
+  });
+}
+
+/** Extract published TCP ports from a `compose ps` JSON row, preferring
+ *  the structured `Publishers` array and falling back to the `Ports`
+ *  display string. Only ports with a non-zero published host port count. */
+function composePortsFrom(o: Record<string, unknown>): ComposePort[] {
+  const out: ComposePort[] = [];
+  const seen = new Set<string>();
+  const add = (hostPort: number, containerPort: number) => {
+    if (!Number.isInteger(hostPort) || hostPort <= 0) return;
+    if (!Number.isInteger(containerPort) || containerPort <= 0) return;
+    const key = `${hostPort}:${containerPort}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ hostPort, containerPort });
+  };
+
+  const publishers = o.Publishers ?? o.publishers;
+  if (Array.isArray(publishers)) {
+    for (const p of publishers) {
+      if (!p || typeof p !== 'object') continue;
+      const pub = p as Record<string, unknown>;
+      const proto = String(pub.Protocol ?? pub.protocol ?? 'tcp').toLowerCase();
+      if (proto !== 'tcp') continue;
+      add(Number(pub.PublishedPort ?? pub.published ?? 0), Number(pub.TargetPort ?? pub.target ?? 0));
+    }
+  }
+
+  if (out.length === 0 && typeof o.Ports === 'string') {
+    for (const m of o.Ports.matchAll(/(?:\d+\.\d+\.\d+\.\d+:)?(\d+)->(\d+)\/tcp/g)) {
+      add(Number.parseInt(m[1], 10), Number.parseInt(m[2], 10));
+    }
+  }
+  return out;
+}
+
+/**
+ * Best-effort parse of each compose service's `depends_on` (docs/up.md
+ * item 7) without a YAML dependency. Handles the two common forms:
+ *
+ *   depends_on: [a, b]            # inline list
+ *   depends_on:                   # block list
+ *     - a
+ *     - b
+ *   depends_on:                   # mapping form (long syntax)
+ *     a:
+ *       condition: service_started
+ *
+ * Returns a map of service name → dependency names. Indentation-driven
+ * and intentionally conservative: anything it can't confidently read is
+ * simply omitted (the field is optional in link.json).
+ */
+export function parseComposeDependsOn(composePath: string): Record<string, string[]> {
+  let text: string;
+  try {
+    text = fs.readFileSync(composePath, 'utf8');
+  } catch {
+    return {};
+  }
+  const lines = text.split('\n');
+  const result: Record<string, string[]> = {};
+
+  const indentOf = (l: string) => l.length - l.replace(/^\s+/, '').length;
+
+  // Locate the top-level `services:` block and its child indent.
+  let i = 0;
+  for (; i < lines.length; i++) {
+    if (/^services:\s*$/.test(lines[i])) break;
+  }
+  if (i >= lines.length) return {};
+  i++;
+
+  // Determine the service-key indent from the first non-blank child.
+  let serviceIndent = -1;
+  for (let j = i; j < lines.length; j++) {
+    const l = lines[j];
+    if (!l.trim() || l.trim().startsWith('#')) continue;
+    if (indentOf(l) === 0) return result; // dedented out of `services:`
+    serviceIndent = indentOf(l);
+    break;
+  }
+  if (serviceIndent < 0) return result;
+
+  let currentService: string | null = null;
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = indentOf(line);
+    if (indent === 0) break; // left the services block
+
+    const serviceMatch = indent === serviceIndent ? line.trim().match(/^([A-Za-z0-9._-]+):\s*$/) : null;
+    if (serviceMatch) {
+      currentService = serviceMatch[1];
+      continue;
+    }
+    if (!currentService) continue;
+
+    const depMatch = line.trim().match(/^depends_on:\s*(.*)$/);
+    if (!depMatch) continue;
+
+    const inline = depMatch[1].trim();
+    const deps: string[] = [];
+    if (inline.startsWith('[')) {
+      // Inline flow list: depends_on: [a, b]
+      for (const tok of inline.replace(/^\[|\]$/g, '').split(',')) {
+        const name = tok.trim().replace(/['"]/g, '');
+        if (name) deps.push(name);
+      }
+    } else {
+      // Block form: list items (`- name`) or mapping keys (`name:`),
+      // indented deeper than `depends_on`.
+      const depIndent = indent;
+      for (let k = i + 1; k < lines.length; k++) {
+        const dl = lines[k];
+        if (!dl.trim() || dl.trim().startsWith('#')) continue;
+        if (indentOf(dl) <= depIndent) break;
+        const listItem = dl.trim().match(/^-\s*['"]?([A-Za-z0-9._-]+)['"]?\s*$/);
+        const mapKey = dl.trim().match(/^['"]?([A-Za-z0-9._-]+)['"]?:\s*$/);
+        if (listItem) deps.push(listItem[1]);
+        else if (mapKey) deps.push(mapKey[1]);
+      }
+    }
+    if (deps.length) result[currentService] = deps;
+  }
+  return result;
 }
 
 // ---- identity + ports --------------------------------------------------
@@ -256,10 +453,11 @@ export { GUEST_WORKSPACE };
 // ---- status ------------------------------------------------------------
 
 /**
- * Print the sandbox state for the cwd project: the VM state, the
- * container's `docker ps` line, and the host-reachable URL (docs/up.md
+ * Print the sandbox state for the cwd project: the VM state, each
+ * service's runtime state, and its host-reachable URL (docs/up.md
  * §2/§4). Returns the process exit code. Called by `appliance status`
- * when a sandbox link is present in cwd.
+ * when a sandbox link is present in cwd. Both the single-container
+ * Dockerfile path and the multi-service compose path are handled.
  */
 export async function runSandboxStatus(opts: { json?: boolean } = {}): Promise<number> {
   // Lazy import to avoid a cycle with link.ts importing nothing here.
@@ -269,6 +467,8 @@ export async function runSandboxStatus(opts: { json?: boolean } = {}): Promise<n
     console.error(chalk.red('no sandbox link in this folder — run `appliance up` first.'));
     return 1;
   }
+  if (sandbox.type === 'compose') return runComposeStatus(sandbox, opts);
+
   const vm = sandbox.vm;
   const status = vmStatus(vm);
   const ip = guestIp(vm);
@@ -321,4 +521,76 @@ export async function runSandboxStatus(opts: { json?: boolean } = {}): Promise<n
   if (url) console.log(`  URL:        ${chalk.bold(url)}`);
   else console.log(chalk.dim('  URL:        guest IP not known yet — is the VM finished booting?'));
   return 0;
+}
+
+/**
+ * Status for a compose project: iterate every service in the link,
+ * overlaying live state from `docker compose ps` where the VM is
+ * reachable, and print each service's state + URL (or `internal` for an
+ * unpublished service). Mirrors the Dockerfile path's block style.
+ */
+async function runComposeStatus(sandbox: import('./link.js').SandboxLink, opts: { json?: boolean }): Promise<number> {
+  const vm = sandbox.vm;
+  const status = vmStatus(vm);
+  const ip = guestIp(vm);
+
+  // Overlay live state from the guest (best-effort — the VM may be down).
+  const live = composePsLive(vm, sandbox.project);
+  const stateOf = (name: string): string | null => live.get(name)?.state ?? null;
+
+  const services = sandbox.services.map((svc) => {
+    const url = ip && svc.exposed && svc.hostPort ? `http://${ip}:${svc.hostPort}` : null;
+    return { ...svc, state: stateOf(svc.name), url };
+  });
+
+  if (opts.json) {
+    console.log(
+      JSON.stringify(
+        {
+          project: sandbox.project,
+          type: sandbox.type,
+          vm,
+          vmRunning: status?.running ?? false,
+          composeFile: sandbox.composeFile ?? null,
+          services,
+        },
+        null,
+        2
+      )
+    );
+    return 0;
+  }
+
+  console.log(chalk.bold(`Sandbox — ${sandbox.project} (${sandbox.type})`));
+  console.log(`  VM:         ${vm} (${status?.running ? chalk.green('running') : chalk.dim('stopped')})`);
+  const nameWidth = Math.max(4, ...services.map((s) => s.name.length));
+  for (const svc of services) {
+    const name = svc.name.padEnd(nameWidth);
+    const stateLabel = svc.state
+      ? svc.state === 'running'
+        ? chalk.green(svc.state)
+        : chalk.yellow(svc.state)
+      : chalk.dim('not running');
+    if (svc.url) {
+      console.log(`  ${name}  ${chalk.bold(svc.url)}   (:${svc.port}) — ${stateLabel}`);
+    } else if (svc.exposed && svc.hostPort) {
+      console.log(`  ${name}  host port ${svc.hostPort} (:${svc.port}) — guest IP unknown — ${stateLabel}`);
+    } else {
+      console.log(`  ${name}  ${chalk.dim('internal')} — ${stateLabel}`);
+    }
+  }
+  return 0;
+}
+
+/** Capture `docker compose ps` in the guest and index it by service
+ *  name. Empty on any failure (VM down / project not up) so callers can
+ *  fall back to the persisted link without special-casing. */
+function composePsLive(vm: string, project: string): Map<string, ComposePsService> {
+  const map = new Map<string, ComposePsService>();
+  const r = vmShellCapture(vm, ['docker', 'compose', '-p', project, 'ps', '--format', 'json', '--all']);
+  if (r.status !== 0) return map;
+  for (const svc of parseComposePsJson(r.stdout)) {
+    if (svc.service) map.set(svc.service, svc);
+  }
+  return map;
 }

@@ -23,14 +23,19 @@ const LINK_FILE = 'link.json';
  * builds (docs/up.md §5).
  */
 export interface SandboxService {
-  /** DNS-safe workload name (= project name for a single Dockerfile). */
+  /** DNS-safe workload name (= project name for a single Dockerfile;
+   *  the compose service name for each compose service). */
   name: string;
-  /** Container port the workload listens on (from EXPOSE / --port). */
-  port: number;
+  /** Container port the workload listens on (from EXPOSE / --port, or
+   *  the container side of a compose `ports:` mapping). Omitted for a
+   *  compose service that publishes no port. */
+  port?: number;
   /** Whether the port is published to the host. */
   exposed: boolean;
   /** Host port the container port is published to, when exposed. */
   hostPort?: number;
+  /** Compose `depends_on` service names, best-effort parsed (item 7). */
+  dependsOn?: string[];
 }
 
 /**
@@ -39,7 +44,7 @@ export interface SandboxService {
  * in-guest Docker engine; absent for plain `deploy`-linked projects.
  */
 export interface SandboxLink {
-  /** Detected project type. Only `dockerfile` is implemented today. */
+  /** Detected project type. `dockerfile` and `compose` are implemented. */
   type: 'dockerfile' | 'compose' | 'devcontainer';
   /** The shared sandbox VM this project runs in. */
   vm: string;
@@ -47,6 +52,9 @@ export interface SandboxLink {
   project: string;
   /** Per-service ports + exposed flags. */
   services: SandboxService[];
+  /** Compose file (relative to cwd) `up` was invoked with, so `down` /
+   *  `logs` can reconstruct the `-f` argument. Compose links only. */
+  composeFile?: string;
 }
 
 export interface ProjectLink {
