@@ -117,10 +117,14 @@ enum Cmd {
         name: String,
     },
     /// Open an interactive shell in the guest over vsock (no SSH, no
-    /// k3s) — or run a single command with `-- <cmd>`.
+    /// k3s) — or run a single command with `-- <cmd>`. Lands as the
+    /// non-root `appliance` user; `--root` lands a root shell.
     Shell {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+        /// Land a root shell instead of dropping to the `appliance` user.
+        #[arg(long, default_value_t = false)]
+        root: bool,
         /// Command to run instead of an interactive shell.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -643,9 +647,9 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        Cmd::Shell { name, command } => {
+        Cmd::Shell { name, root, command } => {
             let cmd = (!command.is_empty()).then(|| command.join(" "));
-            let code = shell::run_client(&name, cmd.as_deref())?;
+            let code = shell::run_client(&name, cmd.as_deref(), root)?;
             std::process::exit(code);
         }
 

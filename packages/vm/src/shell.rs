@@ -16,9 +16,10 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 /// Connect to the VM's shell socket and run a shell. With `command`,
-/// run it and exit; otherwise an interactive login shell. Returns the
-/// process exit code to propagate.
-pub fn run_client(name: &str, command: Option<&str>) -> Result<i32> {
+/// run it and exit; otherwise an interactive login shell. `root` lands a
+/// root shell (the escape hatch) instead of dropping to the non-root
+/// `appliance` user. Returns the process exit code to propagate.
+pub fn run_client(name: &str, command: Option<&str>, root: bool) -> Result<i32> {
     let sock = VmPaths::for_name(name).shell_sock();
     let mut stream = UnixStream::connect(&sock).map_err(|e| {
         anyhow!(
@@ -27,9 +28,11 @@ pub fn run_client(name: &str, command: Option<&str>) -> Result<i32> {
         )
     })?;
 
-    // The agent applies this as the guest PTY size before the shell.
+    // The agent applies this as the guest PTY size before the shell. A
+    // trailing `root` token requests a root shell; the agent strips it
+    // and skips the `su` drop to the appliance user.
     let (rows, cols) = term_size();
-    writeln!(stream, "rows {rows} cols {cols}")?;
+    writeln!(stream, "rows {rows} cols {cols}{}", if root { " root" } else { "" })?;
     if let Some(cmd) = command {
         // The vsock relay is a raw byte pipe with no status channel, so
         // carry the command's exit code back in-band: run it, print a

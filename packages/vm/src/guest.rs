@@ -474,17 +474,36 @@ fi
 /// Per-connection shell run by the vsock agent (socat EXEC target). The
 /// host `appliance-vm shell` client sends an initial "rows R cols C"
 /// line; we apply it as the PTY size (echo off so it isn't painted into
-/// the session), then exec a login shell — landing in the dev workspace
-/// when there is one. bash if the dev toolchain installed it, else sh.
+/// the session), then drop to the non-root `appliance` user with
+/// `su -l` — landing in the workspace (=HOME). bash if the dev toolchain
+/// installed it, else sh.
+///
+/// A trailing `root` token on the size line keeps the shell as root
+/// instead (the `--root` escape hatch, and the host clock-sync, which
+/// needs root for `date -s`). The drop is invisible to the one-shot
+/// exit-code sentinel: root sizes the PTY (it owns the tty), then the
+/// login shell `su` execs inherits the same PTY stdin/stdout, so the
+/// host's trailing `printf '…__APPLIANCE_VM_RC__%d__END__…' "$?"` still
+/// runs in that shell with the command's real `$?`.
 const SHELL_AGENT: &str = r#"#!/bin/sh
 # appliance-vm shell agent — one login shell per vsock connection.
+# Runs as root (socat EXEC), sizes the PTY, then drops to `appliance`
+# unless the caller appended a `root` token to the size line.
 stty -echo 2>/dev/null
 IFS= read -r __SZ
+__ROOT=0
+case "$__SZ" in *" root") __ROOT=1; __SZ="${__SZ% root}";; esac
 [ -n "$__SZ" ] && stty $__SZ 2>/dev/null
 stty echo 2>/dev/null
-[ -d /persist/home ] && export HOME=/persist/home
-cd /persist/workspace 2>/dev/null || cd "$HOME" 2>/dev/null || cd / || true
-if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi
+if command -v bash >/dev/null 2>&1; then __SH=/bin/bash; else __SH=/bin/sh; fi
+if [ "$__ROOT" = 1 ]; then
+  cd /persist/workspace 2>/dev/null || cd /root 2>/dev/null || cd /
+  exec "$__SH" -l
+fi
+# su -l: sets HOME/USER/SHELL from passwd, login shell, cd's to HOME
+# (=/persist/workspace). Same PTY stdin/stdout → the one-shot sentinel
+# still runs here with the command's real $?. (busybox su supports -s/-l.)
+exec su -s "$__SH" -l appliance
 "#;
 
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
@@ -896,10 +915,16 @@ mod tests {
         assert!(!start.contains("__SHELL_VSOCK_PORT__"), "port marker must be substituted");
         assert!(start.contains(&format!("VSOCK-LISTEN:{SHELL_VSOCK_PORT}")));
         assert!(start.contains("/usr/local/bin/appliance-shell-agent"));
-        // The agent script is present and execs a login shell.
+        // The agent script is present, reads the size line, and drops to
+        // the non-root appliance user via a login `su` by default.
         let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
         assert!(agent.contains("read"));
-        assert!(agent.contains("exec bash -l") || agent.contains("exec sh -l"));
+        assert!(agent.contains("exec su -s \"$__SH\" -l appliance"), "default drop to appliance");
+        // The `root` token on the size line keeps a root login shell (the
+        // --root escape hatch + clock-sync); its branch execs the shell
+        // directly, not via su.
+        assert!(agent.contains("*\" root\")"), "root token is stripped from the size line");
+        assert!(agent.contains("exec \"$__SH\" -l"), "root branch keeps a root login shell");
     }
 
     #[test]

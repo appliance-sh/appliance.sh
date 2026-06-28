@@ -656,11 +656,16 @@ function shellSock(name: string): string {
  *  is up, and falling back to the kubectl-debug host shell otherwise
  *  (older VMs, or while the guest agent is still starting). `fallback`
  *  is the chroot argv used on the kubectl path. */
-function runInteractiveShell(name: string, fallback: string[]): number {
+function runInteractiveShell(name: string, fallback: string[], root = false): number {
   if (fs.existsSync(shellSock(name))) {
-    const r = spawnSync(vmBinary(), ['shell', name], { stdio: 'inherit' });
+    // The vsock agent drops to the non-root `appliance` user by default;
+    // `--root` lands a root shell via the agent's escape hatch.
+    const args = root ? ['shell', name, '--root'] : ['shell', name];
+    const r = spawnSync(vmBinary(), args, { stdio: 'inherit' });
     return r.status ?? 1;
   }
+  // The kubectl-debug fallback already chroots in as root, so --root is
+  // a no-op there.
   return runHostShell(name, fallback);
 }
 
@@ -696,16 +701,19 @@ function hostExec(name: string, command: string): { status: number; stdout: stri
 
 program
   .command('shell')
-  .description('open a root shell inside the VM itself (or run one command: appliance vm shell -- uname -a)')
+  .description(
+    'open a shell inside the VM as the non-root appliance user (--root for root; or run one command: appliance vm shell -- uname -a)'
+  )
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--root', 'land a root shell instead of the non-root appliance user', false)
   .argument('[command...]', 'command to run instead of an interactive shell')
-  .action((command: string[], opts: { name: string }) => {
+  .action((command: string[], opts: { name: string; root: boolean }) => {
     // One-shot commands go through kubectl-debug `sh -c` (clean output +
     // an exit code); an interactive shell prefers the fast vsock path.
     if (command.length) {
       process.exit(runHostShell(opts.name, ['/bin/sh', '-c', command.join(' ')]));
     }
-    process.exit(runInteractiveShell(opts.name, ['/bin/sh']));
+    process.exit(runInteractiveShell(opts.name, ['/bin/sh'], opts.root));
   });
 
 function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
