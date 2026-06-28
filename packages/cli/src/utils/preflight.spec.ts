@@ -122,12 +122,14 @@ describe('runFixes', () => {
     };
   }
 
-  it('does nothing when the api-server image check already passes', () => {
-    expect(runFixes(reportWith('pass'))).toEqual([]);
+  it('does nothing when the api-server image check already passes', async () => {
+    expect(await runFixes(reportWith('pass'))).toEqual([]);
   });
 
-  it('skips the image pull when docker is unreachable rather than failing', () => {
-    const outcomes = runFixes(reportWith('warn', 'skipped — Docker daemon is not reachable'));
+  it('skips the image pull when docker is unreachable rather than failing', async () => {
+    // The report carries no `docker` check, so runFixes can't conclude
+    // the daemon is reachable and must skip the pull (never fail).
+    const outcomes = await runFixes(reportWith('warn', 'skipped — Docker daemon is not reachable'));
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0].status).toBe('skipped');
     expect(outcomes[0].detail).toMatch(/not reachable/i);

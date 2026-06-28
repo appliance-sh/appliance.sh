@@ -3,7 +3,9 @@ import * as tls from 'node:tls';
 import { spawnSync } from 'node:child_process';
 import {
   IN_CLUSTER_API_SERVER_DEFAULT_IMAGE,
+  ensureDockerRunning,
   helperBinDir,
+  runInstall,
   runStatus,
   runtimeDaemonStatus,
 } from '@appliance.sh/helper';
@@ -387,21 +389,51 @@ export async function runPreflight(): Promise<PreflightReport> {
 }
 
 /** Auto-resolve the checks doctor can safely fix without forking system
- *  trust decisions. Currently: pre-pull the published api-server image
- *  for the host arch (the same image/pull pattern the bootstrap uses).
- *  Returns a per-fix log line for the caller to render. */
+ *  trust decisions. Returns a per-fix log line for the caller to render. */
 export interface FixOutcome {
   label: string;
   status: 'fixed' | 'skipped' | 'failed';
   detail: string;
 }
 
-export function runFixes(report: PreflightReport): FixOutcome[] {
+/**
+ * Run the safe, non-trust-forking auto-fixes for a preflight report, in
+ * dependency order so each unblocks the next:
+ *
+ *   1. Container runtime — start a stopped-but-startable daemon (colima),
+ *      so the image pull below has somewhere to land.
+ *   2. Helper binaries (crane, kubectl) — drive the auto-installer for
+ *      the providers that support it; crane is required to deliver images
+ *      into the in-VM registry.
+ *   3. api-server image — `docker pull --platform linux/<hostArch>` the
+ *      pinned published image so first deploy is offline-safe and fast.
+ *
+ * The macOS dev-binary signing step is deliberately NOT here: it forks a
+ * trust/identity decision and is therefore prompted by the caller
+ * (`appliance init`), never run blind.
+ */
+export async function runFixes(report: PreflightReport): Promise<FixOutcome[]> {
   const outcomes: FixOutcome[] = [];
 
+  // 1. Container runtime: start it when we safely can.
+  const dockerCheck = report.results.find((r) => r.id === 'docker');
+  let dockerReachable = dockerCheck?.status === 'pass';
+  if (dockerCheck && dockerCheck.status === 'fail') {
+    const fix = await startContainerRuntime();
+    outcomes.push(fix);
+    if (fix.status === 'fixed') dockerReachable = true;
+  }
+
+  // 2. Helper binaries: auto-install the ones the registry can install.
+  const missingBins = report.results.filter((r) => r.id.startsWith('bin:') && r.status !== 'pass');
+  if (missingBins.length > 0) {
+    outcomes.push(...(await installHelperBinaries(missingBins)));
+  }
+
+  // 3. api-server image: pull once docker is reachable.
   const imageCheck = report.results.find((r) => r.id === 'api-server-image');
   if (imageCheck && imageCheck.status !== 'pass') {
-    if (imageCheck.detail?.includes('Docker daemon is not reachable')) {
+    if (!dockerReachable) {
       outcomes.push({
         label: 'pull api-server image',
         status: 'skipped',
@@ -413,6 +445,54 @@ export function runFixes(report: PreflightReport): FixOutcome[] {
   }
 
   return outcomes;
+}
+
+/** Start the container runtime when appliance can do so without a user
+ *  decision (an installed-but-stopped colima). Anything else — docker
+ *  not installed, a GUI runtime that's simply not launched — is left to
+ *  the operator with its existing remediation, so this never forks a
+ *  trust/install decision. */
+async function startContainerRuntime(): Promise<FixOutcome> {
+  const label = 'start container runtime';
+  const status = await runtimeDaemonStatus();
+  if (status.running) {
+    return { label, status: 'skipped', detail: 'Docker daemon already running.' };
+  }
+  if (!status.startable) {
+    return {
+      label,
+      status: 'skipped',
+      detail: 'Docker is not installed or can’t be auto-started — start your runtime manually.',
+    };
+  }
+  try {
+    await ensureDockerRunning();
+    return { label, status: 'fixed', detail: 'started the colima container runtime' };
+  } catch (err) {
+    return { label, status: 'failed', detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Drive the helper auto-installer for the missing managed binaries
+ *  (crane, kubectl). The check id is `bin:<provider>`, so the provider
+ *  name is the suffix. Providers that can't auto-install return guidance
+ *  rather than failing — surfaced as a `skipped` so the report still
+ *  carries the manual remediation. */
+async function installHelperBinaries(missing: CheckResult[]): Promise<FixOutcome[]> {
+  const tools = missing.map((r) => r.id.slice('bin:'.length)).filter(Boolean);
+  let outcomes;
+  try {
+    outcomes = await runInstall({ tools });
+  } catch (err) {
+    return [
+      { label: 'install helper binaries', status: 'failed', detail: err instanceof Error ? err.message : String(err) },
+    ];
+  }
+  return outcomes.map((o) => ({
+    label: `install ${o.provider.name}`,
+    status: o.status === 'installed' || o.status === 'already' ? 'fixed' : o.status === 'failed' ? 'failed' : 'skipped',
+    detail: o.message,
+  }));
 }
 
 /** `docker pull --platform linux/<arch>` the published image — the

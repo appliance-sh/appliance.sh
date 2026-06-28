@@ -75,11 +75,14 @@ export function vmPorts(name: string): {
   }
 }
 
-export function vmBinary(): string {
-  // Resolution order: explicit override → managed install → PATH →
-  // the repo build. The desktop installs into ~/.appliance/bin (and
-  // the npm distribution will ship per-platform binaries); the repo
-  // paths keep `pnpm`-checkout workflows working.
+/** Resolve the appliance-vm binary that `runVm` would invoke, or null
+ *  when none is runnable. Resolution order: explicit override → managed
+ *  install → PATH → the repo build. The desktop installs into
+ *  ~/.appliance/bin (and the npm distribution ships per-platform
+ *  binaries); the repo paths keep `pnpm`-checkout workflows working.
+ *  Returns the path without exiting so callers that only want to inspect
+ *  the binary (e.g. the dev-signing preflight) can probe it safely. */
+export function resolveVmBinary(): string | null {
   const candidates = [
     process.env.APPLIANCE_VM,
     path.join(os.homedir(), '.appliance', 'bin', 'appliance-vm'),
@@ -92,6 +95,12 @@ export function vmBinary(): string {
     const probe = spawnSync(candidate, ['--version'], { stdio: 'ignore' });
     if (probe.status === 0) return candidate;
   }
+  return null;
+}
+
+export function vmBinary(): string {
+  const bin = resolveVmBinary();
+  if (bin) return bin;
   console.error(
     chalk.red(
       'appliance-vm binary not found. Build it with `cargo build && ./scripts/sign-dev.sh` in packages/vm, or set APPLIANCE_VM.'

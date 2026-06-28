@@ -72,7 +72,8 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-env.js'),
   },
   init: {
-    description: 'initialise the CLI with the appliance server',
+    description:
+      'one-tap local onboarding: boot the microVM runtime and guide your first deploy (--remote <url> for cloud creds)',
     load: () => import('./appliance-init.js'),
   },
   keys: {
@@ -200,10 +201,10 @@ function showHelp(): void {
   }
   console.log();
   console.log('Getting started:');
-  console.log('  appliance login                 authenticate against an api-server');
-  console.log('  appliance setup                 link this folder to a project/environment');
-  console.log('  appliance deploy                build and ship the linked appliance');
+  console.log('  appliance init                  from nothing to a reachable runtime (boots the local microVM)');
+  console.log('  appliance deploy                build and ship your app to the runtime');
   console.log('  appliance open                  open the deployed URL in a browser');
+  console.log('  appliance init --remote <url>   set up credentials for a remote/cloud api-server instead');
   console.log();
   console.log('Environment variables:');
   console.log('  APPLIANCE_PROFILE               credential profile to use (overrides the active profile)');
