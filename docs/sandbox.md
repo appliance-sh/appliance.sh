@@ -70,4 +70,4 @@ Alpine ships a maintained `docker` aplet (dockerd + containerd + runc + CNI plug
 
 - [ ] Add `DOCKER_VSOCK_PORT` + guest socat bridge; add a `docker.sock` relay (clone `shell::spawn_relay`, `0600`) and a `VmPaths::docker_sock()`.
 - [ ] Add a per-VM published-port registry + `vm docker publish`; have `host_services` forward registered ports via `spawn_proxy`, drawing host ports from the allocated block and refusing the reserved four **and the auto-forwarded NodePort window `30000-30050`** (`guest.rs:541-542`) — enforce the refusal in code, not just docs.
-- **Accept:** `DOCKER_HOST=unix://…/docker.sock docker ps` works from the host; a published container port is reachable at `127.0.0.1:<allocatedPort>` while `8081/6443/5052/5053` and `30000-30050` stay reserved; a clash prints the `appliance local stop` hint.
+- **Accept:** `DOCKER_HOST=unix://…/docker.sock docker ps` works from the host; a published container port is reachable at `127.0.0.1:<allocatedPort>` while `8081/6443/5052/5053` and `30000-30050` stay reserved; a clash prints the `appliance vm stop` hint.

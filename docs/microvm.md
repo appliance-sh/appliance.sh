@@ -1,26 +1,27 @@
 # Appliance microVMs
 
-Design for the next step beyond k3d-on-docker: Appliance spins up its
-own microVM that runs workloads safely and in isolation — no Docker
-Desktop, no colima, no shared host daemon. Think of it as Appliance's
-sandbox runtime: one purpose-built VM per machine (later: per project)
-whose entire lifecycle belongs to Appliance.
+The microVM is Appliance's local runtime: Appliance spins up its own
+microVM that runs workloads safely and in isolation — no Docker Desktop,
+no colima, no shared host daemon. Think of it as Appliance's sandbox
+runtime: one purpose-built VM per machine (later: per project) whose
+entire lifecycle belongs to Appliance. It replaced the former
+k3d-on-docker runtime, which has been removed.
 
-## Why move past k3d-on-docker
+## Why the microVM replaced k3d-on-docker
 
-The k3d local runtime works, but it rents someone else's VM. On macOS
-the k3d nodes live inside whatever Docker provider the user installed
-(colima, Docker Desktop, OrbStack), which means:
+The former k3d local runtime worked, but it rented someone else's VM. On
+macOS the k3d nodes lived inside whatever Docker provider the user
+installed (colima, Docker Desktop, OrbStack), which meant:
 
-- **Trust + isolation**: workloads share a VM with everything else the
-  user runs in docker. We can't make isolation promises about a VM we
+- **Trust + isolation**: workloads shared a VM with everything else the
+  user ran in docker. We can't make isolation promises about a VM we
   don't own.
-- **Lifecycle fragility**: most local-runtime failure modes we've fixed
-  to date (wedged kubelets after VM restarts, stopped colima VMs,
-  registry mirrors lost across restarts, docker contexts pointing
-  elsewhere) are symptoms of layering on a runtime we don't control.
-- **Onboarding**: "install any container runtime first" is the worst
-  step of `appliance local up`. A built-in VMM removes the only
+- **Lifecycle fragility**: most local-runtime failure modes we fixed
+  over the k3d era (wedged kubelets after VM restarts, stopped colima
+  VMs, registry mirrors lost across restarts, docker contexts pointing
+  elsewhere) were symptoms of layering on a runtime we didn't control.
+- **Onboarding**: "install any container runtime first" was the worst
+  step of bringing the runtime up. A built-in VMM removes the only
   prerequisite we can't auto-install.
 
 ## Architecture
@@ -73,7 +74,9 @@ devices and keep it running".
 - **Linux — KVM.** Target shape: an embedded rust-vmm based VMM
   (mmio virtio devices, no device emulation beyond what the guest
   contract needs). Until that lands, the backend reports itself
-  unavailable with a clear message; k3d remains the Linux path.
+  unavailable with a clear message. There is no k3d fallback — Linux
+  has no local runtime in the interim (use a BYO
+  `appliance-base-kubernetes` cluster).
 - **Windows — WSL2.** WSL2 _is_ a managed utility VM; the backend
   drives `wsl.exe` (import a purpose-built distro tarball, run k3s
   inside it) rather than booting a kernel ourselves. Same guest
@@ -86,8 +89,8 @@ A deliberately tiny, versioned guest — not a general-purpose distro:
 - **Boot**: direct kernel boot (no firmware, no bootloader) of a
   pinned Alpine `virt` kernel + a custom initramfs. Sub-second kernel
   start; the image pair is a few tens of MB, downloaded once into
-  `~/.appliance/vm/images/<version>/` (same managed-asset model as
-  `appliance local install` uses for k3d/kubectl).
+  `~/.appliance/vm/images/<version>/` (same managed-asset model the
+  helper uses for kubectl/crane).
 - **Init**: our own minimal init (busybox + a shell script baked into
   the initramfs): bring up virtio-net via DHCP, mount the virtio-blk
   data disk (mkfs on first boot), then exec **k3s server** with its

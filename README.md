@@ -79,44 +79,43 @@ Optional fields available on all types:
 
 ## CLI Commands
 
-| Command                             | Description                                                                   |
-| ----------------------------------- | ----------------------------------------------------------------------------- |
-| `appliance login`                   | Authenticate with an Appliance API server                                     |
-| `appliance whoami`                  | Show the active profile, server URL, and linked project                       |
-| `appliance configure`               | Create or update `appliance.json` interactively                               |
-| `appliance build`                   | Build the application locally                                                 |
-| `appliance setup`                   | Connect local codebase to a cloud application (writes `.appliance/link.json`) |
-| `appliance link`                    | Link this folder to an existing project/environment without deploying         |
-| `appliance unlink`                  | Remove the local project/environment link                                     |
-| `appliance deploy [project] [env]`  | Build (if needed), upload, and deploy; defaults to the linked target          |
-| `appliance destroy [project] [env]` | Destroy an environment; defaults to the linked target                         |
-| `appliance open [project] [env]`    | Open the latest deployment URL in a browser                                   |
-| `appliance status [project]`        | Show application and environment status; defaults to the linked project       |
-| `appliance list`                    | List all applications and environments                                        |
-| `appliance deployment status <id>`  | Check a specific deployment's status                                          |
-| `appliance deployment cancel`       | Cancel an in-flight deployment                                                |
-| `appliance deployment refresh`      | Reconcile Pulumi state with cloud reality                                     |
-| `appliance local up`                | Start the full local runtime: container runtime → k3d cluster → api-server    |
-| `appliance local stop`              | Stop the local cluster without deleting its state                             |
-| `appliance local delete`            | Delete the local cluster + registry (host data dir is preserved)              |
-| `appliance local status`            | Check tools, the runtime daemon, the cluster, and the local api-server        |
-| `appliance local install`           | Install missing prerequisites (k3d, kubectl) into `~/.appliance/bin`          |
-| `appliance vm up`                   | Boot the isolated microVM runtime (no docker provider needed for the cluster) |
-| `appliance vm stop` / `delete`      | Stop (state preserved) or delete the microVM                                  |
+| Command                             | Description                                                                         |
+| ----------------------------------- | ----------------------------------------------------------------------------------- |
+| `appliance login`                   | Authenticate with an Appliance API server                                           |
+| `appliance whoami`                  | Show the active profile, server URL, and linked project                             |
+| `appliance configure`               | Create or update `appliance.json` interactively                                     |
+| `appliance build`                   | Build the application locally                                                       |
+| `appliance setup`                   | Connect local codebase to a cloud application (writes `.appliance/link.json`)       |
+| `appliance link`                    | Link this folder to an existing project/environment without deploying               |
+| `appliance unlink`                  | Remove the local project/environment link                                           |
+| `appliance deploy [project] [env]`  | Build (if needed), upload, and deploy; defaults to the linked target                |
+| `appliance destroy [project] [env]` | Destroy an environment; defaults to the linked target                               |
+| `appliance open [project] [env]`    | Open the latest deployment URL in a browser                                         |
+| `appliance status [project]`        | Show application and environment status; defaults to the linked project             |
+| `appliance list`                    | List all applications and environments                                              |
+| `appliance deployment status <id>`  | Check a specific deployment's status                                                |
+| `appliance deployment cancel`       | Cancel an in-flight deployment                                                      |
+| `appliance deployment refresh`      | Reconcile Pulumi state with cloud reality                                           |
+| `appliance vm up`                   | Boot the isolated microVM local runtime (no docker provider needed for the cluster) |
+| `appliance vm stop` / `delete`      | Stop (state preserved) or delete the microVM                                        |
+| `appliance vm status`               | Check the microVM runtime, its api-server, and the active profile                   |
+| `appliance doctor`                  | Run first-run preflight checks (`--fix` auto-resolves the safe ones)                |
 
 Top-level commands like `setup`, `status`, and `list` are shortcuts for `appliance app setup`, `appliance app status`, and `appliance app list`.
 
 ### Local development runtime
 
-`appliance local up` turns your machine into a self-contained Appliance target: it starts the container runtime (auto-starting colima when it's your active docker runtime), creates a k3d Kubernetes cluster with an attached image registry, deploys the Appliance api-server _into_ the cluster, and logs you in under the `local-runtime` profile. From there the normal flow works unchanged against `http://api.appliance.localhost:8081`:
+`appliance vm up` turns your machine into a self-contained Appliance target: it boots an isolated microVM (Virtualization.framework on macOS) running a Kubernetes cluster with an in-VM image registry, deploys the Appliance api-server _into_ the cluster, and logs you in under the `microvm` profile. From there the normal flow works unchanged against `http://api.appliance.localhost:8081`:
 
 ```bash
-appliance local up
-APPLIANCE_PROFILE=local-runtime appliance deploy my-app dev
+appliance vm up
+APPLIANCE_PROFILE=microvm appliance deploy my-app dev
 # → http://my-app-dev.appliance.localhost:8081
 ```
 
-The same API and SDK drive both targets — deploys against the local cluster build a container image and hand the api-server an image reference, while cloud deploys upload a build for server-side processing.
+The same API and SDK drive both targets — deploys against the local runtime build a container image and push it to the in-VM registry, while cloud deploys upload a build for server-side processing.
+
+> The microVM is the sole local runtime; the host-side k3d runtime (`appliance local`) has been removed. macOS / Virtualization.framework is supported today — Linux/Windows wait on the KVM/WSL2 backend.
 
 ### The link file
 
@@ -139,32 +138,38 @@ See the [`examples/`](examples/) directory:
 - **demo-node-container** — Node.js app deployed as a container
 - **demo-python-framework** — Python app deployed as a framework type
 - **demo-python-container** — Python app deployed as a container
-- **demo-local-runtime.sh** — end-to-end deploy/destroy of both
-  container demos against the local Kubernetes runtime (k3d)
 
 ## Local Kubernetes runtime
 
-For offline / single-machine development, Appliance supports a
-`appliance-base-local` base that targets a k3d cluster on the
-developer's machine instead of AWS. The desktop app manages the
-cluster lifecycle (start, stop, delete) and the api-server's
-`LocalContainerDeploymentService` maps each appliance to a
-Kubernetes Deployment + Service via `kubectl apply` / `kubectl delete`.
+For single-machine development, Appliance runs a Kubernetes cluster
+inside an isolated microVM it boots itself (`appliance vm up`). The
+api-server's `LocalContainerDeploymentService` (the generic
+`KubernetesDeploymentService`) maps each appliance to a Kubernetes
+Deployment + Service + Ingress via the k8s API — the same engine that
+drives a bring-your-own (`appliance-base-kubernetes`) cluster.
 
-Requirements: `docker`, `k3d`, `kubectl`.
-
-Quick start:
+Requirements: macOS with Virtualization.framework, plus `docker` /
+`kubectl` for building and pushing application images. Quick start:
 
 ```bash
-# from the repo root
-./examples/demo-local-runtime.sh
+appliance vm up
+APPLIANCE_PROFILE=microvm appliance deploy my-app dev
+appliance destroy my-app dev
 ```
 
-The script boots a k3d cluster, builds + imports the
-`demo-node-container` and `demo-python-container` images, launches
-the api-server with an `appliance-base-local` config, deploys both
-demos, and then destroys them. State persists under
-`~/.appliance/local-runtime`.
+### Migrating from `appliance local` (k3d)
+
+The host-side k3d local runtime has been removed. Replace it as follows:
+
+- **Local dev:** use `appliance vm up` (the microVM runtime) instead of
+  `appliance local up`. Deploy with `--profile microvm`. Application
+  images are delivered via the in-VM registry (registry-only — there is
+  no `k3d image import` step). `appliance up` remains the near-zero-config
+  way to run a single repo's container in the shared sandbox microVM.
+- **CI / headless / non-macOS:** point deploys at a real bring-your-own
+  `appliance-base-kubernetes` cluster (inline `kubeconfig`, or
+  `server` + `token`, plus a `dataDir`). The k3d-in-Docker path is gone
+  until the KVM/WSL2 microVM backend lands.
 
 ## Development
 

@@ -13,7 +13,7 @@ import type { PreflightReport } from './preflight.js';
 
 // These tests cover the deterministic decision logic in the preflight
 // suite — the bits that don't depend on what's installed on the test
-// machine. Checks that shell out to docker/k3d are exercised through
+// machine. Checks that shell out to docker/kubectl are exercised through
 // their pure branches (e.g. the "docker unreachable" short-circuit)
 // rather than by provisioning real infra.
 

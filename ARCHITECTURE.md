@@ -71,7 +71,7 @@ All models are defined as Zod schemas in `packages/sdk/src/models/`.
 
 - **aws-public**: `{ type: 'appliance-base-aws-public', name, region, dns: { domainName, createZone?, attachZone? } }`
 - **aws-vpc**: `{ type: 'appliance-base-aws-vpc', name, region, dns, vpc: { vpcCidr?, numberOfAzs? } | { vpcId } }`
-- **local**: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort?, hostnameSuffix?, ingressClassName? } }` — desktop-managed k3d runtime; no DNS, no region. Persisted form carries a `local.dataDir` for the filesystem object store.
+- **local** _(deprecated)_: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort?, hostnameSuffix?, ingressClassName? } }` — the former host-side k3d runtime. Removed; the enum value & schema are retained only so deploys created before the cutover still parse. New local deploys use the microVM, which is an `appliance-base-kubernetes` base under the hood.
 - **kubernetes**: `{ type: 'appliance-base-kubernetes', name, kubernetes: { server?, ca?, token?, kubeconfig?, namespace?, hostnameSuffix?, ingressClassName?, hostPort?, dataDir, registry? } }` — generic BYO Kubernetes cluster reachable via URL + credentials (or an inline kubeconfig, or in-cluster ServiceAccount when api-server is itself in the cluster). `hostPort` is the host-side ingress/LB port used when composing reported deploy URLs (defaults to 80).
 
 Both `local` and `kubernetes` are handled by the same `KubernetesDeploymentService` under the hood. Use the helper `isKubernetesBase(config)` (exported from `@appliance.sh/sdk`) to branch on "is this a k8s-driven base" rather than enumerating the two variants explicitly.
@@ -187,19 +187,19 @@ The api-server picks the implementation at startup based on `APPLIANCE_BASE_CONF
 
 Two base variants drive deploys against a Kubernetes cluster instead of AWS:
 
-- **`appliance-base-local`** — desktop-managed k3d cluster on the developer's machine. The desktop owns cluster lifecycle (start/stop/delete) and pre-flight (Docker, k3d, kubectl).
-- **`appliance-base-kubernetes`** — generic BYO cluster reachable via URL + credentials. The same machinery, but cluster lifecycle and credential provisioning are out of band.
+- **`appliance-base-kubernetes`** — generic Kubernetes cluster reachable via URL + credentials (or an inline kubeconfig, or in-cluster ServiceAccount). Covers both BYO clusters and the **microVM local runtime** (`appliance vm up`), which is an `appliance-base-kubernetes` cluster under the hood.
+- **`appliance-base-local`** _(deprecated)_ — the former host-side k3d runtime. Removed; the type is retained only so deploys created before the cutover still parse.
 
 Both variants flow through `KubernetesDeploymentService` (`@appliance.sh/infra/lib/local/`), which talks to the cluster via `@kubernetes/client-node` rather than shelling out to `kubectl`. Each appliance maps to a Deployment + Service (NodePort) + Ingress in the configured namespace; destroy tears the same trio down.
 
-| Cloud component              | Kubernetes equivalent                                                                                             |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| S3 object store              | `FilesystemObjectStore` rooted at `kubernetes.dataDir` (PVC-mounted in-cluster, host-path on local k3d)           |
-| ECR image push (via `crane`) | `docker push` to a cluster-attached registry (k3d local) or to any reachable registry (generic kubernetes)        |
-| Pulumi-driven Lambda deploy  | k8s API `apply` (read → create-or-replace) of a Deployment + Service + Ingress per appliance                      |
-| Lambda execution role        | k8s ServiceAccount (default)                                                                                      |
-| CloudFront / Route53         | Cluster Ingress (Traefik on k3d) at `<stack>.<hostnameSuffix>` — defaults to `*.appliance.localhost` on local k3d |
-| Pulumi cancel / refresh      | No-op — the k8s API state IS the source of truth                                                                  |
+| Cloud component              | Kubernetes equivalent                                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| S3 object store              | `FilesystemObjectStore` rooted at `kubernetes.dataDir` (PVC-mounted in-cluster)                              |
+| ECR image push (via `crane`) | `docker push` to the runtime's image registry (the microVM's in-VM registry, or any reachable registry)      |
+| Pulumi-driven Lambda deploy  | k8s API `apply` (read → create-or-replace) of a Deployment + Service + Ingress per appliance                 |
+| Lambda execution role        | k8s ServiceAccount (default)                                                                                 |
+| CloudFront / Route53         | Cluster Ingress (Traefik) at `<stack>.<hostnameSuffix>` — defaults to `*.appliance.localhost` on the microVM |
+| Pulumi cancel / refresh      | No-op — the k8s API state IS the source of truth                                                             |
 
 #### Cluster connection
 
@@ -208,66 +208,52 @@ Both variants flow through `KubernetesDeploymentService` (`@appliance.sh/infra/l
 1. `appliance-base-kubernetes` with inline `kubernetes.kubeconfig` (YAML).
 2. `appliance-base-kubernetes` with `kubernetes.server` + `kubernetes.token` (+ optional `ca`).
 3. `appliance-base-kubernetes` with nothing set — `kc.loadFromCluster()` reads the mounted ServiceAccount (the path taken when api-server itself runs in-cluster).
-4. `appliance-base-local` — falls back to the host's default kubeconfig (preserves prior k3d-on-laptop behavior).
+4. `appliance-base-local` _(deprecated)_ — falls back to the host's default kubeconfig.
 
 #### Deploying to a Kubernetes base
 
 Kubernetes-driven api-servers reject upload-flow builds (the in-cluster api-server has no docker daemon to build with) — deploys reference **container images** instead. `appliance deploy` detects the base type via `GET /api/v1/cluster-info` and switches pipeline automatically:
 
 1. `docker build` the appliance directory (container-type manifests only — framework apps need a Dockerfile to deploy locally).
-2. Push to the cluster-attached registry (`kubernetes.registry.url`) when one exists, and best-effort `k3d image import` the same ref — the import makes deploys independent of registry-mirror configuration (`--registry-use` only takes effect at cluster create, so older clusters lack the mirror).
+2. Push the image to the runtime's image registry (`kubernetes.registry.url`) — the microVM's in-VM registry, or any registry a BYO cluster can reach. Image delivery is **registry-only**; there is no host-side image-import fallback.
 3. Register a `remote-image` build (`POST /api/v1/builds` with `{ type: 'remote-image', uploadUrl, port }`). The declared `port` rides on the build record and becomes the k8s Service target port — remote images carry no manifest to read it from.
 
-Reported deploy URLs are composed as `http://<stack>.<hostnameSuffix>[:<hostPort>]`; `kubernetes.hostPort` declares the host-side port the cluster's ingress/LB answers on (8081 for the managed k3d runtime, defaults to 80 for directly-routable clusters).
+Reported deploy URLs are composed as `http://<stack>.<hostnameSuffix>[:<hostPort>]`; `kubernetes.hostPort` declares the host-side port the cluster's ingress/LB answers on (8081 for the microVM runtime, defaults to 80 for directly-routable clusters).
 
 #### In-cluster api-server
 
 api-server runs as a Kubernetes Deployment inside the cluster it manages — mirroring the AWS path where api-server is itself a deployed appliance. The bootstrap (desktop: `bootstrap_in_cluster_api_server` Tauri command; CLI: `bootstrapInClusterApiServer` in `@appliance.sh/helper`) applies the manifests (Deployment + Service + Ingress + ServiceAccount + ClusterRole(Binding) + Secret + PVC) into the `appliance-system` namespace, waits for the Ingress at `api.appliance.localhost` to be reachable, and mints the first API key via the bootstrap token.
 
-The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:latest`. For local iteration, build the image (`packages/api-server/scripts/docker-prep.sh`), push it to the cluster registry (`localhost:5050/appliance-api-server:<tag>`), then pass that ref through `BootstrapInClusterInput.image` / `appliance local up --image`.
+The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:latest`. For local iteration, build the image (`packages/api-server/scripts/docker-prep.sh`), push it to the runtime's registry (`localhost:5052/appliance-api-server:<tag>` for the microVM), then pass that ref through `BootstrapInClusterOptions.image` / `appliance vm up --image`.
 
-#### MicroVM engine
+#### MicroVM engine (the local runtime)
 
-The next-generation local runtime boots an isolated VM that Appliance
-owns end-to-end (`packages/vm`, design in `docs/microvm.md`): direct
-kernel boot via the platform hypervisor (Virtualization.framework on
-macOS; KVM/WSL2 scaffolded), k3s on containerd inside, an in-VM image
-registry, and host-side TCP forwards that preserve the exact
+The local runtime boots an isolated VM that Appliance owns end-to-end
+(`packages/vm`, design in `docs/microvm.md`): direct kernel boot via the
+platform hypervisor (Virtualization.framework on macOS; KVM/WSL2
+scaffolded), k3s on containerd inside, an in-VM image registry, and
+host-side TCP forwards that preserve the exact
 `*.appliance.localhost:8081` URL surface. `appliance vm up` boots it,
 bootstraps the in-VM api-server, and registers the `microvm` profile;
-`appliance deploy --profile microvm` then works verbatim. The k3d
-engine below remains supported — the two coexist (one at a time on
-host port 8081; the bind error names the fix). The CLI keeps them as
-separate commands (`appliance vm` / `appliance local`), but the desktop
-presents them as a single **Local runtime** with one choice — "sandbox
-with a virtual machine (recommended)", default on (microVM); off runs
-host-side k3d — and a one-press first-run prompt sets up the sandboxed
-default and connects.
+`appliance deploy --profile microvm` then works verbatim. It is the sole
+local runtime — the former host-side k3d engine has been removed (macOS /
+Virtualization.framework is supported today; Linux/Windows wait on the
+KVM/WSL2 backend, with no k3d fallback in the interim). The desktop
+presents it as the single **Local runtime**, set up by a one-press
+first-run prompt.
 
-Because local clusters run the host's architecture and can't emulate
-(no binfmt in the microVM; k3d runs in the host-arch docker VM), every
-host-side image delivery targets the host arch: the api-server image is
-extracted with `docker save --platform linux/<host>` (works for single-
-or multi-arch images, fails fast otherwise), and app-image builds are
-pinned to the host arch regardless of the manifest's `platform` — a
-cross-arch image would otherwise crashloop with `exec format error`.
+Because the local cluster runs the host's architecture and can't emulate
+(no binfmt in the microVM), every host-side image delivery targets the
+host arch: the api-server image is extracted with
+`docker save --platform linux/<host>` (works for single- or multi-arch
+images, fails fast otherwise), and app-image builds are pinned to the
+host arch regardless of the manifest's `platform` — a cross-arch image
+would otherwise crashloop with `exec format error`.
 
-#### Local cluster lifecycle (k3d)
-
-Cluster lifecycle is a host-OS concern that doesn't fit in api-server. The shared implementation lives in `@appliance.sh/helper` (`cluster.ts`, `runtime.ts`, `api-server.ts`) and is exposed two ways: the CLI's `appliance local` commands and the desktop's Tauri commands (`packages/desktop/src-tauri/src/lib.rs`, an earlier Rust port of the same flows — keep the two in sync until the desktop delegates to the sidecar).
-
-- `appliance local up` / `start_local_runtime` — brings the runtime daemon up (auto-starting colima when it's the active runtime), creates-or-starts the k3d cluster with a sibling registry (`<cluster>-registry` on host port 5050, attached via `--registry-use`), publishes the serverlb on the configured host port, bootstraps the in-cluster api-server, and saves credentials (CLI: the `local-runtime` profile; desktop: persisted cluster registry).
-- `appliance local stop` / `stop_local_cluster` — stops the cluster without deleting state.
-- `appliance local delete` / `delete_local_cluster` — confirm-gated teardown; also removes the matching registry. The host data dir survives.
-- `appliance local status` / `local_preflight` + `local_cluster_status` — tool checks (docker/k3d/kubectl), daemon reachability, cluster existence/running state, api-server reachability.
-- `appliance local runtime start` / `start_container_runtime` — starts the container runtime when appliance can do so safely.
-
-Two robustness behaviors live in the shared cluster module:
-
-- **Node-readiness gate**: container-level "running" doesn't imply usable — after the Docker VM restarts underneath a cluster, kubelets can come back wedged (`kubectl get nodes` shows NotReady forever, pods sit Pending). `startLocalCluster` waits for every node to report Ready and recovers once with a full stop/start before failing.
-- **colima auto-start**: the docker provider is install-detect-only, but a _stopped_ runtime is auto-started when (and only when) the docker CLI is wired to colima (`docker context show` == `colima` or `DOCKER_HOST` points at its socket). GUI runtimes (Docker Desktop, OrbStack) and system dockerd get actionable guidance instead.
-
-On macOS, the k3d nodes and the registry both run inside the Docker Desktop / Colima micro-VM — that's the "underlying micro VM" layer the lifecycle commands orchestrate.
+Lifecycle (boot / stop / delete) belongs to the `appliance vm` commands
+and the desktop's microVM Tauri commands, driving the `appliance-vm` Rust
+binary in `packages/vm`. The shared in-cluster api-server bootstrap lives
+in `@appliance.sh/helper` (`api-server.ts`).
 
 ### Installing Appliance on AWS
 
