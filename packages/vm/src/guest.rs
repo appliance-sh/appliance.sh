@@ -318,9 +318,11 @@ fi"#;
 ///     dev toolchain.
 ///   • dockerd runs as its own fully separate engine: `--data-root
 ///     /persist/docker` (images/volumes/its bundled containerd state all
-///     survive vm stop/up on the data disk), socket
-///     `/persist/docker/docker.sock`. k3s's embedded containerd at
-///     /persist/k3s is never shared.
+///     survive vm stop/up on the data disk). It listens on the default
+///     `/var/run/docker.sock` (so the in-guest `docker` CLI + scripts
+///     work with no DOCKER_HOST) AND on `/persist/docker/docker.sock`
+///     (the stable path the host-side vsock relay will bridge). k3s's
+///     embedded containerd at /persist/k3s is never shared.
 ///   • dockerd's egress (registry pulls/builds) is policed cooperatively
 ///     by injecting HTTP(S)_PROXY/NO_PROXY pointed at the per-VM forward
 ///     proxy on the subnet gateway. This is NOT a hard boundary and does
@@ -353,28 +355,41 @@ fi
 (
   rm -f /persist/.docker-ready
   apk update --no-progress >/dev/null 2>&1 || true
-  if apk add --no-progress docker docker-cli-compose; then
-    echo "appliance-docker: docker package installed"
-    # Egress env for dockerd's own traffic (registry pulls/builds). The
-    # node-wide egress CA (trusted above via update-ca-certificates) lets
-    # MITM'd TLS validate. NO_PROXY keeps daemon-local/bridge traffic and
-    # the loopback off the proxy.
-    if [ -n "$APPLIANCE_DOCKER_PROXY" ]; then
-      export HTTP_PROXY="$APPLIANCE_DOCKER_PROXY"
-      export HTTPS_PROXY="$APPLIANCE_DOCKER_PROXY"
-      export NO_PROXY="localhost,127.0.0.1,::1,172.17.0.0/16,10.42.0.0/16,10.43.0.0/16"
+  # apk takes an exclusive DB lock. The boot-time world install and the
+  # dev toolchain install (also backgrounded) may hold it when we fire,
+  # so a single `apk add` loses the race with "Unable to lock database".
+  # Retry until the lock frees instead of giving up until the next boot.
+  i=0
+  while :; do
+    if apk add --no-progress docker docker-cli-compose; then
+      echo "appliance-docker: docker package installed"
+      # Egress env for dockerd's own traffic (registry pulls/builds). The
+      # node-wide egress CA (trusted above via update-ca-certificates) lets
+      # MITM'd TLS validate. NO_PROXY keeps daemon-local/bridge traffic and
+      # the loopback off the proxy.
+      if [ -n "$APPLIANCE_DOCKER_PROXY" ]; then
+        export HTTP_PROXY="$APPLIANCE_DOCKER_PROXY"
+        export HTTPS_PROXY="$APPLIANCE_DOCKER_PROXY"
+        export NO_PROXY="localhost,127.0.0.1,::1,172.17.0.0/16,10.42.0.0/16,10.43.0.0/16"
+      fi
+      # Fully separate engine: own data-root, own bundled containerd, own
+      # socket — k3s keeps its embedded containerd at /persist/k3s.
+      dockerd \
+        --data-root /persist/docker \
+        -H unix:///var/run/docker.sock \
+        -H unix:///persist/docker/docker.sock \
+        >/var/log/appliance-docker.log 2>&1 &
+      : > /persist/.docker-ready
+      echo "appliance-docker: dockerd started on /persist/docker/docker.sock"
+      break
     fi
-    # Fully separate engine: own data-root, own bundled containerd, own
-    # socket — k3s keeps its embedded containerd at /persist/k3s.
-    dockerd \
-      --data-root /persist/docker \
-      -H unix:///persist/docker/docker.sock \
-      >/var/log/appliance-docker.log 2>&1 &
-    : > /persist/.docker-ready
-    echo "appliance-docker: dockerd started on /persist/docker/docker.sock"
-  else
-    echo "appliance-docker: docker install failed (will retry on next boot)"
-  fi
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      echo "appliance-docker: docker install failed after retries (will retry on next boot)"
+      break
+    fi
+    sleep 5
+  done
 ) &
 "#;
 
@@ -783,8 +798,10 @@ mod tests {
         // Packaged from the Alpine community repo, cached on /persist.
         assert!(start.contains("apk add --no-progress docker docker-cli-compose"));
         assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
-        // Fully separate engine: own data-root + socket under /persist.
+        // Fully separate engine: own data-root, listening on the default
+        // socket (in-guest CLI) + the stable /persist path (vsock relay).
         assert!(start.contains("--data-root /persist/docker"));
+        assert!(start.contains("-H unix:///var/run/docker.sock"));
         assert!(start.contains("-H unix:///persist/docker/docker.sock"));
         // dockerd is backgrounded and launched only inside the provision
         // subshell — it must not gate the k3s readiness handoff. (k3s is
