@@ -443,7 +443,7 @@ export class ApplianceClient {
    */
   async streamPodLogs(
     pod: string,
-    opts: { container?: string; tailLines?: number; namespace?: string; signal: AbortSignal },
+    opts: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number; signal: AbortSignal },
     onLine: (line: string) => void
   ): Promise<Result<void>> {
     try {
@@ -452,6 +452,7 @@ export class ApplianceClient {
       if (opts.container) params.set('container', opts.container);
       if (opts.tailLines !== undefined) params.set('tailLines', String(opts.tailLines));
       if (opts.namespace) params.set('namespace', opts.namespace);
+      if (opts.sinceSeconds !== undefined) params.set('sinceSeconds', String(opts.sinceSeconds));
       const url = `${this.baseUrl}/api/v1/pods/${encodeURIComponent(pod)}/logs?${params.toString()}`;
 
       const headers: Record<string, string> = {};

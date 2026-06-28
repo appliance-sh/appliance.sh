@@ -26,6 +26,15 @@ function answered409(res: import('express').Response, error: unknown): boolean {
   return false;
 }
 
+/** The apiserver's HTTP status off a k8s `ApiException` (`@kubernetes/
+ *  client-node` v1 surfaces it as a numeric `.code`), so a read against
+ *  a missing pod forwards 404 instead of masking it as a 500. Only an
+ *  in-range client/server status [400,599] is honored. */
+function k8sStatusCode(error: unknown): number | undefined {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'number' && code >= 400 && code <= 599 ? code : undefined;
+}
+
 // GET /api/v1/workloads?namespace=<ns>
 //
 // Namespace-scoped Deployments/Pods/Services snapshot. Defaults to the
@@ -106,12 +115,21 @@ podLogsRoutes.get('/:name/logs', async (req, res) => {
         namespace,
         sinceSeconds,
       });
-      // Open the 200 stream now even if the pod is quiet, so the client
-      // sees an established connection before the first line.
-      if (!res.headersSent) res.flushHeaders();
+      // Attach the disconnect → abort handlers BEFORE anything else, then
+      // immediately re-check liveness: if the client went away during the
+      // kube round-trip above, its 'close' event already fired before
+      // these handlers existed, so the guard tears the upstream watch down
+      // now instead of leaking it on the open-window race.
       const abort = () => controller.abort();
       req.on('close', abort);
       res.on('close', abort);
+      if (req.destroyed || res.destroyed || !res.writable) {
+        controller.abort();
+        return;
+      }
+      // Open the 200 stream now even if the pod is quiet, so the client
+      // sees an established connection before the first line.
+      if (!res.headersSent) res.flushHeaders();
       return;
     }
 
@@ -129,6 +147,9 @@ podLogsRoutes.get('/:name/logs', async (req, res) => {
       return;
     }
     res.removeHeader('Content-Type');
-    res.status(500).json({ error: 'Failed to read pod logs', message: String(error) });
+    // A missing pod rejects with a k8s ApiException carrying `code: 404`;
+    // forward that status rather than masking every upstream error as 500.
+    const status = k8sStatusCode(error) ?? 500;
+    res.status(status).json({ error: 'Failed to read pod logs', message: String(error) });
   }
 });

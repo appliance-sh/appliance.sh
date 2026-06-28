@@ -78,6 +78,10 @@ export class WorkloadsService {
    * (the route maps that to 404).
    */
   async listEnvironmentWorkloads(environmentId: string): Promise<Workloads | null> {
+    // Gate on the cluster base BEFORE the env lookup so a non-Kubernetes
+    // base answers 409 ("not available on this base") rather than a 404
+    // for an environment it could never read workloads for anyway.
+    this.ensureKubernetesBase();
     const environment = await environmentService.get(environmentId);
     if (!environment) return null;
     return this.cluster().listWorkloads({ labelSelector: `app.kubernetes.io/name=${environment.stackName}` });
