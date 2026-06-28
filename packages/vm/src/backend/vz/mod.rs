@@ -117,6 +117,13 @@ impl VmBackend for VzBackend {
         // independent of k3s.
         shell::spawn_relay(&queue, &vm, paths.shell_sock());
 
+        // Push host wall-clock time into the guest at bring-up and
+        // periodically. The guest clock lags the host (no NTP), and the
+        // api-server verifies signed-request timestamps against the guest
+        // clock — without this, host-signed requests look future-dated
+        // and get rejected with an opaque 401.
+        shell::spawn_clock_sync(&queue, &vm);
+
         // Guest-facing host services (IP discovery, port forwards,
         // kubeconfig handoff) run on a side thread so the parking loop
         // below stays the single owner of lifecycle decisions.
