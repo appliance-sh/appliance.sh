@@ -609,6 +609,7 @@ export function createMockHost(): ConsoleHost {
               running: vm.running,
               kubeconfigReady: vm.running,
               phase: vm.running ? ('ready' as const) : undefined,
+              dev: vm.dev,
               apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
             };
           },
@@ -632,6 +633,30 @@ export function createMockHost(): ConsoleHost {
             vm.running = true;
             // Register + auto-select the VM's cluster, like the real engine.
             registerMockMicroVmCluster(vm);
+          },
+          async devUp(onEvent: (event: { message: string }) => void, opts?: { mount?: string }) {
+            const profile = vm.name === 'appliance' ? 'microvm' : `microvm-${vm.name}`;
+            const lines = [
+              `starting VM '${vm.name}' as a dev environment (host pid 4242)`,
+              'waiting for kubernetes endpoint......',
+              `VM '${vm.name}' is up`,
+              '» provisioning dev toolchain in the workspace',
+              ...(opts?.mount ? [`» sharing host folder ${opts.mount} into /persist/workspace`] : []),
+              `✓ dev environment ready; credentials saved to profile ${profile}`,
+            ];
+            for (const message of lines) {
+              await sleep(400);
+              onEvent({ message });
+            }
+            vm.exists = true;
+            vm.running = true;
+            vm.dev = true;
+            // Register + auto-select the VM's cluster, like the real engine.
+            registerMockMicroVmCluster(vm);
+          },
+          async cleanupShell() {
+            // Best-effort sweep of debugger pods a shell leaves behind; a no-op in the mock.
+            await sleep(120);
           },
           async stop() {
             await sleep(800);
@@ -741,6 +766,8 @@ interface MockVm {
   name: string;
   exists: boolean;
   running: boolean;
+  /** Provisioned as a development environment (`appliance vm dev up`). */
+  dev: boolean;
   hostPort: number;
   apiPort: number;
   registryPort: number;
@@ -757,6 +784,7 @@ const microVms: Record<string, MockVm> = {
     name: 'appliance',
     exists: true,
     running: false,
+    dev: false,
     hostPort: 8081,
     apiPort: 6443,
     registryPort: 5052,
@@ -771,6 +799,7 @@ const microVms: Record<string, MockVm> = {
     name: 'traffic',
     exists: true,
     running: true,
+    dev: false,
     hostPort: 8100,
     apiPort: 8101,
     registryPort: 8102,
@@ -800,6 +829,7 @@ function mockVm(name: string): MockVm {
       name,
       exists: false,
       running: false,
+      dev: false,
       hostPort: base,
       apiPort: base + 1,
       registryPort: base + 2,

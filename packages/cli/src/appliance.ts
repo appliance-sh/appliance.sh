@@ -123,6 +123,18 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'remove the local project/environment link',
     load: () => import('./appliance-unlink.js'),
   },
+  up: {
+    description: 'build + run this project (Dockerfile, compose, or devcontainer) in the shared sandbox microVM',
+    load: () => import('./appliance-up.js'),
+  },
+  down: {
+    description: "stop and remove this project's sandbox container",
+    load: () => import('./appliance-down.js'),
+  },
+  shell: {
+    description: "enter this project's sandbox (devcontainer exec, or the VM host shell)",
+    load: () => import('./appliance-shell.js'),
+  },
   whoami: {
     description: 'show active profile, server URL, and linked project',
     load: () => import('./appliance-whoami.js'),
@@ -217,6 +229,18 @@ async function main(): Promise<void> {
   }
 
   const sub = args[0];
+
+  // `appliance status` routes by link.json: a `sandbox` link (an
+  // `appliance up` folder) shows the sandbox container + URL; otherwise
+  // it falls through to the `app status` shortcut below (docs/up.md §2).
+  if (sub === 'status') {
+    const { readSandboxLink } = await import('./utils/link.js');
+    if (readSandboxLink()) {
+      const { runSandboxStatus } = await import('./utils/sandbox.js');
+      const json = args.slice(1).includes('--json');
+      process.exit(await runSandboxStatus({ json }));
+    }
+  }
 
   // Shortcut: rewrite argv so the target subcommand sees its own
   // sub-name as the first positional. Falls through to the regular

@@ -171,7 +171,15 @@ export async function verifySignedRequest(request: VerifyRequestInput, keyLookup
         requiredFields: ['@method', '@path', '@authority'],
         requiredParams: ['keyid', 'alg', 'created'],
         maxAge: 300,
-        tolerance: 1,
+        // Clock-skew slack between the signing client (the host) and the
+        // verifying server (a microVM guest). The guest clock can lag the
+        // host by several seconds and is not NTP-synced, so 1s was far too
+        // tight: a host-signed `created` lands in the guest's "future" and
+        // EVERY signature is rejected as too-old/future-dated — surfacing
+        // as an opaque 401, independent of the key. maxAge (300s) stays the
+        // real replay bound; this only absorbs reasonable skew. The complete
+        // fix is syncing the guest clock to the host (tracked separately).
+        tolerance: 15,
       },
       { method: request.method, url: request.url, headers: request.headers }
     );

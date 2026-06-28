@@ -54,6 +54,9 @@ enum Cmd {
         /// /persist/workspace (implies --dev).
         #[arg(long)]
         mount: Option<String>,
+        /// Provision an in-guest Docker engine (dockerd) alongside k3s.
+        #[arg(long, default_value_t = false)]
+        docker: bool,
     },
     /// Start a VM in the background (creates it with defaults first if needed).
     Start {
@@ -91,6 +94,11 @@ enum Cmd {
         /// reverts to the data disk on the next boot.
         #[arg(long, default_value_t = false)]
         no_mount: bool,
+        /// Provision an in-guest Docker engine (dockerd) alongside k3s, so
+        /// the VM can build and run containers / compose / devcontainers.
+        /// Persisted; applies on the next boot; never silently turned off.
+        #[arg(long, default_value_t = false)]
+        docker: bool,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -303,6 +311,7 @@ fn run() -> Result<()> {
             disk,
             dev,
             mount,
+            docker,
         } => {
             // A shared host folder only makes sense in a dev environment,
             // so --mount implies --dev.
@@ -325,6 +334,7 @@ fn run() -> Result<()> {
                 egress_port,
                 dev,
                 dev_mount,
+                docker,
                 ..VmSpec::defaults(&name)
             };
             store::save_spec(&spec)?;
@@ -367,6 +377,7 @@ fn run() -> Result<()> {
             dev,
             mount,
             no_mount,
+            docker,
         } => {
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
@@ -383,6 +394,12 @@ fn run() -> Result<()> {
             if dev {
                 spec.dev = true;
             }
+            // `--docker` is a one-way toggle too: it provisions dockerd but
+            // its absence never deprovisions, matching --dev's semantics.
+            let was_docker = spec.docker;
+            if docker {
+                spec.docker = true;
+            }
             // Mount override: --no-mount stops sharing; --mount sets or
             // replaces the shared host folder (and implies a dev env).
             let mount_changed = if no_mount {
@@ -397,7 +414,8 @@ fn run() -> Result<()> {
                 false
             };
             let dev_enabled = spec.dev && !was_dev;
-            if resized || dev_enabled || mount_changed {
+            let docker_enabled = spec.docker && !was_docker;
+            if resized || dev_enabled || mount_changed || docker_enabled {
                 store::save_spec(&spec)?;
                 if store::read_live_pid(&name).is_some() {
                     if resized {
@@ -409,6 +427,11 @@ fn run() -> Result<()> {
                     if dev_enabled {
                         println!(
                             "note: VM '{name}' is already running — dev provisioning applies on its next boot"
+                        );
+                    }
+                    if docker_enabled {
+                        println!(
+                            "note: VM '{name}' is already running — docker provisioning applies on its next boot"
                         );
                     }
                     if mount_changed {

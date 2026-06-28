@@ -81,6 +81,8 @@ impl VmBackend for VzBackend {
             spec.registry_port,
             spec.dev,
             spec.dev_mount.is_some(),
+            spec.docker,
+            spec.egress_port,
         )?;
 
         // The console log is the VM's primary observable output —
@@ -114,6 +116,13 @@ impl VmBackend for VzBackend {
         // connection bridges to a fresh guest vsock PTY. Best-effort and
         // independent of k3s.
         shell::spawn_relay(&queue, &vm, paths.shell_sock());
+
+        // Push host wall-clock time into the guest at bring-up and
+        // periodically. The guest clock lags the host (no NTP), and the
+        // api-server verifies signed-request timestamps against the guest
+        // clock — without this, host-signed requests look future-dated
+        // and get rejected with an opaque 401.
+        shell::spawn_clock_sync(&queue, &vm);
 
         // Guest-facing host services (IP discovery, port forwards,
         // kubeconfig handoff) run on a side thread so the parking loop

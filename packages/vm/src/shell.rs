@@ -10,7 +10,7 @@
 use crate::spec::VmPaths;
 use anyhow::{anyhow, bail, Result};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -31,8 +31,13 @@ pub fn run_client(name: &str, command: Option<&str>) -> Result<i32> {
     let (rows, cols) = term_size();
     writeln!(stream, "rows {rows} cols {cols}")?;
     if let Some(cmd) = command {
-        // Run one command, then drop the login shell.
-        writeln!(stream, "{cmd}\nexit")?;
+        // The vsock relay is a raw byte pipe with no status channel, so
+        // carry the command's exit code back in-band: run it, print a
+        // sentinel holding `$?`, then drop the login shell. The client
+        // parses the sentinel below to propagate the real exit code (a
+        // bare `exit` would only ever surface the login shell's status,
+        // which the relay then discards).
+        writeln!(stream, "{}; printf '\\n{}%d__END__\\n' \"$?\"\nexit", cmd, RC_MARK)?;
     }
 
     let interactive = command.is_none() && is_tty(libc::STDIN_FILENO);
@@ -58,8 +63,64 @@ pub fn run_client(name: &str, command: Option<&str>) -> Result<i32> {
 
     // guest -> stdout, on this thread: it returns when the shell exits
     // and the socket closes, at which point the terminal is restored.
+    if command.is_some() {
+        // One-shot: stream output through, but intercept the exit-code
+        // sentinel and propagate the command's real exit code.
+        return Ok(pump_until_sentinel(&mut sock_to_out, &mut out));
+    }
     let _ = std::io::copy(&mut sock_to_out, &mut out);
     Ok(0)
+}
+
+/// Marker the one-shot command appends as `\n<RC_MARK><n>__END__\n`.
+const RC_MARK: &str = "__APPLIANCE_VM_RC__";
+
+/// Stream guest output to `w`, watching for the exit-code sentinel. Lines
+/// carrying the marker are withheld — both the echoed command line (which
+/// keeps a literal `%d`, so it won't parse) and the real sentinel — and
+/// the parsed code is returned. Streams line-by-line so long-running
+/// commands (`logs -f`, builds) still show progress as it arrives.
+fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line);
+            if text.contains(RC_MARK) {
+                if let Some(code) = parse_rc(&text) {
+                    return code;
+                }
+                continue; // echoed command line — drop it
+            }
+            let _ = w.write_all(&line);
+            let _ = w.flush();
+        }
+    }
+    if !buf.is_empty() {
+        let text = String::from_utf8_lossy(&buf);
+        if let Some(code) = parse_rc(&text) {
+            return code;
+        }
+        if !text.contains(RC_MARK) {
+            let _ = w.write_all(&buf);
+        }
+    }
+    0
+}
+
+/// Parse `<RC_MARK><digits>__END__` out of a line, if the code is present
+/// and expanded (the echoed command keeps a literal `%d` and won't parse).
+fn parse_rc(line: &str) -> Option<i32> {
+    let start = line.find(RC_MARK)? + RC_MARK.len();
+    let rest = &line[start..];
+    let end = rest.find("__END__")?;
+    rest[..end].trim().parse::<i32>().ok()
 }
 
 /// dup a std fd into an owned `File` (unbuffered, and closing it never
@@ -114,5 +175,34 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_expanded_exit_code() {
+        assert_eq!(parse_rc("__APPLIANCE_VM_RC__0__END__\r\n"), Some(0));
+        assert_eq!(parse_rc("__APPLIANCE_VM_RC__7__END__"), Some(7));
+        assert_eq!(parse_rc("x __APPLIANCE_VM_RC__42__END__ y"), Some(42));
+    }
+
+    #[test]
+    fn ignores_echoed_literal_marker() {
+        // The echoed command keeps a literal `%d`, which must not parse.
+        assert_eq!(parse_rc("printf '__APPLIANCE_VM_RC__%d__END__' \"$?\""), None);
+        assert_eq!(parse_rc("plain output line"), None);
+    }
+
+    #[test]
+    fn pump_returns_code_and_withholds_sentinel() {
+        let input = b"hello\n__APPLIANCE_VM_RC__3__END__\nlogout\n";
+        let mut out: Vec<u8> = Vec::new();
+        let code = pump_until_sentinel(&mut &input[..], &mut out);
+        assert_eq!(code, 3);
+        // The sentinel line (and anything after it) is withheld.
+        assert_eq!(out, b"hello\n");
     }
 }

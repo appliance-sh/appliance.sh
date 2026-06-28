@@ -1,0 +1,100 @@
+{
+  "$comment": "Coordination config for the Appliance multi-agent team. Companion to Notion doc '00 — Onboarding & Ways of Working'. The board is the single source of truth; this file records the repo-level facts agents need (verify bar, recipe, invariants). Recon recorded 2026-06-27.",
+  "repo": {
+    "remote": "appliance-sh/appliance.sh",
+    "checkout": "~/Workspaces/appliance.sh",
+    "defaultBranch": "main",
+    "packageManager": "pnpm@10.28.2",
+    "node": ">=24.14.1 <25",
+    "buildSystem": "pnpm workspaces + Nx (TS) and Cargo (Rust microVM crate)",
+    "version": "1.49.0"
+  },
+  "layout": {
+    "kind": "monorepo",
+    "tsPackages": {
+      "@appliance.sh/sdk": "Core SDK — Zod models, API client, ObjectStore abstraction. The contract; build first so consumers see types.",
+      "@appliance.sh/api-server": "Express REST control plane (projects/environments/deployments/builds). Vitest specs.",
+      "@appliance.sh/infra": "Pulumi IaC (AWS) + KubernetesDeploymentService (local/BYO k8s).",
+      "@appliance.sh/helper": "Shared host-side flows (cluster.ts, runtime.ts, api-server.ts) used by CLI + desktop.",
+      "@appliance.sh/cli": "Commander.js + Inquirer CLI. Ships compiled single-file binaries.",
+      "@appliance.sh/desktop": "Tauri (Rust shell in src-tauri/) + web UI. lib.rs is a Rust port of helper flows — keep in sync.",
+      "@appliance.sh/app": "Web app UI.",
+      "@appliance.sh/console": "Console UI.",
+      "@appliance.sh/install-aws": "AWS CDK installer (emits CloudFormation template).",
+      "@appliance.sh/bootstrap": "Bootstrap package.",
+      "appliance.sh": "Umbrella/meta package."
+    },
+    "rustCrates": {
+      "packages/vm": "MicroVM engine: direct-kernel boot (Virtualization.framework on macOS; KVM/WSL2 scaffolded), k3s on containerd in-guest, in-VM registry, host TCP forwards preserving *.appliance.localhost:8081, VirtioFS host-folder share, vsock shell, bring-up phase reporting."
+    },
+    "depGraph": "api-server -> infra -> sdk ; cli -> sdk ; install-aws -> sdk ; desktop -> helper -> sdk"
+  },
+  "verify": {
+    "comment": "THE green bar. Nothing reaches In Review without it green. No single `pnpm verify` script exists yet — wiring one (and triaging any pre-existing red) is tracked infra work. Run the sequence below.",
+    "steps": [
+      "pnpm install",
+      "pnpm run build",
+      "pnpm exec nx run-many --target=typecheck --all",
+      "pnpm run lint:check",
+      "pnpm exec nx run-many --target=test --all",
+      "cd packages/vm && cargo build && cargo test && cargo clippy -- -D warnings"
+    ],
+    "scoped": {
+      "comment": "For a change touching only some packages, gate on the affected ones (faster). Examples:",
+      "ts": "pnpm --filter @appliance.sh/<pkg> run build && pnpm --filter @appliance.sh/<pkg> run test",
+      "frontend-typecheck": "pnpm --filter @appliance.sh/{app,console,desktop} run typecheck",
+      "rust": "cd packages/vm && cargo build && cargo test && cargo clippy"
+    },
+    "knownPreexisting": "Historically the desktop typecheck reported errors about missing @tauri-apps/plugin-* types — verify current state; do not let pre-existing red mask new regressions."
+  },
+  "featureRecipe": {
+    "comment": "Touch points in order so the SDK contract never drifts. Skip steps a change doesn't reach.",
+    "steps": [
+      "1. SDK models — packages/sdk/src/models/ Zod schema (the contract). Rebuild SDK so consumers typecheck against new types.",
+      "2. api-server — packages/api-server/src/ routes + services (control plane). Add/extend Vitest specs.",
+      "3. SDK API client — packages/sdk/src/ client methods for new endpoints.",
+      "4. infra/helper — packages/infra/lib/... deployment services; packages/helper host-side flows.",
+      "5. CLI + desktop — packages/cli/src/ Commander command AND packages/desktop/src-tauri Tauri command, kept in sync.",
+      "6. vm (Rust) — packages/vm if the microVM host/guest boundary is touched.",
+      "7. Tests + docs — extend specs; update ARCHITECTURE.md / docs/; conventional commit feeds the changelog."
+    ]
+  },
+  "invariants": [
+    "Board = single source of truth; one writer per task (hold the lease; stale Claim id write = no-op).",
+    "SDK is the contract — rebuild @appliance.sh/sdk before consumers typecheck (workspace:* resolves to dist).",
+    "CLI `appliance local` (k3d) and desktop Tauri lib.rs are two ports of the same flows — keep in sync until desktop delegates to the sidecar.",
+    "microVM (`appliance vm`) and k3d (`appliance local`) engines coexist but only one binds host port 8081 at a time; bind error names the fix.",
+    "Local clusters run host architecture and cannot emulate — pin image builds to host arch (cross-arch => exec format error).",
+    "Branch on isKubernetesBase(config) from @appliance.sh/sdk rather than enumerating local vs kubernetes bases.",
+    "Kubernetes-driven api-servers reject upload-flow builds (no docker daemon) — use container-image/remote-image builds.",
+    "Never commit images/binaries (screenshots, PNGs, build outputs) into the repo — attach PR captures via GitHub user-attachments.",
+    "Never commit/push on main; commit/push only when the owner asks; conventional lowercase-led commit subjects.",
+    "~/.appliance/ holds credentials.json (0600), vm/images cache, and CLI profiles."
+  ],
+  "release": {
+    "tool": "nx release with conventional commits",
+    "commands": { "interactive": "pnpm run release", "ci": "pnpm run release:ci" }
+  },
+  "tags": [
+    "runtime",
+    "cli",
+    "api",
+    "scheduler",
+    "sandbox",
+    "config",
+    "packaging",
+    "docs",
+    "infra",
+    "release",
+    "security"
+  ],
+  "board": {
+    "roadmap": "collection://3124fb10-0035-8005-bd37-000bf86fd0f6",
+    "roadmapDb": "3124fb10-0035-80aa-be37-e44ad7c94772",
+    "roster": "collection://3864fb10-0035-80da-b05c-000b4d7c02ad",
+    "owner": "User (owner)",
+    "manager": "Morgan",
+    "workers": { "Avery": ["runtime", "cli", "config"], "Blake": ["api", "scheduler", "sandbox"] },
+    "reviewers": { "Quinn": "code", "Sasha": "security", "Devon": "design", "Parker": "product-metrics" }
+  }
+}

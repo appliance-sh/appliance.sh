@@ -48,7 +48,62 @@ pub struct VmSpec {
     /// Set by `appliance vm dev up --mount <path>`; implies `dev`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_mount: Option<String>,
+    /// When set, the guest bootstrap provisions an in-guest Docker
+    /// engine (`dockerd` on the Alpine `docker` aplet, cached on the
+    /// data disk) alongside k3s, with its data-root, containerd and
+    /// socket all under `/persist/docker`. Decoupled from the bring-up
+    /// phases: `vm up` reaches `Ready` on k3s alone and never waits on
+    /// dockerd. A plain `vm up` leaves it false; it is never silently
+    /// turned back off.
+    #[serde(default)]
+    pub docker: bool,
+    /// Container ports published from the in-guest Docker engine, each
+    /// mapped to a host loopback port drawn from this VM's allocated
+    /// block (see `allocate_published_port`). `host_services` reads this
+    /// on bring-up and forwards each entry over the NAT subnet. Empty by
+    /// default and absent from legacy specs (which parse to `vec![]`).
+    #[serde(default)]
+    pub published: Vec<PublishedPort>,
 }
+
+/// One published container port: the in-guest container port and the
+/// host loopback port forwarded to it. Persisted with the spec and
+/// consumed (later) by the boot-time forwarding code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedPort {
+    /// Host loopback port (`127.0.0.1:<host>`), allocated from this VM's
+    /// block and never one of the reserved/auto-forwarded ports.
+    pub host: u16,
+    /// Container port inside the guest the host port forwards to.
+    pub container: u16,
+}
+
+// NOTE: the allocator below and its constants are exercised by the
+// unit tests but not yet wired into a non-test caller — the consumer is
+// the boot-dependent published-port forwarding (`host_services` reading
+// `VmSpec::published` and calling `spawn_proxy`), which is the rest of
+// E2.3 and out of scope for this pure slice. Allow dead_code here so the
+// `-D warnings` gate stays green until that code lands.
+
+/// The four canonical host ports reserved for ingress, kubernetes API,
+/// registry, and egress respectively. The default VM keeps these; a
+/// published port may never reuse one (docs/sandbox.md §5, finding C4).
+#[allow(dead_code)]
+pub const RESERVED_HOST_PORTS: [u16; 4] = [8081, 6443, 5052, 5053];
+
+/// The deterministic-NodePort window `host_services` blanket-forwards
+/// (`guest.rs:631`, `30000..=30050` inclusive). A published port must
+/// stay clear of it so the two forwards can never collide.
+#[allow(dead_code)]
+pub const NODEPORT_FORWARD_RANGE: std::ops::RangeInclusive<u16> = 30000..=30050;
+
+/// Host-port search range published container ports draw from. Starts
+/// well above the per-VM four-port block base (8100) the resource
+/// allocator hands out, and stops below the auto-forwarded NodePort
+/// window so a published port can never shadow either.
+#[allow(dead_code)]
+const PUBLISHED_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=29999;
 
 /// The default VM name. The default VM keeps the canonical host ports
 /// (8081/6443/5052/5053) for backward compatibility and parity with
@@ -86,6 +141,8 @@ impl VmSpec {
             egress_port: 5053,
             dev: false,
             dev_mount: None,
+            docker: false,
+            published: Vec::new(),
         }
     }
 
@@ -114,6 +171,25 @@ impl VmSpec {
             }
             slot += 1;
         }
+    }
+
+    /// Allocate a free host loopback port for a container-published
+    /// port, drawing from this VM's host-port range. Refuses, in code
+    /// (docs/sandbox.md §5, security finding C4), the four reserved
+    /// ports (ingress/api/registry/egress) and the auto-forwarded
+    /// NodePort window `30000-30050` — both are already blanket-bound on
+    /// the host (`guest.rs:host_services`), so handing one out would
+    /// guarantee a collision. Also skips any host port in `used`
+    /// (this VM's existing published ports plus the caller's reserved
+    /// set). Returns the lowest free port, or `None` when the range is
+    /// exhausted — never a reserved one.
+    #[allow(dead_code)]
+    pub fn allocate_published_port(used: &std::collections::HashSet<u16>) -> Option<u16> {
+        PUBLISHED_PORT_RANGE.clone().find(|&port| {
+            !RESERVED_HOST_PORTS.contains(&port)
+                && !NODEPORT_FORWARD_RANGE.contains(&port)
+                && !used.contains(&port)
+        })
     }
 
     /// Apply optional per-VM resource overrides in place, validating
@@ -298,5 +374,92 @@ mod tests {
         assert_eq!(spec.registry_port, 5052);
         // Old specs predate the dev flag — it must default to off.
         assert!(!spec.dev);
+        // Old specs predate the docker flag too — default off.
+        assert!(!spec.docker);
+    }
+
+    #[test]
+    fn allocate_published_port_never_returns_a_reserved_or_nodeport() {
+        use std::collections::HashSet;
+        // With nothing used, the allocator returns the lowest port in
+        // its range — and it is neither reserved nor in the NodePort
+        // window.
+        let port = VmSpec::allocate_published_port(&HashSet::new()).unwrap();
+        assert!(!RESERVED_HOST_PORTS.contains(&port));
+        assert!(!NODEPORT_FORWARD_RANGE.contains(&port));
+
+        // Even if the caller marks everything *except* a reserved port
+        // and a NodePort-window port as used, the allocator refuses both
+        // and keeps searching rather than handing one out.
+        let mut used: HashSet<u16> = PUBLISHED_PORT_RANGE.clone().collect();
+        // Free up exactly two slots: one reserved-valued (which is below
+        // the range anyway) and the bottom of the NodePort window.
+        used.remove(&20000);
+        let port = VmSpec::allocate_published_port(&used).unwrap();
+        assert_eq!(port, 20000, "the one free in-range slot must be chosen");
+        for &reserved in &RESERVED_HOST_PORTS {
+            assert_ne!(port, reserved);
+        }
+        for nodeport in NODEPORT_FORWARD_RANGE {
+            assert_ne!(port, nodeport);
+        }
+    }
+
+    #[test]
+    fn allocate_published_port_skips_used_and_errors_when_exhausted() {
+        use std::collections::HashSet;
+        // The lowest in-range port marked used is skipped for the next.
+        let mut used: HashSet<u16> = HashSet::new();
+        let first = VmSpec::allocate_published_port(&used).unwrap();
+        used.insert(first);
+        let second = VmSpec::allocate_published_port(&used).unwrap();
+        assert!(second > first, "a used port must not be handed out twice");
+        assert!(!used.contains(&second));
+
+        // Marking the whole range used exhausts the allocator: it
+        // returns None rather than falling back to a reserved port.
+        let all: HashSet<u16> = PUBLISHED_PORT_RANGE.clone().collect();
+        assert_eq!(VmSpec::allocate_published_port(&all), None);
+    }
+
+    #[test]
+    fn published_ports_round_trip_and_default_empty_for_legacy_specs() {
+        // A legacy spec predates the published field — it must parse to
+        // an empty vec, not fail.
+        let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
+        let spec: VmSpec = serde_json::from_str(legacy).unwrap();
+        assert!(spec.published.is_empty(), "legacy specs default to no published ports");
+
+        // A populated published map survives a JSON round-trip with its
+        // host→container mapping intact.
+        let mut spec = VmSpec::defaults("x");
+        assert!(spec.published.is_empty(), "fresh specs publish nothing");
+        spec.published = vec![
+            PublishedPort { host: 20000, container: 8080 },
+            PublishedPort { host: 20001, container: 5432 },
+        ];
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.published, spec.published);
+        // camelCase: the container field serializes as `container`,
+        // host as `host`.
+        assert!(json.contains("\"host\":20000"));
+        assert!(json.contains("\"container\":8080"));
+    }
+
+    #[test]
+    fn docker_flag_round_trips_through_json() {
+        // A docker-enabled spec serializes the flag and reads it back.
+        let mut spec = VmSpec::defaults("x");
+        assert!(!spec.docker, "default must be off");
+        spec.docker = true;
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.docker, "docker flag must survive a JSON round-trip");
+
+        // A serialized default spec carries docker:false explicitly.
+        let default_json = serde_json::to_string(&VmSpec::defaults("x")).unwrap();
+        let back: VmSpec = serde_json::from_str(&default_json).unwrap();
+        assert!(!back.docker);
     }
 }
