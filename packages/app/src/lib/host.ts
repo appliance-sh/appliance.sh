@@ -285,12 +285,11 @@ export interface TerminalHost {
 }
 
 /**
- * Stable cluster ids for the two local engines. They double as the
- * CLI profile names in ~/.appliance/profiles.json — mirror
- * LOCAL_RUNTIME_CLUSTER_ID / MICROVM_CLUSTER_ID in the desktop's
- * lib.rs and MICROVM_PROFILE in the CLI.
+ * Stable cluster id for the microVM engine. Doubles as the CLI
+ * profile name in ~/.appliance/profiles.json — mirrors
+ * MICROVM_CLUSTER_ID in the desktop's lib.rs and MICROVM_PROFILE in
+ * the CLI.
  */
-export const LOCAL_RUNTIME_CLUSTER_ID = 'local-runtime';
 export const MICROVM_CLUSTER_ID = 'microvm';
 
 /** The canonical (default) microVM name — keeps the bare `microvm`

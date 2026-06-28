@@ -292,7 +292,7 @@ export class ApplianceClient {
    * when the cluster's metrics-server is installed — aggregate
    * CPU/memory usage.
    *
-   * Only Kubernetes-driven bases (local k3d + generic Kubernetes)
+   * Only Kubernetes-driven bases (local microVM + generic Kubernetes)
    * expose pod-level health. On AWS/Lambda bases, or when the cluster
    * is unreachable, the server returns `status: 'unknown'` with a
    * `message` rather than an error — callers should render that as

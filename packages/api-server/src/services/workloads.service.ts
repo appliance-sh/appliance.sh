@@ -21,7 +21,7 @@ export class NonKubernetesBaseError extends Error {
 
 /**
  * Reads cluster workloads + pod logs for the console/SDK. Only
- * Kubernetes-driven bases (local k3d / microVM + generic Kubernetes)
+ * Kubernetes-driven bases (local microVM + generic Kubernetes)
  * carry pod/deployment/service state, so every method gates on
  * `isKubernetesBase` and instantiates the same `@appliance.sh/infra`
  * cluster client the deploy executor + health service use.

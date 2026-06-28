@@ -622,12 +622,12 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
     fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
-    // Bind failures here are almost always the other engine (k3d's
-    // serverlb publishes the same 8081) — name the fix, don't let it
-    // surface as a generic timeout.
+    // Bind failures here are almost always another microVM already
+    // holding the port — name the fix, don't let it surface as a
+    // generic timeout.
     let bind_hint = |port: u16, what: &str| {
         format!(
-            "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. If the k3d runtime is running, stop it first (`appliance local stop`)."
+            "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. Stop the microVM holding it with `appliance vm stop`, or run `appliance doctor` to find what owns the port."
         )
     };
     crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))

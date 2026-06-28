@@ -14,7 +14,7 @@ export const DEFAULT_LOCAL_NAMESPACE = 'appliance';
 // Host port the runtime's ingress LoadBalancer publishes. Default 8081 —
 // keeps clear of the desktop's 1420 dev server and common 8080.
 export const DEFAULT_LOCAL_HOST_PORT = 8081;
-// Host-side port the in-runtime image registry publishes on. Picked out
-// of the way of common dev tools (5000 is occupied by macOS AirPlay
-// Receiver on Sequoia+, 5001 by some VPN clients).
+// Legacy default for the registryPort plumbing, retained for back-compat;
+// the surviving in-runtime registry is the microVM's, which advertises its
+// own registry URL explicitly (no host-side port is probed anymore).
 export const DEFAULT_LOCAL_REGISTRY_PORT = 5050;

@@ -6,7 +6,7 @@ import { logger } from '../logger';
 /**
  * Computes per-environment health for the console/SDK.
  *
- * Only Kubernetes-driven bases (local k3d + generic Kubernetes) carry
+ * Only Kubernetes-driven bases (local microVM + generic Kubernetes) carry
  * pod-level readiness/restart state, so health is sourced from the
  * same `@appliance.sh/infra` cluster client the deploy executor uses.
  * On AWS/Lambda bases — which have no pod/restart semantics — and when
