@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { DEFAULT_LOCAL_CLUSTER_NAME, DEFAULT_LOCAL_NAMESPACE, kubeContextForCluster } from '@appliance.sh/helper';
+import { DEFAULT_LOCAL_NAMESPACE } from '@appliance.sh/helper';
 
 // Resolve which local cluster a CLI command should talk to, and how to
 // reach it with `kubectl`. Observability commands (`appliance logs`,
@@ -10,14 +10,15 @@ import { DEFAULT_LOCAL_CLUSTER_NAME, DEFAULT_LOCAL_NAMESPACE, kubeContextForClus
 // exposes no log/health stream today, and the workloads it schedules
 // carry well-known labels we can select on.
 //
-// The mapping from a credentials profile to a cluster mirrors how
-// `appliance vm` / `appliance local` lay things out on disk:
+// The microVM is the sole local runtime, so the default target is its
+// kubeconfig. The mapping from a credentials profile to a cluster
+// mirrors how `appliance vm` lays things out on disk:
 //
 //   profile `microvm`           → ~/.appliance/vm/appliance/kubeconfig.yaml
 //   profile `microvm-<name>`    → ~/.appliance/vm/<name>/kubeconfig.yaml
-//   profile `local-runtime`     → kubectl context `k3d-appliance-local`
+//   anything else / unset       → the default microVM's kubeconfig
 //
-// Both `appliance vm` and `appliance local` label workloads identically
+// `appliance vm` labels workloads via
 // (see packages/infra/.../LocalContainerDeploymentService.renderManifest):
 // the Deployment/Service share `app.kubernetes.io/name: <stackName>`,
 // where <stackName> is the environment's `stackName` (`<project>-<env>`).
@@ -31,13 +32,14 @@ export const MANAGED_BY_VALUE = 'appliance.sh';
 const DEFAULT_VM_NAME = 'appliance';
 
 /** How to address a cluster with `kubectl`: either an explicit
- *  kubeconfig file (microVM engine) or a named context in the user's
- *  default kubeconfig (k3d local engine). */
+ *  kubeconfig file (the microVM engine ships one) or a named context in
+ *  the user's default kubeconfig (an explicit `--context` override, e.g.
+ *  for a BYO cluster). */
 export interface ClusterTarget {
   /** Absolute path to a kubeconfig file, when the engine ships one. */
   kubeconfig?: string;
-  /** kubectl context name, when the engine writes into the default
-   *  kubeconfig (k3d). */
+  /** kubectl context name, when targeting a context in the default
+   *  kubeconfig (via an explicit `--context` override). */
   context?: string;
   /** Kubernetes namespace the workloads live in. */
   namespace: string;
@@ -80,13 +82,14 @@ export function vmNameForProfile(profile: string | undefined): string | null {
 
 /**
  * Resolve a usable kubectl target from explicit overrides + the active
- * profile. Throws with an actionable message when a microVM profile is
- * selected but its kubeconfig isn't on disk (VM not up).
+ * profile. Throws with an actionable message when the microVM kubeconfig
+ * isn't on disk (VM not up).
  *
  * Resolution order:
  *   1. --kubeconfig / --context overrides (either, validated).
  *   2. microVM profile → that VM's kubeconfig file.
- *   3. local-runtime (or anything else local) → the k3d context.
+ *   3. anything else / unset → the default microVM's kubeconfig (the
+ *      sole local runtime).
  */
 export function resolveClusterTarget(opts: ResolveClusterOptions): ClusterTarget {
   const namespace = opts.namespace ?? DEFAULT_LOCAL_NAMESPACE;
@@ -106,26 +109,19 @@ export function resolveClusterTarget(opts: ResolveClusterOptions): ClusterTarget
     };
   }
 
-  const vmName = vmNameForProfile(opts.profile);
-  if (vmName) {
-    const kubeconfig = vmKubeconfigPath(vmName);
-    if (!fs.existsSync(kubeconfig)) {
-      throw new ClusterTargetError(
-        `no kubeconfig for microVM "${vmName}" at ${kubeconfig} — is it up? Run \`appliance vm up${
-          vmName === DEFAULT_VM_NAME ? '' : ` --name ${vmName}`
-        }\`.`
-      );
-    }
-    return { kubeconfig, namespace, source: `microvm:${vmName}` };
+  // A microVM profile names its VM; anything else (no profile, a cloud
+  // profile, …) falls back to the default microVM, the sole local
+  // runtime. Either way the target is the VM's on-disk kubeconfig.
+  const vmName = vmNameForProfile(opts.profile) ?? DEFAULT_VM_NAME;
+  const kubeconfig = vmKubeconfigPath(vmName);
+  if (!fs.existsSync(kubeconfig)) {
+    throw new ClusterTargetError(
+      `no kubeconfig for microVM "${vmName}" at ${kubeconfig} — is it up? Run \`appliance vm up${
+        vmName === DEFAULT_VM_NAME ? '' : ` --name ${vmName}`
+      }\`.`
+    );
   }
-
-  // Default: the k3d local runtime. Its context is written into the
-  // user's default kubeconfig by k3d, so no explicit file is needed.
-  return {
-    context: kubeContextForCluster(DEFAULT_LOCAL_CLUSTER_NAME),
-    namespace,
-    source: 'local-runtime',
-  };
+  return { kubeconfig, namespace, source: `microvm:${vmName}` };
 }
 
 /**
