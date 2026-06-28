@@ -124,6 +124,12 @@ if ! mount -t ext4 /dev/vda "$PERSIST"; then
   echo "WARNING: data disk mount failed — falling back to tmpfs (no persistence, limited space)"
 fi
 
+# --- non-root appliance user ----------------------------------------
+# Substituted with the provisioning block below on EVERY VM (uid/gid
+# pinned at build time). Runs after the /persist mount so HOME +
+# workspace land on the persistent disk, and before the vsock shell
+# agent so the first shell connection can already `su` to a real user.
+__APP_USER_PROVISION__
 # --- vsock shell agent (appliance-vm shell) -------------------------
 # A PTY login shell served per connection on a fixed vsock port. The
 # host's resident process bridges a local Unix socket to this; no SSH,
@@ -243,6 +249,75 @@ mkdir -p /srv/handoff
 ) &
 "#;
 
+/// Non-root `appliance` user provisioning, substituted into
+/// `APPLIANCE_START` (the `__APP_USER_PROVISION__` marker) on EVERY VM.
+///
+/// Diskless Alpine rebuilds `/etc/passwd`, `/etc/group`, `/etc/shadow`
+/// and `/etc/sudoers.d` into tmpfs on every boot, so the user is
+/// (re)created each boot rather than once. The idempotency story is the
+/// **pinned uid/gid** (`__APP_UID__`/`__APP_GID__`, substituted at
+/// boot-media build time): stable ids keep ownership of files on the
+/// persistent `/persist` disk consistent across reboots, and the
+/// `|| true` guards make the re-runs harmless.
+///
+/// The user lands in `wheel` (passwordless sudo via `/etc/sudoers.d`)
+/// here; `docker` group membership is added in `DOCKER_PROVISION` (the
+/// group only exists after `apk add docker`). HOME is
+/// `/persist/workspace`, with an npm global prefix under HOME so
+/// `appliance up`'s `npm i -g @devcontainers/cli` installs unprivileged.
+const APP_USER_PROVISION: &str = r#"
+echo "appliance-user: provisioning the non-root appliance user"
+# uid/gid are PINNED (host uid/gid on --mount VMs, 1000 otherwise) so
+# /persist ownership stays stable across the diskless rebuild each boot.
+APP_USER=appliance
+APP_UID=__APP_UID__
+APP_GID=__APP_GID__
+APP_HOME=/persist/workspace
+
+mkdir -p "$APP_HOME"
+addgroup -g "$APP_GID" "$APP_USER" 2>/dev/null || true
+# busybox adduser: -D no password, -H don't create home (it's on
+# /persist, made above), -h home, -s login shell, -G primary group,
+# -u uid. adduser/addgroup are busybox builtins (always present).
+adduser -D -H -u "$APP_UID" -G "$APP_USER" -h "$APP_HOME" -s /bin/sh "$APP_USER" 2>/dev/null || true
+addgroup "$APP_USER" wheel 2>/dev/null || true
+# docker group membership is added in DOCKER_PROVISION (the group only
+# exists once the docker package is installed), not here.
+chown "$APP_UID:$APP_GID" "$APP_HOME" 2>/dev/null || true
+chmod 0755 "$APP_HOME" 2>/dev/null || true
+
+# Passwordless sudo for wheel via a drop-in (the diskless rebuild wipes
+# /etc/sudoers.d too, so rewrite it every boot).
+mkdir -p /etc/sudoers.d
+printf '%s\n' "$APP_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appliance
+chmod 0440 /etc/sudoers.d/appliance
+
+# Login env for the appliance user: npm global prefix under HOME so
+# global installs (appliance up) succeed unprivileged. /etc/profile.d/*.sh
+# is sourced by the login shell the agent's `su -l` starts.
+mkdir -p /etc/profile.d
+cat > /etc/profile.d/appliance-user.sh <<'PROFILE'
+export NPM_CONFIG_PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+PROFILE
+"#;
+
+/// Resolve the `appliance` user's uid/gid for the guest. On a
+/// VirtioFS-mounted (`--mount`) VM the host folder is shared at the
+/// user's HOME (`/persist/workspace`) and presents **host-side
+/// ownership**, so the guest user must carry the host user's uid/gid to
+/// read/write that tree as the host user does (a fixed 1000 would lose
+/// write access). Without a share there is no host ownership to match,
+/// so the conventional `1000` is used. Pure so the substitution logic is
+/// unit-tested without a live VM.
+fn resolve_app_ids(mount: bool, host_uid: u32, host_gid: u32) -> (u32, u32) {
+    if mount {
+        (host_uid, host_gid)
+    } else {
+        (1000, 1000)
+    }
+}
+
 /// Dev-environment provisioning, substituted into `APPLIANCE_START`
 /// (the `__DEV_PROVISION__` marker) only for VMs created with
 /// `appliance vm dev`. Two halves:
@@ -259,18 +334,21 @@ mkdir -p /srv/handoff
 ///     `vm dev status`.
 const DEV_PROVISION: &str = r#"
 echo "appliance-dev: provisioning development environment"
-mkdir -p /persist/workspace /persist/home /persist/apk-cache
+# HOME is /persist/workspace now (consolidated; the appliance user's
+# passwd entry points there), so no separate /persist/home.
+mkdir -p /persist/workspace /persist/apk-cache
 # Persist apk's download cache on the data disk so reprovisioning each
 # boot is fast and works offline once primed (the network repo is only
 # hit the first time, or for packages added later).
 ln -sfn /persist/apk-cache /etc/apk/cache
 __DEV_MOUNT__
-# Every login shell gets a stable HOME on the persistent disk; the
-# `dev shell` entry cd's into the workspace itself.
+# Mark the dev environment and extend PATH. HOME is NOT exported here:
+# the appliance user's passwd entry (HOME=/persist/workspace) is the one
+# source of truth, and `su -l` derives HOME from it — re-exporting it
+# would override the user's HOME and break /persist ownership.
 mkdir -p /etc/profile.d
 cat > /etc/profile.d/appliance-dev.sh <<'PROFILE'
 export APPLIANCE_DEV=1
-export HOME=/persist/home
 export PATH="$HOME/.local/bin:$PATH"
 PROFILE
 # Install the toolchain in the background: first boot pulls from the
@@ -446,10 +524,13 @@ fn build_apkovl(
     // lets containerd pull from TLS registries.
     // socat backs the vsock shell agent (appliance-vm shell); it's tiny
     // and gives every VM a k3s-independent host shell.
+    // sudo gives the non-root `appliance` user passwordless escalation
+    // (wheel + /etc/sudoers.d); the diskless init installs it from the
+    // network repo before appliance.start provisions the user.
     file(
         "etc/apk/world",
         0o644,
-        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\n",
+        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\n",
     )?;
     file(
         "etc/apk/repositories",
@@ -465,6 +546,14 @@ fn build_apkovl(
         0o644,
         b"rc_cgroup_mode=\"unified\"\nrc_logger=\"YES\"\n",
     )?;
+    // The non-root appliance user is provisioned on every VM. uid/gid
+    // are pinned here: the host user's own ids on a VirtioFS-mounted VM
+    // (so the shared workspace stays writable), 1000 otherwise.
+    let (app_uid, app_gid) =
+        resolve_app_ids(mount, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let app_user_provision = APP_USER_PROVISION
+        .replace("__APP_UID__", &app_uid.to_string())
+        .replace("__APP_GID__", &app_gid.to_string());
     file(
         "etc/local.d/appliance.start",
         0o755,
@@ -473,6 +562,7 @@ fn build_apkovl(
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
             .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
+            .replace("__APP_USER_PROVISION__", &app_user_provision)
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
             .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
             .replace("__DOCKER_PROVISION__", if docker { DOCKER_PROVISION } else { "" })
@@ -725,7 +815,9 @@ mod tests {
         let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
-        assert!(!start.contains("/persist/workspace"));
+        // The base user block references /persist/workspace on every VM,
+        // so assert on dev-only wiring instead.
+        assert!(!start.contains("appliance-dev: provisioning"));
         assert!(!start.contains("apk add"));
 
         // Dev: the workspace, persistent apk cache, login profile, and
@@ -738,6 +830,59 @@ mod tests {
         assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
         assert!(start.contains("apk add"));
         assert!(start.contains("/persist/.dev-ready"));
+    }
+
+    #[test]
+    fn appliance_user_provisioned_on_every_vm() {
+        // The non-root user is unconditional — present even on a plain
+        // (non-dev, non-docker, non-mount) VM, just like the shell agent.
+        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
+        // User + primary group, pinned uid/gid, on the persistent home.
+        assert!(start.contains("APP_USER=appliance"));
+        assert!(start.contains("adduser -D -H -u \"$APP_UID\" -G \"$APP_USER\" -h \"$APP_HOME\" -s /bin/sh \"$APP_USER\""));
+        assert!(start.contains("APP_HOME=/persist/workspace"));
+        // wheel (sudo) membership + a passwordless sudoers drop-in.
+        assert!(start.contains("addgroup \"$APP_USER\" wheel"));
+        assert!(start.contains("/etc/sudoers.d/appliance"));
+        assert!(start.contains("ALL=(ALL) NOPASSWD:ALL"));
+        // npm global prefix under HOME so `appliance up` installs the
+        // devcontainers CLI unprivileged.
+        assert!(start.contains("/etc/profile.d/appliance-user.sh"));
+        assert!(start.contains("NPM_CONFIG_PREFIX=\"$HOME/.local\""));
+        // sudo is in the base package set so it's installed before the
+        // bootstrap provisions the user.
+        let world = apkovl_file(&plain, "etc/apk/world").unwrap();
+        assert!(world.lines().any(|l| l == "sudo"));
+        // The provisioning runs after the /persist mount and before the
+        // shell agent listens (so the first connection can `su`).
+        let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
+        let user_at = start.find("provisioning the non-root appliance user").unwrap();
+        let agent_at = start.find("VSOCK-LISTEN:").unwrap();
+        assert!(mount_at < user_at && user_at < agent_at, "user block must sit between the persist mount and the shell agent");
+    }
+
+    #[test]
+    fn appliance_user_uid_gid_pinned_per_mount() {
+        // Pure resolver: a share matches the host ids; no share is 1000.
+        assert_eq!(resolve_app_ids(false, 501, 20), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
+
+        // A non-mount VM pins the conventional 1000/1000.
+        let plain = build_apkovl(5052, None, true, false, false, 5053).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains("APP_UID=1000"));
+        assert!(start.contains("APP_GID=1000"));
+
+        // A --mount VM pins the host user's own uid/gid so the shared
+        // workspace (host-side ownership over virtiofs) stays writable.
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+        let shared = build_apkovl(5052, None, true, true, false, 5053).unwrap();
+        let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains(&format!("APP_UID={host_uid}")), "mounted VM must pin the host uid");
+        assert!(start.contains(&format!("APP_GID={host_gid}")), "mounted VM must pin the host gid");
     }
 
     #[test]
