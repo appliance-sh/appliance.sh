@@ -32,8 +32,6 @@ export type {
   LocalDeploymentInfo,
   LocalPodInfo,
   LocalServiceInfo,
-  LocalWorkloads,
-  LocalPodLogsInput,
   LocalApplianceManifest,
   LocalBuildAndImportInput,
   LocalLogEvent,

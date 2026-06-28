@@ -17,9 +17,11 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
+import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
 import { TerminalDrawer } from './terminal-drawer';
@@ -417,6 +419,29 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
     }
   }, [microVmReady, queryClient]);
 
+  // Cluster-ready probe: the engine's `kubeconfigReady` says the VM's
+  // host process is up and k3s answers, but "ready" for the console
+  // means the in-VM api-server is actually serving — that's what every
+  // other view reads through. Probe its unauthenticated `/healthz` (a
+  // base-URL HTTP check, no kubectl) once the VM reports ready; the
+  // badge reads `running` only when both agree. healthz is unsigned, so
+  // a bare client over the VM's apiServerUrl suffices.
+  const healthClient = React.useMemo(
+    () => (status?.apiServerUrl ? createApplianceClient({ baseUrl: status.apiServerUrl }) : null),
+    [status?.apiServerUrl]
+  );
+  const healthzQuery = useQuery({
+    queryKey: ['microvm', name, 'healthz', status?.apiServerUrl ?? ''],
+    enabled: Boolean(healthClient) && microVmReady,
+    queryFn: async () => {
+      const res = await healthClient!.healthz();
+      return res.success;
+    },
+    // Poll quickly until the api-server answers, then back off.
+    refetchInterval: (q) => (q.state.data === true ? 15_000 : 3_000),
+  });
+  const clusterServing = microVmReady && healthzQuery.data === true;
+
   const state = !status
     ? 'checking…'
     : !status.available
@@ -429,11 +454,12 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
         ? 'starting…'
         : status.running
           ? // The host process being up is not the same as the cluster
-            // being ready: k3s may still be coming up, or bring-up may
-            // have errored. Reflect that instead of a blunt "running".
+            // being ready: k3s may still be coming up, the in-VM
+            // api-server may not be serving yet, or bring-up may have
+            // errored. Reflect that instead of a blunt "running".
             status.phase === 'failed'
             ? 'failed'
-            : status.kubeconfigReady
+            : clusterServing
               ? 'running'
               : 'starting…'
           : status.exists
@@ -621,7 +647,7 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
 
       {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
-      {status?.running && status.kubeconfigReady ? <WorkloadsPanel engine="microvm" vmName={name} /> : null}
+      {clusterServing ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
 
       {shellOpen ? (
         <TerminalDrawer
@@ -1223,7 +1249,7 @@ function PreflightPanel({
             <p className="mt-0.5 text-xs text-amber-200/80">
               {onlyDaemonDown
                 ? 'The local runtime needs a running Docker daemon. Start it below, then re-check.'
-                : 'Image builds and workload reads need Docker + kubectl. Install the missing tools below, then re-check.'}
+                : 'Image builds need Docker; pod shells and deploys need kubectl. Install the missing tools below, then re-check.'}
             </p>
           </div>
         </div>
@@ -1386,15 +1412,29 @@ function PreflightRow({
   );
 }
 
-function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: string }) {
+function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: string }) {
   const host = useHost();
+  const queryClient = useQueryClient();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
   const [shellPod, setShellPod] = React.useState<LocalPodInfo | null>(null);
-  // For the microVM engine, clusterName carries the VM name so the host
-  // resolves that VM's kubeconfig (multiple VMs run concurrently).
+
+  // Workloads + pod logs now read through the in-VM api-server (the same
+  // signed ApplianceClient that powers projects/deployments) instead of
+  // a kubectl shell-out. The client is bound to the *active* cluster, so
+  // we can only read this VM's workloads when it is the selected one;
+  // otherwise we'd surface another cluster's state under this card.
+  const client = useApplianceClient();
+  const { data: config } = useQuery({ queryKey: ['host', 'config'], queryFn: () => host.getConfig() });
+  const isActive = config?.selectedClusterId === clusterId;
+
   const workloadsQuery = useQuery({
-    queryKey: ['local-runtime', 'workloads', engine ?? 'microvm', vmName ?? ''],
-    queryFn: () => host.local!.listWorkloads(engine ? { engine, clusterName: vmName } : undefined),
+    queryKey: ['local-runtime', 'workloads', clusterId],
+    enabled: Boolean(client) && isActive,
+    queryFn: async () => {
+      const res = await client!.listWorkloads();
+      if (!res.success) throw res.error;
+      return res.data;
+    },
     refetchInterval: 5_000,
   });
 
@@ -1405,21 +1445,35 @@ function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: strin
     <>
       <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">
-            {engine === 'microvm' ? `Workloads · ${vmName ?? 'appliance'}` : 'Workloads'}
-          </h2>
+          <h2 className="text-sm font-semibold">Workloads · {vmName ?? 'appliance'}</h2>
           <Button
             variant="ghost"
             size="icon"
             aria-label="Refresh workloads"
             onClick={() => workloadsQuery.refetch()}
-            disabled={workloadsQuery.isFetching}
+            disabled={workloadsQuery.isFetching || !isActive}
           >
             <RefreshCw className={cn('h-4 w-4', workloadsQuery.isFetching && 'animate-spin')} />
           </Button>
         </div>
 
-        {workloadsQuery.isLoading ? (
+        {!isActive ? (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Select this microVM as the active cluster to read its workloads through the api-server.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                await host.selectCluster(clusterId);
+                queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+              }}
+            >
+              Select cluster
+            </Button>
+          </div>
+        ) : workloadsQuery.isLoading ? (
           <p className="text-xs text-[var(--color-muted-foreground)]">Loading…</p>
         ) : workloadsQuery.isError ? (
           <p className="text-xs text-red-300">{(workloadsQuery.error as Error).message}</p>
@@ -1436,11 +1490,16 @@ function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: strin
         ) : null}
       </section>
 
-      {activePod ? (
-        <PodLogsDrawer pod={activePod} engine={engine} vmName={vmName} onClose={() => setActivePod(null)} />
+      {activePod && client ? (
+        <PodLogsDrawer pod={activePod} client={client} onClose={() => setActivePod(null)} />
       ) : null}
       {shellPod ? (
-        <TerminalDrawer target={shellPod.name} engine={engine} clusterName={vmName} onClose={() => setShellPod(null)} />
+        <TerminalDrawer
+          target={shellPod.name}
+          engine="microvm"
+          clusterName={vmName}
+          onClose={() => setShellPod(null)}
+        />
       ) : null}
     </>
   );
@@ -1580,27 +1639,59 @@ function ServicesTable({ services }: { services: LocalServiceInfo[] }) {
   );
 }
 
-function PodLogsDrawer({
-  pod,
-  engine,
-  vmName,
-  onClose,
-}: {
-  pod: LocalPodInfo;
-  engine?: 'microvm';
-  vmName?: string;
-  onClose: () => void;
-}) {
-  const host = useHost();
-  const logsQuery = useQuery({
-    queryKey: ['local-runtime', 'logs', engine ?? 'microvm', vmName ?? '', pod.name],
-    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500, engine, clusterName: vmName }),
-  });
-  const logs = logsQuery.data ?? '';
+// Live pod-log tail. Opens a single chunked `follow` stream against the
+// api-server (`streamPodLogs`) — the last 500 lines, then new lines as
+// they arrive — instead of polling a snapshot. The stream is aborted on
+// unmount or when the viewed pod changes.
+const LOG_BUFFER_MAX = 5_000;
 
+function PodLogsDrawer({ pod, client, onClose }: { pod: LocalPodInfo; client: ApplianceClient; onClose: () => void }) {
+  const [lines, setLines] = React.useState<string[]>([]);
+  const [phase, setPhase] = React.useState<'connecting' | 'live' | 'ended' | 'error'>('connecting');
+  const [error, setError] = React.useState<string | null>(null);
+  const preRef = React.useRef<HTMLPreElement | null>(null);
+
+  React.useEffect(() => {
+    const controller = new AbortController();
+    setLines([]);
+    setError(null);
+    setPhase('connecting');
+    let started = false;
+    void client
+      .streamPodLogs(pod.name, { tailLines: 500, signal: controller.signal }, (line) => {
+        if (!started) {
+          started = true;
+          setPhase('live');
+        }
+        setLines((prev) => {
+          const next = prev.length >= LOG_BUFFER_MAX ? prev.slice(prev.length - LOG_BUFFER_MAX + 1) : prev.slice();
+          next.push(line);
+          return next;
+        });
+      })
+      .then((res) => {
+        if (controller.signal.aborted) return;
+        if (!res.success) {
+          setError(res.error.message);
+          setPhase('error');
+        } else {
+          setPhase('ended');
+        }
+      });
+    // Abort the follow on unmount / pod switch — the SDK treats an abort
+    // as a clean close, not a failure.
+    return () => controller.abort();
+  }, [client, pod.name]);
+
+  // Keep the newest lines in view as the stream appends.
+  React.useEffect(() => {
+    if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight;
+  }, [lines]);
+
+  const text = lines.join('\n');
   const copy = async () => {
     if (typeof navigator !== 'undefined' && navigator.clipboard) {
-      await navigator.clipboard.writeText(logs);
+      await navigator.clipboard.writeText(text);
     }
   };
 
@@ -1621,10 +1712,35 @@ function PodLogsDrawer({
             <div className="text-sm font-semibold">Pod logs</div>
             <div className="font-mono text-xs text-[var(--color-muted-foreground)]">{pod.name}</div>
           </div>
-          <div className="flex items-center gap-1">
-            <Button variant="outline" size="sm" onClick={() => logsQuery.refetch()} disabled={logsQuery.isFetching}>
-              <RefreshCw className={cn('h-3.5 w-3.5', logsQuery.isFetching && 'animate-spin')} /> Refresh
-            </Button>
+          <div className="flex items-center gap-2">
+            <span
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium',
+                phase === 'live'
+                  ? 'bg-green-500/15 text-green-300'
+                  : phase === 'error'
+                    ? 'bg-red-500/15 text-red-300'
+                    : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+              )}
+            >
+              <span
+                className={cn(
+                  'h-1.5 w-1.5 rounded-full',
+                  phase === 'live'
+                    ? 'animate-pulse bg-green-400'
+                    : phase === 'error'
+                      ? 'bg-red-400'
+                      : 'bg-[var(--color-muted-foreground)]'
+                )}
+              />
+              {phase === 'live'
+                ? 'Live'
+                : phase === 'connecting'
+                  ? 'Connecting…'
+                  : phase === 'error'
+                    ? 'Error'
+                    : 'Ended'}
+            </span>
             <Button variant="outline" size="sm" onClick={copy}>
               <Copy className="h-3.5 w-3.5" /> Copy
             </Button>
@@ -1633,12 +1749,19 @@ function PodLogsDrawer({
             </Button>
           </div>
         </header>
-        <pre className="flex-1 overflow-auto whitespace-pre-wrap bg-black/40 p-3 font-mono text-xs leading-relaxed">
-          {logsQuery.isLoading
-            ? 'Loading…'
-            : logsQuery.isError
-              ? (logsQuery.error as Error).message
-              : logs || <span className="text-[var(--color-muted-foreground)]">No log lines yet.</span>}
+        <pre
+          ref={preRef}
+          className="flex-1 overflow-auto whitespace-pre-wrap bg-black/40 p-3 font-mono text-xs leading-relaxed"
+        >
+          {phase === 'error' ? (
+            <span className="text-red-300">{error}</span>
+          ) : text ? (
+            text
+          ) : phase === 'connecting' ? (
+            'Connecting…'
+          ) : (
+            <span className="text-[var(--color-muted-foreground)]">No log lines yet.</span>
+          )}
         </pre>
       </div>
     </div>

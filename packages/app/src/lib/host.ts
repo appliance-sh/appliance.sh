@@ -507,22 +507,6 @@ export interface LocalServiceInfo {
   targetPort?: number;
 }
 
-export interface LocalWorkloads {
-  deployments: LocalDeploymentInfo[];
-  pods: LocalPodInfo[];
-  services: LocalServiceInfo[];
-}
-
-export interface LocalPodLogsInput {
-  podName: string;
-  container?: string;
-  tailLines?: number;
-  clusterName?: string;
-  namespace?: string;
-  /** See LocalRuntimeInput.engine. */
-  engine?: 'microvm';
-}
-
 /** Parsed contents of an appliance manifest (json or sandbox-evaluated ts/js). */
 export interface LocalApplianceManifest {
   manifest?: string;
@@ -649,11 +633,10 @@ export interface LocalRuntimeHost {
    */
   startContainerRuntime?(): Promise<void>;
 
-  /** Snapshot of Deployments / Pods / Services in the appliance
-   *  namespace of the selected microVM (engine routed). */
-  listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads>;
-  /** One-shot `kubectl logs --tail` for the named pod. */
-  tailPodLogs(input: LocalPodLogsInput): Promise<string>;
+  // Workloads + pod logs are no longer read here: the console reads them
+  // through the in-VM api-server via `ApplianceClient.listWorkloads()` /
+  // `getPodLogs()` / `streamPodLogs()` (control-plane.md §4), the same
+  // signed base-URL path that powers projects/deployments. No kubectl.
 
   /** Open a native folder picker. Returns null on cancel. */
   pickDirectory(): Promise<string | null>;

@@ -1956,8 +1956,8 @@ struct BootstrapInClusterResult {
 fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
     // namespace must track cfg.namespace (which honors user
     // input.namespace override). Hardcoding to DEFAULT_LOCAL_NAMESPACE
-    // would silently diverge from the namespace the desktop's
-    // list_local_workloads queries against. hostnameSuffix +
+    // would silently diverge from the namespace the api-server's
+    // workloads endpoint queries against. hostnameSuffix +
     // ingressClassName are currently not user-overridable so the
     // defaults match LocalContainerDeploymentService's defaults; lift
     // them onto ResolvedRuntimeConfig if/when an override surface
@@ -3288,47 +3288,11 @@ async fn microvm_creds_forget(name: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-// --- kubectl-driven workloads & logs --------------------------------
-
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct LocalWorkloads {
-    deployments: Vec<DeploymentInfo>,
-    pods: Vec<PodInfo>,
-    services: Vec<ServiceInfo>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeploymentInfo {
-    name: String,
-    image: Option<String>,
-    desired: i64,
-    ready: i64,
-    available: i64,
-    created_at: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PodInfo {
-    name: String,
-    phase: String,
-    ready: bool,
-    restart_count: i64,
-    container_image: Option<String>,
-    created_at: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServiceInfo {
-    name: String,
-    service_type: String,
-    cluster_ip: Option<String>,
-    node_port: Option<i64>,
-    target_port: Option<i64>,
-}
+// --- kubectl target selection (terminals/PTY) -----------------------
+//
+// Workloads + pod logs used to shell out to `kubectl` here; the console
+// now reads them through the in-VM api-server (control-plane.md §4), so
+// only the interactive PTY paths below still resolve a kube target.
 
 /// kubectl target-selection args for the microVM engine: the
 /// kubeconfig appliance-vm fetched out of the guest. The microVM is
@@ -3358,174 +3322,6 @@ fn kube_target_args(engine: Option<&str>, cluster_name: &str) -> Result<Vec<Stri
         "--kubeconfig".to_string(),
         kubeconfig.to_string_lossy().into_owned(),
     ])
-}
-
-#[tauri::command]
-async fn list_local_workloads(
-    app: AppHandle,
-    input: Option<LocalRuntimeInput>,
-) -> Result<LocalWorkloads, String> {
-    let input = input.unwrap_or_default();
-    let cfg = resolve_runtime_config(&app, &input)?;
-    let target = kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?;
-
-    let mut args: Vec<&str> = vec!["kubectl"];
-    args.extend(target.iter().map(String::as_str));
-    args.extend(["-n", &cfg.namespace, "get", "deploy,pod,svc", "-o", "json"]);
-    let (ok, stdout, stderr) = run_status_command(&args).await?;
-    if !ok {
-        // Namespace-not-found shows up as a "NotFound" error. Treat
-        // that as "no workloads yet" so the UI doesn't flash an error
-        // before the user has deployed anything.
-        if stderr.contains("(NotFound)") || stderr.contains("not found") {
-            return Ok(LocalWorkloads::default());
-        }
-        return Err(format!("kubectl get failed: {}", stderr));
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
-    let mut out = LocalWorkloads::default();
-    if let Some(items) = parsed.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-            let name = item
-                .pointer("/metadata/name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
-            let created_at = item
-                .pointer("/metadata/creationTimestamp")
-                .and_then(|t| t.as_str())
-                .map(String::from);
-            match kind {
-                "Deployment" => {
-                    let image = item
-                        .pointer("/spec/template/spec/containers/0/image")
-                        .and_then(|i| i.as_str())
-                        .map(String::from);
-                    let desired = item.pointer("/spec/replicas").and_then(|n| n.as_i64()).unwrap_or(0);
-                    let ready = item
-                        .pointer("/status/readyReplicas")
-                        .and_then(|n| n.as_i64())
-                        .unwrap_or(0);
-                    let available = item
-                        .pointer("/status/availableReplicas")
-                        .and_then(|n| n.as_i64())
-                        .unwrap_or(0);
-                    out.deployments.push(DeploymentInfo {
-                        name,
-                        image,
-                        desired,
-                        ready,
-                        available,
-                        created_at,
-                    });
-                }
-                "Pod" => {
-                    let phase = item
-                        .pointer("/status/phase")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let container_image = item
-                        .pointer("/spec/containers/0/image")
-                        .and_then(|i| i.as_str())
-                        .map(String::from);
-                    let (ready, restart_count) = item
-                        .pointer("/status/containerStatuses")
-                        .and_then(|cs| cs.as_array())
-                        .map(|arr| {
-                            let ready = arr.iter().all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false));
-                            let restarts = arr
-                                .iter()
-                                .map(|c| c.get("restartCount").and_then(|r| r.as_i64()).unwrap_or(0))
-                                .sum::<i64>();
-                            (ready, restarts)
-                        })
-                        .unwrap_or((false, 0));
-                    out.pods.push(PodInfo {
-                        name,
-                        phase,
-                        ready,
-                        restart_count,
-                        container_image,
-                        created_at,
-                    });
-                }
-                "Service" => {
-                    let service_type = item
-                        .pointer("/spec/type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("ClusterIP")
-                        .to_string();
-                    let cluster_ip = item
-                        .pointer("/spec/clusterIP")
-                        .and_then(|i| i.as_str())
-                        .map(String::from);
-                    let ports = item.pointer("/spec/ports").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-                    let first_port = ports.first();
-                    let node_port = first_port.and_then(|p| p.get("nodePort")).and_then(|n| n.as_i64());
-                    let target_port = first_port
-                        .and_then(|p| p.get("targetPort"))
-                        .and_then(|n| n.as_i64());
-                    out.services.push(ServiceInfo {
-                        name,
-                        service_type,
-                        cluster_ip,
-                        node_port,
-                        target_port,
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PodLogsInput {
-    pod_name: String,
-    #[serde(default)]
-    container: Option<String>,
-    #[serde(default)]
-    tail_lines: Option<i64>,
-    #[serde(default)]
-    cluster_name: Option<String>,
-    #[serde(default)]
-    namespace: Option<String>,
-    /// See LocalRuntimeInput.engine — "microvm" reads through the
-    /// microVM's kubeconfig.
-    #[serde(default)]
-    engine: Option<String>,
-}
-
-#[tauri::command]
-async fn tail_local_pod_logs(
-    app: AppHandle,
-    input: PodLogsInput,
-) -> Result<String, String> {
-    let runtime_input = LocalRuntimeInput {
-        cluster_name: input.cluster_name.clone(),
-        namespace: input.namespace.clone(),
-        ..Default::default()
-    };
-    let cfg = resolve_runtime_config(&app, &runtime_input)?;
-    let target = kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?;
-    let tail = input.tail_lines.unwrap_or(200).to_string();
-    let mut args: Vec<&str> = vec!["kubectl"];
-    args.extend(target.iter().map(String::as_str));
-    args.extend(["-n", &cfg.namespace, "logs", &input.pod_name, "--tail", &tail]);
-    if let Some(c) = input.container.as_deref() {
-        args.push("-c");
-        args.push(c);
-    }
-    let (ok, stdout, stderr) = run_status_command(&args).await?;
-    if !ok {
-        return Err(format!("kubectl logs failed: {}", stderr));
-    }
-    Ok(stdout)
 }
 
 // --- interactive terminals (PTY) ------------------------------------
@@ -4335,8 +4131,6 @@ pub fn run() {
             local_helper_install,
             local_preflight,
             start_container_runtime,
-            list_local_workloads,
-            tail_local_pod_logs,
             read_appliance_manifest,
             build_and_import_image,
             bootstrap_in_cluster_api_server,

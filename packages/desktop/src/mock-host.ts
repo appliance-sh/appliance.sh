@@ -6,7 +6,6 @@ import type {
   ConsoleHost,
   HostConfig,
   LocalPreflightCheck,
-  LocalWorkloads,
 } from '@appliance.sh/app';
 
 // Browser-runnable stand-in for the Tauri host, so the desktop-only
@@ -181,55 +180,6 @@ function preflight(): LocalPreflightCheck[] {
   ];
 }
 
-const WORKLOADS: LocalWorkloads = {
-  deployments: [
-    {
-      name: 'demo-node-dev',
-      image: 'localhost:5052/demo-node-container:latest',
-      desired: 1,
-      ready: 1,
-      available: 1,
-      createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
-    },
-    {
-      name: 'demo-python-dev',
-      image: 'localhost:5052/demo-python-container:latest',
-      desired: 1,
-      ready: 0,
-      available: 0,
-      createdAt: new Date(Date.now() - 3 * 60_000).toISOString(),
-    },
-  ],
-  pods: [
-    {
-      name: 'demo-node-dev-5c58d6c8d-dmbfn',
-      phase: 'Running',
-      ready: true,
-      restartCount: 0,
-      containerImage: 'localhost:5052/demo-node-container:latest',
-      createdAt: new Date(Date.now() - 40 * 60_000).toISOString(),
-    },
-    {
-      name: 'demo-python-dev-7f9c4b6d5-x2x9k',
-      phase: 'Pending',
-      ready: false,
-      restartCount: 2,
-      containerImage: 'localhost:5052/demo-python-container:latest',
-      createdAt: new Date(Date.now() - 3 * 60_000).toISOString(),
-    },
-  ],
-  services: [
-    { name: 'demo-node-dev', serviceType: 'NodePort', clusterIp: '10.43.42.92', nodePort: 30006, targetPort: 3000 },
-    { name: 'demo-python-dev', serviceType: 'NodePort', clusterIp: '10.43.123.197', nodePort: 30030, targetPort: 8080 },
-  ],
-};
-
-const POD_LOGS = [
-  '{"timestamp":"2026-06-10T12:46:02.011Z","level":"info","message":"server started","port":3000}',
-  '{"timestamp":"2026-06-10T12:46:02.058Z","level":"info","message":"request","path":"/","status":200}',
-  '{"timestamp":"2026-06-10T12:47:11.402Z","level":"info","message":"request","path":"/healthz","status":200}',
-].join('\n');
-
 // ---- host ---------------------------------------------------------------
 
 export function createMockHost(): ConsoleHost {
@@ -381,15 +331,6 @@ export function createMockHost(): ConsoleHost {
         }
         await sleep(1_500);
         getRuntime().daemonRunning = true;
-      },
-
-      async listWorkloads() {
-        return WORKLOADS;
-      },
-
-      async tailPodLogs() {
-        await sleep(300);
-        return POD_LOGS;
       },
 
       async pickDirectory() {

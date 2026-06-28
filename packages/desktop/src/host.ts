@@ -29,10 +29,7 @@ import type {
   LocalBuildAndImportInput,
   LocalHelperInstallResult,
   LocalLogEvent,
-  LocalPodLogsInput,
   LocalPreflightCheck,
-  LocalRuntimeInput,
-  LocalWorkloads,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,
@@ -175,12 +172,6 @@ export const tauriHost: ConsoleHost = {
     },
     async startContainerRuntime(): Promise<void> {
       await invoke('start_container_runtime');
-    },
-    async listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads> {
-      return invoke<LocalWorkloads>('list_local_workloads', { input: input ?? null });
-    },
-    async tailPodLogs(input: LocalPodLogsInput): Promise<string> {
-      return invoke<string>('tail_local_pod_logs', { input });
     },
     async pickDirectory(): Promise<string | null> {
       // Tauri's dialog plugin returns the chosen folder path, or null
