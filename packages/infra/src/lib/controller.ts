@@ -14,8 +14,9 @@ export function lookup(baseConfig: ApplianceBaseConfigInput) {
       // the api-server's KubernetesDeploymentService handles the
       // whole deploy/destroy cycle directly via the k8s API. The
       // declarative `applianceInfra()` entrypoint is AWS-only.
+      // (ApplianceLocal is a deprecated alias of ApplianceKubernetes.)
       throw new Error(
-        `${baseConfig.type} bases do not have a Pulumi-managed baseline; use the desktop or apply the api-server manifest directly to manage cluster lifecycle.`
+        `${baseConfig.type} bases do not have a Pulumi-managed baseline; bring up the microVM runtime (\`appliance vm up\`) or apply the api-server manifest directly to manage cluster lifecycle.`
       );
   }
 }

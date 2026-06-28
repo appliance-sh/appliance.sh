@@ -3,25 +3,28 @@ import { z } from 'zod';
 export enum ApplianceBaseType {
   ApplianceAwsPublic = 'appliance-base-aws-public',
   ApplianceAwsVpc = 'appliance-base-aws-vpc',
-  // Local container runtime backed by a Kubernetes cluster on the
-  // developer's machine (k3d/kind/colima). Mirrors the cloud bases'
-  // deploy/destroy surface but maps each appliance to a k8s
-  // Deployment + Service rather than a Lambda. Used by the desktop
-  // for offline / single-machine development.
+  /**
+   * @deprecated Use {@link ApplianceBaseType.ApplianceKubernetes}. This
+   * was the host-side k3d local runtime, which has been removed — the
+   * microVM (an `appliance-base-kubernetes` cluster under the hood) is
+   * now the sole local runtime. The enum value & schema are retained
+   * for back-compat: the executor/infra still branch on it for deploys
+   * created before the cutover.
+   */
   ApplianceLocal = 'appliance-base-local',
   // Generic Kubernetes base: api-server drives an arbitrary k8s
-  // cluster identified by URL + credentials. Same machinery as
-  // ApplianceLocal under the hood, but without the desktop-managed
-  // k3d lifecycle assumptions — connection details are explicit
-  // rather than discovered from the host's default kubeconfig.
+  // cluster identified by URL + credentials (inline kubeconfig or
+  // server + token). The microVM local runtime uses this variant. The
+  // sole Kubernetes-driven base going forward.
   ApplianceKubernetes = 'appliance-base-kubernetes',
 }
 
 // True for any base whose deploys go through the Kubernetes API
 // client (KubernetesDeploymentService), rather than Pulumi. Use
-// this to gate branches that are about "is this a k8s-driven base"
-// rather than "is this specifically the k3d-on-developer-laptop
-// base." Doubles as a TypeScript type guard: callers that pass a
+// this to gate branches that are about "is this a k8s-driven base."
+// Stays true for `appliance-base-kubernetes` (the microVM runtime and
+// BYO clusters) and the deprecated `appliance-base-local` alias.
+// Doubles as a TypeScript type guard: callers that pass a
 // discriminated-union value get the union narrowed to the k8s
 // variants on the truthy branch and the non-k8s variants on the
 // falsy branch.
@@ -65,18 +68,18 @@ export const applianceAwsVpcInput = applianceBaseAwsInput.extend({
 
 export type ApplianceBaseAwsVpcInput = z.infer<typeof applianceAwsVpcInput>;
 
-// Local container runtime base. `dns` is omitted because services
-// are reached via host-side port forwards (`kubectl port-forward`)
-// or a NodePort/Ingress published by the k3d loadbalancer — there is
-// no Route 53 equivalent. `cluster` carries the bits the api-server
-// needs to talk to the local kube-apiserver and pick a namespace
-// for appliance workloads.
+/**
+ * @deprecated Use {@link applianceKubernetesInput}. The host-side k3d
+ * local runtime this described has been removed; retained so deploys
+ * created before the cutover still parse. `dns` is omitted because
+ * services are reached via a NodePort/Ingress published by the local
+ * runtime — there is no Route 53 equivalent.
+ */
 export const applianceLocalInput = applianceBaseInput.omit({ dns: true }).extend({
   type: z.literal(ApplianceBaseType.ApplianceLocal),
   cluster: z
     .object({
-      // k3d cluster name. Defaults to `appliance-local` when omitted.
-      // The desktop manages cluster lifecycle by this name.
+      // Cluster name. Defaults to `appliance-local` when omitted.
       clusterName: z.string().optional(),
       // Kubernetes namespace appliances get deployed into. Auto-created
       // by the deployment service on first deploy when missing.
@@ -88,6 +91,7 @@ export const applianceLocalInput = applianceBaseInput.omit({ dns: true }).extend
     .optional(),
 });
 
+/** @deprecated Use {@link ApplianceKubernetesInput}. */
 export type ApplianceLocalInput = z.infer<typeof applianceLocalInput>;
 
 // Generic Kubernetes base. The caller supplies enough to construct a
@@ -121,8 +125,8 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
     // Host-side port the cluster's ingress/LB is reachable on from
     // the operator's machine — used only to compose the URLs reported
     // back from deploys (`http://<host>[:<hostPort>]`). Defaults to
-    // 80 (a directly-routable cluster); the desktop-managed k3d
-    // runtime publishes its serverlb on 8081 and sets this.
+    // 80 (a directly-routable cluster); the microVM local runtime
+    // publishes its ingress on 8081 and sets this.
     hostPort: z.number().int().min(1).max(65535).optional(),
     // Path mounted into the api-server pod that backs the
     // FilesystemObjectStore. Typically a PVC mount such as `/data`.
@@ -197,11 +201,13 @@ export const applianceBaseConfig = z.object({
         .optional(),
     })
     .optional(),
-  // Local container runtime config. Present for
-  // `appliance-base-local` bases. `dataDir` is an absolute path the
-  // api-server uses as the filesystem object store root (replaces
-  // S3 for projects/environments/deployments). `cluster` mirrors
-  // the input shape; defaults are filled in by the consumer.
+  // Deprecated local container runtime config. Present only for legacy
+  // `appliance-base-local` bases (the host-side k3d runtime has been
+  // removed; `appliance-base-kubernetes` + its `kubernetes` block is the
+  // replacement). `dataDir` is an absolute path the api-server uses as
+  // the filesystem object store root (replaces S3 for
+  // projects/environments/deployments). `cluster` mirrors the input
+  // shape; defaults are filled in by the consumer.
   local: z
     .object({
       dataDir: z.string(),
@@ -219,9 +225,9 @@ export const applianceBaseConfig = z.object({
           // setups that route via custom DNS.
           hostnameSuffix: z.string().optional(),
           // Ingress class the per-appliance Ingress declares.
-          // Defaults to k3s/k3d's built-in `traefik` controller.
-          // Override for clusters that swapped in nginx-ingress or
-          // similar.
+          // Defaults to the local runtime's built-in `traefik`
+          // controller. Override for clusters that swapped in
+          // nginx-ingress or similar.
           ingressClassName: z.string().optional(),
         })
         .optional(),

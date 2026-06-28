@@ -105,8 +105,9 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
 
     let result;
     if (baseConfig && isKubernetesBase(baseConfig)) {
-      // Kubernetes-driven runtime (local k3d + generic external
-      // cluster) — no Pulumi, no cancel-aware stack handle. Build
+      // Kubernetes-driven runtime (the microVM local runtime + any
+      // generic external cluster) — no Pulumi, no cancel-aware stack
+      // handle. Build
       // resolution still flows through buildService so the upstream
       // upload/remote-image distinction is preserved, but the
       // executor maps the resolved bits into LocalResolvedBuild

@@ -1,10 +1,6 @@
 import * as k8s from '@kubernetes/client-node';
 import * as fs from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
-
-const execFileAsync = promisify(execFile);
 
 // Egress confinement (see docs/microvm.md): the host (appliance-vm)
 // publishes the policy into this ConfigMap; the executor reflects it
@@ -19,12 +15,12 @@ export const DEFAULT_LOCAL_CLUSTER_NAME = 'appliance-local';
 export const DEFAULT_LOCAL_NAMESPACE = 'appliance';
 export const DEFAULT_LOCAL_HOST_PORT = 8081;
 
-// NodePort window the demo k3d cluster maps onto the host. Picked
-// small (51 ports) so the docker-proxy footprint on macOS stays
-// tractable — at ~2700 ports the colima daemon has been observed to
-// fall over. The deployment service derives a deterministic NodePort
-// from the stack name within this range so each appliance ends up
-// reachable on a stable host port.
+// NodePort window the local runtime maps onto the host. Picked small
+// (51 ports) so the docker-proxy footprint on macOS stays tractable —
+// at ~2700 ports the colima daemon has been observed to fall over. The
+// deployment service derives a deterministic NodePort from the stack
+// name within this range so each appliance ends up reachable on a stable
+// host port.
 export const DEFAULT_LOCAL_NODEPORT_MIN = 30000;
 export const DEFAULT_LOCAL_NODEPORT_MAX = 30050;
 
@@ -122,19 +118,19 @@ const ROLLOUT_POLL_INTERVAL_MS = 1_000;
 
 /**
  * Drives appliance deploys against an arbitrary Kubernetes cluster
- * (`appliance-base-local` k3d, or `appliance-base-kubernetes` for any
- * cluster reachable via URL + credentials). Maps each deploy to a
+ * (`appliance-base-local`, the deprecated alias, or
+ * `appliance-base-kubernetes` for any cluster reachable via URL +
+ * credentials — including the microVM runtime). Maps each deploy to a
  * Deployment + Service + Ingress trio in the configured namespace;
  * destroy tears the same trio down.
  *
  * Talks to the cluster via `@kubernetes/client-node` rather than
  * shelling out to `kubectl`, so the same code path works whether
- * api-server runs on the host pointing at k3d, in-cluster via a
- * ServiceAccount, or against a remote control plane.
+ * api-server runs in-cluster via a ServiceAccount or against a remote
+ * control plane.
  *
- * Cluster lifecycle (create/start/stop of the underlying k3d cluster)
- * remains the desktop's responsibility — see Tauri's
- * `start_local_cluster` etc.
+ * Cluster lifecycle (boot/stop of the underlying runtime) remains the
+ * microVM engine's (appliance-vm) responsibility.
  */
 export class KubernetesDeploymentService {
   private readonly cluster: ClusterConfig;
@@ -168,11 +164,10 @@ export class KubernetesDeploymentService {
     build: LocalResolvedBuild
   ): Promise<LocalDeploymentResult> {
     await this.ensureNamespace();
-    // Best-effort import: silently skips when the image is not in the
-    // host Docker daemon, the k3d CLI is missing, or the base is a
-    // generic (non-k3d) Kubernetes cluster. For those cases k8s falls
-    // back to a registry pull, which is the desired behaviour.
-    await this.maybeImportImage(build.imageUri);
+    // Image delivery is registry-only: the build pipeline pushes the
+    // image to a registry the cluster can reach (the microVM's in-VM
+    // registry, or a BYO cluster's). There is no host-side image import
+    // anymore — k8s pulls from the registry.
 
     const nodePort = deterministicNodePort(stackName);
     const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
@@ -448,31 +443,6 @@ export class KubernetesDeploymentService {
     await this.core.createNamespace({
       body: { apiVersion: 'v1', kind: 'Namespace', metadata: { name: this.cluster.namespace } },
     });
-  }
-
-  private async maybeImportImage(image: string): Promise<void> {
-    // Image-import is only meaningful for the k3d-on-laptop runtime.
-    // Generic Kubernetes bases must have the image already pushed to
-    // a registry the cluster can reach.
-    if (this.baseConfig.type !== ApplianceBaseType.ApplianceLocal) return;
-    // Only push host-built images into k3d. Anything with a registry
-    // host (a `.` or `:port` before the first slash) is treated as
-    // remote-pull territory and skipped.
-    if (isRegistryReference(image)) return;
-    try {
-      await execFileAsync('k3d', ['image', 'import', image, '-c', this.cluster.clusterName], {
-        maxBuffer: 64 * 1024 * 1024,
-      });
-    } catch (err) {
-      // k3d not installed, image missing from host daemon, etc. —
-      // let the deploy proceed: kubelet will surface ImagePullBackOff
-      // on the Pod which the rollout-wait will then time out on.
-      // Surfacing the import error here would hide unrelated failures.
-      const message = err instanceof Error ? err.message : String(err);
-      if (!/already in use|exists/.test(message)) {
-        console.warn(`k3d image import skipped: ${message}`);
-      }
-    }
   }
 
   /**
@@ -806,11 +776,6 @@ function idempotentMessage(noop: boolean, hostnameUrl: string, nodePortUrl: stri
   return `Stack updated. URL: ${hostnameUrl}`;
 }
 
-function isRegistryReference(image: string): boolean {
-  const firstSegment = image.split('/')[0];
-  return firstSegment.includes('.') || firstSegment.includes(':');
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -821,7 +786,7 @@ export interface ManifestParams {
   image: string;
   port: number;
   /** Explicit NodePort the Service should bind. When omitted, k8s
-   *  picks any free port in 30000-32767. The demo cluster only
+   *  picks any free port in 30000-32767. The local runtime only
    *  publishes a small NodePort window, so the executor sets this
    *  deterministically per stack via deterministicNodePort(). */
   nodePort?: number;
@@ -830,7 +795,7 @@ export interface ManifestParams {
   /** Public hostname Traefik routes to this appliance via the
    *  generated Ingress. Typically `<stackName>.appliance.localhost`. */
   hostname: string;
-  /** IngressClass the Ingress declares (k3s/k3d ships `traefik`). */
+  /** IngressClass the Ingress declares (the local runtime ships `traefik`). */
   ingressClassName: string;
   /** Outbound-traffic confinement. When set, the workload is wired to
    *  route egress through the runtime's proxy (HTTP(S)_PROXY) so the

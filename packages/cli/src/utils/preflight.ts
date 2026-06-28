@@ -26,15 +26,15 @@ import type { StatusEntry } from '@appliance.sh/helper';
  *  (`docker pull`) and the bootstrap path can never drift apart. */
 export const PUBLISHED_API_SERVER_IMAGE = IN_CLUSTER_API_SERVER_DEFAULT_IMAGE;
 
-/** The microVM (and local k3d) runtimes can't emulate, so the
- *  api-server image must carry the host's architecture. Mirrors
- *  VM_HOST_ARCH in appliance-vm.ts. */
+/** The microVM runtime can't emulate, so the api-server image must
+ *  carry the host's architecture. Mirrors VM_HOST_ARCH in
+ *  appliance-vm.ts. */
 export const HOST_ARCH: 'arm64' | 'amd64' = process.arch === 'arm64' ? 'arm64' : 'amd64';
 
-/** Ports the default local/microVM runtimes forward on the host. A
- *  conflicting listener here is the single most common cause of a
- *  silent first-run failure (k3d binds the port, the bind fails, the
- *  cluster start times out with an opaque message). */
+/** Ports the microVM runtime forwards on the host. A conflicting
+ *  listener here is the single most common cause of a silent first-run
+ *  failure (the runtime can't bind the port, and startup times out with
+ *  an opaque message). */
 export const REQUIRED_PORTS: PortSpec[] = [
   { port: 8081, purpose: 'ingress (HTTP) — *.appliance.localhost', probe: 'http://127.0.0.1:8081/' },
   { port: 6443, purpose: 'kubernetes API server', tlsProbe: true },
@@ -107,7 +107,7 @@ export async function checkDockerRuntime(): Promise<CheckResult> {
       'docker',
       'Container runtime (Docker)',
       'docker CLI not found on PATH',
-      'Install a container runtime — Docker Desktop, OrbStack, or Colima (`brew install colima docker`). See `appliance local install`.'
+      'Install a container runtime — Docker Desktop, OrbStack, or Colima (`brew install colima docker`).'
     );
   }
   const daemon = await runtimeDaemonStatus();
@@ -119,7 +119,7 @@ export async function checkDockerRuntime(): Promise<CheckResult> {
     'Container runtime (Docker)',
     `${version} — installed, but the daemon is not reachable`,
     daemon.startable
-      ? 'Docker is installed but its colima VM is stopped. Run `colima start` (or `appliance local runtime start`).'
+      ? 'Docker is installed but its colima VM is stopped. Run `colima start`.'
       : 'Start your container runtime (Docker Desktop / OrbStack, or `colima start`), then re-run `appliance doctor`.'
   );
 }
@@ -161,7 +161,7 @@ export function checkBun(): CheckResult {
 
 // ---- helper-managed binaries -------------------------------------------
 
-/** crane / kubectl / k3d from the helper provider registry. Probed via
+/** crane / kubectl from the helper provider registry. Probed via
  *  `runStatus` so the resolution order (managed bin dir → PATH) matches
  *  exactly what the rest of the CLI uses. `crane` is optional (microVM
  *  only) → `warn`; the required tools → `fail`. */
@@ -174,9 +174,9 @@ export async function checkHelperBinaries(): Promise<CheckResult[]> {
     return [
       fail(
         'helper-binaries',
-        'Helper binaries (crane, kubectl, k3d)',
+        'Helper binaries (crane, kubectl)',
         `could not probe helper providers: ${message}`,
-        'Run `appliance local install` to install the helper-managed binaries.'
+        'Install the helper-managed binaries (kubectl, crane), then re-run `appliance doctor`.'
       ),
     ];
   }
@@ -191,7 +191,7 @@ export async function checkHelperBinaries(): Promise<CheckResult[]> {
         return pass(`bin:${provider.name}`, label, check.version);
       }
       const remediation = provider.autoInstallable
-        ? `Run \`appliance local install ${provider.name}\` to install it under ${helperBinDir()}.`
+        ? `Install ${provider.name} under ${helperBinDir()} or via your package manager; the microVM runtime fetches it automatically on \`appliance vm up\` when missing.`
         : provider.manualInstall({ binDir: helperBinDir(), platform: 'darwin', arch: 'arm64' }).instructions;
       const detail = check.error ?? 'not installed';
       // crane is microVM-only and not "required" — a missing crane only
