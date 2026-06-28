@@ -45,6 +45,27 @@ export function keychainAccountFor(name: string, profile: Pick<Profile, 'managed
 }
 
 /**
+ * Parse the raw password payload a desktop-written Keychain entry stores
+ * (a serialized ApiKey, `{"id","secret"}`). Pure and unit-testable: trims,
+ * JSON-parses, and guards that both fields are non-empty strings. Returns
+ * null on any malformed / empty / non-string payload so callers fall back
+ * to the profiles.json copy. Never logs the secret.
+ */
+export function parseKeychainPayload(out: string): KeychainApiKey | null {
+  const trimmed = out.trim();
+  if (!trimmed) return null;
+  let parsed: { id?: unknown; secret?: unknown };
+  try {
+    parsed = JSON.parse(trimmed) as { id?: unknown; secret?: unknown };
+  } catch {
+    return null;
+  }
+  if (typeof parsed.id !== 'string' || typeof parsed.secret !== 'string') return null;
+  if (parsed.id.length === 0 || parsed.secret.length === 0) return null;
+  return { keyId: parsed.id, secret: parsed.secret };
+}
+
+/**
  * Read a desktop-written Keychain entry, avoiding a GUI prompt where
  * possible. Uses `security find-generic-password -w`, which prints the
  * stored password (the JSON ApiKey) to stdout. A cross-binary read of an
@@ -60,14 +81,10 @@ export function readKeychainApiKey(account: string): KeychainApiKey | null {
     const out = execFileSync(SECURITY_BIN, ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (!out) return null;
-    const parsed = JSON.parse(out) as { id?: unknown; secret?: unknown };
-    if (typeof parsed.id !== 'string' || typeof parsed.secret !== 'string') return null;
-    if (parsed.id.length === 0 || parsed.secret.length === 0) return null;
-    return { keyId: parsed.id, secret: parsed.secret };
+    });
+    return parseKeychainPayload(out);
   } catch {
-    // Item missing, malformed, or access denied — fall back to file.
+    // Item missing or access denied — fall back to file.
     return null;
   }
 }

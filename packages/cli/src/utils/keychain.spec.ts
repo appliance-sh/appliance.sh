@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chooseCredential, keychainAccountFor, type KeychainApiKey } from './keychain.js';
+import { chooseCredential, keychainAccountFor, parseKeychainPayload, type KeychainApiKey } from './keychain.js';
 
 describe('chooseCredential', () => {
   const fileCopy = { keyId: 'file-key', secret: 'file-secret' };
@@ -46,5 +46,34 @@ describe('keychainAccountFor', () => {
     } else {
       expect(account).toBeNull();
     }
+  });
+});
+
+describe('parseKeychainPayload', () => {
+  it('parses a well-formed payload into an ApiKey', () => {
+    expect(parseKeychainPayload('{"id":"k1","secret":"s1"}')).toEqual({ keyId: 'k1', secret: 's1' });
+  });
+
+  it('trims surrounding whitespace before parsing (security -w appends a newline)', () => {
+    expect(parseKeychainPayload('  {"id":"k1","secret":"s1"}\n')).toEqual({ keyId: 'k1', secret: 's1' });
+  });
+
+  it('returns null for an empty or whitespace-only payload', () => {
+    expect(parseKeychainPayload('')).toBeNull();
+    expect(parseKeychainPayload('   \n')).toBeNull();
+  });
+
+  it('returns null for a malformed (non-JSON) payload instead of throwing', () => {
+    expect(parseKeychainPayload('not json')).toBeNull();
+    expect(parseKeychainPayload('{ unterminated')).toBeNull();
+  });
+
+  it('returns null when id/secret are missing, non-string, or empty', () => {
+    expect(parseKeychainPayload('{"secret":"s1"}')).toBeNull();
+    expect(parseKeychainPayload('{"id":"k1"}')).toBeNull();
+    expect(parseKeychainPayload('{"id":42,"secret":"s1"}')).toBeNull();
+    expect(parseKeychainPayload('{"id":"k1","secret":null}')).toBeNull();
+    expect(parseKeychainPayload('{"id":"","secret":"s1"}')).toBeNull();
+    expect(parseKeychainPayload('{"id":"k1","secret":""}')).toBeNull();
   });
 });

@@ -523,12 +523,13 @@ fn ingest_shared_into_legacy(
 /// SCOPE: this guards in-PROCESS races only (it's a process-global
 /// Mutex). It does NOT serialize against the CLI, which is a separate
 /// process that performs its own read-modify-write of profiles.json
-/// (e.g. `appliance keys rotate`). A cross-process advisory file lock
-/// around profiles.json is the remaining piece of stage-3 concurrency
-/// safety — see docs/credentials.md. Until then the window is small
-/// (both sides do atomic temp-file renames, so neither can read a
-/// half-written file; the risk is purely last-writer-wins on
-/// interleaved full read→write cycles).
+/// (e.g. `appliance keys rotate`). The CLI now takes a cross-process
+/// advisory lockfile (profiles.json.lock) around its own RMW cycles;
+/// the remaining piece is having THIS desktop adopt the same lockfile —
+/// see docs/credentials.md. Until it does, a desktop↔CLI interleave is
+/// still last-writer-wins (both sides do atomic temp-file renames, so
+/// neither can read a half-written file; the residual risk is purely a
+/// lost write on interleaved full read→write cycles).
 fn config_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

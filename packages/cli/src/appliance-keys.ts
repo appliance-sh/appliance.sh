@@ -14,13 +14,31 @@ import { keychainAccountFor, writeKeychainApiKey } from './utils/keychain.js';
 // failed desktop-managed write leaves a differing keyId, which makes
 // resolveProfileSecret prefer this fresher file copy over the stale
 // Keychain one.
-function persistRotatedCredential(profileName: string, profile: Profile, next: { id: string; secret: string }): void {
+//
+// Returns `keychainWriteFailed: true` only when the Keychain was the
+// canonical store for this profile (desktop-managed on macOS) AND the
+// write to it failed — e.g. the user declined the ACL prompt. The new
+// key is safe in profiles.json either way, but in that case the desktop
+// keeps reading its stale Keychain copy, so the caller must warn instead
+// of promising automatic pickup.
+function persistRotatedCredential(
+  profileName: string,
+  profile: Profile,
+  next: { id: string; secret: string }
+): { keychainWriteFailed: boolean } {
   const account = keychainAccountFor(profileName, profile);
-  if (account && writeKeychainApiKey(account, { keyId: next.id, secret: next.secret })) {
-    upsertProfile(profileName, { ...profile, keyId: next.id, secret: '' }, { makeActive: false });
-    return;
+  if (account) {
+    if (writeKeychainApiKey(account, { keyId: next.id, secret: next.secret })) {
+      upsertProfile(profileName, { ...profile, keyId: next.id, secret: '' }, { makeActive: false });
+      return { keychainWriteFailed: false };
+    }
+    // Canonical store unreachable: keep the secret in profiles.json so the
+    // CLI still works, and signal the degraded write to the caller.
+    upsertProfile(profileName, { ...profile, keyId: next.id, secret: next.secret }, { makeActive: false });
+    return { keychainWriteFailed: true };
   }
   upsertProfile(profileName, { ...profile, keyId: next.id, secret: next.secret }, { makeActive: false });
+  return { keychainWriteFailed: false };
 }
 
 // `appliance keys` — lifecycle for the cluster's API credentials.
@@ -119,17 +137,31 @@ program
     // Atomic swap: preserve every other field on the profile (apiUrl,
     // managed, stateBackendUrl, lastBootstrapInput, createdAt) and only
     // replace the credential material (Keychain-first on macOS).
-    persistRotatedCredential(profileName, profile, next);
+    const { keychainWriteFailed } = persistRotatedCredential(profileName, profile, next);
 
     console.log();
     console.log(`${chalk.green('✓')} Rotated. Profile ${chalk.bold(profileName)} now uses key ${chalk.bold(next.id)}.`);
     console.log(chalk.dim('  The previous key has been revoked server-side.'));
     if (profile.managed !== 'cli') {
-      console.log(
-        chalk.dim(
-          '  The desktop app picks up the rotated key automatically on its next cluster sync ' + '(no action needed).'
-        )
-      );
+      if (keychainWriteFailed) {
+        // Desktop-managed on macOS, but the canonical Keychain write failed
+        // (the new key is only in profiles.json). The desktop reads the
+        // Keychain, so it would keep using the old, server-revoked key with
+        // no automatic recovery — say so instead of promising auto-pickup.
+        console.log(
+          chalk.yellow(
+            '  Saved to profiles.json, but couldn’t update the macOS Keychain (access may have been denied). ' +
+              'The desktop app may keep using the old key until you re-authenticate the cluster there ' +
+              'or re-run `appliance keys rotate`.'
+          )
+        );
+      } else {
+        console.log(
+          chalk.dim(
+            '  The desktop app picks up the rotated key automatically on its next cluster sync ' + '(no action needed).'
+          )
+        );
+      }
     }
   });
 
