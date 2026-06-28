@@ -75,8 +75,14 @@ program
           keyId: profile.keyId,
           // Truncate so a copy-pasted terminal log doesn't leak the
           // full key, while still letting the user recognise which
-          // key they're using.
-          secret: profile.secret ? `${profile.secret.slice(0, 6)}…(redacted)` : null,
+          // key they're using. On macOS a desktop-managed cluster's
+          // secret lives in the Keychain, not the file — say so rather
+          // than render a misleading null.
+          secret: profile.secret
+            ? `${profile.secret.slice(0, 6)}…(redacted)`
+            : profile.managed === 'desktop' && process.platform === 'darwin'
+              ? '(stored in macOS Keychain)'
+              : null,
           createdAt: profile.createdAt ?? null,
           managed: profile.managed ?? null,
           stateBackendUrl: profile.stateBackendUrl ?? null,

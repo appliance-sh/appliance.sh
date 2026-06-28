@@ -3,7 +3,25 @@ import chalk from 'chalk';
 import { createApplianceClient } from '@appliance.sh/sdk';
 import { loadCredentials, getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
-import { readProfiles, resolveProfile, upsertProfile } from './utils/profile-store.js';
+import { type Profile, readProfiles, resolveProfile, upsertProfile } from './utils/profile-store.js';
+import { keychainAccountFor, writeKeychainApiKey } from './utils/keychain.js';
+
+// Persist a freshly-rotated credential. On macOS a desktop-managed
+// cluster's secret is canonical in the Keychain, so push the new key
+// there and keep the cleartext OUT of profiles.json (metadata-only
+// entry). Everywhere else — and if the Keychain write fails so the user
+// isn't stranded — the secret is written to profiles.json (0600); a
+// failed desktop-managed write leaves a differing keyId, which makes
+// resolveProfileSecret prefer this fresher file copy over the stale
+// Keychain one.
+function persistRotatedCredential(profileName: string, profile: Profile, next: { id: string; secret: string }): void {
+  const account = keychainAccountFor(profileName, profile);
+  if (account && writeKeychainApiKey(account, { keyId: next.id, secret: next.secret })) {
+    upsertProfile(profileName, { ...profile, keyId: next.id, secret: '' }, { makeActive: false });
+    return;
+  }
+  upsertProfile(profileName, { ...profile, keyId: next.id, secret: next.secret }, { makeActive: false });
+}
 
 // `appliance keys` — lifecycle for the cluster's API credentials.
 //
@@ -93,15 +111,15 @@ program
       // old one is revoked, so the unsaved-but-valid id/secret is the
       // only working credential. Save it, then exit non-zero so the
       // failure is visible.
-      upsertProfile(profileName, { ...profile, keyId: next.id, secret: next.secret }, { makeActive: false });
+      persistRotatedCredential(profileName, profile, next);
       console.error(chalk.dim(`  (saved the new key to profile ${profileName} as a fallback)`));
       process.exit(1);
     }
 
     // Atomic swap: preserve every other field on the profile (apiUrl,
     // managed, stateBackendUrl, lastBootstrapInput, createdAt) and only
-    // replace the credential material.
-    upsertProfile(profileName, { ...profile, keyId: next.id, secret: next.secret }, { makeActive: false });
+    // replace the credential material (Keychain-first on macOS).
+    persistRotatedCredential(profileName, profile, next);
 
     console.log();
     console.log(`${chalk.green('✓')} Rotated. Profile ${chalk.bold(profileName)} now uses key ${chalk.bold(next.id)}.`);

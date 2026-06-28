@@ -130,16 +130,25 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, HostError> {
 // ============================================================
 // Shared profile store: ~/.appliance/profiles.json
 //
+// CREDENTIAL MODEL (E4.4, Keychain-first — see docs/control-plane.md §5):
+//   * macOS: the OS Keychain (account `cluster:<id>`) is the CANONICAL
+//     store for each desktop-managed cluster's secret. profiles.json
+//     carries only metadata (apiUrl, keyId, name, …) with an EMPTY
+//     secret, and the CLI reads the secret back from the Keychain. The
+//     secret is therefore never duplicated to cleartext on disk.
+//   * non-macOS (Linux/cloud/CI): profiles.json (mode 0600) is the
+//     canonical store, since the CLI cannot read libsecret/DPAPI. The
+//     desktop dual-writes the secret to the file there, as before.
+//
 // The desktop runs in DUAL-MODE persistence:
 //   1. The OS keychain holds each cluster's API key secret (account
-//      `cluster:<id>`). This is the more-secure store and stays the
-//      primary source for secrets on the desktop side.
+//      `cluster:<id>`). The canonical secret store on macOS.
 //   2. The legacy <app-config>/config.json holds cluster metadata
 //      (name, URL, createdAt, etc.) — kept as a mirror so a downgrade
 //      to the previous desktop binary remains non-destructive.
-//   3. ~/.appliance/profiles.json mirrors BOTH metadata and secrets in
-//      a format the CLI reads directly. Updated on every persisted
-//      write so the CLI sees the same clusters the desktop sees.
+//   3. ~/.appliance/profiles.json mirrors metadata (and, on non-macOS,
+//      the secret) in a format the CLI reads directly. Updated on every
+//      persisted write so the CLI sees the same clusters the desktop sees.
 //
 // Reads prefer the legacy file when it has clusters; otherwise the
 // shared file is ingested into the legacy stores so the rest of the
@@ -239,11 +248,26 @@ fn write_shared_profiles(file: &SharedProfilesFile) -> Result<(), HostError> {
     Ok(())
 }
 
+/// The secret to persist into the shared profiles.json for a
+/// desktop-managed cluster. On macOS the Keychain is canonical, so the
+/// file gets an EMPTY secret (the CLI reads it back from the Keychain) —
+/// the secret is never written to cleartext on disk. Elsewhere the file
+/// is canonical, so the secret is written through. Pure so the policy is
+/// unit-testable on any host.
+fn shared_secret_for_platform(secret: String, is_macos: bool) -> String {
+    if is_macos {
+        String::new()
+    } else {
+        secret
+    }
+}
+
 /// Reflect the current desktop-side state into the shared file. Reads
-/// each cluster's secret out of the keychain; clusters without a
-/// keychain secret get the entry left as-is from any prior write
-/// (defensive — partial state is more useful than a missing entry).
-/// CLI-managed entries (managed != "desktop") are preserved untouched.
+/// each cluster's secret out of the keychain (for the key_id metadata,
+/// and the secret itself on non-macOS); clusters without a keychain
+/// secret get the entry left as-is from any prior write (defensive —
+/// partial state is more useful than a missing entry). CLI-managed
+/// entries (managed != "desktop") are preserved untouched.
 fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
     let mut file = read_shared_profiles().unwrap_or_default();
     file.profiles.retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
@@ -273,7 +297,7 @@ fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
             SharedProfileEntry {
                 api_url: cluster.api_server_url.clone(),
                 key_id,
-                secret: secret_value,
+                secret: shared_secret_for_platform(secret_value, cfg!(target_os = "macos")),
                 created_at: Some(cluster.created_at.clone()),
                 state_backend_url: cluster.state_backend_url.clone(),
                 last_bootstrap_input: cluster.last_bootstrap_input.clone(),
@@ -287,27 +311,27 @@ fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
 }
 
 // ============================================================
-// Single-source-of-truth migration (stage 1: non-destructive seed)
+// Non-macOS profile seed (non-destructive)
 //
-// GOAL: make ~/.appliance/profiles.json the authoritative store for
-// every desktop cluster's secret and turn the macOS keychain into a
-// one-way derived cache (read FROM profiles.json, written TO keychain).
-//
-// Before we can flip the read direction, every secret that currently
-// lives ONLY in the keychain (desktop-managed clusters created before
-// this change, where mirror_to_shared_profiles wrote the metadata but
-// an older build never copied the secret, or where the shared entry's
-// secret was cleared) must be copied into profiles.json. Otherwise
-// flipping the read to source from profiles.json would surface an
-// empty secret and silently break the cluster.
+// E4.4 settled the canonical store split (control-plane.md §5):
+//   * macOS  → the Keychain is canonical; the CLI reads it directly and
+//     the secret is NEVER copied to cleartext. The seed below is a no-op
+//     on macOS (see seed_profiles_from_keychain).
+//   * non-macOS → profiles.json (0600) is canonical, because the CLI
+//     cannot read libsecret/DPAPI. So on those platforms every secret
+//     that currently lives ONLY in the keychain (desktop-managed
+//     clusters created before this change, where mirror_to_shared_profiles
+//     wrote metadata but an older build never copied the secret, or where
+//     the shared entry's secret was cleared) must be copied into
+//     profiles.json — otherwise the CLI would surface an empty secret and
+//     silently break the cluster.
 //
 // This is the SEED step. It is:
 //   * non-destructive — it only ever WRITES into profiles.json; it
 //     never deletes or overwrites a keychain entry, and never clears
 //     a secret;
 //   * authoritative-preserving — it refuses to overwrite a non-empty
-//     secret already in profiles.json (that copy is, by definition,
-//     the authoritative one once this lands);
+//     secret already in profiles.json;
 //   * idempotent — re-running it once everything is seeded is a no-op.
 // ============================================================
 
@@ -402,6 +426,14 @@ fn decide_seed(
 /// across the call (as the sync path does) so the read-modify-write of
 /// profiles.json doesn't interleave with another desktop write.
 fn seed_profiles_from_keychain(cfg: &PersistedConfig) -> Result<usize, HostError> {
+    // macOS keeps the Keychain canonical and the CLI reads it directly,
+    // so there is nothing to seed into profiles.json — and seeding would
+    // copy the secret to cleartext, the exact leak the Keychain-first
+    // model avoids. The seed stays active on non-macOS, where
+    // profiles.json is the canonical store (E4.4 / control-plane.md §5).
+    if cfg!(target_os = "macos") {
+        return Ok(0);
+    }
     let mut file = read_shared_profiles().unwrap_or_default();
     let mut seeded = 0usize;
     for cluster in &cfg.clusters {
@@ -456,13 +488,19 @@ fn ingest_shared_into_legacy(
             // The keychain copy below comes from this very entry.
             synced_key_id: Some(entry.key_id.clone()),
         };
-        let _ = write_api_key(
-            &cluster_keychain_account(id),
-            &ApiKey {
-                id: entry.key_id.clone(),
-                secret: entry.secret.clone(),
-            },
-        );
+        // Only seed the Keychain when the shared entry actually carries a
+        // secret. A macOS desktop-managed entry has an EMPTY secret (the
+        // Keychain is canonical), so writing it here would clobber the
+        // real Keychain copy with an empty value — never do that.
+        if !entry.secret.is_empty() {
+            let _ = write_api_key(
+                &cluster_keychain_account(id),
+                &ApiKey {
+                    id: entry.key_id.clone(),
+                    secret: entry.secret.clone(),
+                },
+            );
+        }
         cfg.clusters.push(cluster);
     }
     cfg.selected_cluster_id = shared.active_profile.clone();
@@ -4281,6 +4319,26 @@ mod tests {
         // empty profile. Leave the (meta-only or absent) state alone.
         let cluster = test_cluster("prod");
         assert_eq!(decide_seed(&cluster, None, None), SeedDecision::NothingToSeed);
+    }
+
+    // ---- Keychain-first secret placement (E4.4) ------------------
+
+    #[test]
+    fn macos_keeps_the_secret_out_of_the_shared_file() {
+        // macOS: the Keychain is canonical, so the mirror writes an
+        // empty secret into profiles.json (the CLI reads it back from
+        // the Keychain). Never duplicate the secret to cleartext.
+        assert_eq!(shared_secret_for_platform("s3cr3t".to_string(), true), "");
+    }
+
+    #[test]
+    fn non_macos_writes_the_secret_through_to_the_file() {
+        // Linux/cloud/CI: profiles.json (0600) is the canonical store
+        // because the CLI cannot read libsecret/DPAPI.
+        assert_eq!(
+            shared_secret_for_platform("s3cr3t".to_string(), false),
+            "s3cr3t"
+        );
     }
 
     #[test]
