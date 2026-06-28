@@ -30,6 +30,8 @@
     "dev": "nx run-many --target=build --all && concurrently -k -n sdk,infra,server -c blue,magenta,green \"pnpm --filter @appliance.sh/sdk run build:watch\" \"pnpm --filter @appliance.sh/infra run build:watch\" \"pnpm --filter @appliance.sh/api-server run start:dev\"",
     "dev:setup": "pnpm --filter @appliance.sh/sdk run dev:setup && pnpm --filter @appliance.sh/cli run dev:setup && pnpm --filter @appliance.sh/infra run dev:setup",
     "deploy": "pnpm --filter @appliance.sh/infra run deploy",
+    "tauri:build": "pnpm --filter @appliance.sh/desktop run tauri:build",
+    "tauri:dev": "pnpm --filter @appliance.sh/desktop run tauri:dev",
     "test": "echo \"Error: no test specified\" && exit 1",
     "verify": "bash scripts/verify.sh",
     "prepare": "husky || true",
