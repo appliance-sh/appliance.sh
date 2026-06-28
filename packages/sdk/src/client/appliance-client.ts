@@ -6,6 +6,7 @@ import { EnvironmentHealth } from '../models/environment-health';
 import { Deployment } from '../models/deployment';
 import { ApiKeyCreateResponse } from '../models/api-key';
 import { ApplianceBaseConfig } from '../models/appliance-base';
+import { Workloads } from '../models/workloads';
 import { signRequest } from '../signing';
 
 export class ApplianceClient {
@@ -77,6 +78,47 @@ export class ApplianceClient {
 
       const data = await response.json();
       return { success: true, data: data as T };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  }
+
+  /**
+   * Like `request<T>`, but resolves the response as a plain text body
+   * instead of JSON. Used by `getPodLogs`, whose endpoint answers
+   * `text/plain` (a log tail), not JSON. Signs body-less GETs via the
+   * same credential-only path `request` takes for them.
+   */
+  private async requestText(method: string, path: string, timeout?: number): Promise<Result<string>> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout ?? this.timeout);
+
+      const url = `${this.baseUrl}${path}`;
+      const headers: Record<string, string> = {};
+
+      if (this.credentials) {
+        const sigHeaders = await signRequest(this.credentials, {
+          method: method.toUpperCase(),
+          url,
+          headers,
+        });
+        Object.assign(headers, sigHeaders);
+      }
+
+      const response = await fetch(url, { method, headers, signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        return { success: false, error: new Error(`HTTP ${response.status}: ${errorBody}`) };
+      }
+
+      const data = await response.text();
+      return { success: true, data };
     } catch (error) {
       return {
         success: false,
@@ -340,6 +382,154 @@ export class ApplianceClient {
 
   async getDeployment(id: string): Promise<Result<Deployment>> {
     return this.request<Deployment>('GET', `/api/v1/deployments/${id}`);
+  }
+
+  // Workloads + pod logs
+  //
+  // Read-only views of the cluster behind this base. Only available on
+  // Kubernetes-driven bases — AWS/Lambda bases answer 409 (surfaced as a
+  // failed Result). These move the desktop's former kubectl shell-outs
+  // behind the api-server so local and cloud are the same base-URL call.
+
+  /**
+   * List the workloads (Deployments / Pods / Services) in a namespace.
+   * Defaults to the server's configured namespace (`appliance`) when
+   * `namespace` is omitted.
+   */
+  async listWorkloads(opts?: { namespace?: string }): Promise<Result<Workloads>> {
+    const params = new URLSearchParams();
+    if (opts?.namespace) params.set('namespace', opts.namespace);
+    const query = params.toString();
+    return this.request<Workloads>('GET', `/api/v1/workloads${query ? `?${query}` : ''}`);
+  }
+
+  /**
+   * List the workloads backing a single environment, filtered to its
+   * stack via the `app.kubernetes.io/name` label.
+   */
+  async listEnvironmentWorkloads(environmentId: string): Promise<Result<Workloads>> {
+    return this.request<Workloads>('GET', `/api/v1/environments/${environmentId}/workloads`);
+  }
+
+  /**
+   * Read a pod's logs as a text tail (a snapshot, not a stream). For a
+   * live follow use `streamPodLogs`. `tailLines` defaults server-side to
+   * 200; `container` is required only for multi-container pods.
+   */
+  async getPodLogs(
+    pod: string,
+    opts?: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number }
+  ): Promise<Result<string>> {
+    const params = new URLSearchParams();
+    if (opts?.container) params.set('container', opts.container);
+    if (opts?.tailLines !== undefined) params.set('tailLines', String(opts.tailLines));
+    if (opts?.namespace) params.set('namespace', opts.namespace);
+    if (opts?.sinceSeconds !== undefined) params.set('sinceSeconds', String(opts.sinceSeconds));
+    const query = params.toString();
+    return this.requestText('GET', `/api/v1/pods/${encodeURIComponent(pod)}/logs${query ? `?${query}` : ''}`);
+  }
+
+  /**
+   * Follow a pod's logs, invoking `onLine` for each line until the
+   * supplied `AbortSignal` fires (the caller aborts to stop). Signs a
+   * body-less GET — auth is checked once, when the stream opens, so a
+   * long-lived follow stays open past the signature's `expires` window
+   * (control-plane.md §2). Needs its own fetch path because `request`
+   * buffers the whole body via `response.json()` and can't yield
+   * incrementally.
+   *
+   * Resolves `{ success: true }` on a clean end (EOF or abort); a
+   * connect/transport failure resolves to a failed Result.
+   */
+  async streamPodLogs(
+    pod: string,
+    opts: { container?: string; tailLines?: number; namespace?: string; signal: AbortSignal },
+    onLine: (line: string) => void
+  ): Promise<Result<void>> {
+    try {
+      const params = new URLSearchParams();
+      params.set('follow', '1');
+      if (opts.container) params.set('container', opts.container);
+      if (opts.tailLines !== undefined) params.set('tailLines', String(opts.tailLines));
+      if (opts.namespace) params.set('namespace', opts.namespace);
+      const url = `${this.baseUrl}/api/v1/pods/${encodeURIComponent(pod)}/logs?${params.toString()}`;
+
+      const headers: Record<string, string> = {};
+      if (this.credentials) {
+        const sigHeaders = await signRequest(this.credentials, { method: 'GET', url, headers });
+        Object.assign(headers, sigHeaders);
+      }
+
+      const response = await fetch(url, { method: 'GET', headers, signal: opts.signal });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        return { success: false, error: new Error(`HTTP ${response.status}: ${errorBody}`) };
+      }
+      if (!response.body) {
+        return { success: false, error: new Error('Log stream response has no body') };
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let newlineIndex: number;
+          while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
+            buffer = buffer.slice(newlineIndex + 1);
+            onLine(line);
+          }
+        }
+        // Flush any trailing partial line (a final line without a newline).
+        buffer += decoder.decode();
+        if (buffer.length > 0) onLine(buffer.replace(/\r$/, ''));
+        return { success: true, data: undefined };
+      } catch (err) {
+        // The caller aborting is the normal way to stop a follow — treat
+        // it as a clean close rather than a failure.
+        if (opts.signal.aborted) return { success: true, data: undefined };
+        throw err;
+      }
+    } catch (error) {
+      if (opts.signal.aborted) return { success: true, data: undefined };
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  }
+
+  /**
+   * Unsigned liveness probe (`GET /healthz`). The desktop resolves this
+   * as a base-URL HTTP check for its "cluster ready" badge instead of a
+   * kubectl reachability shell-out. No credentials required.
+   */
+  async healthz(): Promise<Result<{ ok: true }>> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+      const response = await fetch(`${this.baseUrl}/healthz`, { method: 'GET', signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        return { success: false, error: new Error(`HTTP ${response.status}: ${errorBody}`) };
+      }
+
+      const data = await response.json();
+      return { success: true, data: data as { ok: true } };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
   }
 
   /**
