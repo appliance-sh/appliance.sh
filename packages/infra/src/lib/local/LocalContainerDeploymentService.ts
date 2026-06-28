@@ -1,6 +1,13 @@
 import * as k8s from '@kubernetes/client-node';
 import * as fs from 'node:fs';
-import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
+import { Writable } from 'node:stream';
+import {
+  ApplianceBaseConfig,
+  ApplianceBaseType,
+  getKubernetesParams,
+  isKubernetesBase,
+  Workloads,
+} from '@appliance.sh/sdk';
 
 // Egress confinement (see docs/microvm.md): the host (appliance-vm)
 // publishes the policy into this ConfigMap; the executor reflects it
@@ -139,6 +146,7 @@ export class KubernetesDeploymentService {
   private readonly core: k8s.CoreV1Api;
   private readonly apps: k8s.AppsV1Api;
   private readonly metrics: k8s.Metrics;
+  private readonly logs: k8s.Log;
 
   constructor(private readonly baseConfig: ApplianceBaseConfig) {
     if (!isKubernetesBase(baseConfig)) {
@@ -156,6 +164,80 @@ export class KubernetesDeploymentService {
     // metrics-server is installed. getDeploymentHealth() tolerates it
     // being unreachable so health works on clusters without one.
     this.metrics = new k8s.Metrics(this.kc);
+    // Streams a pod's log over the k8s watch API (used by
+    // streamPodLogs); shares the same KubeConfig as every other client.
+    this.logs = new k8s.Log(this.kc);
+  }
+
+  /**
+   * Snapshot of the workloads in a namespace: Deployments, Pods, and
+   * Services, summarised to the columns the console renders. Read-only.
+   *
+   * Defaults to the configured namespace. Pass `labelSelector` to scope
+   * to a single appliance's stack — the deploy path labels every
+   * resource `app.kubernetes.io/name: <stackName>` (see renderManifest),
+   * so `app.kubernetes.io/name=<stackName>` filters to one environment.
+   *
+   * Mirrors the desktop's former `kubectl get deploy,pod,svc -o json`
+   * read; lists go through the same CoreV1/AppsV1 clients the deploy +
+   * health paths already use, so no new RBAC or wiring is required.
+   */
+  async listWorkloads(opts?: { namespace?: string; labelSelector?: string }): Promise<Workloads> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    const labelSelector = opts?.labelSelector;
+    const [deployments, pods, services] = await Promise.all([
+      this.apps.listNamespacedDeployment({ namespace, labelSelector }),
+      this.core.listNamespacedPod({ namespace, labelSelector }),
+      this.core.listNamespacedService({ namespace, labelSelector }),
+    ]);
+    return {
+      deployments: (deployments.items ?? []).map(summarizeWorkloadDeployment),
+      pods: (pods.items ?? []).map(summarizeWorkloadPod),
+      services: (services.items ?? []).map(summarizeWorkloadService),
+    };
+  }
+
+  /**
+   * Read a pod's logs as a single text blob (the tail). Drop-in for the
+   * desktop's former `kubectl logs` snapshot. `tailLines` bounds the
+   * read; `sinceSeconds` limits it to a recent window; `container`
+   * selects one of a multi-container pod's containers (required when the
+   * pod has more than one). RBAC for `pods/log` is already granted.
+   */
+  async getPodLogs(
+    podName: string,
+    opts?: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number }
+  ): Promise<string> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    return this.core.readNamespacedPodLog({
+      name: podName,
+      namespace,
+      container: opts?.container,
+      tailLines: opts?.tailLines,
+      sinceSeconds: opts?.sinceSeconds,
+    });
+  }
+
+  /**
+   * Follow a pod's logs, piping the k8s watch stream straight into the
+   * supplied Writable (e.g. the HTTP response) as raw chunked text.
+   * Returns the AbortController the watch is bound to — abort it (or
+   * end the destination) to tear the stream down. The caller owns the
+   * destination's lifecycle; this only opens and pipes the watch.
+   */
+  async streamPodLogs(
+    podName: string,
+    destination: Writable,
+    opts?: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number }
+  ): Promise<AbortController> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    // The Log helper requires a container name positionally; '' lets the
+    // apiserver default to the pod's sole container (matching kubectl).
+    return this.logs.log(namespace, podName, opts?.container ?? '', destination, {
+      follow: true,
+      tailLines: opts?.tailLines,
+      sinceSeconds: opts?.sinceSeconds,
+    });
   }
 
   async deploy(
@@ -709,6 +791,59 @@ export function summarizePod(pod: k8s.V1Pod): PodHealth {
     ready,
     restarts,
     ...(reason ? { reason } : {}),
+  };
+}
+
+/** RFC3339 creation timestamp off a resource's metadata, when present.
+ *  client-node surfaces it as a Date; normalise to an ISO string. */
+function creationTimestamp(meta: k8s.V1ObjectMeta | undefined): string | undefined {
+  const ts = meta?.creationTimestamp;
+  if (!ts) return undefined;
+  return ts instanceof Date ? ts.toISOString() : new Date(ts).toISOString();
+}
+
+/** Collapse a Deployment into the `kubectl get deploy` columns the
+ *  console renders (image + desired/ready/available replica counts). */
+export function summarizeWorkloadDeployment(dep: k8s.V1Deployment): Workloads['deployments'][number] {
+  return {
+    name: dep.metadata?.name ?? '',
+    image: dep.spec?.template?.spec?.containers?.[0]?.image ?? undefined,
+    desired: dep.spec?.replicas ?? 0,
+    ready: dep.status?.readyReplicas ?? 0,
+    available: dep.status?.availableReplicas ?? 0,
+    createdAt: creationTimestamp(dep.metadata),
+  };
+}
+
+/** Collapse a Pod into the `kubectl get pods` columns: phase, the READY
+ *  rollup (every container Ready), summed restarts, and the first
+ *  container's image. */
+export function summarizeWorkloadPod(pod: k8s.V1Pod): Workloads['pods'][number] {
+  const statuses = pod.status?.containerStatuses ?? [];
+  const restartCount = statuses.reduce((acc, c) => acc + (c.restartCount ?? 0), 0);
+  const ready = statuses.length > 0 && statuses.every((c) => c.ready === true);
+  return {
+    name: pod.metadata?.name ?? '',
+    phase: pod.status?.phase ?? 'Unknown',
+    ready,
+    restartCount,
+    containerImage: pod.spec?.containers?.[0]?.image ?? undefined,
+    createdAt: creationTimestamp(pod.metadata),
+  };
+}
+
+/** Collapse a Service into the `kubectl get svc` columns: type, cluster
+ *  IP, and the first port's nodePort/targetPort. A named (string)
+ *  targetPort is omitted — the console field is numeric-only. */
+export function summarizeWorkloadService(svc: k8s.V1Service): Workloads['services'][number] {
+  const firstPort = svc.spec?.ports?.[0];
+  const targetPort = typeof firstPort?.targetPort === 'number' ? firstPort.targetPort : undefined;
+  return {
+    name: svc.metadata?.name ?? '',
+    serviceType: svc.spec?.type ?? 'ClusterIP',
+    clusterIp: svc.spec?.clusterIP ?? undefined,
+    nodePort: typeof firstPort?.nodePort === 'number' ? firstPort.nodePort : undefined,
+    targetPort,
   };
 }
 
