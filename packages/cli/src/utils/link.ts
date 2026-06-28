@@ -16,11 +16,44 @@ import * as path from 'node:path';
 const LINK_DIR = '.appliance';
 const LINK_FILE = 'link.json';
 
+/**
+ * One service inside a sandbox project. For the Dockerfile slice this
+ * is always a single entry; compose (a follow-up) models N services.
+ * Shaped to be 1:1 promotable to a cloud Environment's per-service
+ * builds (docs/up.md §5).
+ */
+export interface SandboxService {
+  /** DNS-safe workload name (= project name for a single Dockerfile). */
+  name: string;
+  /** Container port the workload listens on (from EXPOSE / --port). */
+  port: number;
+  /** Whether the port is published to the host. */
+  exposed: boolean;
+  /** Host port the container port is published to, when exposed. */
+  hostPort?: number;
+}
+
+/**
+ * `appliance up` state, persisted additively alongside the api-server
+ * link fields (docs/up.md §5). Present only for folders driven by the
+ * in-guest Docker engine; absent for plain `deploy`-linked projects.
+ */
+export interface SandboxLink {
+  /** Detected project type. Only `dockerfile` is implemented today. */
+  type: 'dockerfile' | 'compose' | 'devcontainer';
+  /** The shared sandbox VM this project runs in. */
+  vm: string;
+  /** Deterministic project id (cwd basename, normalized to a label). */
+  project: string;
+  /** Per-service ports + exposed flags. */
+  services: SandboxService[];
+}
+
 export interface ProjectLink {
   /** Project name on the api-server. */
-  projectName: string;
+  projectName?: string;
   /** Default environment to target. */
-  environmentName: string;
+  environmentName?: string;
   /**
    * API server URL the link was created against. Stored for parity
    * with the credentials profile; mismatch between this and the
@@ -34,6 +67,11 @@ export interface ProjectLink {
   profile?: string;
   /** ISO timestamp recording when the link was last written. */
   linkedAt?: string;
+  /**
+   * `appliance up` sandbox state. Additive — does not disturb the
+   * api-server `projectName`/`environmentName` fields above.
+   */
+  sandbox?: SandboxLink;
 }
 
 export interface LinkLocation {
@@ -61,26 +99,40 @@ export function findLinkLocation(startDir: string = process.cwd()): LinkLocation
   }
 }
 
-/** Parsed link or null if no link exists / file is malformed. */
-export function readLink(startDir?: string): ProjectLink | null {
+/**
+ * Parse the raw link file (any valid object), or null if none exists /
+ * it's malformed. Lower-level than `readLink` — it does not require the
+ * api-server fields, so a sandbox-only link is returned intact.
+ */
+export function readRawLink(startDir?: string): ProjectLink | null {
   const loc = findLinkLocation(startDir);
   if (!loc) return null;
   try {
-    const raw = fs.readFileSync(loc.filePath, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof parsed.projectName === 'string' &&
-      typeof parsed.environmentName === 'string'
-    ) {
-      return parsed as ProjectLink;
-    }
+    const parsed = JSON.parse(fs.readFileSync(loc.filePath, 'utf-8'));
+    if (parsed && typeof parsed === 'object') return parsed as ProjectLink;
     return null;
   } catch {
     // Corrupt file shouldn't brick the CLI — treat as no link.
     return null;
   }
+}
+
+/**
+ * Parsed api-server link or null if no link exists / the file lacks the
+ * api-server project + environment fields (e.g. a sandbox-only link).
+ */
+export function readLink(startDir?: string): ProjectLink | null {
+  const parsed = readRawLink(startDir);
+  if (parsed && typeof parsed.projectName === 'string' && typeof parsed.environmentName === 'string') {
+    return parsed;
+  }
+  return null;
+}
+
+/** The sandbox block of the cwd link, or null when there isn't one. */
+export function readSandboxLink(startDir?: string): SandboxLink | null {
+  const parsed = readRawLink(startDir);
+  return parsed?.sandbox ?? null;
 }
 
 /**
@@ -95,6 +147,21 @@ export function writeLink(link: ProjectLink, rootDir: string = process.cwd()): s
   const payload: ProjectLink = { ...link, linkedAt: link.linkedAt ?? new Date().toISOString() };
   fs.writeFileSync(filePath, JSON.stringify(payload, null, 2) + '\n');
   return filePath;
+}
+
+/**
+ * Merge a `sandbox` block into the cwd link additively, preserving any
+ * existing api-server `projectName`/`environmentName` fields. Pass null
+ * to remove the sandbox block (e.g. on `down`). Writes (and creates)
+ * `.appliance/link.json` in `rootDir`.
+ */
+export function writeSandboxLink(sandbox: SandboxLink | null, rootDir: string = process.cwd()): string {
+  const existing = readRawLink(rootDir) ?? {};
+  const next: ProjectLink = { ...existing };
+  if (sandbox) next.sandbox = sandbox;
+  else delete next.sandbox;
+  // Touch linkedAt so the timestamp reflects this write.
+  return writeLink({ ...next, linkedAt: new Date().toISOString() }, rootDir);
 }
 
 /**

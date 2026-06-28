@@ -5,7 +5,8 @@ import { createApplianceClient } from '@appliance.sh/sdk';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 import { loadCredentials, getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
-import { readLink } from './utils/link.js';
+import { readLink, readSandboxLink } from './utils/link.js';
+import { vmShell } from './utils/sandbox.js';
 import { resolveEnvironment } from './utils/deployment-target.js';
 import { ClusterTargetError, kubectlBaseArgs, resolveClusterTarget, stackSelector } from './utils/cluster-target.js';
 
@@ -52,6 +53,25 @@ program
       kubeconfig?: string;
       context?: string;
     }>();
+
+    // Route by link.json (docs/up.md §2): an `appliance up` folder logs
+    // its sandbox container via the in-guest docker engine. Only when no
+    // explicit api-server `<project> <environment>` target was passed —
+    // that always means the deployment-logs path below.
+    const sandbox = readSandboxLink();
+    if (sandbox && !cliProject && !cliEnvironment) {
+      const args = ['docker', 'logs', '--tail', opts.tail];
+      if (opts.follow) args.push('-f');
+      args.push(sandbox.project);
+      console.error(
+        chalk.dim(
+          `Streaming logs for sandbox ${chalk.bold(sandbox.project)} (${sandbox.vm})${
+            opts.follow ? ' — Ctrl-C to stop' : ''
+          }`
+        )
+      );
+      process.exit(vmShell(sandbox.vm, args));
+    }
 
     const credentials = loadCredentials();
     if (!credentials) {
