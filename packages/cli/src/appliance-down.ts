@@ -43,6 +43,22 @@ program
       return;
     }
 
+    if (sandbox.type === 'devcontainer') {
+      // The @devcontainers/cli has no `down`; remove the container it
+      // brought up directly, by the id recorded at `up` time.
+      const containerId = sandbox.containerId ?? sandbox.project;
+      console.log(chalk.cyan(`» removing devcontainer ${containerId.slice(0, 12)} in '${vm}'`));
+      const code = vmShell(vm, ['docker', 'rm', '-f', containerId]);
+      if (code !== 0) {
+        console.log(chalk.yellow(`  container ${containerId.slice(0, 12)} was not running (or the VM is stopped)`));
+      } else {
+        console.log(`${chalk.green('✓')} removed ${containerId.slice(0, 12)}`);
+      }
+      writeSandboxLink(null);
+      console.log(chalk.dim('  sandbox link cleared'));
+      return;
+    }
+
     console.log(chalk.cyan(`» removing container ${sandbox.project} in '${vm}'`));
     const code = vmShell(vm, ['docker', 'rm', '-f', sandbox.project]);
     if (code !== 0) {

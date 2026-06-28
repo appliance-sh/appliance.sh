@@ -44,7 +44,8 @@ export interface SandboxService {
  * in-guest Docker engine; absent for plain `deploy`-linked projects.
  */
 export interface SandboxLink {
-  /** Detected project type. `dockerfile` and `compose` are implemented. */
+  /** Detected project type. `dockerfile`, `compose`, and `devcontainer`
+   *  are implemented. */
   type: 'dockerfile' | 'compose' | 'devcontainer';
   /** The shared sandbox VM this project runs in. */
   vm: string;
@@ -55,6 +56,13 @@ export interface SandboxLink {
   /** Compose file (relative to cwd) `up` was invoked with, so `down` /
    *  `logs` can reconstruct the `-f` argument. Compose links only. */
   composeFile?: string;
+  /** Container id the `@devcontainers/cli` brought up, used by `down` /
+   *  `logs` / `status` / `shell`. Devcontainer links only. */
+  containerId?: string;
+  /** Guest workspace folder the devcontainer was started against
+   *  (the VirtioFS share, e.g. `/persist/workspace`). Devcontainer
+   *  links only — `shell` / `exec` re-pass it as `--workspace-folder`. */
+  workspace?: string;
 }
 
 export interface ProjectLink {

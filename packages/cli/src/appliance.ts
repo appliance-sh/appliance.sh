@@ -124,12 +124,16 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-unlink.js'),
   },
   up: {
-    description: 'build + run this project (Dockerfile) in the shared sandbox microVM',
+    description: 'build + run this project (Dockerfile, compose, or devcontainer) in the shared sandbox microVM',
     load: () => import('./appliance-up.js'),
   },
   down: {
     description: "stop and remove this project's sandbox container",
     load: () => import('./appliance-down.js'),
+  },
+  shell: {
+    description: "enter this project's sandbox (devcontainer exec, or the VM host shell)",
+    load: () => import('./appliance-shell.js'),
   },
   whoami: {
     description: 'show active profile, server URL, and linked project',

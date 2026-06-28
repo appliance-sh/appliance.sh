@@ -128,7 +128,7 @@ export type ProjectType = 'dockerfile' | 'compose' | 'devcontainer' | 'none';
 
 /** Compose file names in compose's own discovery order (docs/up.md §1). */
 export const COMPOSE_FILES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
-const DEVCONTAINER_FILES = ['.devcontainer/devcontainer.json', '.devcontainer.json'];
+export const DEVCONTAINER_FILES = ['.devcontainer/devcontainer.json', '.devcontainer.json'];
 
 /** The first compose file present in `dir` (by COMPOSE_FILES precedence),
  *  as a bare file name relative to `dir`, or null when none exists. */
@@ -359,6 +359,90 @@ export function parseComposeDependsOn(composePath: string): Record<string, strin
   return result;
 }
 
+// ---- devcontainer introspection ----------------------------------------
+
+/** The machine-readable result of `devcontainer up`. The CLI emits one
+ *  JSON object on stdout once bring-up finishes. */
+export interface DevcontainerUpResult {
+  outcome: string;
+  containerId?: string;
+  remoteUser?: string;
+  remoteWorkspaceFolder?: string;
+  message?: string;
+}
+
+/**
+ * Parse the `devcontainer up` result. The CLI streams progress on
+ * stderr and prints a single JSON object on stdout (e.g.
+ * `{"outcome":"success","containerId":"<id>",...}`). We scan every line
+ * and return the LAST parseable JSON object that carries an `outcome`
+ * — robust to any leading non-JSON noise sharing the stdout stream.
+ * Returns null when no result object is present.
+ */
+export function parseDevcontainerUp(stdout: string): DevcontainerUpResult | null {
+  let result: DevcontainerUpResult | null = null;
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj && typeof obj === 'object' && 'outcome' in obj) {
+        result = {
+          outcome: String(obj.outcome),
+          containerId: obj.containerId == null ? undefined : String(obj.containerId),
+          remoteUser: obj.remoteUser == null ? undefined : String(obj.remoteUser),
+          remoteWorkspaceFolder: obj.remoteWorkspaceFolder == null ? undefined : String(obj.remoteWorkspaceFolder),
+          message: obj.message == null ? undefined : String(obj.message),
+        };
+      }
+    } catch {
+      // Not a JSON line — skip (progress is on stderr, but be defensive).
+    }
+  }
+  return result;
+}
+
+/** One published port of a devcontainer's container, from `docker port`. */
+export interface PublishedPort {
+  hostPort: number;
+  containerPort: number;
+}
+
+/**
+ * Parse `docker port <container>` output into published TCP mappings.
+ * Each line looks like `3000/tcp -> 0.0.0.0:8201` (a container may emit
+ * an IPv4 and IPv6 line for the same mapping — dedupe). UDP lines are
+ * ignored. Returns the mappings in the order docker reports them.
+ */
+export function parseDockerPort(stdout: string): PublishedPort[] {
+  const out: PublishedPort[] = [];
+  const seen = new Set<string>();
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    // `<containerPort>/<proto> -> <host>:<hostPort>`
+    const m = line.match(/^(\d+)\/(tcp|udp)\s*->\s*.*:(\d+)$/i);
+    if (!m) continue;
+    if (m[2].toLowerCase() !== 'tcp') continue;
+    const containerPort = Number.parseInt(m[1], 10);
+    const hostPort = Number.parseInt(m[3], 10);
+    if (!Number.isInteger(containerPort) || !Number.isInteger(hostPort)) continue;
+    const key = `${hostPort}:${containerPort}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ hostPort, containerPort });
+  }
+  return out;
+}
+
+/** Capture the published ports of a container in the guest, best-effort.
+ *  Empty on any failure (container gone / VM down). */
+export function devcontainerPublishedPorts(vm: string, containerId: string): PublishedPort[] {
+  const r = vmShellCapture(vm, ['docker', 'port', containerId]);
+  if (r.status !== 0) return [];
+  return parseDockerPort(r.stdout);
+}
+
 // ---- identity + ports --------------------------------------------------
 
 /** Normalize a string to a DNS-1123 label (lowercase alphanumeric + `-`,
@@ -468,6 +552,7 @@ export async function runSandboxStatus(opts: { json?: boolean } = {}): Promise<n
     return 1;
   }
   if (sandbox.type === 'compose') return runComposeStatus(sandbox, opts);
+  if (sandbox.type === 'devcontainer') return runDevcontainerStatus(sandbox, opts);
 
   const vm = sandbox.vm;
   const status = vmStatus(vm);
@@ -578,6 +663,77 @@ async function runComposeStatus(sandbox: import('./link.js').SandboxLink, opts: 
     } else {
       console.log(`  ${name}  ${chalk.dim('internal')} — ${stateLabel}`);
     }
+  }
+  return 0;
+}
+
+/**
+ * Status for a devcontainer project: show the container (by id) state
+ * and any host-reachable URL for its published ports. The container is
+ * looked up by the id the `@devcontainers/cli` reported at `up` time.
+ */
+async function runDevcontainerStatus(
+  sandbox: import('./link.js').SandboxLink,
+  opts: { json?: boolean }
+): Promise<number> {
+  const vm = sandbox.vm;
+  const status = vmStatus(vm);
+  const ip = guestIp(vm);
+  const containerId = sandbox.containerId ?? '';
+
+  // `docker ps` filtered to this container id, formatted as a single
+  // tab-separated line for parsing + display.
+  const ps = containerId
+    ? vmShellCapture(vm, [
+        'docker',
+        'ps',
+        '-a',
+        '--filter',
+        `id=${containerId}`,
+        '--format',
+        '{{.ID}}\t{{.Status}}\t{{.Ports}}',
+      ])
+    : { status: 1, stdout: '' };
+  const psLine = ps.status === 0 ? ps.stdout : '';
+  const [, state, ports] = psLine ? psLine.split('\t') : [];
+
+  const published = containerId && psLine ? devcontainerPublishedPorts(vm, containerId) : [];
+  const urls = ip ? published.map((p) => ({ ...p, url: `http://${ip}:${p.hostPort}` })) : [];
+
+  if (opts.json) {
+    console.log(
+      JSON.stringify(
+        {
+          project: sandbox.project,
+          type: sandbox.type,
+          vm,
+          vmRunning: status?.running ?? false,
+          containerId: containerId || null,
+          state: state ?? null,
+          ports: ports ?? null,
+          workspace: sandbox.workspace ?? null,
+          urls,
+        },
+        null,
+        2
+      )
+    );
+    return 0;
+  }
+
+  console.log(chalk.bold(`Sandbox — ${sandbox.project} (${sandbox.type})`));
+  console.log(`  VM:         ${vm} (${status?.running ? chalk.green('running') : chalk.dim('stopped')})`);
+  if (!psLine) {
+    console.log(`  Container:  ${chalk.yellow('not found')} — run \`appliance up\` to start it`);
+    return 0;
+  }
+  console.log(`  Container:  ${containerId.slice(0, 12)} (${state ?? 'unknown'})`);
+  if (urls.length) {
+    for (const u of urls) console.log(`  URL:        ${chalk.bold(u.url)}   (container :${u.containerPort})`);
+  } else if (published.length && !ip) {
+    console.log(chalk.dim('  URL:        guest IP not known yet — is the VM finished booting?'));
+  } else {
+    console.log(chalk.dim('  Ports:      none published — enter it with `appliance shell`'));
   }
   return 0;
 }

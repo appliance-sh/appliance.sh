@@ -9,12 +9,14 @@ import {
   GUEST_WORKSPACE,
   deterministicHostPort,
   detectProjectType,
+  devcontainerPublishedPorts,
   dnsLabel,
   ensureSandboxVm,
   findComposeFile,
   guestIp,
   parseComposeDependsOn,
   parseComposePsJson,
+  parseDevcontainerUp,
   parseExposedPort,
   vmShell,
   vmShellCapture,
@@ -24,13 +26,13 @@ import type { SandboxService } from './utils/link.js';
 // `appliance up` — near-zero-config local run of a repo's own container
 // definition in the shared sandbox microVM (docs/up.md §2, §5, §6 A).
 //
-// This version implements the Dockerfile and docker-compose slices:
-// detect the project type in cwd, bring up the sandbox VM with the
-// workspace shared + docker provisioned, build + run in-guest against
-// the mounted workspace (a single image, or `docker compose up` for a
-// compose project), publish the declared ports, persist a `sandbox`
+// This version implements the Dockerfile, docker-compose, and
+// devcontainer slices: detect the project type in cwd, bring up the
+// sandbox VM with the workspace shared + docker provisioned, build + run
+// in-guest against the mounted workspace (a single image, `docker
+// compose up` for a compose project, or the official `@devcontainers/cli`
+// for a devcontainer), publish the declared ports, persist a `sandbox`
 // block to link.json, and print the host-reachable URL map.
-// Devcontainer is detected and rejected with guidance, not run.
 
 ensureHelperBinOnPath();
 
@@ -74,10 +76,14 @@ async function runUp(opts: { vm: string; port?: number; hostPort?: number; detac
     await runComposeUp(opts, cwd);
     return;
   }
-  // Devcontainer is detected by precedence (docs/up.md §1) but not
-  // implemented here — exit cleanly with the unsupported notice.
+  if (type === 'devcontainer') {
+    await runDevcontainerUp(opts, cwd);
+    return;
+  }
   if (type !== 'dockerfile') {
-    console.log(`detected ${type}: not yet supported by \`up\` (Dockerfile + compose in this version)`);
+    // Unreachable today (detectProjectType only returns the four types),
+    // but guard rather than fall through to the Dockerfile path.
+    console.log(`detected ${type}: not yet supported by \`up\``);
     return;
   }
 
@@ -231,6 +237,99 @@ async function runComposeUp(opts: { vm: string }, cwd: string): Promise<void> {
     console.log(chalk.yellow('  Run `appliance status` once the VM finishes booting to get the URLs.'));
   }
   console.log(chalk.dim(`  Logs: appliance logs -f      Stop: appliance down`));
+  console.log(chalk.dim(`  Linked: ${linkPath}`));
+}
+
+/**
+ * Devcontainer bring-up (docs/up.md §6 C): ensure the sandbox VM, ensure
+ * the official `@devcontainers/cli` is installed in-guest, then run
+ * `devcontainer up --workspace-folder /persist/workspace` against the
+ * shared workspace so the repo's `devcontainer.json` toolchain comes up
+ * verbatim. The CLI drives the in-guest dockerd exactly as our
+ * Dockerfile/compose paths do, so the resulting container coexists with
+ * other sandbox projects on the same daemon (docs/up.md §3).
+ *
+ * `devcontainer up` is idempotent and prints a machine-readable JSON
+ * result on stdout; we parse the last result object to get the
+ * `containerId` + `outcome`, then surface any published ports as
+ * host-reachable URLs and persist the link for `down`/`logs`/`shell`.
+ */
+async function runDevcontainerUp(opts: { vm: string }, cwd: string): Promise<void> {
+  const project = dnsLabel(path.basename(cwd));
+  const vm = opts.vm;
+
+  console.log(chalk.bold(`Detected: devcontainer (${project})`));
+
+  // 1. Boot/ensure the sandbox VM with docker + this workspace mounted.
+  await ensureSandboxVm(vm, cwd);
+
+  // 2. Ensure the devcontainers CLI is present, then bring the
+  //    devcontainer up — in ONE in-guest invocation, output captured.
+  //    node + npm ship in the dev VM; `npm i -g @devcontainers/cli` (only
+  //    when the binary is missing) hits the network, which is allowed.
+  //    The merged PTY stream carries both the progress log and the final
+  //    `{"outcome":...,"containerId":...}` JSON result we parse. (Running
+  //    `up` twice raced the result line; installing in a separate shell
+  //    raced the PATH update — folding both into one shell fixes both.)
+  console.log(
+    chalk.cyan(`» devcontainer up --workspace-folder ${GUEST_WORKSPACE} (installing @devcontainers/cli if needed)…`)
+  );
+  const script =
+    'command -v devcontainer >/dev/null 2>&1 || npm install -g @devcontainers/cli >/dev/null 2>&1; ' +
+    `devcontainer up --workspace-folder ${GUEST_WORKSPACE}`;
+  const result = vmShellCapture(vm, ['sh', '-lc', script]);
+  const parsed = parseDevcontainerUp(result.stdout);
+  if (!parsed) {
+    throw new Error('devcontainer up did not report a result.\n' + `Raw output:\n${result.stdout || '(empty)'}`);
+  }
+  if (parsed.outcome !== 'success') {
+    throw new Error(`devcontainer up failed: ${parsed.message ?? parsed.outcome}`);
+  }
+  const containerId = parsed.containerId;
+  if (!containerId) {
+    throw new Error('devcontainer up succeeded but reported no containerId.');
+  }
+
+  // 5. Discover any published ports so we can surface host-reachable URLs.
+  const published = devcontainerPublishedPorts(vm, containerId);
+
+  // 6. Persist the sandbox link (additive to any api-server link).
+  const sandbox: SandboxLink = {
+    type: 'devcontainer',
+    vm,
+    project,
+    containerId,
+    workspace: GUEST_WORKSPACE,
+    services: published.map((p) => ({
+      name: project,
+      port: p.containerPort,
+      exposed: true,
+      hostPort: p.hostPort,
+    })),
+  };
+  const linkPath = writeSandboxLink(sandbox, cwd);
+
+  // 7. Surface the result. A devcontainer often publishes no ports (it's
+  //    a workspace you shell into) — point at `appliance shell` then.
+  const ip = guestIp(vm);
+  console.log();
+  console.log(chalk.green(`Sandbox up — ${project} (devcontainer)`));
+  console.log(`  Container:  ${chalk.bold(containerId.slice(0, 12))}`);
+  if (published.length) {
+    for (const p of published) {
+      if (ip) {
+        console.log(`  ${project}  →  ${chalk.bold(`http://${ip}:${p.hostPort}`)}   (container :${p.containerPort})`);
+      } else {
+        console.log(
+          `  ${project}  published on host port ${p.hostPort} (:${p.containerPort}) — guest IP not known yet`
+        );
+      }
+    }
+    if (!ip) console.log(chalk.yellow('  Run `appliance status` once the VM finishes booting to get the URLs.'));
+  } else {
+    console.log(chalk.dim('  no published ports — enter the container with `appliance shell`'));
+  }
+  console.log(chalk.dim(`  Enter: appliance shell       Logs: appliance logs -f      Stop: appliance down`));
   console.log(chalk.dim(`  Linked: ${linkPath}`));
 }
 

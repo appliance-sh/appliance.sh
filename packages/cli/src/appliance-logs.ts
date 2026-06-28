@@ -78,9 +78,13 @@ program
         );
         process.exit(vmShell(sandbox.vm, args));
       }
+      // Dockerfile + devcontainer are both single containers: a
+      // devcontainer logs by the recorded container id, a Dockerfile by
+      // its project (= container) name.
+      const target = sandbox.type === 'devcontainer' ? (sandbox.containerId ?? sandbox.project) : sandbox.project;
       const args = ['docker', 'logs', '--tail', opts.tail];
       if (opts.follow) args.push('-f');
-      args.push(sandbox.project);
+      args.push(target);
       console.error(
         chalk.dim(
           `Streaming logs for sandbox ${chalk.bold(sandbox.project)} (${sandbox.vm})${
