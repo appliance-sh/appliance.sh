@@ -441,6 +441,14 @@ fi
   while :; do
     if apk add --no-progress docker docker-cli-compose; then
       echo "appliance-docker: docker package installed"
+      # The `docker` group is created by the docker apk package, so add
+      # the non-root appliance user to it now (the user-provisioning block
+      # couldn't — the group didn't exist yet). This lets `appliance up` /
+      # devcontainer exec reach root dockerd's socket (root:docker 0660)
+      # without sudo. dockerd stays a root daemon. No daemon restart
+      # needed: any fresh one-shot shell after .docker-ready picks up the
+      # group membership from /etc/group.
+      addgroup appliance docker 2>/dev/null || true
       # Egress env for dockerd's own traffic (registry pulls/builds). The
       # node-wide egress CA (trusted above via update-ca-certificates) lets
       # MITM'd TLS validate. NO_PROXY keeps daemon-local/bridge traffic and
@@ -968,6 +976,10 @@ mod tests {
         // Packaged from the Alpine community repo, cached on /persist.
         assert!(start.contains("apk add --no-progress docker docker-cli-compose"));
         assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
+        // The non-root appliance user joins the docker group (created by
+        // the docker package) so `appliance up` reaches dockerd without
+        // sudo — added after the install, where the group exists.
+        assert!(start.contains("addgroup appliance docker"));
         // Fully separate engine: own data-root, listening on the default
         // socket (in-guest CLI) + the stable /persist path (vsock relay).
         assert!(start.contains("--data-root /persist/docker"));
