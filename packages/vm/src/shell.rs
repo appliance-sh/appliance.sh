@@ -83,6 +83,12 @@ const RC_MARK: &str = "__APPLIANCE_VM_RC__";
 /// keeps a literal `%d`, so it won't parse) and the real sentinel — and
 /// the parsed code is returned. Streams line-by-line so long-running
 /// commands (`logs -f`, builds) still show progress as it arrives.
+///
+/// This is the one-shot path only (`command.is_some()`). If the stream
+/// hits EOF without ever yielding the sentinel, the shell died before the
+/// command's exit code could be reported — e.g. the `su -l appliance`
+/// drop failed — so return a non-zero code (255) rather than a silent
+/// success-with-empty-output that would mask such breakage.
 fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -114,7 +120,9 @@ fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
             let _ = w.write_all(&buf);
         }
     }
-    0
+    // EOF without a sentinel: the shell never reported the command's exit
+    // code (it died first). Surface failure, not silent success.
+    255
 }
 
 /// Parse `<RC_MARK><digits>__END__` out of a line, if the code is present
@@ -207,5 +215,23 @@ mod tests {
         assert_eq!(code, 3);
         // The sentinel line (and anything after it) is withheld.
         assert_eq!(out, b"hello\n");
+    }
+
+    #[test]
+    fn pump_eof_without_sentinel_is_failure() {
+        // A shell that dies before the sentinel prints (e.g. the `su -l`
+        // drop failed) must surface as failure, not silent success — any
+        // partial output is still flushed through.
+        let input = b"partial output, no sentinel\n";
+        let mut out: Vec<u8> = Vec::new();
+        let code = pump_until_sentinel(&mut &input[..], &mut out);
+        assert_eq!(code, 255);
+        assert_eq!(out, b"partial output, no sentinel\n");
+
+        // Empty stream (shell died immediately) is failure too.
+        let mut out: Vec<u8> = Vec::new();
+        let code = pump_until_sentinel(&mut &b""[..], &mut out);
+        assert_eq!(code, 255);
+        assert!(out.is_empty());
     }
 }

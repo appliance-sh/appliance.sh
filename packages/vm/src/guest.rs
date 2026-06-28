@@ -275,11 +275,32 @@ APP_GID=__APP_GID__
 APP_HOME=/persist/workspace
 
 mkdir -p "$APP_HOME"
-addgroup -g "$APP_GID" "$APP_USER" 2>/dev/null || true
+# Resolve the group that already owns $APP_GID. Alpine baselayout pins
+# several gids (e.g. gid 20 is `dialout`), and on a --mount VM $APP_GID is
+# the host's primary gid — `staff=20` on macOS — which collides. When a
+# group already owns the gid the appliance user joins IT as its primary
+# group; `addgroup -g <taken-gid>` would fail ("gid in use") and a
+# swallowed failure there leaves the user (and the vsock `su`) broken.
+# Only create a fresh `appliance` group when the gid is actually free.
+APP_GROUP=$(awk -F: -v g="$APP_GID" '$3==g{print $1; exit}' /etc/group)
+if [ -n "$APP_GROUP" ]; then
+  echo "appliance-user: gid $APP_GID already owned by group '$APP_GROUP' — using it as the primary group"
+else
+  addgroup -g "$APP_GID" "$APP_USER"
+  APP_GROUP="$APP_USER"
+fi
 # busybox adduser: -D no password, -H don't create home (it's on
 # /persist, made above), -h home, -s login shell, -G primary group,
 # -u uid. adduser/addgroup are busybox builtins (always present).
-adduser -D -H -u "$APP_UID" -G "$APP_USER" -h "$APP_HOME" -s /bin/sh "$APP_USER" 2>/dev/null || true
+adduser -D -H -u "$APP_UID" -G "$APP_GROUP" -h "$APP_HOME" -s /bin/sh "$APP_USER"
+# Verify loudly: a swallowed adduser failure (the gid collision used to
+# land exactly here) leaves the vsock shell unable to `su -l appliance`,
+# so surface it on the console instead of silently booting a broken shell.
+if id "$APP_USER" >/dev/null 2>&1; then
+  echo "appliance-user: created $APP_USER (uid=$(id -u "$APP_USER") gid=$(id -g "$APP_USER") group=$(id -gn "$APP_USER"))"
+else
+  echo "appliance-user: FATAL could not create $APP_USER (uid=$APP_UID gid=$APP_GID group=$APP_GROUP)"
+fi
 addgroup "$APP_USER" wheel 2>/dev/null || true
 # docker group membership is added in DOCKER_PROVISION (the group only
 # exists once the docker package is installed), not here.
@@ -311,7 +332,12 @@ PROFILE
 /// so the conventional `1000` is used. Pure so the substitution logic is
 /// unit-tested without a live VM.
 fn resolve_app_ids(mount: bool, host_uid: u32, host_gid: u32) -> (u32, u32) {
-    if mount {
+    // A host uid/gid of 0 means `appliance` is itself running as root;
+    // pinning (0,0) would make the supposedly "non-root" guest user uid 0
+    // and collapse the whole model. Fall back to the conventional
+    // 1000/1000 then — a root-owned share's writability stays a manual
+    // concern, but the guest user is never root.
+    if mount && host_uid != 0 && host_gid != 0 {
         (host_uid, host_gid)
     } else {
         (1000, 1000)
@@ -868,7 +894,12 @@ mod tests {
         assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
         // User + primary group, pinned uid/gid, on the persistent home.
         assert!(start.contains("APP_USER=appliance"));
-        assert!(start.contains("adduser -D -H -u \"$APP_UID\" -G \"$APP_USER\" -h \"$APP_HOME\" -s /bin/sh \"$APP_USER\""));
+        assert!(start.contains("adduser -D -H -u \"$APP_UID\" -G \"$APP_GROUP\" -h \"$APP_HOME\" -s /bin/sh \"$APP_USER\""));
+        // The user's primary group is resolved from /etc/group so a host
+        // gid that collides with a baselayout group (e.g. staff=20 →
+        // dialout) reuses that group instead of failing `addgroup`.
+        assert!(start.contains("APP_GROUP=$(awk -F: -v g=\"$APP_GID\" '$3==g{print $1; exit}' /etc/group)"));
+        assert!(start.contains("addgroup -g \"$APP_GID\" \"$APP_USER\""));
         assert!(start.contains("APP_HOME=/persist/workspace"));
         // wheel (sudo) membership + a passwordless sudoers drop-in.
         assert!(start.contains("addgroup \"$APP_USER\" wheel"));
@@ -903,13 +934,32 @@ mod tests {
         assert!(start.contains("APP_GID=1000"));
 
         // A --mount VM pins the host user's own uid/gid so the shared
-        // workspace (host-side ownership over virtiofs) stays writable.
+        // workspace (host-side ownership over virtiofs) stays writable —
+        // except when the host is root, where the resolver falls back to
+        // 1000 (asserted separately), so derive the expected ids the same
+        // way and don't hard-code the live host's values.
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
+        let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
         let shared = build_apkovl(5052, None, true, true, false, 5053).unwrap();
         let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
-        assert!(start.contains(&format!("APP_UID={host_uid}")), "mounted VM must pin the host uid");
-        assert!(start.contains(&format!("APP_GID={host_gid}")), "mounted VM must pin the host gid");
+        assert!(start.contains(&format!("APP_UID={exp_uid}")), "mounted VM must pin the resolved uid");
+        assert!(start.contains(&format!("APP_GID={exp_gid}")), "mounted VM must pin the resolved gid");
+    }
+
+    #[test]
+    fn resolve_app_ids_falls_back_when_host_is_root() {
+        // Running `appliance` as root must NOT mint a uid-0 "non-root"
+        // user: the mount path falls back to the conventional 1000/1000
+        // whenever the host uid or gid is 0.
+        assert_eq!(resolve_app_ids(true, 0, 0), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 0, 20), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 501, 0), (1000, 1000));
+        // A non-root host still carries its own ids onto the shared tree.
+        assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
+        // No share is always 1000/1000, root host or not.
+        assert_eq!(resolve_app_ids(false, 0, 0), (1000, 1000));
+        assert_eq!(resolve_app_ids(false, 501, 20), (1000, 1000));
     }
 
     #[test]

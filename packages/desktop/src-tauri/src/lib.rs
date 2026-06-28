@@ -3567,7 +3567,7 @@ struct TerminalOpenInput {
 /// the CLI: a stable HOME on the persistent disk, cd into the
 /// workspace, and bash once the toolchain has installed it (sh until
 /// then).
-const DEV_SHELL_LOGIN: &str = "export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; \
+const DEV_SHELL_LOGIN: &str = "export HOME=/persist/workspace; cd /persist/workspace 2>/dev/null || true; \
      if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi";
 
 /// Build the argv for a shell into the microVM host itself, riding

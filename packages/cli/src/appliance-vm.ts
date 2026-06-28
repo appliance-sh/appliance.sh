@@ -736,7 +736,7 @@ function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
 // persistent disk, cd into the workspace, and bash when the toolchain
 // has installed it (falling back to sh while it's still provisioning).
 const DEV_SHELL_LOGIN =
-  'export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ' +
+  'export HOME=/persist/workspace; cd /persist/workspace 2>/dev/null || true; ' +
   'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi';
 
 const dev = program
@@ -788,7 +788,7 @@ dev
     // an interactive dev shell prefers the fast vsock path, which lands
     // in /persist/workspace via the guest agent.
     if (command.length) {
-      const script = `export HOME=/persist/home; cd /persist/workspace 2>/dev/null || true; ${command.join(' ')}`;
+      const script = `export HOME=/persist/workspace; cd /persist/workspace 2>/dev/null || true; ${command.join(' ')}`;
       process.exit(runHostShell(opts.name, ['/bin/sh', '-c', script]));
     }
     process.exit(runInteractiveShell(opts.name, ['/bin/sh', '-c', DEV_SHELL_LOGIN]));
