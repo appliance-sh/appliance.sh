@@ -18,9 +18,9 @@ import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './utils/credentials.js';
 import { readProfiles, removeProfile } from './utils/profile-store.js';
 
-// `appliance vm` — the microVM runtime engine (appliance-vm). Same
-// developer surface as `appliance local` (the k3d engine), but the
-// workloads run inside an isolated VM that Appliance itself boots:
+// `appliance vm` — the microVM runtime engine (appliance-vm), the sole
+// local runtime now that bare k3d has been removed. Workloads run inside
+// an isolated VM that Appliance itself boots:
 // no docker provider required for the cluster, only for building and
 // pushing application images.
 //
@@ -215,8 +215,8 @@ async function runUp(
     `localhost:${ports.registryPort}/appliance-api-server:latest`
   );
 
-  // 4. In-VM api-server: same shared bootstrap as the k3d engine,
-  //    pointed at the VM's kubeconfig and registry.
+  // 4. In-VM api-server: the shared in-cluster bootstrap, pointed at the
+  //    VM's kubeconfig and registry.
   const existing = readProfiles().profiles[profile];
   const apiServerUrl = apiServerUrlForHostPort(ports.hostPort);
   const runtime = {
@@ -227,8 +227,7 @@ async function runUp(
   let verified = false;
   if (existing) {
     // Reconcile manifests, then keep existing credentials when they
-    // still authenticate — same no-key-sprawl behavior as
-    // `appliance local up`.
+    // still authenticate — no-key-sprawl behavior.
     try {
       await waitForApiServerUrl(apiServerUrl, 30_000);
       const client = createApplianceClient({

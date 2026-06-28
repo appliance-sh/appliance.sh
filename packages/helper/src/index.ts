@@ -19,22 +19,8 @@ export {
   DEFAULT_LOCAL_CLUSTER_NAME,
   DEFAULT_LOCAL_HOST_PORT,
   DEFAULT_LOCAL_NAMESPACE,
-  DEFAULT_LOCAL_NODEPORT_MAX,
-  DEFAULT_LOCAL_NODEPORT_MIN,
   DEFAULT_LOCAL_REGISTRY_PORT,
-  deleteLocalCluster,
-  ensureRegistry,
-  importImageToCluster,
-  isWedgedStartFailure,
-  kubeContextForCluster,
-  localClusterStatus,
-  probeRegistryUrl,
-  registryNameForCluster,
-  startLocalCluster,
-  stopLocalCluster,
-  waitForNodesReady,
 } from './cluster.js';
-export type { LocalClusterOptions, LocalClusterStatus } from './cluster.js';
 export {
   IN_CLUSTER_API_SERVER_DEFAULT_IMAGE,
   IN_CLUSTER_API_SERVER_HOSTNAME,

@@ -6,7 +6,7 @@ import { buildApplianceZip } from './utils/build-package.js';
 import chalk from 'chalk';
 
 // When invoked directly (commander dispatch covers this too), make
-// sure helper-installed docker / k3d / kubectl resolve on PATH.
+// sure helper-installed docker / kubectl / crane resolve on PATH.
 ensureHelperBinOnPath();
 
 const DEFAULT_OUTPUT = 'appliance.zip';

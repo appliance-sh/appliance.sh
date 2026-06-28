@@ -1,20 +1,19 @@
 // Build-and-publish pipeline for Kubernetes-base deploys. Cloud bases
 // take an uploaded appliance.zip and build server-side; Kubernetes
-// bases (local k3d, BYO clusters) deploy container images directly —
-// the in-cluster api-server has no docker daemon, so image production
-// is a host-side concern. This mirrors the desktop's
-// `build_and_import_image` Tauri command: build the image, push it to
-// the cluster-attached registry when one exists, and import it into
-// the k3d containerd store as a fallback for clusters whose
-// registries.yaml doesn't mirror the registry (`--registry-use` only
-// takes effect at cluster create time).
+// bases (the microVM runtime, BYO clusters) deploy container images
+// directly — the in-cluster api-server has no docker daemon, so image
+// production is a host-side concern. This mirrors the desktop's
+// `build_and_import_image` Tauri command: build the image and push it to
+// the runtime's image registry (the microVM's in-VM registry, or a BYO
+// cluster's). Image delivery is registry-only — there is no k3d
+// `image import` fallback anymore.
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import chalk from 'chalk';
-import { DEFAULT_LOCAL_CLUSTER_NAME, helperBinDir, importImageToCluster, runInstall } from '@appliance.sh/helper';
+import { helperBinDir, runInstall } from '@appliance.sh/helper';
 import { provenanceArgs } from './docker.js';
 
 export interface PublishLocalImageOptions {
@@ -26,11 +25,10 @@ export interface PublishLocalImageOptions {
    *  produced an image tagged `<name>` already (same contract as the
    *  zip pipeline's packageContainer). */
   buildScript?: string;
-  /** Cluster-attached registry (e.g. `localhost:5050`), or null when
-   *  the base has none. */
+  /** The runtime's image registry (e.g. `localhost:5052`), or null when
+   *  the base has none. A null registry can't receive a local build —
+   *  delivery is registry-only. */
   registryUrl: string | null;
-  /** k3d cluster to import into as a fallback. */
-  clusterName?: string;
   /** Docker build context (the appliance directory). Defaults to cwd,
    *  so `appliance deploy -d app/` builds `app/`'s Dockerfile rather
    *  than looking in the current directory. */
@@ -63,50 +61,38 @@ export async function publishLocalApplianceImage(opts: PublishLocalImageOptions)
     }
   }
 
-  let pushed = false;
-  let publishedRef = imageRef;
-  if (opts.registryUrl) {
-    console.log(chalk.dim(`Pushing ${imageRef}`));
-    try {
-      execFileSync('docker', ['push', imageRef], { stdio: 'inherit' });
-      pushed = true;
-    } catch {
-      // `docker push` executes inside the docker VM (colima/Desktop),
-      // where the host's 127.0.0.1 registries (the microVM engine's
-      // forwarded registry) don't exist. Retry host-side with crane —
-      // which also returns a digest ref, making redeploys roll even
-      // under a reused tag.
-      console.log(chalk.dim('docker push failed — retrying host-side with crane'));
-      try {
-        publishedRef = await cranePush(imageRef);
-        pushed = true;
-        console.log(chalk.dim(`pushed ${publishedRef}`));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.log(chalk.yellow(`Registry push failed (${message}) — falling back to k3d image import.`));
-      }
-    }
-  }
-
-  // Import into the cluster's containerd store regardless of push
-  // outcome: with `imagePullPolicy: IfNotPresent` the imported copy
-  // makes the deploy independent of registry mirror configuration,
-  // which older clusters lack. Best-effort — a BYO (non-k3d) cluster
-  // has nothing to import into.
-  let imported = false;
-  try {
-    imported = await importImageToCluster(imageRef, opts.clusterName ?? DEFAULT_LOCAL_CLUSTER_NAME);
-    if (imported) console.log(chalk.dim(`Imported ${imageRef} into the cluster`));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.log(chalk.dim(`k3d image import skipped: ${message}`));
-  }
-
-  if (!pushed && !imported) {
+  // Image delivery is registry-only. A Kubernetes base with no registry
+  // can't receive a host-built image — there's no `k3d image import`
+  // fallback anymore.
+  if (!opts.registryUrl) {
     throw new Error(
-      `Could not deliver ${imageRef} to the cluster: no reachable registry and k3d image import failed. ` +
-        'Check that the cluster is running (`appliance local status`).'
+      `Cannot deliver ${imageRef}: this base has no image registry configured. ` +
+        'Bring up the microVM runtime (`appliance vm up`), which provides an in-VM registry, ' +
+        'or configure a registry on the Kubernetes base.'
     );
+  }
+
+  console.log(chalk.dim(`Pushing ${imageRef}`));
+  let publishedRef = imageRef;
+  try {
+    execFileSync('docker', ['push', imageRef], { stdio: 'inherit' });
+  } catch {
+    // `docker push` executes inside the docker VM (colima/Desktop),
+    // where the host's 127.0.0.1 registries (the microVM engine's
+    // forwarded registry) don't exist. Retry host-side with crane —
+    // which also returns a digest ref, making redeploys roll even
+    // under a reused tag.
+    console.log(chalk.dim('docker push failed — retrying host-side with crane'));
+    try {
+      publishedRef = await cranePush(imageRef);
+      console.log(chalk.dim(`pushed ${publishedRef}`));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Could not deliver ${imageRef} to the registry at ${opts.registryUrl}: ${message}. ` +
+          'Check that the runtime is up (`appliance vm status`).'
+      );
+    }
   }
   return publishedRef;
 }

@@ -2,7 +2,7 @@
   "name": "@appliance.sh/helper",
   "version": "1.49.0",
   "private": true,
-  "description": "Cross-platform dependency installer for the Appliance local runtime (docker / k3d / kubectl)",
+  "description": "Cross-platform dependency installer for the Appliance local runtime (docker / kubectl / crane)",
   "repository": {
     "type": "git",
     "url": "https://github.com/appliance-sh/appliance.sh.git",

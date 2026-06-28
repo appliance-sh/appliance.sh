@@ -17,16 +17,16 @@ describe('remediationHint', () => {
 
   it('points missing-kubeconfig failures at bringing the runtime up', () => {
     const hint = remediationHint('no kubeconfig at /x/kubeconfig.yaml — is the VM up?');
-    expect(hint).toMatch(/appliance (local|vm) up/);
+    expect(hint).toMatch(/appliance vm up/);
   });
 
-  it('points a not-running cluster at `appliance local up`', () => {
-    expect(remediationHint('cluster appliance-local does not exist')).toMatch(/appliance local up/);
-    expect(remediationHint('k3d cluster list failed')).toMatch(/appliance local up/);
+  it('points a not-running runtime at `appliance vm up`', () => {
+    expect(remediationHint('cluster appliance-local does not exist')).toMatch(/appliance vm up/);
+    expect(remediationHint('no such cluster')).toMatch(/appliance vm up/);
   });
 
   it('points container-runtime failures at starting the runtime', () => {
-    expect(remediationHint('Cannot connect to the Docker daemon')).toMatch(/appliance local runtime start/);
+    expect(remediationHint('Cannot connect to the Docker daemon')).toMatch(/colima start|Docker Desktop/);
   });
 
   it('treats 5xx as a transient server error worth a retry', () => {

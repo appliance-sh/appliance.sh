@@ -276,9 +276,9 @@ async function resolveKubernetesBuildId(
   }
 
   // Loopback registries mean the cluster runs on this machine, and it
-  // can't emulate — the microVM has no binfmt, and k3d runs in the
-  // host-arch docker VM. A cross-arch image just crashloops with `exec
-  // format error` after an opaque rollout timeout, so pin the build to
+  // can't emulate — the microVM has no binfmt. A cross-arch image just
+  // crashloops with `exec format error` after an opaque rollout timeout,
+  // so pin the build to
   // the host arch for local targets regardless of the manifest's
   // `platform` (which typically targets a cloud runtime). The override
   // doesn't touch a user `scripts.build` — that script owns its arch.
@@ -299,13 +299,11 @@ async function resolveKubernetesBuildId(
     }
     platform = `linux/${hostArch}`;
   }
-  const clusterName = baseConfig.local?.cluster?.clusterName;
   const imageRef = await publishLocalApplianceImage({
     name: appliance.name,
     platform,
     buildScript: appliance.scripts?.build,
     registryUrl,
-    clusterName,
     // Build the appliance's own directory (honors -d/-f), not whatever
     // cwd the deploy was invoked from.
     context: resolveApplianceDir(program),
@@ -382,8 +380,8 @@ registerManifestOptions(program)
       console.error(chalk.red('Not logged in — no credentials for the active profile.'));
       console.error(
         chalk.dim(
-          'Run `appliance login` to authenticate, or start a local runtime with `appliance local up` / `appliance vm up` ' +
-            '(which save a profile for you). `appliance whoami` shows the active profile; `appliance doctor` checks the host prerequisites.'
+          'Run `appliance login` to authenticate, or start the local runtime with `appliance vm up` ' +
+            '(which saves a profile for you). `appliance whoami` shows the active profile; `appliance doctor` checks the host prerequisites.'
         )
       );
       process.exit(1);

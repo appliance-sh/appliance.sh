@@ -336,7 +336,9 @@ program
       if (r.error) {
         const code = (r.error as NodeJS.ErrnoException).code;
         if (code === 'ENOENT') {
-          console.error(chalk.red('kubectl not found on PATH. Install it (e.g. `appliance local install kubectl`).'));
+          console.error(
+            chalk.red('kubectl not found on PATH. Install it (e.g. `brew install kubernetes-cli`), then retry.')
+          );
           process.exit(1);
         }
         console.error(chalk.red(`Failed to run kubectl: ${r.error.message}`));

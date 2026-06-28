@@ -8,16 +8,14 @@ import {
   DEFAULT_LOCAL_HOST_PORT,
   DEFAULT_LOCAL_NAMESPACE,
   DEFAULT_LOCAL_REGISTRY_PORT,
-  importImageToCluster,
-  probeRegistryUrl,
 } from './cluster.js';
 import type { ProgressEvent } from './types.js';
 
 // In-cluster api-server bootstrap: render the manifest bundle, apply
 // it via kubectl, wait for the Ingress to answer, and mint the first
-// API key. TypeScript port of the desktop's
-// `bootstrap_in_cluster_api_server` (packages/desktop/src-tauri/src/lib.rs)
-// so `appliance local up` can stand up the full runtime headlessly.
+// API key. Shared by the microVM engine (`appliance vm up`, which passes
+// its per-VM kubeconfig + in-VM registry URL) and the desktop's
+// `bootstrap_in_cluster_api_server`.
 
 export const IN_CLUSTER_API_SERVER_NAMESPACE = 'appliance-system';
 export const IN_CLUSTER_API_SERVER_NAME = 'api-server';
@@ -37,9 +35,9 @@ export interface LocalRuntimeOptions {
   hostPort?: number;
   registryPort?: number;
   dataDir?: string;
-  /** Host-side registry URL to advertise in the base config. When
-   *  set, the k3d registry probe is skipped entirely — used by the
-   *  microVM engine, whose registry isn't a k3d container. */
+  /** Host-side registry URL to advertise in the base config — the
+   *  microVM engine passes its in-VM registry URL here. When unset,
+   *  no registry block is emitted (image delivery is registry-only). */
   registryUrl?: string;
 }
 
@@ -50,8 +48,8 @@ export interface ResolvedRuntimeConfig {
   dataDir: string;
   apiServerUrl: string;
   registryPort: number;
-  /** Host-side URL of the k3d-attached registry (e.g. `localhost:5050`),
-   *  or null when no matching registry container exists. */
+  /** Host-side URL of the runtime's image registry (e.g.
+   *  `localhost:5052` for the microVM), or null when none was provided. */
   registryUrl: string | null;
 }
 
@@ -81,7 +79,10 @@ export async function resolveRuntimeConfig(input: LocalRuntimeOptions = {}): Pro
     dataDir: input.dataDir ?? defaultLocalRuntimeDir(),
     apiServerUrl: apiServerUrlForHostPort(hostPort),
     registryPort,
-    registryUrl: input.registryUrl ?? (await probeRegistryUrl(clusterName, registryPort)),
+    // Registry-only image delivery: the caller (microVM engine) advertises
+    // its registry URL explicitly; there is no cluster-attached registry to
+    // probe for anymore.
+    registryUrl: input.registryUrl ?? null,
   };
 }
 
@@ -98,8 +99,8 @@ export function buildInClusterBaseConfig(cfg: ResolvedRuntimeConfig): string {
     namespace: cfg.namespace,
     hostnameSuffix: 'appliance.localhost',
     ingressClassName: 'traefik',
-    // The k3d serverlb publishes ingress :80 on this host port —
-    // deploy-result URLs must carry it to be clickable from the host.
+    // The runtime publishes ingress :80 on this host port — deploy-result
+    // URLs must carry it to be clickable from the host.
     hostPort: cfg.hostPort,
   };
   if (cfg.registryUrl) {
@@ -426,9 +427,9 @@ export interface BootstrapInClusterOptions {
    *  apply. First boots include a full image pull + extraction, so
    *  the default is generous. */
   readyTimeoutMs?: number;
-  /** Kubeconfig the kubectl calls should use. Defaults to the
-   *  ambient kubeconfig (the k3d path); the microVM engine passes
-   *  the per-VM file appliance-vm fetched. */
+  /** Kubeconfig the kubectl calls should use. Defaults to the ambient
+   *  kubeconfig; the microVM engine passes the per-VM file appliance-vm
+   *  fetched. */
   kubeconfigPath?: string;
   /** Override the api-server image reference (see
    *  IN_CLUSTER_API_SERVER_DEFAULT_IMAGE for the default + rationale). */
@@ -447,10 +448,11 @@ export interface BootstrapInClusterResult {
 }
 
 /**
- * Apply the in-cluster api-server manifests to the running k3d
- * cluster, wait for the deployment to become reachable, and mint the
- * first API key. Idempotent: applying twice reconciles the manifest in
- * place and mints a fresh key.
+ * Apply the in-cluster api-server manifests to the running cluster,
+ * wait for the deployment to become reachable, and mint the first API
+ * key. Idempotent: applying twice reconciles the manifest in place and
+ * mints a fresh key. Image delivery is registry-only — the api-server
+ * image is pulled from ghcr (or the registry the caller advertised).
  */
 export async function bootstrapInClusterApiServer(
   opts: BootstrapInClusterOptions = {}
@@ -464,16 +466,6 @@ export async function bootstrapInClusterApiServer(
   const bootstrapToken =
     (await readExistingBootstrapToken({ kubeconfigPath: opts.kubeconfigPath })) ??
     crypto.randomUUID().replaceAll('-', '');
-
-  // When the image is sitting in the local docker daemon (the
-  // build-locally iteration path), import it straight into the
-  // cluster's containerd store. k3d-only: covers clusters whose
-  // registries.yaml doesn't mirror the sibling registry. The microVM
-  // path (kubeconfigPath set) delivers images via its in-VM registry
-  // instead — there is no k3d cluster to import into.
-  if (!opts.kubeconfigPath && (await importImageToCluster(image, cfg.clusterName))) {
-    emit(`imported ${image} into cluster ${cfg.clusterName}`);
-  }
 
   emit(`applying api-server manifests (image ${image})`);
   await kubectlApplyManifest(renderInClusterApiServerManifest(cfg, image, bootstrapToken), {

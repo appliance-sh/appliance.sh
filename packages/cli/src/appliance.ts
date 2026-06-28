@@ -4,7 +4,7 @@ import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 import * as sdk from '@appliance.sh/sdk';
 
 // Prepend ~/.appliance/bin to PATH so any downstream spawns (docker,
-// k3d, kubectl) resolve helper-installed binaries when the system
+// kubectl, crane) resolve helper-installed binaries when the system
 // PATH lacks them. Idempotent; safe to also call from a subcommand
 // entry directly.
 ensureHelperBinOnPath();
@@ -84,7 +84,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-link.js'),
   },
   local: {
-    description: 'manage the local k3d-backed runtime',
+    description: '(removed) the local k3d runtime — use `appliance vm` / `appliance up`',
     load: () => import('./appliance-local.js'),
   },
   logs: {
