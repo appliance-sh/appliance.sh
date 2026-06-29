@@ -151,6 +151,13 @@ export function readSandboxLink(startDir?: string): SandboxLink | null {
   return parsed?.sandbox ?? null;
 }
 
+/** The sandbox VM the cwd project is linked to, or null when there's no
+ *  sandbox link yet. The agent runner (utils/agent.ts) targets this VM,
+ *  falling back to the shared default sandbox VM when null. */
+export function readSandboxVm(startDir?: string): string | null {
+  return readSandboxLink(startDir)?.vm ?? null;
+}
+
 /**
  * Write the link file at `rootDir/.appliance/link.json`. Defaults to
  * cwd. Creates the directory if needed; writes are atomic from the
