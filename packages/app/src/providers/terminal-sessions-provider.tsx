@@ -26,6 +26,27 @@ import type { TerminalSession } from '@/lib/host';
 
 export type TerminalStatus = 'connecting' | 'open' | 'closed' | 'error';
 
+/** Plain-language label for a session status. Shared by the dock tab
+ *  (E3.3) and the drawer pill (E3.2) so the four-way status semantics
+ *  ('open' = Live, 'connecting', 'error', 'closed' = Ended) can't drift
+ *  between the two copies. */
+export function statusLabel(status: TerminalStatus): string {
+  return status === 'open' ? 'Live' : status === 'connecting' ? 'Connecting…' : status === 'error' ? 'Error' : 'Ended';
+}
+
+/** Tailwind classes for the small status dot, keyed by status — also shared
+ *  by both surfaces so the colour semantics (green pulse = Live, red =
+ *  Error, muted pulse = Connecting, muted = Ended) stay in lock-step. */
+export function statusDotClass(status: TerminalStatus): string {
+  return status === 'open'
+    ? 'animate-pulse bg-green-400'
+    : status === 'error'
+      ? 'bg-red-400'
+      : status === 'connecting'
+        ? 'animate-pulse bg-[var(--color-muted-foreground)]'
+        : 'bg-[var(--color-muted-foreground)]';
+}
+
 /** Args to open or focus a terminal session. */
 export interface OpenTerminalOptions {
   /** kubectl/shell target — a pod name, or the VM name for a host shell. */
@@ -281,11 +302,21 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
     (id: string): string | null => {
       const live = liveRef.current.get(id);
       if (!live) return null;
-      return openSession({
+      const opts: OpenTerminalOptions = {
         target: live.target,
         engine: live.engine,
         clusterName: live.clusterName,
         mode: live.mode,
+      };
+      // Without a disambiguator a fork is byte-identical to its source
+      // (same derived title + subtitle) and, once nothing is active
+      // (activeId null after nav), the two tabs can't be told apart. Suffix
+      // the clone with its index among shells already on this target so
+      // concurrent shells read distinctly ("… 2", "… 3", …).
+      const onSameTarget = Array.from(liveRef.current.values()).filter((s) => s.target === live.target).length;
+      return openSession({
+        ...opts,
+        title: `${deriveTitle(opts)} ${onSameTarget + 1}`,
         sessionKey: `dup:${++nextSessionSeq}`,
       });
     },

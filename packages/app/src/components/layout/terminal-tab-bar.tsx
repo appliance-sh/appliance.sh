@@ -1,6 +1,11 @@
 import * as React from 'react';
 import { Plus, X } from 'lucide-react';
-import { useTerminalSessions, type TerminalSessionMeta } from '@/providers/terminal-sessions-provider';
+import {
+  useTerminalSessions,
+  statusLabel,
+  statusDotClass,
+  type TerminalSessionMeta,
+} from '@/providers/terminal-sessions-provider';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { cn } from '@/lib/utils';
 
@@ -13,29 +18,12 @@ import { cn } from '@/lib/utils';
 // not auto-reaped; they are clearly flagged (dimmed, "Ended"/"Error" dot)
 // and carry a close affordance so the user removes them deliberately.
 
-function statusLabel(status: TerminalSessionMeta['status']): string {
-  return status === 'open' ? 'Live' : status === 'connecting' ? 'Connecting…' : status === 'error' ? 'Error' : 'Ended';
-}
-
 // Compact projection of E3.2's `StatusPill`: same colour semantics
-// (green pulse = Live, red = Error, muted = Connecting/Ended) shrunk to a
-// single dot so it fits a tab. The full label rides the tab's `title`.
+// (shared `statusDotClass`) shrunk to a single dot so it fits a tab. The
+// status word is also folded into the tab button's accessible name (it is
+// not colour-only) — this dot is decorative for assistive tech.
 function StatusDot({ status }: { status: TerminalSessionMeta['status'] }) {
-  return (
-    <span
-      aria-hidden
-      className={cn(
-        'h-1.5 w-1.5 shrink-0 rounded-full',
-        status === 'open'
-          ? 'animate-pulse bg-green-400'
-          : status === 'error'
-            ? 'bg-red-400'
-            : status === 'connecting'
-              ? 'animate-pulse bg-[var(--color-muted-foreground)]'
-              : 'bg-[var(--color-muted-foreground)]'
-      )}
-    />
-  );
+  return <span aria-hidden className={cn('h-1.5 w-1.5 shrink-0 rounded-full', statusDotClass(status))} />;
 }
 
 function TerminalTab({
@@ -54,6 +42,10 @@ function TerminalTab({
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(session.title);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
+  // Set while cancelling so the blur that fires when the still-focused input
+  // unmounts (`editing=false`) does NOT run the commit — otherwise Escape
+  // would commit the discarded draft instead of dropping it.
+  const skipBlurRef = React.useRef(false);
   // A self-exited / failed shell is dead weight — dim it so the live tabs
   // read first, but keep it present (and closable) per Devon's nit.
   const dead = session.status === 'closed' || session.status === 'error';
@@ -74,6 +66,7 @@ function TerminalTab({
     onRename(draft);
   };
   const cancel = () => {
+    skipBlurRef.current = true;
     setEditing(false);
     setDraft(session.title);
   };
@@ -95,7 +88,16 @@ function TerminalTab({
           ref={inputRef}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onBlur={commit}
+          onBlur={() => {
+            // Cancel (Escape) unmounts this still-focused input, which fires
+            // a blur on the removed node; that blur must NOT commit the draft
+            // the user just discarded — swallow it once and reset the latch.
+            if (skipBlurRef.current) {
+              skipBlurRef.current = false;
+              return;
+            }
+            commit();
+          }}
           onKeyDown={(e) => {
             // Keep keystrokes out of any underlying terminal.
             e.stopPropagation();
@@ -110,8 +112,22 @@ function TerminalTab({
           type="button"
           onClick={onSelect}
           onDoubleClick={startEdit}
+          onKeyDown={(e) => {
+            // Keyboard rename path: F2 starts editing the focused tab, so
+            // rename isn't double-click-only (and double-click stays as the
+            // discoverable mouse route, hinted by the button title).
+            if (e.key === 'F2') {
+              e.preventDefault();
+              startEdit();
+            }
+          }}
           className="min-w-0 flex-1 truncate text-left"
           aria-pressed={active}
+          // Fold the status word into the accessible name so a screen-reader
+          // / keyboard user can tell a live tab from a dead one — the dot is
+          // colour-only and aria-hidden.
+          aria-label={`${session.title} (${statusLabel(session.status)})`}
+          title="Double-click or press F2 to rename"
         >
           {session.title}
         </button>
@@ -154,18 +170,22 @@ export function TerminalTabBar() {
   );
 
   // The "+" forks a new concurrent shell from the active tab (or the most
-  // recent one) — the dock has no VM context of its own to target.
-  const forkSource = sessions.find((s) => s.id === activeId) ?? sessions[sessions.length - 1];
+  // recent one) — the dock has no VM context of its own to target. The dock
+  // only mounts with ≥1 session, so a fork source always exists; no disabled
+  // guard is needed.
   const handleNew = React.useCallback(() => {
-    if (forkSource) duplicateSession(forkSource.id);
-  }, [duplicateSession, forkSource]);
+    const source = sessions.find((s) => s.id === activeId) ?? sessions[sessions.length - 1];
+    if (source) duplicateSession(source.id);
+  }, [duplicateSession, sessions, activeId]);
 
   return (
-    <div className="flex items-center gap-2 overflow-x-auto">
+    <div className="flex items-center gap-2">
+      {/* "Shells" label and "+" sit OUTSIDE the scroll strip so they stay
+          pinned when the tabs overflow horizontally. */}
       <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-[var(--color-muted-foreground)]">
         Shells
       </span>
-      <div className="flex items-center gap-1.5">
+      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
         {sessions.map((session) => (
           <TerminalTab
             key={session.id}
@@ -180,8 +200,7 @@ export function TerminalTabBar() {
       <button
         type="button"
         onClick={handleNew}
-        disabled={!forkSource}
-        className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-accent)] hover:text-[var(--color-foreground)] disabled:pointer-events-none disabled:opacity-40"
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-accent)] hover:text-[var(--color-foreground)]"
         title="Open another shell on the same target"
         aria-label="Open another shell"
       >

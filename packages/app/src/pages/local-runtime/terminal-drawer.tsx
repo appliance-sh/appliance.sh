@@ -1,6 +1,11 @@
 import * as React from 'react';
 import { useLocation } from 'react-router';
-import { useTerminalSessions, type TerminalSessionMeta } from '@/providers/terminal-sessions-provider';
+import {
+  useTerminalSessions,
+  statusLabel,
+  statusDotClass,
+  type TerminalSessionMeta,
+} from '@/providers/terminal-sessions-provider';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { cn } from '@/lib/utils';
@@ -22,8 +27,6 @@ import { cn } from '@/lib/utils';
 // live surfaces read the same: a pulsing green "Live" when connected,
 // plain-language states otherwise.
 function StatusPill({ status }: { status: TerminalSessionMeta['status'] }) {
-  const label =
-    status === 'open' ? 'Live' : status === 'connecting' ? 'Connecting…' : status === 'error' ? 'Error' : 'Ended';
   return (
     <span
       className={cn(
@@ -35,17 +38,10 @@ function StatusPill({ status }: { status: TerminalSessionMeta['status'] }) {
             : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
       )}
     >
-      <span
-        className={cn(
-          'h-1.5 w-1.5 rounded-full',
-          status === 'open'
-            ? 'animate-pulse bg-green-400'
-            : status === 'error'
-              ? 'bg-red-400'
-              : 'bg-[var(--color-muted-foreground)]'
-        )}
-      />
-      {label}
+      {/* Label + dot come from the shared helpers so the dock tab (E3.3) and
+          this pill (E3.2) can't drift on the four-way status semantics. */}
+      <span className={cn('h-1.5 w-1.5 rounded-full', statusDotClass(status))} />
+      {statusLabel(status)}
     </span>
   );
 }
