@@ -1,15 +1,19 @@
 # Agent login — interactive OAuth + the agent-agnostic auth-mode seam (Phase 5)
 
-**Status:** Design (L0 spike). **Scope:** the design L1–L3 build to — it adds
-**interactive "Sign in with Claude" (subscription OAuth) login** alongside the
-existing API-key login, and generalizes the credential into an **agent-agnostic
+**Status:** **L1 + L2 SHIPPED** (`packages/cli`: `utils/agent.ts`,
+`appliance-agent.ts`); L0 design + L3 (desktop) below. It adds **interactive
+"Sign in with Claude" (subscription OAuth) login** alongside the existing
+API-key login, and generalizes the credential into an **agent-agnostic
 auth-mode abstraction** so other CLI agents drop in later. **Branch:**
 `feat/phase5-agent-sandboxes`. **Builds on:** the shipped Phase 5 broker
 ([docs/agent-sandbox.md](agent-sandbox.md)) — read it first; this doc only adds a
 **second auth mode** to that exact broker, with the same guarantees.
 
-This is **design, not feature code.** No runner/broker/desktop behavior changes
-until L1–L3 implement it.
+L1 (login mode-picker + host `claude setup-token` capture + kind-tagged store +
+kind-aware `print-key`) and L2 (broker Bearer/OAuth injection: cred rule
+`header=authorization`, in-guest `CLAUDE_CODE_OAUTH_TOKEN=<placeholder>`) are
+implemented. **The Rust broker (`creds.rs`/`mitm.rs`/`egress.rs`) is unchanged —
+OAuth is a values-only change.** L3 (desktop) is still design.
 
 ## 0. Headline + the hard ToS constraint (read first)
 
@@ -24,15 +28,38 @@ MITM scope, same peer-pin. The token, like the key, **never enters the VM**.
 > **ToS constraint — bake in, do not design around (Feb 2026).** Subscription
 > OAuth tokens are intended for **Claude Code / claude.ai direct use ONLY**.
 > This design is acceptable **only because we run the `claude` binary
-> _directly_ inside the VM** and the broker merely swaps the auth header on
-> _Claude Code's own_ outbound calls to `api.anthropic.com`. We do **NOT**
-> expose a model-API endpoint, **NOT** wrap/proxy/rewrite the Anthropic model
-> API as a third-party service, and **NOT** resell access. The broker is a
-> header-injection point on the agent's own traffic, not an API gateway.
+> _directly_ inside the VM** as a **single-purpose Claude sandbox**. We do
+> **NOT** expose a model-API endpoint, **NOT** wrap/proxy/rewrite the Anthropic
+> model API as a third-party service, and **NOT** resell access. The broker is
+> a header-injection point on the agent's own traffic, not an API gateway.
 > **Any future work that turns this into an API-as-a-service (a listener that
 > accepts arbitrary model requests and forwards them under the user's
-> subscription token) is out of bounds.** L1's "Sign in with Claude" copy must
-> carry a short version of this caveat.
+> subscription token) is out of bounds.** L1's "Sign in with Claude" copy
+> carries a short version of this caveat.
+>
+> **Correction (Sasha §4) — the "Claude-Code-only" posture is NOT
+> broker-enforced.** Be precise about what the broker does: it injects the
+> Bearer (or api-key) header on **all** guest→`api.anthropic.com` traffic and
+> **cannot distinguish `claude`'s own calls from any other guest process** —
+> the cred rule matches by **host**, not by which binary made the request
+> (`creds.rs` `first_matching(inject)` keys on the host). So "the token is used
+> only by Claude Code's own direct calls" rests entirely on the VM being a
+> **single-purpose Claude sandbox** — a property of how we provision and use
+> the VM, **not** something the broker checks or enforces. This is the **same
+> class** of honest limit as "egress is cooperative, not enforced" and "the
+> microVM is the only real isolation boundary" (`docs/agent-sandbox.md` §9): a
+> jailbroken guest could point another process at `api.anthropic.com` and the
+> broker would inject the token on it too (it still **cannot read** the token —
+> that's brokered host-side). Keeping the VM single-purpose is the operator's
+> responsibility; the ToS posture is a provisioning/compliance boundary, not a
+> network control.
+>
+> **One more at-rest note:** the one-year `setup-token` OAuth token is a
+> **longer-lived secret than an API key**, so a compromise of the **host**
+> credential store is worth roughly **a year of subscription access** until the
+> token expires or is revoked. This does **not** add a new trust boundary — it
+> is the **same host-compromise threat model** as the API key (host Keychain /
+> `0600` file), just a longer blast-radius window on that one existing surface.
 
 > **Why a one-year token ⇒ no refresh plumbing.** `claude setup-token` returns a
 > **one-year** token. We deliberately do **NOT** use the short-lived (~60 min)
@@ -73,9 +100,9 @@ export interface AuthMode {
    *  chain picking a different header (§3). */
   env: string; // 'ANTHROPIC_API_KEY' | 'CLAUDE_CODE_OAUTH_TOKEN'
   /** Host-side interactive login that yields this credential (OAuth only).
-   *  Run on the HOST; prints a URL the user opens in their own browser;
-   *  returns the long-lived token on stdout. Absent for api-key (the user
-   *  pastes/pipes the key). */
+   *  Run on the HOST; opens a browser + shows the URL, then reveals the
+   *  long-lived token in its TUI (captured via a hidden paste — §2, §7.1).
+   *  Absent for api-key (the user pastes/pipes the key). */
   loginCmd?: string; // 'claude setup-token'
   /** Inert, syntactically-shaped placeholder put in `env` in-guest. The CLI
    *  needs *a* credential present to start + emit the header; the proxy
@@ -195,15 +222,20 @@ the one-year `sk-ant-oat01-` token, and stores it host-side **tagged `kind:'oaut
    `kind` tag (§5).
 
 2. **Sign in with Claude** (new): run the selected mode's `loginCmd`
-   (`claude setup-token`) **on the host**, with its TTY inherited so the user
-   sees the URL and the browser opens, while we **also capture stdout**. On exit,
-   extract the token by grepping captured output for the `sk-ant-oat01-` prefix
-   (robust to whether the URL goes to stderr/tty and the token to stdout), then
-   `writeAgentKey(token, 'oauth')`. **`claude setup-token` runs host-side, never
-   in the VM**, and **requires `claude` installed on the host** + a Pro/Max/
-   Team/Enterprise subscription — both are precondition checks with actionable
-   errors. The token is returned to us and stored; it is **not** saved by
-   `setup-token` anywhere else.
+   (`claude setup-token`) **on the host** with its **TTY fully inherited** so
+   the user sees the URL, the browser opens, and they paste the authorization
+   code — the native flow. `setup-token` turned out to be a full-screen Ink TUI
+   that reveals the one-year token **on-screen only** (no clean stdout line; it
+   needs a TTY) and persists no copy of its own (§7.1, §7.2). So on exit L1
+   captures the token via a **hidden in-process paste prompt** —
+   `extractOAuthToken` pulls the `sk-ant-oat01-…` token out of the bare token or
+   the whole `export CLAUDE_CODE_OAUTH_TOKEN=…` line — then
+   `writeAgentKey(token, 'oauth')`. The token is **never echoed, never logged,
+   never written to a temp file** (Sasha §7.1): it goes straight from the prompt
+   to the Keychain. **`claude setup-token` runs host-side, never in the VM**, and
+   **requires `claude` installed on the host** + a Pro/Max/Team/Enterprise
+   subscription — a missing host `claude` is detected (`hostHasClaude`) with an
+   actionable error rather than a crash.
 
 Surface selection as either an interactive prompt (`API key` / `Sign in with
 Claude`) or explicit flags: `appliance agent login --oauth` vs
@@ -395,46 +427,86 @@ the user's subscription **but cannot read the token** (it's brokered host-side).
 Nothing here tightens or loosens that.
 
 **The ToS constraint is a security/compliance boundary, not just a doc note.**
-We broker the subscription token **only** onto Claude Code's own direct calls
-(§0). We must never build a listener that accepts arbitrary model requests and
-forwards them under the token — that would be reselling the subscription API and
-is explicitly out of bounds. The header-injection design _cannot_ become that by
-accident (it only rewrites a header on the agent's own egress), and L1–L3 must
-not add an API-gateway surface.
+We broker the subscription token onto guest→`api.anthropic.com` traffic in a
+**single-purpose Claude sandbox**, so in practice it is spent only on Claude
+Code's own direct calls — but, per the §0 correction, that "only" is **enforced
+by how we provision the VM, not by the broker** (the cred rule matches by host,
+not by which process called). We must never build a listener that accepts
+arbitrary model requests and forwards them under the token — that would be
+reselling the subscription API and is explicitly out of bounds. The
+header-injection design _cannot_ become that by accident (it only rewrites a
+header on the guest's own egress to one host; it is not an API gateway), and
+L1–L3 must not add an API-gateway surface. The longer-lived OAuth token widens
+the at-rest blast radius of a **host** compromise (≈ a year of access) but adds
+**no new boundary** — same host-compromise threat model as the API key (§0).
 
-## 7. Open questions / verify items (for Eliot / Sasha)
+## 7. Empirical findings + remaining verify items (for Eliot / Sasha)
 
-Empirical checks L1–L3 must confirm (analogous to the A0 STEP-0 placeholder
-confirmation, which validated the api-key placeholder is accepted without local
-pre-validation):
+What L1/L2 confirmed on this host (`claude` 2.1.195), and what is still owed
+live (needs a Pro/Max account + a booted VM):
 
-1. **`setup-token` stdout/stderr split.** Confirm exactly where `claude
-setup-token` prints the URL vs the token, so the L1 capture (grep stdout for
-   `sk-ant-oat01-` while inheriting the TTY for the URL) is robust. If
-   `setup-token` is fully interactive with no clean stdout token line, L1 may
-   need to parse the terminal output or prompt the user to paste the token —
-   resolve before L1 ships. **Highest-leverage unknown here.**
-2. **OAuth placeholder accepted without local pre-validation.** Confirm `claude`
-   starts and emits `Authorization: Bearer sk-ant-oat01-appliance-proxy` when
-   `CLAUDE_CODE_OAUTH_TOKEN` is the inert placeholder (the analogue of the
-   verified api-key placeholder). If it pre-validates the token shape, adjust
-   the placeholder to a shape it accepts.
-3. **Precedence in practice.** Confirm that with **only**
+1. **`setup-token` is a full-screen Ink TUI — there is NO clean stdout token
+   line (RESOLVED differently than the L0 design assumed).** Empirically
+   `claude setup-token`: (a) **requires a TTY** — with stdout/stderr piped it
+   emits nothing; (b) opens the browser, then renders the sign-in URL and the
+   minted token **inline in a TUI** (ANSI-coloured, line-wrapped), ending with
+   **"Store this token securely. You won't be able to see it again."** and
+   "Use this token by setting: `export CLAUDE_CODE_OAUTH_TOKEN=<token>`"; (c)
+   prompts the user to **paste the authorization code** from the browser. So
+   the design's "grep stdout for `sk-ant-oat01-` while inheriting the TTY" is
+   **not achievable** — one stdout fd cannot be both the Ink TTY and a capture
+   pipe, a PTY tee would need a native dep (`node-pty`), and `script(1)` would
+   write the token to a temp file (forbidden by Sasha §7.1). **L1's capture
+   therefore inherits the TTY for the native flow, then reads the token back
+   via a HIDDEN in-process paste prompt** (`extractOAuthToken` pulls the
+   `sk-ant-oat01-…` token out of the bare token OR the whole
+   `export CLAUDE_CODE_OAUTH_TOKEN=…` line, stripping ANSI). This is in-process,
+   never echoed, never a temp file — honouring §7.1. (The token is shown inline,
+   not on an alternate screen, so it stays in scrollback for the user to copy
+   after `setup-token` exits.)
+2. **`setup-token` does NOT persist a second at-rest copy (Sasha §5 —
+   CHECKED at the source level; LIVE end-to-end owed).** The `setupTokenHandler`
+   in the `claude` binary is a **display-only** Ink flow ("you won't be able to
+   see it again"); the credential-persisting code path
+   (`claudeAiOauth.accessToken` written to the macOS login Keychain item
+   `Claude Code-credentials` / `~/.claude/.credentials.json` off-mac) belongs to
+   the **separate `claude /login` / `auth login` flow**, not `setup-token`. So
+   `setup-token` mints the token, shows it once, and **leaves no copy of its
+   own** — after L1 captures it, the only at-rest copy is our host store
+   (`sh.appliance.agent`). **Note (host footprint):** if the user has _also_ run
+   `claude /login` on the host, the host already holds a `Claude Code-credentials`
+   Keychain item from _that_ flow (it was present on this host) — that is a
+   pre-existing footprint of normal Claude Code use, **unrelated** to
+   `setup-token`. **Owed:** confirm end-to-end with a real account that no
+   `Claude Code-credentials` item appears/changes _as a result of_
+   `setup-token` (diff the Keychain before/after a real run).
+3. **OAuth placeholder accepted without local pre-validation (OWED, LIVE).**
+   Confirm `claude` starts and emits `Authorization: Bearer
+sk-ant-oat01-appliance-proxy` when `CLAUDE_CODE_OAUTH_TOKEN` is the inert
+   placeholder — the analogue of the verified api-key placeholder. Needs a
+   booted VM; the placeholder is oauth-shaped to maximise the chance it is
+   accepted without a shape pre-check.
+4. **Precedence in practice (OWED, LIVE).** Confirm that with **only**
    `CLAUDE_CODE_OAUTH_TOKEN` set in-guest (no `ANTHROPIC_API_KEY`), `claude`
-   actually emits the Bearer (not falling through to interactive `/login`), so
-   the broker overwrites a real header. (Design sets exactly one env to make
-   this deterministic.)
-4. **Host `claude` dependency for OAuth login.** `claude setup-token` needs
-   `claude` on the **host**. Decide the precondition UX: detect + actionable
-   error ("install Claude Code on this Mac to sign in"), or offer to install it
-   host-side. (API-key mode has no host `claude` dependency.)
-5. **Keychain envelope migration.** Confirm the back-compat read (bare string →
-   `kind:'api-key'`) is sufficient, or whether to actively rewrite existing
-   items to the JSON envelope on next `login`.
+   emits the Bearer rather than falling through to interactive `/login`. The
+   build sets exactly one auth env (`launchEnvAssigns` writes only
+   `mode.env=mode.placeholder`) to make this deterministic; a unit test asserts
+   the OAuth-mode launch line sets `CLAUDE_CODE_OAUTH_TOKEN` and **not**
+   `ANTHROPIC_API_KEY`.
+5. **Host `claude` dependency for OAuth login (RESOLVED).** `claude setup-token`
+   needs `claude` on the **host**; L1 detects it (`hostHasClaude()` →
+   `claude --version`) and, when absent, prints an actionable error ("install
+   Claude Code on this host … or use an API key `appliance agent login --key`")
+   instead of crashing. API-key mode has no host `claude` dependency.
+6. **Keychain envelope back-compat (RESOLVED).** The store is a JSON envelope
+   `{"kind","value"}`; `parseStoredCred` reads a legacy **bare** string as
+   `kind:'api-key'` (no migration step needed), and **fails closed** (→ `null`
+   → `print-key` exits 1 → proxy 502) on an **unparseable/truncated** envelope
+   — it never hands the raw bytes of a broken envelope to the proxy as a key.
 
 Non-blocking / owner forks: whether to keep `api-key` as the default offered
-mode or lead with "Sign in with Claude"; whether the desktop indicator should
-show token expiry (one year out) as a re-login nudge.
+mode or lead with "Sign in with Claude"; whether the desktop indicator (L3)
+should show token expiry (one year out) as a re-login nudge.
 
 ---
 
