@@ -11,6 +11,8 @@ import type {
   MicroVmSummary,
   AgentInfo,
   AgentLaunchInput,
+  AgentAuthStatus,
+  AgentAuthKind,
   AddClusterInput,
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
@@ -398,6 +400,29 @@ export const tauriHost: ConsoleHost = {
     },
     async relaunch(): Promise<void> {
       await relaunchApp();
+    },
+  },
+
+  // Host-side agent credential login (Phase 5, L3). Stores the Anthropic
+  // credential (API key or subscription OAuth token) in the same host
+  // Keychain item / 0600 file the CLI's `writeAgentKey` uses — the value
+  // never enters the VM; the egress broker injects it host-side. The Rust
+  // side never logs the value.
+  agentAuth: {
+    status(): Promise<AgentAuthStatus> {
+      return invoke<AgentAuthStatus>('microvm_agent_login_status');
+    },
+    async login(input: { kind: AgentAuthKind; value: string }): Promise<void> {
+      await invoke('microvm_agent_login', { kind: input.kind, value: input.value });
+    },
+    async logout(): Promise<void> {
+      await invoke('microvm_agent_logout');
+    },
+    hasHostClaude(): Promise<boolean> {
+      return invoke<boolean>('microvm_agent_has_host_claude');
+    },
+    runSetupToken(): Promise<boolean> {
+      return invoke<boolean>('microvm_agent_run_setup_token');
     },
   },
 };

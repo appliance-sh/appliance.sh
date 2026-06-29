@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Check, RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
+import { AgentLoginPanel } from '@/components/agent-login';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
@@ -19,6 +20,7 @@ export function SettingsPage() {
   const { toast } = useToast();
   const canBootstrap = Boolean(host.bootstrap);
   const canSelfUpdate = Boolean(host.updater);
+  const canAgentAuth = Boolean(host.agentAuth);
   const { config, isLoading } = useSelectedCluster();
   const clusters = config?.clusters ?? [];
   const selectedId = config?.selectedClusterId ?? null;
@@ -110,6 +112,8 @@ export function SettingsPage() {
           </>
         )}
       </Section>
+
+      {canAgentAuth ? <AgentAuthSection /> : null}
 
       {canSelfUpdate ? <UpdatesSection /> : null}
 
@@ -1158,6 +1162,26 @@ function UpdatesSection() {
         ) : null}
       </div>
     </Section>
+  );
+}
+
+// Agent authentication (Phase 5, L3 / docs/agent-login.md §4). Desktop-only:
+// store an Anthropic credential (API key OR "Sign in with Claude" OAuth)
+// host-side so coding agents can reach Anthropic. The credential is brokered
+// into the sandbox at request time and NEVER enters the VM. Bespoke section
+// shell (not `Section`) so the panel's own layout isn't nested inside a `<dl>`.
+function AgentAuthSection() {
+  return (
+    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+      <div>
+        <h2 className="text-sm font-semibold">Agent authentication</h2>
+        <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
+          Sign in so coding agents can reach Anthropic — API key or your Claude subscription. Stored on this machine and
+          brokered into the sandbox; it never enters the VM.
+        </p>
+      </div>
+      <AgentLoginPanel />
+    </section>
   );
 }
 

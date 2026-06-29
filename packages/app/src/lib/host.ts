@@ -270,6 +270,54 @@ export interface ConsoleHost {
    * When present, Settings exposes a "Check for updates" panel.
    */
   updater?: UpdaterHost;
+  /**
+   * Host-side agent credential login (Phase 5, L3 / docs/agent-login.md
+   * §4). Lets a DESKTOP-only user authenticate the agent — API key OR
+   * subscription OAuth ("Sign in with Claude") — without a terminal. The
+   * credential is stored host-side (Keychain) and NEVER sent to the VM;
+   * the egress broker injects it host-side at request time. Optional —
+   * desktop-only.
+   */
+  agentAuth?: AgentAuthHost;
+}
+
+/** The kind of Anthropic credential stored host-side. Mirrors the CLI's
+ *  `AgentAuthKind` (`packages/cli/src/utils/agent.ts`): `api-key` is brokered
+ *  as `X-Api-Key`; `oauth` is the one-year `sk-ant-oat01-…` subscription
+ *  token brokered as `Authorization: Bearer`. */
+export type AgentAuthKind = 'api-key' | 'oauth';
+
+/** Whether a host credential is stored, and (best-effort) its kind, so the
+ *  UI can show a "signed in as …" indicator. NEVER carries the secret value.
+ *  `kind` may be null even when configured (on macOS we avoid reading the
+ *  secret just to label it — that would trigger a Keychain access prompt). */
+export interface AgentAuthStatus {
+  configured: boolean;
+  kind: AgentAuthKind | null;
+}
+
+/** Store/inspect the host-side Anthropic credential for agents (L3). All
+ *  operations are host-global (not per-VM) and the secret is written ONLY to
+ *  the host store — it never enters any VM. */
+export interface AgentAuthHost {
+  /** Is a credential stored, and (best-effort) what kind? Never returns the
+   *  secret. Cheap + prompt-free so the UI can poll it. */
+  status(): Promise<AgentAuthStatus>;
+  /** Store an Anthropic credential host-side, tagged by kind. `value` is the
+   *  bare API key, or the `sk-ant-oat01-…` OAuth token. Never logged, never
+   *  sent to the VM (mirrors the CLI's `writeAgentKey`). */
+  login(input: { kind: AgentAuthKind; value: string }): Promise<void>;
+  /** Forget the stored host credential. */
+  logout(): Promise<void>;
+  /** Is `claude` present + runnable on this HOST? "Sign in with Claude" runs
+   *  `claude setup-token` host-side, so this gates the OAuth path. */
+  hasHostClaude(): Promise<boolean>;
+  /** Best-effort: launch `claude setup-token` in a VISIBLE host terminal so
+   *  the user can complete the browser sign-in and copy the one-year token to
+   *  paste back. Resolves `false` where no auto-launch exists (the UI then
+   *  shows the manual command). The token is NOT captured here — `setup-token`
+   *  shows it on-screen only (docs/agent-login.md §7). */
+  runSetupToken(): Promise<boolean>;
 }
 
 export type TerminalEvent = { type: 'data'; data: string } | { type: 'exit'; code?: number };

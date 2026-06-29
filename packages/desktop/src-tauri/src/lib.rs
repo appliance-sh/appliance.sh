@@ -3937,6 +3937,244 @@ async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) ->
 }
 
 // ============================================================
+// Agent credential login (Phase 5, L3 — docs/agent-login.md §4).
+//
+// Lets a DESKTOP-only user authenticate the agent — API key OR subscription
+// OAuth ("Sign in with Claude") — without a terminal. The credential is
+// stored host-side ONLY and is NEVER sent to the VM: the egress broker
+// injects it host-side on the outbound request (the VM holds at most an
+// inert placeholder). This mirrors the CLI's host store
+// (`packages/cli/src/utils/agent.ts` writeAgentKey / parseStoredCred): the
+// SAME Keychain item (`sh.appliance.agent` / `anthropic`) / 0600 file and the
+// SAME kind-tagged JSON envelope `{"kind":"…","value":"…"}`, so L1's
+// `print-key` (run by the broker at inject time) reads it back unchanged.
+//
+// IMPORTANT: the envelope format MUST stay in sync with parseStoredCred in
+// packages/cli/src/utils/agent.ts — a drift fails the broker CLOSED.
+// ============================================================
+
+const AGENT_KEYCHAIN_SERVICE: &str = "sh.appliance.agent";
+const AGENT_KEYCHAIN_ACCOUNT: &str = "anthropic";
+
+/// The off-macOS host store path (`~/.appliance/agent/anthropic-key`).
+/// Mirrors `agentKeyFile()` in the CLI.
+#[cfg(not(target_os = "macos"))]
+fn agent_key_file() -> Option<PathBuf> {
+    Some(home_dir()?.join(".appliance").join("agent").join("anthropic-key"))
+}
+
+/// Whether a host credential is stored, and (best-effort) its kind. Never
+/// carries the secret value. Serialized to the frontend's `AgentAuthStatus`.
+#[derive(Serialize)]
+struct AgentAuthStatus {
+    configured: bool,
+    /// `api-key` | `oauth` when known; null on macOS (we do NOT read the
+    /// secret just to render a label — that would trigger a Keychain access
+    /// prompt) or when nothing is stored.
+    kind: Option<String>,
+}
+
+/// Write the kind-tagged credential envelope to the host Keychain (macOS).
+/// `security add-generic-password -U` upserts. The secret is briefly on
+/// `security`'s argv — the SAME documented tradeoff as the CLI's
+/// writeAgentKey (there's no stdin form); it is passed via execvp (no shell),
+/// so it cannot be word-split or interpreted. NEVER logged.
+#[cfg(target_os = "macos")]
+fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            AGENT_KEYCHAIN_SERVICE,
+            "-a",
+            AGENT_KEYCHAIN_ACCOUNT,
+            "-w",
+            envelope,
+        ])
+        .output()
+        .map_err(|e| format!("could not run `security`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "failed to store the credential in the Keychain: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Write the kind-tagged credential envelope to a 0600 file off-macOS.
+/// Mirrors the CLI's writeAgentKey fallback. NEVER logged.
+#[cfg(not(target_os = "macos"))]
+fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
+    let file = agent_key_file().ok_or("cannot resolve the home directory")?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("could not create the agent store dir: {e}"))?;
+    }
+    std::fs::write(&file, envelope).map_err(|e| format!("could not write the agent store: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("could not chmod the agent store: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Store an Anthropic credential host-side, tagged by `kind` (L3). Builds the
+/// SAME `{"kind","value"}` envelope the CLI's writeAgentKey writes, so the
+/// broker's `print-key` reads it back. The credential is written ONLY to the
+/// host store — it is NEVER sent to the VM. NEVER logs the value.
+#[tauri::command]
+async fn microvm_agent_login(kind: String, value: String) -> Result<(), String> {
+    let kind = kind.trim();
+    if kind != "api-key" && kind != "oauth" {
+        return Err(format!("unknown credential kind '{kind}' (expected 'api-key' or 'oauth')"));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("refusing to store an empty Anthropic credential".to_string());
+    }
+    // serde_json escapes the value safely; parseStoredCred reads the envelope
+    // order-independently, so this matches the CLI's JSON.stringify shape.
+    let envelope = serde_json::json!({ "kind": kind, "value": value }).to_string();
+    store_agent_cred_envelope(&envelope)
+}
+
+/// Parse ONLY the kind out of a stored envelope (off-macOS), mirroring
+/// parseStoredCred: a legacy bare string is `api-key`; an
+/// unparseable/truncated/empty-value envelope is `None` (→ not configured).
+/// NEVER returns the secret value.
+#[cfg(not(target_os = "macos"))]
+fn parse_cred_kind(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('{') {
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        let kind = v.get("kind").and_then(|k| k.as_str())?;
+        let value_ok = v
+            .get("value")
+            .and_then(|x| x.as_str())
+            .is_some_and(|x| !x.trim().is_empty());
+        if (kind == "api-key" || kind == "oauth") && value_ok {
+            return Some(kind.to_string());
+        }
+        return None;
+    }
+    Some("api-key".to_string()) // legacy bare string → api-key
+}
+
+/// macOS: does the Keychain item EXIST? Attribute lookup (no `-w`), which
+/// does NOT decrypt the secret and so does NOT trigger an access prompt. We
+/// deliberately don't read the secret just to label it, so `kind` is null.
+#[cfg(target_os = "macos")]
+fn read_agent_cred_status() -> AgentAuthStatus {
+    let configured = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            AGENT_KEYCHAIN_SERVICE,
+            "-a",
+            AGENT_KEYCHAIN_ACCOUNT,
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    AgentAuthStatus { configured, kind: None }
+}
+
+/// Off-macOS: the 0600 file is plain-readable, so report the parsed kind.
+#[cfg(not(target_os = "macos"))]
+fn read_agent_cred_status() -> AgentAuthStatus {
+    let kind = agent_key_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|raw| parse_cred_kind(&raw));
+    AgentAuthStatus { configured: kind.is_some(), kind }
+}
+
+/// Report whether a host Anthropic credential is stored (+ best-effort kind),
+/// for the desktop's "signed in as …" indicator. Never exposes the secret.
+#[tauri::command]
+async fn microvm_agent_login_status() -> Result<AgentAuthStatus, String> {
+    Ok(read_agent_cred_status())
+}
+
+/// Forget the stored host credential (macOS Keychain item / 0600 file).
+#[cfg(target_os = "macos")]
+fn forget_agent_cred() {
+    let _ = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            AGENT_KEYCHAIN_SERVICE,
+            "-a",
+            AGENT_KEYCHAIN_ACCOUNT,
+        ])
+        .output();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn forget_agent_cred() {
+    if let Some(f) = agent_key_file() {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// Forget the stored host Anthropic credential (the desktop "sign out").
+#[tauri::command]
+async fn microvm_agent_logout() -> Result<(), String> {
+    forget_agent_cred();
+    Ok(())
+}
+
+/// Is `claude` present + runnable on this HOST? "Sign in with Claude" runs
+/// `claude setup-token` host-side (mirrors the CLI's hostHasClaude). The
+/// launch PATH is pre-augmented with the user's bin dirs at startup
+/// (ensure_user_paths_on_path), so a Homebrew / `~/.local/bin` `claude`
+/// resolves the same as in the user's shell.
+#[tauri::command]
+async fn microvm_agent_has_host_claude() -> bool {
+    matches!(run_status_command(&["claude", "--version"]).await, Ok((true, _, _)))
+}
+
+/// Best-effort: open Terminal.app running `claude setup-token` (macOS) so the
+/// user can complete the browser sign-in and copy the one-year token to paste
+/// back into the desktop. We do NOT capture the token here — `setup-token` is
+/// a full-screen TUI that reveals it on-screen only (docs/agent-login.md §7).
+#[cfg(target_os = "macos")]
+async fn open_setup_token_terminal() -> Result<bool, String> {
+    let (ok, _out, err) = run_status_command(&[
+        "/usr/bin/osascript",
+        "-e",
+        "tell application \"Terminal\" to do script \"claude setup-token\"",
+        "-e",
+        "tell application \"Terminal\" to activate",
+    ])
+    .await?;
+    if !ok {
+        return Err(format!("could not open Terminal to run `claude setup-token`: {}", err.trim()));
+    }
+    Ok(true)
+}
+
+/// No reliable cross-platform "open a visible terminal running X" — the UI
+/// falls back to showing the manual `claude setup-token` command.
+#[cfg(not(target_os = "macos"))]
+async fn open_setup_token_terminal() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Launch `claude setup-token` in a visible host terminal (best-effort).
+/// Resolves `false` where no auto-launch exists (the UI shows the manual
+/// command). The token is captured via the desktop paste field, not here.
+#[tauri::command]
+async fn microvm_agent_run_setup_token() -> Result<bool, String> {
+    open_setup_token_terminal().await
+}
+
+// ============================================================
 // Build + deploy from a local source folder.
 //
 // Driven by the desktop's deploy wizard: pick a folder containing an
@@ -4548,6 +4786,11 @@ pub fn run() {
             microvm_agent_start,
             microvm_agent_list,
             microvm_agent_stop,
+            microvm_agent_login,
+            microvm_agent_login_status,
+            microvm_agent_logout,
+            microvm_agent_has_host_claude,
+            microvm_agent_run_setup_token,
             microvm_stop,
             microvm_delete,
             microvm_egress_get,

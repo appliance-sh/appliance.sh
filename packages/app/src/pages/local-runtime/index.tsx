@@ -21,12 +21,14 @@ import {
 import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
+import { AgentLoginPanel } from '@/components/agent-login';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions, mintAgentSessionId, agentSessionKey } from '@/providers/terminal-sessions-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
 import type {
+  AgentAuthStatus,
   EgressEvent,
   EgressPolicy,
   LocalDeploymentInfo,
@@ -683,15 +685,37 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
 function LaunchAgentButton({ name, disabledReason }: { name: string; disabledReason?: string | null }) {
   const host = useHost();
   const terminals = useTerminalSessions();
+  const agentAuth = host.agentAuth;
   const [open, setOpen] = React.useState(false);
   const [task, setTask] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
+  // Host-side credential status (L3). Null while unknown (still loading, or
+  // the web shell has no `agentAuth`); when the desktop reports `configured:
+  // false`, the launcher shows the in-app login affordance instead of the
+  // task input — so a desktop-only user can authenticate without a terminal
+  // rather than hitting the keyless 502.
+  const [authStatus, setAuthStatus] = React.useState<AgentAuthStatus | null>(null);
   // Synchronous re-entrancy latch: the `busy` state in the keydown closure
   // is stale within the same tick, so a rapid double-Enter could fire two
   // launches before the first re-render disables the input. The ref flips
   // before any await, so the second Enter is dropped.
   const launchingRef = React.useRef(false);
+
+  // Refresh the credential status when the launcher opens (and after a login
+  // or a keyless failure), so the gate reflects the live host store.
+  const refreshAuth = React.useCallback(() => {
+    if (!agentAuth) return;
+    void agentAuth
+      .status()
+      .then(setAuthStatus)
+      .catch(() => setAuthStatus(null));
+  }, [agentAuth]);
+  React.useEffect(() => {
+    if (open) refreshAuth();
+  }, [open, refreshAuth]);
+
+  const needsLogin = Boolean(agentAuth) && authStatus !== null && !authStatus.configured;
 
   const launch = async () => {
     if (launchingRef.current) return;
@@ -724,8 +748,10 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       setTask('');
     } catch (e) {
       // Surfaces the CLI's stderr verbatim — most often "No Anthropic key
-      // configured" (run `appliance agent login`).
+      // configured". Re-check the host store so a keyless failure flips the
+      // launcher to the in-app login affordance.
       setErr(e instanceof Error ? e.message : String(e));
+      refreshAuth();
     } finally {
       setBusy(false);
       launchingRef.current = false;
@@ -765,6 +791,24 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       </Button>
     );
   }
+  // Keyless gate (L3): the desktop reports no stored credential, so offer the
+  // in-app login (API key OR Sign in with Claude) right here instead of
+  // letting the launch fail at the broker. The credential is brokered in and
+  // never enters the VM.
+  if (needsLogin) {
+    return (
+      <div className="flex max-w-md flex-col items-start gap-2">
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Sign in to run agents — your Anthropic credential is stored on this machine and brokered in; it never enters
+          the VM.
+        </p>
+        <AgentLoginPanel onAuthenticated={setAuthStatus} />
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col items-start gap-1">
       <div className="flex items-center gap-2">
@@ -788,17 +832,29 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
           Cancel
         </Button>
       </div>
-      {/* The login pointer stays visible ALONGSIDE an error (a missing key is
-          the most common failure, and the fix is exactly this command) —
-          they're no longer mutually exclusive. The error is an alert. */}
+      {/* A keyless failure flips the launcher to the login affordance above;
+          any other error shows here as an alert. */}
       {err ? (
         <p role="alert" className="max-w-[28rem] font-mono text-[10px] text-red-300">
           {err}
         </p>
       ) : null}
       <p className="text-[10px] text-[var(--color-muted-foreground)]">
-        Runs <code className="font-mono">claude</code> in the shared workspace. Store your key once with{' '}
-        <code className="font-mono">appliance agent login</code> — it&rsquo;s brokered in and never enters the VM.
+        Runs <code className="font-mono">claude</code> in the shared workspace — your Anthropic credential is brokered
+        in and never enters the VM.{' '}
+        {agentAuth ? (
+          authStatus?.configured ? (
+            <>
+              Signed in
+              {authStatus.kind ? ` (${authStatus.kind === 'oauth' ? 'Claude subscription' : 'API key'})` : ''} — manage
+              in Settings.
+            </>
+          ) : null
+        ) : (
+          <>
+            Store your key once with <code className="font-mono">appliance agent login</code>.
+          </>
+        )}
       </p>
       {/* Honest-limits caveat (Parker): the key is brokered, but the
           workspace is not. Surface the blast radius where the user launches

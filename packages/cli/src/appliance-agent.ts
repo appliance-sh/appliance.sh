@@ -1,17 +1,21 @@
 import * as path from 'node:path';
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { password } from '@inquirer/prompts';
+import { password, select } from '@inquirer/prompts';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 
 import {
   type AutonomousResult,
   type RunAgentResult,
   adapterForType,
+  extractOAuthToken,
   forgetAgentKey,
+  hostHasClaude,
   readAgentKey,
   runAgent,
+  runSetupTokenInteractive,
   targetVm,
+  wireValueForCred,
   writeAgentKey,
 } from './utils/agent.js';
 import { runVm } from './utils/sandbox.js';
@@ -239,26 +243,47 @@ program
 
 program
   .command('login')
-  .description('store the Anthropic API key host-side (Keychain on macOS; 0600 file elsewhere). Never enters the VM.')
-  .option('--key <value>', 'the API key (argv-visible; prefer the interactive prompt or stdin)')
-  .action(async (opts: { key?: string }) => {
+  .description(
+    'store an Anthropic credential host-side (Keychain on macOS; 0600 file elsewhere). ' +
+      'API key OR "Sign in with Claude" (subscription OAuth). Never enters the VM.'
+  )
+  .option('--key <value>', 'API-key mode: the key (argv-visible; prefer the interactive prompt or stdin)')
+  .option('--oauth', 'OAuth mode: sign in with your Claude subscription via `claude setup-token` on this host', false)
+  .action(async (opts: { key?: string; oauth: boolean }) => {
+    // Mode selection: an explicit flag wins; a piped/`--key` invocation is
+    // api-key; otherwise an interactive TTY gets the picker.
+    let useOauth = opts.oauth;
+    const stdinPiped = !process.stdin.isTTY;
+    if (!useOauth && !opts.key && !stdinPiped) {
+      useOauth =
+        (await select({
+          message: 'How should the agent authenticate to Anthropic?',
+          choices: [
+            { name: 'API key (paste an Anthropic API key)', value: 'api-key' },
+            { name: 'Sign in with Claude (subscription OAuth via `claude setup-token`)', value: 'oauth' },
+          ],
+        })) === 'oauth';
+    }
+
+    if (useOauth) {
+      await oauthLogin();
+      return;
+    }
+
+    // API-key path (unchanged except the explicit `'api-key'` kind tag).
     let key = opts.key;
     if (!key) {
       // Read from a pipe when stdin isn't a TTY (`… | appliance agent
       // login`), else prompt with a hidden input — neither puts the key
       // on argv.
-      if (!process.stdin.isTTY) {
-        key = await readStdin();
-      } else {
-        key = await password({ message: 'Paste your Anthropic API key:', mask: '*' });
-      }
+      key = stdinPiped ? await readStdin() : await password({ message: 'Paste your Anthropic API key:', mask: '*' });
     }
     key = (key ?? '').trim();
     if (!key) {
       console.error(chalk.red('no key provided.'));
       process.exit(1);
     }
-    writeAgentKey(key);
+    writeAgentKey(key, 'api-key');
     // NEVER echo the key.
     console.log(
       `${chalk.green('✓')} Anthropic key stored host-side. It is brokered into agents and never enters the VM.`
@@ -275,16 +300,22 @@ program
 
 program
   .command('print-key')
-  .description('HOST helper: print the resolved Anthropic key to stdout for the egress proxy (do not call directly)')
+  .description(
+    'HOST helper: print the resolved Anthropic credential to stdout for the egress proxy (do not call directly)'
+  )
   .action(() => {
-    const key = readAgentKey();
-    if (!key) {
+    const cred = readAgentKey();
+    if (!cred) {
       // Exit non-zero with NO stdout so the proxy helper resolves to
-      // nothing and fails CLOSED (it never forwards the placeholder).
+      // nothing and fails CLOSED (it never forwards the placeholder). This
+      // also fires on an unparseable/truncated envelope (readAgentKey →
+      // null), so a corrupt store fails closed rather than leaking bytes.
       process.exit(1);
     }
-    // Raw key to stdout, nothing else; the proxy trims it.
-    process.stdout.write(key);
+    // The wire-ready header value per stored kind: api-key → the bare key;
+    // oauth → `Bearer <token>`. Nothing else; the proxy trims it. NEVER
+    // logged.
+    process.stdout.write(wireValueForCred(cred));
   });
 
 /** Colorize a (pre-padded) status cell by status + reconciled liveness:
@@ -323,6 +354,69 @@ function printAutonomousSummary(id: string, result: AutonomousResult, workspaceD
   }
   console.log();
   console.log(chalk.dim(`Review the changes in ${workspaceDir}  (e.g. \`git -C ${workspaceDir} diff\`).`));
+}
+
+/**
+ * "Sign in with Claude" — the host-side subscription OAuth login (L1).
+ *
+ * Runs `claude setup-token` on the HOST with the TTY inherited (browser opens,
+ * the sign-in URL + the minted one-year token are shown inline), then captures
+ * the token via a HIDDEN paste prompt and stores it tagged `oauth`.
+ *
+ * Why a paste prompt and not a stdout grep: `claude setup-token` is an Ink TUI
+ * that REVEALS the token on-screen only — it prints no clean stdout line and
+ * (verified, docs/agent-login.md §7) persists no copy of its own. So the robust
+ * capture inherits the TTY for the native flow, then reads the token back
+ * in-process. Per Sasha §7.1 the token is NEVER echoed, NEVER logged, and NEVER
+ * written to a temp file — it goes straight from the paste prompt to the
+ * Keychain.
+ */
+async function oauthLogin(): Promise<void> {
+  // Host `claude` is a hard precondition for `setup-token`; detect + guide
+  // rather than crash (docs §2, §7).
+  if (!hostHasClaude()) {
+    console.error(
+      chalk.red('Claude Code is not installed on this host. ') +
+        'Install it to sign in with your subscription ' +
+        `(${chalk.bold('npm install -g @anthropic-ai/claude-code')}), ` +
+        `or use an API key: ${chalk.bold('appliance agent login --key <key>')}.`
+    );
+    process.exit(1);
+  }
+
+  console.log(chalk.cyan('» Signing in with Claude (subscription OAuth).'));
+  console.log(
+    chalk.dim(
+      '  This runs `claude setup-token` on this host; a browser opens for sign-in.\n' +
+        "  The one-year token is brokered onto Claude Code's own api.anthropic.com\n" +
+        '  calls and never enters the VM. Use only in a single-purpose Claude sandbox\n' +
+        '  (the broker injects on ALL guest→api.anthropic.com traffic — see docs/agent-login.md §4).'
+    )
+  );
+
+  const code = runSetupTokenInteractive();
+  if (code !== 0) {
+    console.error(chalk.red(`\`claude setup-token\` exited ${code}; not signed in.`));
+    process.exit(1);
+  }
+
+  // Capture the token shown above via a hidden paste — accepts the bare token
+  // or the whole `export CLAUDE_CODE_OAUTH_TOKEN=…` line (extractOAuthToken
+  // pulls the sk-ant-oat01- token out). NEVER echoed.
+  const pasted = await password({ message: 'Paste the token shown above (sk-ant-oat01-…):', mask: '*' });
+  const token = extractOAuthToken(pasted ?? '');
+  if (!token) {
+    console.error(
+      chalk.red('could not find an sk-ant-oat01- token in what you pasted. ') +
+        'Re-run `appliance agent login --oauth` and paste the token shown by setup-token.'
+    );
+    process.exit(1);
+  }
+  writeAgentKey(token, 'oauth');
+  // NEVER echo the token.
+  console.log(
+    `${chalk.green('✓')} Signed in with Claude. The subscription token is stored host-side and never enters the VM.`
+  );
 }
 
 function readStdin(): Promise<string> {

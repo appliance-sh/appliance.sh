@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 
@@ -46,16 +46,48 @@ export interface AgentLaunchOpts {
   task?: string;
 }
 
-/** A per-host credential rule the broker applies (mirrors creds.rs
- *  CredentialRule). `helper` is resolved to an ABSOLUTE host command by
- *  the runner before it's written, so the proxy never relies on PATH. */
-export interface AgentCredentialRule {
-  host: string;
-  inject: boolean;
-  capture: boolean;
-  header: string;
-  /** Set by the runner (absolute `appliance agent print-key`). */
-  helper?: string;
+/** The kind of credential the user stored host-side. The host store tags
+ *  every secret with its kind; the runner matches that tag to an AuthMode
+ *  (docs/agent-login.md §1, §5). */
+export type AgentAuthKind = 'api-key' | 'oauth';
+
+/** A stored host-side credential: its kind + the opaque secret value. The
+ *  Keychain/0600 item is a small JSON envelope so the kind travels with the
+ *  value atomically in one item (docs/agent-login.md §5). */
+export interface StoredCred {
+  kind: AgentAuthKind;
+  value: string;
+}
+
+/** One way an agent authenticates (docs/agent-login.md §1) — the agent-agnostic
+ *  seam. The runner selects a mode by the kind of credential the user stored
+ *  host-side, then derives the broker cred-rule header, the in-guest
+ *  placeholder env, and the host login command from it. So dropping in another
+ *  CLI agent is just a new `authModes` array — no transport/broker/runner
+ *  change. */
+export interface AuthMode {
+  /** Which stored credential kind this mode consumes. */
+  kind: AgentAuthKind;
+  /** The wire header the agent CLI emits its credential on, and the header the
+   *  broker rewrites host-side. */
+  header: 'x-api-key' | 'authorization';
+  /** Auth-scheme prefix for the header value (OAuth bearer). When set, the
+   *  host `print-key` helper emits `"<scheme> <secret>"`; when unset it emits
+   *  the bare secret — so the proxy's set_header stays a literal value-replace
+   *  (docs §3). */
+  scheme?: 'Bearer';
+  /** The single in-guest env var that carries the (placeholder) credential so
+   *  the CLI starts + emits `header`. Exactly ONE auth env is set per launch —
+   *  the selected mode's — to keep the CLI's credential-precedence chain from
+   *  picking a different header (docs §1). */
+  env: string;
+  /** Host-side interactive login that yields this credential (OAuth only).
+   *  Run on the HOST; absent for api-key (the user pastes/pipes the key). */
+  loginCmd?: string;
+  /** Inert, syntactically-shaped placeholder put in `env` in-guest. The CLI
+   *  needs *a* credential present to start + emit the header; the proxy
+   *  overwrites it host-side. Capturing it buys an attacker nothing. */
+  placeholder: string;
 }
 
 /** An agent-type adapter. Claude Code first; codex/aider/etc. are later
@@ -66,10 +98,13 @@ export interface AgentAdapter {
   installCmd: string;
   /** The launch argv inside the session (docs §6). */
   launchArgv(opts: AgentLaunchOpts): string[];
-  /** Hosts whose auth header the broker injects host-side (docs §3). */
-  credHosts: AgentCredentialRule[];
-  /** Inert placeholder env so the CLI starts + emits its auth header. */
-  placeholderEnv?: Record<string, string>;
+  /** The single API host the broker injects the auth header on (MVP: one host
+   *  per adapter). */
+  apiHost: string;
+  /** The auth modes this agent supports. The runner picks the one whose `kind`
+   *  matches the stored credential; an unsupported stored kind errors
+   *  actionably (docs §1, §2). */
+  authModes: AuthMode[];
   /** Agent-specific runtime env (e.g. CLAUDE_CODE_CERT_STORE). */
   runtimeEnv?: Record<string, string>;
   /** Extract a result from autonomous stdout (A6). */
@@ -87,6 +122,18 @@ export const ANTHROPIC_HOST = 'api.anthropic.com';
  *  pre-validation and emits the request — a 401 comes from upstream, not
  *  a local check. Capturing it buys an attacker nothing. */
 export const ANTHROPIC_PLACEHOLDER_KEY = 'sk-ant-appliance-proxy';
+
+/** The INERT placeholder put in the guest's `CLAUDE_CODE_OAUTH_TOKEN` in OAuth
+ *  mode — oauth-shaped (`sk-ant-oat01-…`) so `claude` starts and emits
+ *  `Authorization: Bearer <placeholder>`, which the proxy overwrites host-side
+ *  with the real Bearer token before it leaves (docs/agent-login.md §3, §5).
+ *  Inert; capturing it buys an attacker nothing. */
+export const ANTHROPIC_OAUTH_PLACEHOLDER = 'sk-ant-oat01-appliance-proxy';
+
+/** The host-side interactive sign-in that mints the one-year OAuth token
+ *  (docs/agent-login.md §2). The `claude` binary on the HOST runs this; it
+ *  never runs in the VM. */
+export const CLAUDE_OAUTH_LOGIN_CMD = 'claude setup-token';
 
 /** The guest path the egress CA is trusted at (guest.rs:105). Used only
  *  as a NODE_EXTRA_CA_CERTS belt-and-suspenders; CLAUDE_CODE_CERT_STORE's
@@ -118,8 +165,28 @@ export const claudeCodeAdapter: AgentAdapter = {
     // token is shQuoted by composeLaunchLine, so a multi-word task is safe.
     return opts.task ? ['claude', opts.task] : ['claude'];
   },
-  credHosts: [{ host: ANTHROPIC_HOST, inject: true, capture: false, header: 'x-api-key' }],
-  placeholderEnv: { ANTHROPIC_API_KEY: ANTHROPIC_PLACEHOLDER_KEY },
+  apiHost: ANTHROPIC_HOST,
+  // Claude Code declares BOTH modes. The runner sets exactly one in-guest auth
+  // env per launch (the selected mode's) so the CLI's credential-precedence
+  // chain — ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY > apiKeyHelper >
+  // CLAUDE_CODE_OAUTH_TOKEN > interactive /login — deterministically emits the
+  // header the broker rewrites (docs/agent-login.md §1).
+  authModes: [
+    {
+      kind: 'api-key',
+      header: 'x-api-key',
+      env: 'ANTHROPIC_API_KEY',
+      placeholder: ANTHROPIC_PLACEHOLDER_KEY,
+    },
+    {
+      kind: 'oauth',
+      header: 'authorization',
+      scheme: 'Bearer',
+      env: 'CLAUDE_CODE_OAUTH_TOKEN',
+      loginCmd: CLAUDE_OAUTH_LOGIN_CMD, // host-side; one-year token, shown once
+      placeholder: ANTHROPIC_OAUTH_PLACEHOLDER,
+    },
+  ],
   runtimeEnv: { CLAUDE_CODE_CERT_STORE: 'bundled,system' },
   parseResult(stdout: string): { ok: boolean; summary?: string } {
     // Claude Code's --output-format json prints one result object.
@@ -166,54 +233,152 @@ function agentKeyFile(): string {
 }
 
 /**
- * Read the host Anthropic key, Keychain-first on macOS, 0600-file
- * elsewhere. Returns null when unset/locked/denied. NEVER logs the key.
- * This is the resolution the `print-key` helper outputs to the proxy.
+ * Parse a stored host secret into a tagged credential, or null (fail-closed).
+ *
+ * The store holds either the current JSON envelope `{"kind","value"}` or — for
+ * back-compat — a legacy BARE api-key string. Rules (Sasha nit):
+ *   • A valid bare (non-`{`) string  ⇒ `{ kind: 'api-key', value }`.
+ *   • A well-formed envelope         ⇒ that `{ kind, value }`.
+ *   • Anything that LOOKS like an envelope (starts with `{`) but is
+ *     unparseable / truncated / missing a known kind or value ⇒ `null`.
+ *     We must NEVER hand the raw bytes of a broken envelope to the proxy as
+ *     an api-key value — a `null` makes `print-key` exit 1 → the proxy fails
+ *     CLOSED (docs/agent-login.md §5).
  */
-export function readAgentKey(): string | null {
+export function parseStoredCred(raw: string): StoredCred | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if (s.startsWith('{')) {
+    try {
+      const o = JSON.parse(s) as { kind?: unknown; value?: unknown };
+      const kind = o.kind;
+      const value = typeof o.value === 'string' ? o.value.trim() : '';
+      if ((kind === 'api-key' || kind === 'oauth') && value) return { kind, value };
+      return null; // truncated/unknown-kind/empty-value envelope → fail closed
+    } catch {
+      return null; // unparseable envelope → fail closed (never treat as a key)
+    }
+  }
+  // Legacy bare string → api-key, so pre-envelope logins keep working.
+  return { kind: 'api-key', value: s };
+}
+
+/**
+ * Read the host Anthropic credential, Keychain-first on macOS, 0600-file
+ * elsewhere, decoding the kind-tagged envelope (back-compat: a bare string is
+ * an api-key). Returns null when unset/locked/denied/unparseable. NEVER logs
+ * the secret. This is the resolution the `print-key` helper renders for the
+ * proxy.
+ */
+export function readAgentKey(): StoredCred | null {
+  let raw: string;
   if (isMacOS()) {
     try {
-      const out = execFileSync(
+      raw = execFileSync(
         SECURITY_BIN,
         ['find-generic-password', '-s', AGENT_KEYCHAIN_SERVICE, '-a', AGENT_KEYCHAIN_ACCOUNT, '-w'],
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }
       );
-      const v = out.trim();
-      return v.length > 0 ? v : null;
+    } catch {
+      return null;
+    }
+  } else {
+    try {
+      raw = fs.readFileSync(agentKeyFile(), 'utf-8');
     } catch {
       return null;
     }
   }
-  try {
-    const v = fs.readFileSync(agentKeyFile(), 'utf-8').trim();
-    return v.length > 0 ? v : null;
-  } catch {
-    return null;
-  }
+  return parseStoredCred(raw);
 }
 
 /**
- * Store the host Anthropic key. macOS Keychain `-U` upsert; 0600 file
- * elsewhere. On macOS the secret is briefly on argv to `security`
- * (no stdin option for add-generic-password) — the documented, accepted
- * tradeoff (same as utils/keychain.ts writeKeychainApiKey), gated to this
- * rare login path. NEVER logs the key.
+ * Store the host Anthropic credential as a kind-tagged JSON envelope. macOS
+ * Keychain `-U` upsert; 0600 file elsewhere. On macOS the secret is briefly on
+ * argv to `security` (no stdin option for add-generic-password) — the
+ * documented, accepted tradeoff (same as utils/keychain.ts
+ * writeKeychainApiKey), gated to this rare login path. NEVER logs the secret.
  */
-export function writeAgentKey(key: string): void {
-  const value = key.trim();
-  if (!value) throw new Error('refusing to store an empty Anthropic key');
+export function writeAgentKey(value: string, kind: AgentAuthKind): void {
+  const secret = value.trim();
+  if (!secret) throw new Error('refusing to store an empty Anthropic credential');
+  const envelope = JSON.stringify({ kind, value: secret } satisfies StoredCred);
   if (isMacOS()) {
     execFileSync(
       SECURITY_BIN,
-      ['add-generic-password', '-U', '-s', AGENT_KEYCHAIN_SERVICE, '-a', AGENT_KEYCHAIN_ACCOUNT, '-w', value],
+      ['add-generic-password', '-U', '-s', AGENT_KEYCHAIN_SERVICE, '-a', AGENT_KEYCHAIN_ACCOUNT, '-w', envelope],
       { stdio: ['ignore', 'ignore', 'ignore'] }
     );
     return;
   }
   const file = agentKeyFile();
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, value, { mode: 0o600 });
+  fs.writeFileSync(file, envelope, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
+}
+
+/** The wire-ready header VALUE the proxy injects, per stored kind: api-key →
+ *  the bare secret; oauth → `Bearer <secret>`. The `Bearer ` scheme mirrors
+ *  the selected AuthMode.scheme so the proxy's set_header stays a literal
+ *  value-replace (docs/agent-login.md §2, §3). NEVER logged. */
+export function wireValueForCred(cred: StoredCred): string {
+  return cred.kind === 'oauth' ? `Bearer ${cred.value}` : cred.value;
+}
+
+/** Select the AuthMode whose kind matches the stored credential. Throws an
+ *  actionable error if the agent doesn't declare that kind (e.g. an api-key
+ *  stored for an OAuth-only agent) — docs/agent-login.md §1, §2. */
+export function resolveAuthMode(adapter: AgentAdapter, kind: AgentAuthKind): AuthMode {
+  const mode = adapter.authModes.find((m) => m.kind === kind);
+  if (!mode) {
+    const supported = adapter.authModes.map((m) => m.kind).join(', ');
+    throw new Error(
+      `the stored credential kind '${kind}' is not supported by agent '${adapter.type}' ` +
+        `(supported: ${supported}). Re-run \`appliance agent login\` to store a compatible credential.`
+    );
+  }
+  return mode;
+}
+
+/** Pull the first `sk-ant-oat01-…` OAuth token out of an arbitrary blob,
+ *  stripping ANSI escapes first. Robust to the user pasting the bare token OR
+ *  the whole `export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…` line `setup-token`
+ *  prints, with surrounding whitespace/colour codes. Returns null when no token
+ *  is present (docs/agent-login.md §2, §7). Pure + unit-tested. */
+export function extractOAuthToken(raw: string): string | null {
+  // eslint-disable-next-line no-control-regex
+  const clean = raw.replace(/\[[0-9;?]*[ -/]*[@-~]/g, '');
+  const m = clean.match(/sk-ant-oat01-[A-Za-z0-9_-]+/);
+  return m ? m[0] : null;
+}
+
+/** Is the `claude` binary present + runnable on this HOST? OAuth login shells
+ *  `claude setup-token` host-side, so a missing host `claude` is a precondition
+ *  with an actionable error rather than a crash (docs/agent-login.md §2, §7). */
+export function hostHasClaude(): boolean {
+  try {
+    execFileSync('claude', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Run `claude setup-token` on the HOST with the TTY inherited so the user sees
+ *  the sign-in URL, the browser opens, and they paste the auth code — the
+ *  native flow. Returns the exit code. The token is NOT captured here:
+ *  `setup-token` is an Ink TUI that REVEALS the one-year token on-screen only
+ *  (it prints no clean stdout line and persists no copy — docs/agent-login.md
+ *  §7), so the caller captures it via a hidden in-process paste prompt. This
+ *  helper NEVER writes a tmp file and NEVER logs the token (Sasha §7.1). */
+export function runSetupTokenInteractive(): number {
+  const r = spawnSync('claude', ['setup-token'], { stdio: 'inherit' });
+  if (r.error) {
+    const code = (r.error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return 127; // host `claude` vanished between checks
+    throw r.error;
+  }
+  return r.status ?? 1;
 }
 
 /** Forget the stored host key (`appliance agent logout`). */
@@ -302,9 +467,12 @@ export function printKeyHelperCommand(): string {
 }
 
 /** The proxy/CA/placeholder env, rendered as `K=V` assignments for an
- *  `env …` prefix. Values are fixed/metachar-free (URLs, constant paths),
- *  so they're left unquoted. */
-function launchEnvAssigns(adapter: AgentAdapter, proxyUrl: string): string {
+ *  `env …` prefix. Values are fixed/metachar-free (URLs, constant paths,
+ *  inert placeholders), so they're left unquoted. Exactly ONE auth env is
+ *  set — the selected mode's `env=placeholder` — so the CLI's
+ *  credential-precedence chain emits the header the broker rewrites
+ *  (docs/agent-login.md §1). */
+function launchEnvAssigns(adapter: AgentAdapter, mode: AuthMode, proxyUrl: string): string {
   const env: Record<string, string> = {
     HTTP_PROXY: proxyUrl,
     HTTPS_PROXY: proxyUrl,
@@ -314,7 +482,7 @@ function launchEnvAssigns(adapter: AgentAdapter, proxyUrl: string): string {
     no_proxy: AGENT_NO_PROXY,
     NODE_EXTRA_CA_CERTS: GUEST_EGRESS_CA,
     ...(adapter.runtimeEnv ?? {}),
-    ...(adapter.placeholderEnv ?? {}),
+    [mode.env]: mode.placeholder,
   };
   return Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
@@ -337,9 +505,15 @@ function launchEnvAssigns(adapter: AgentAdapter, proxyUrl: string): string {
  *  (`--wait`, §6) passes `exec=false` so the login shell OUTLIVES the agent
  *  and the trailing exit-code sentinel (shell.rs) can still fire to carry
  *  the agent's real exit code back over the status-less byte pipe. */
-export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts: AgentLaunchOpts, exec = true): string {
+export function composeLaunchLine(
+  adapter: AgentAdapter,
+  mode: AuthMode,
+  proxyUrl: string,
+  opts: AgentLaunchOpts,
+  exec = true
+): string {
   const argv = adapter.launchArgv(opts).map(shQuote).join(' ');
-  return `cd ${GUEST_WORKSPACE}; ${exec ? 'exec ' : ''}env ${launchEnvAssigns(adapter, proxyUrl)} ${argv}`;
+  return `cd ${GUEST_WORKSPACE}; ${exec ? 'exec ' : ''}env ${launchEnvAssigns(adapter, mode, proxyUrl)} ${argv}`;
 }
 
 // ---- autonomous result capture (A6) ------------------------------------
@@ -388,11 +562,12 @@ export function agentResultPaths(projectDir: string, sessionId: string): AgentRe
  *  progress) stays on the pane so an attached tab can watch the run live. */
 export function composeAutonomousCaptureLine(
   adapter: AgentAdapter,
+  mode: AuthMode,
   proxyUrl: string,
   opts: AgentLaunchOpts,
   paths: Pick<AgentResultPaths, 'guestJson' | 'guestRc' | 'guestDir'>
 ): string {
-  const assigns = launchEnvAssigns(adapter, proxyUrl);
+  const assigns = launchEnvAssigns(adapter, mode, proxyUrl);
   const argv = adapter
     .launchArgv({ ...opts, mode: 'autonomous' })
     .map(shQuote)
@@ -465,20 +640,18 @@ function resolveProxyUrl(vm: string): string {
   throw new Error(`could not resolve the egress proxy URL for VM '${vm}' (egress gateway gave no HTTPS_PROXY)`);
 }
 
-/** Apply the broker's per-host cred rule(s) + turn MITM on for this VM
- *  (A2). Idempotent. The Anthropic rule is inject + capture:false with the
- *  pinned-absolute `print-key` helper; the placeholder never enters
- *  egress-secrets.json. */
-export function configureBroker(vm: string, adapter: AgentAdapter): void {
+/** Apply the broker's cred rule for the selected auth mode + turn MITM on for
+ *  this VM (A2). Idempotent. The single `apiHost` rule is inject + capture:false
+ *  with the pinned-absolute `print-key` helper, on the mode's header
+ *  (`x-api-key` for api-key, `authorization` for oauth). The write is an upsert
+ *  keyed on host, so switching modes REPLACES the rule (never a dual rule, so
+ *  `first_matching(inject)` stays unambiguous — docs/agent-login.md §2). The
+ *  placeholder never enters egress-secrets.json (capture:false). */
+export function configureBroker(vm: string, adapter: AgentAdapter, mode: AuthMode): void {
   const helper = printKeyHelperCommand();
-  for (const rule of adapter.credHosts) {
-    const args = ['creds', 'add', rule.host, '--name', vm, '--header', rule.header];
-    if (rule.inject) args.push('--inject');
-    if (rule.capture) args.push('--capture');
-    args.push('--helper', rule.helper ?? helper);
-    const code = runVm(args);
-    if (code !== 0) throw new Error(`failed to write the credential rule for ${rule.host} (exit ${code})`);
-  }
+  const args = ['creds', 'add', adapter.apiHost, '--name', vm, '--header', mode.header, '--inject', '--helper', helper];
+  const code = runVm(args);
+  if (code !== 0) throw new Error(`failed to write the credential rule for ${adapter.apiHost} (exit ${code})`);
   const mitm = runVm(['egress', 'mitm', 'on', '--name', vm]);
   if (mitm !== 0) throw new Error(`failed to enable TLS interception on VM '${vm}' (exit ${mitm})`);
 }
@@ -531,20 +704,27 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult>
   const projectDir = path.resolve(opts.projectDir ?? process.cwd());
   const wait = mode === 'autonomous' && opts.wait === true;
 
-  // Fail fast before booting anything if the host key isn't configured —
-  // the proxy fails closed, so the agent would only hit a 502 otherwise.
-  if (!readAgentKey()) {
+  // Fail fast before booting anything if the host credential isn't configured —
+  // the proxy fails closed, so the agent would only hit a 502 otherwise. The
+  // stored kind also selects the auth mode (header/env/placeholder).
+  const cred = readAgentKey();
+  if (!cred) {
     throw new Error(
-      'Anthropic key not configured. Run `appliance agent login` to store it host-side ' +
+      'Anthropic credential not configured. Run `appliance agent login` to store it host-side ' +
         '(it is brokered into the agent and never enters the VM).'
     );
   }
+  // Pick the broker header + in-guest env/placeholder from the stored kind. An
+  // unsupported kind (e.g. an api-key for an OAuth-only agent) errors here.
+  const authMode = resolveAuthMode(adapter, cred.kind);
 
   console.log(chalk.cyan(`» ensuring sandbox VM '${vm}' with the workspace mounted`));
   await ensureSandboxVm(vm, projectDir);
 
-  console.log(chalk.cyan('» configuring the host credential broker (Anthropic key injected at the proxy)'));
-  configureBroker(vm, adapter);
+  console.log(
+    chalk.cyan(`» configuring the host credential broker (${cred.kind} injected at the proxy on ${authMode.header})`)
+  );
+  configureBroker(vm, adapter, authMode);
 
   const proxyUrl = resolveProxyUrl(vm);
   const sessionId = opts.sessionId ? ensureAgentSessionId(opts.sessionId) : mintAgentSessionId();
@@ -555,7 +735,7 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult>
   // agent's real exit code come back in-band. Non-exec so the sentinel can
   // fire after claude; install joined with `&&` so a failed install aborts.
   if (wait) {
-    const line = composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task }, false);
+    const line = composeLaunchLine(adapter, authMode, proxyUrl, { mode, task: opts.task }, false);
     const script = `(${adapter.installCmd}) && (${line})`;
     console.log(chalk.cyan(`» running ${adapter.type} headless to completion (--wait) — capturing the result`));
     const r = vmRunScript(vm, script);
@@ -566,8 +746,8 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult>
   const tmuxSession = `appliance-${sessionId}`;
   const launchLine =
     mode === 'autonomous'
-      ? composeAutonomousCaptureLine(adapter, proxyUrl, { mode, task: opts.task }, paths)
-      : composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task });
+      ? composeAutonomousCaptureLine(adapter, authMode, proxyUrl, { mode, task: opts.task }, paths)
+      : composeLaunchLine(adapter, authMode, proxyUrl, { mode, task: opts.task });
 
   // One in-guest invocation (runs as the appliance user via the vsock
   // one-shot path): install-on-first-use, then create the DETACHED tmux
