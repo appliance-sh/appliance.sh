@@ -2,6 +2,8 @@ import type {
   AddClusterInput,
   AgentInfo,
   AgentLaunchInput,
+  AgentAuthKind,
+  AgentAuthStatus,
   BootstrapEvent,
   BootstrapResult,
   Cluster,
@@ -58,6 +60,12 @@ const MOCK_UPDATE_AVAILABLE = true;
 // Fixed running version for the mock update feed (the real running
 // version isn't available to desktop-package source — see check()).
 const MOCK_CURRENT_VERSION = '1.48.0';
+
+// Agent-login mock (Phase 5, L3): the host-side credential store, in memory.
+// Flip `MOCK_HAS_HOST_CLAUDE` to false to QA the "Sign in with Claude" gate
+// (no host `claude` → install guidance / use an API key).
+let mockAgentCred: AgentAuthKind | null = null;
+const MOCK_HAS_HOST_CLAUDE = true;
 
 /** Bump the minor of a semver string for the mock update feed. */
 function bumpMinor(version: string): string {
@@ -267,6 +275,35 @@ export function createMockHost(): ConsoleHost {
       async relaunch() {
         // A real relaunch swaps the process; in the browser, just reload.
         window.location.reload();
+      },
+    },
+
+    // Agent credential login (Phase 5, L3). In-memory stand-in for the host
+    // Keychain so the launcher's keyless path + the Settings panel can be
+    // developed in a browser. `MOCK_HAS_HOST_CLAUDE` toggles the
+    // "Sign in with Claude" gate; `runSetupToken` returns false so the UI
+    // exercises the manual-command fallback (no real Terminal in a browser).
+    agentAuth: {
+      async status(): Promise<AgentAuthStatus> {
+        await sleep(60);
+        return mockAgentCred ? { configured: true, kind: mockAgentCred } : { configured: false, kind: null };
+      },
+      async login(input: { kind: AgentAuthKind; value: string }) {
+        await sleep(150);
+        if (!input.value.trim()) throw new Error('refusing to store an empty Anthropic credential');
+        mockAgentCred = input.kind;
+      },
+      async logout() {
+        await sleep(80);
+        mockAgentCred = null;
+      },
+      async hasHostClaude() {
+        await sleep(60);
+        return MOCK_HAS_HOST_CLAUDE;
+      },
+      async runSetupToken() {
+        await sleep(80);
+        return false; // no real Terminal in a browser → manual-command fallback
       },
     },
 
