@@ -283,12 +283,24 @@ function summarizeHealth(
 }
 
 function EmptyProjects() {
+  const navigate = useNavigate();
+  // A freshly-onboarded user with no projects gets a button, not just a
+  // command to copy. The deploy wizard (/local-runtime/deploy) find-or-creates
+  // the project + environment and writes the link itself, so there's no
+  // separate "project setup" step — the CLI snippet stays as a secondary hint
+  // for terminal-first users.
   return (
     <div className="mx-auto max-w-md space-y-4 py-16 text-center">
       <h2 className="text-lg font-semibold">Deploy your first project</h2>
       <p className="text-sm text-[var(--color-muted-foreground)]">
-        Run this from an application directory with an <code className="font-mono">appliance.json</code> — it creates
-        the project, builds, and deploys in one step.
+        Pick an application folder with an <code className="font-mono">appliance.json</code> — the wizard creates the
+        project, builds, and deploys in one step.
+      </p>
+      <Button size="lg" onClick={() => navigate('/local-runtime/deploy')}>
+        Deploy your first app
+      </Button>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Prefer the terminal? Run this from your app directory instead:
       </p>
       <CommandSnippet command="appliance deploy" className="text-left" />
       <p className="text-xs text-[var(--color-muted-foreground)]">The deployed app appears here with its live URL.</p>

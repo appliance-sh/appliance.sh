@@ -358,8 +358,9 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 // pending → running (spinner) → completed (check). The streamed boot
 // lines live underneath as a collapsible detail, and a `failed` phase
 // fails fast — the in-flight rung turns red and the error is surfaced
-// with a Retry. Lands on a clean "ready" state with an "Open dashboard"
-// CTA (E5.3 swaps that for "Deploy your first app").
+// with a Retry. Lands on a clean "ready" state whose primary CTA leads
+// straight into the first deploy ("Deploy your first app" →
+// /local-runtime/deploy), with "Open dashboard" as the secondary action.
 // ============================================================
 
 // The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
@@ -622,8 +623,20 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
             <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
             <dd className="font-mono">{microVmClusterId(name)}</dd>
           </dl>
+          {/* The runtime being up is the middle, not the end — lead straight
+              into the first deploy. The wizard find-or-creates the project +
+              environment and writes the link itself, so there's no separate
+              "project setup" step to discover first. "Open dashboard" stays
+              as the secondary escape hatch. */}
+          <p className="text-xs text-[var(--color-muted-foreground)]">
+            Next, deploy your first app. The wizard creates the project and environment for you — no separate setup step
+            needed.
+          </p>
           <div className="flex gap-2">
-            <Button onClick={() => navigate('/')}>Open dashboard</Button>
+            <Button onClick={() => navigate('/local-runtime/deploy')}>Deploy your first app</Button>
+            <Button variant="outline" onClick={() => navigate('/')}>
+              Open dashboard
+            </Button>
             <Button variant="outline" onClick={() => navigate('/local-runtime')}>
               Manage runtimes
             </Button>
