@@ -1,8 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { DEFAULT_SANDBOX_VM, runVmCapture } from './sandbox.js';
-import { readSandboxVm } from './link.js';
+import { runVmCapture } from './sandbox.js';
+import { findLinkLocation } from './link.js';
+import { adapterForType, claudeCodeAdapter, readAutonomousResultFromFiles, targetVm } from './agent.js';
 
 // Per-project agent registry (Phase 5, A4) — `.appliance/agents.json`,
 // the sibling of `link.json` (utils/link.ts). It records the coding
@@ -47,6 +48,16 @@ export interface AgentRecord {
   vm?: string;
   /** How it was launched (display only). */
   mode?: 'interactive' | 'autonomous';
+  /** ISO timestamp the run reached a terminal state (autonomous, A6). */
+  endedAt?: string;
+  /** The autonomous run's exit code (null when none was captured, A6). */
+  exitCode?: number | null;
+  /** Host path to the captured `--output-format json` result on the shared
+   *  workspace. Set for a DETACHED autonomous run; reconcile reads it to
+   *  finalize the status to done/error (A6, docs §6). */
+  resultPath?: string;
+  /** Short result summary surfaced by `list` + the desktop badge (A6). */
+  summary?: string;
 }
 
 /** The on-disk file shape (docs §7 wraps the list in `{ agents }`). */
@@ -90,7 +101,27 @@ function resolveRegistryFile(rootDir?: string): string {
   return findRegistryFile() ?? registryFileFor(process.cwd());
 }
 
+/** The project root the registry should live in: the walk-up `.appliance/`
+ *  root (beside `link.json`, or an existing `agents.json`), else the
+ *  resolved dir. Running `appliance agent start` from a SUBDIRECTORY of a
+ *  linked project then records into the project's existing `.appliance/`
+ *  instead of dropping a stray `agents.json` in the subdir (A3 nit). */
+export function projectRootFor(startDir: string): string {
+  const here = path.resolve(startDir);
+  const link = findLinkLocation(here);
+  if (link) return link.rootDir;
+  const reg = findRegistryFile(here);
+  if (reg) return path.dirname(path.dirname(reg));
+  return here;
+}
+
 // ---- read / write ------------------------------------------------------
+
+const AGENT_STATUSES: readonly AgentStatus[] = ['running', 'done', 'error', 'exited'];
+
+function isAgentStatus(v: unknown): v is AgentStatus {
+  return typeof v === 'string' && (AGENT_STATUSES as readonly string[]).includes(v);
+}
 
 function isAgentRecord(v: unknown): v is AgentRecord {
   if (!v || typeof v !== 'object') return false;
@@ -99,7 +130,7 @@ function isAgentRecord(v: unknown): v is AgentRecord {
     typeof r.id === 'string' &&
     typeof r.type === 'string' &&
     typeof r.sessionId === 'string' &&
-    typeof r.status === 'string' &&
+    isAgentStatus(r.status) &&
     typeof r.launchedAt === 'string'
   );
 }
@@ -213,9 +244,30 @@ export function findAgent(arg: string, agents: AgentRecord[]): AgentRecord | nul
 // ---- liveness reconciliation -------------------------------------------
 
 /** The VM an entry runs in: its recorded `vm`, else the cwd project's
- *  linked sandbox VM, else the shared default. */
+ *  linked sandbox VM, else the shared default (via `targetVm`, the shared
+ *  resolver in agent.ts). */
 function vmForRecord(record: AgentRecord): string {
-  return record.vm ?? readSandboxVm() ?? DEFAULT_SANDBOX_VM;
+  return record.vm ?? targetVm();
+}
+
+/** Finalize a DETACHED autonomous run whose tmux session has ended by
+ *  reading its captured result from the shared workspace (the guest wrote
+ *  it; VirtioFS makes it the same file host-side, A6). Returns the terminal
+ *  patch (done/error + summary + exit code + endedAt), or null when there's
+ *  no result file — the run produced nothing, so it falls through to the
+ *  generic `exited`. Only autonomous records with a `resultPath` qualify. */
+function finalizeEndedAutonomous(agent: AgentRecord): Partial<AgentRecord> | null {
+  if (agent.mode !== 'autonomous' || !agent.resultPath) return null;
+  const adapter = adapterForType(agent.type) ?? claudeCodeAdapter;
+  const rcPath = agent.resultPath.replace(/\.json$/, '.rc');
+  const result = readAutonomousResultFromFiles(agent.resultPath, rcPath, adapter);
+  if (!result) return null;
+  return {
+    status: result.status,
+    summary: result.summary,
+    exitCode: result.exitCode,
+    endedAt: agent.endedAt ?? new Date().toISOString(),
+  };
 }
 
 /** The set of live session ids in a VM (`appliance-vm sessions list <vm>`,
@@ -228,7 +280,10 @@ export function listLiveSessionIds(vm: string): Set<string> | null {
   if (r.status !== 0) return null;
   try {
     const parsed: unknown = JSON.parse(r.stdout || '[]');
-    if (!Array.isArray(parsed)) return new Set();
+    // Non-array JSON is an UNKNOWN listing (a banner, an error object), not
+    // an empty one — return null so a `running` agent isn't false-flipped
+    // to `exited`. Matches the catch's honest-unknown semantics (A3 nit).
+    if (!Array.isArray(parsed)) return null;
     const ids = new Set<string>();
     for (const e of parsed) {
       if (e && typeof e === 'object' && typeof (e as { id?: unknown }).id === 'string') {
@@ -243,13 +298,15 @@ export function listLiveSessionIds(vm: string): Set<string> | null {
 
 /** Pure reconcile core (unit-tested): cross-check each agent's session id
  *  against its VM's live session set. A `running` entry whose session is
- *  gone becomes `exited`; terminal states (`done`/`error`/`exited`) are
- *  never resurrected. A VM with an unknown (null) live set leaves its
- *  agents untouched and reports liveness `null`. */
+ *  gone is finalized — `finalize` first claims an autonomous run's captured
+ *  result (done/error + summary), otherwise it becomes `exited`. Terminal
+ *  states (`done`/`error`/`exited`) are never resurrected. A VM with an
+ *  unknown (null) live set leaves its agents untouched, liveness `null`. */
 export function reconcileStatuses(
   agents: AgentRecord[],
   liveByVm: Map<string, Set<string> | null>,
-  vmOf: (a: AgentRecord) => string
+  vmOf: (a: AgentRecord) => string,
+  finalize?: (a: AgentRecord) => Partial<AgentRecord> | null
 ): { agents: AgentRecord[]; changed: boolean; live: Record<string, boolean | null> } {
   let changed = false;
   const live: Record<string, boolean | null> = {};
@@ -263,7 +320,8 @@ export function reconcileStatuses(
     live[a.sessionId] = isLive;
     if (!isLive && a.status === 'running') {
       changed = true;
-      return { ...a, status: 'exited' as AgentStatus };
+      const patch = finalize?.(a);
+      return patch ? { ...a, ...patch } : { ...a, status: 'exited' as AgentStatus };
     }
     return a;
   });
@@ -285,7 +343,7 @@ export function reconcileRegistry(rootDir?: string): {
     const vm = vmForRecord(a);
     if (!liveByVm.has(vm)) liveByVm.set(vm, listLiveSessionIds(vm));
   }
-  const { agents: next, changed, live } = reconcileStatuses(agents, liveByVm, vmForRecord);
+  const { agents: next, changed, live } = reconcileStatuses(agents, liveByVm, vmForRecord, finalizeEndedAutonomous);
   if (changed) writeRegistryFile(file, next);
   return { agents: next, live };
 }

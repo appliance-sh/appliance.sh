@@ -344,6 +344,27 @@ command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
 Both share one transport and one session namespace; the only difference is
 the first command and whether a human is attached.
 
+**Autonomous lifecycle (A6 — chosen default: detached; `--wait` to block).**
+`appliance agent start --task "<prompt>" --autonomous` **detaches by
+default**: it launches the headless run into the `agent-<id>` tmux session
+and returns immediately with the registry entry `running`, so a desktop tab
+can attach to watch and the terminal is freed. The detached launch line
+redirects Claude's `--output-format json` result to
+`/persist/workspace/.appliance/agent-results/<id>.json` (+ a sibling `.rc`
+holding the exit code) on the **VirtioFS-shared** workspace; because that is
+the same tree host-side, `appliance agent list` reconcile reads it once the
+tmux session ends and flips the entry to `done`/`error` with a short
+`summary` — no VM round-trip to collect the outcome.
+
+`--wait` instead **blocks**: it runs the headless task to completion as a
+captured one-shot over the vsock exit-code sentinel (`shell.rs:63`,`:209`),
+collecting stdout + the real exit code in-band, then classifies the result
+(`done` iff exit 0 AND a non-error parsed result, else `error`), records the
+terminal state, prints the result text + a "review the changes" pointer, and
+exits non-zero on error so scripts can gate on it. The shared classifier is
+`classifyAutonomousResult` (`utils/agent.ts`); the per-adapter result
+extraction is `parseResult` (§8b).
+
 ## 7. Agent registry — `.appliance/agents.json`
 
 Per-project, alongside `link.json` (same `.appliance/` dir,

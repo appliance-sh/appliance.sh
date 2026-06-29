@@ -133,6 +133,13 @@ export const claudeCodeAdapter: AgentAdapter = {
   },
 };
 
+/** Map an agent-type to its adapter. Claude Code is the only one today;
+ *  codex/aider/etc. are future adapter objects (docs §8b). Shared by the
+ *  CLI command group and the registry's autonomous-result finalizer. */
+export function adapterForType(type: string): AgentAdapter | null {
+  return type === claudeCodeAdapter.type ? claudeCodeAdapter : null;
+}
+
 // ---- host key store (A2 — the broker's host side) ----------------------
 //
 // The Anthropic key lives host-side ONLY: macOS Keychain
@@ -288,18 +295,10 @@ export function printKeyHelperCommand(): string {
   return `${shQuote(exe)} ${shQuote(nodeAgentEntry())} print-key`;
 }
 
-/** Compose the in-session launch line: cd to the workspace then exec the
- *  agent under the proxy/CA/placeholder env.
- *
- *  The agent argv — including the user-controlled autonomous `--task`
- *  prompt — is shell-quoted PER TOKEN, and `runAgent` then wraps the whole
- *  line with the POSIX `'\''` trick before handing it to
- *  `tmux new-session`. So a multi-word task no longer mis-parses
- *  (`claude -p fix the test` would otherwise take only `fix`) and a single
- *  quote in the task can't break out of the wrapper into arbitrary
- *  in-guest exec. The env values are fixed/metachar-free (URLs, constant
- *  paths), so they're left unquoted. */
-export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts: AgentLaunchOpts): string {
+/** The proxy/CA/placeholder env, rendered as `K=V` assignments for an
+ *  `env …` prefix. Values are fixed/metachar-free (URLs, constant paths),
+ *  so they're left unquoted. */
+function launchEnvAssigns(adapter: AgentAdapter, proxyUrl: string): string {
   const env: Record<string, string> = {
     HTTP_PROXY: proxyUrl,
     HTTPS_PROXY: proxyUrl,
@@ -311,11 +310,141 @@ export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts:
     ...(adapter.runtimeEnv ?? {}),
     ...(adapter.placeholderEnv ?? {}),
   };
-  const assigns = Object.entries(env)
+  return Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
     .join(' ');
+}
+
+/** Compose the in-session launch line: cd to the workspace then run the
+ *  agent under the proxy/CA/placeholder env.
+ *
+ *  The agent argv — including the user-controlled autonomous `--task`
+ *  prompt — is shell-quoted PER TOKEN, and `runAgent` then wraps the whole
+ *  line with the POSIX `'\''` trick before handing it to
+ *  `tmux new-session`. So a multi-word task no longer mis-parses
+ *  (`claude -p fix the test` would otherwise take only `fix`) and a single
+ *  quote in the task can't break out of the wrapper into arbitrary
+ *  in-guest exec.
+ *
+ *  `exec` (default) hands the session straight to the agent — right for the
+ *  detached tmux launch (interactive TTY). The one-shot capture path
+ *  (`--wait`, §6) passes `exec=false` so the login shell OUTLIVES the agent
+ *  and the trailing exit-code sentinel (shell.rs) can still fire to carry
+ *  the agent's real exit code back over the status-less byte pipe. */
+export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts: AgentLaunchOpts, exec = true): string {
   const argv = adapter.launchArgv(opts).map(shQuote).join(' ');
-  return `cd ${GUEST_WORKSPACE}; exec env ${assigns} ${argv}`;
+  return `cd ${GUEST_WORKSPACE}; ${exec ? 'exec ' : ''}env ${launchEnvAssigns(adapter, proxyUrl)} ${argv}`;
+}
+
+// ---- autonomous result capture (A6) ------------------------------------
+//
+// The autonomous run (`claude -p … --output-format json`) is captured one
+// of two ways, both feeding `classifyAutonomousResult`:
+//   • `--wait` (blocking): runs the headless argv as a captured one-shot
+//     over the vsock sentinel path (shell.rs) — stdout + the real exit code
+//     come back in-band; no result file is needed.
+//   • detached (default): the launch line redirects the JSON result to a
+//     file on the VirtioFS-shared workspace and records the exit code, so
+//     the host can collect the outcome AFTER the tmux session ends —
+//     `reconcileRegistry` reads it to flip the status to done/error.
+
+/** The host + guest paths an autonomous run's result/exit-code are
+ *  captured to. The workspace is VirtioFS-shared, so the guest writes under
+ *  `/persist/workspace/.appliance/agent-results` and the host reads the
+ *  SAME tree at `<projectDir>/.appliance/agent-results` — no VM round-trip
+ *  to collect a detached run's result (docs/agent-sandbox.md §6). */
+export interface AgentResultPaths {
+  hostJson: string;
+  hostRc: string;
+  guestJson: string;
+  guestRc: string;
+  guestDir: string;
+}
+
+const AGENT_RESULTS_REL = '.appliance/agent-results';
+
+export function agentResultPaths(projectDir: string, sessionId: string): AgentResultPaths {
+  const root = path.resolve(projectDir);
+  return {
+    hostJson: path.join(root, '.appliance', 'agent-results', `${sessionId}.json`),
+    hostRc: path.join(root, '.appliance', 'agent-results', `${sessionId}.rc`),
+    guestJson: `${GUEST_WORKSPACE}/${AGENT_RESULTS_REL}/${sessionId}.json`,
+    guestRc: `${GUEST_WORKSPACE}/${AGENT_RESULTS_REL}/${sessionId}.rc`,
+    guestDir: `${GUEST_WORKSPACE}/${AGENT_RESULTS_REL}`,
+  };
+}
+
+/** The detached-autonomous launch line: like `composeLaunchLine` but it
+ *  runs the headless argv NON-exec'd, redirecting the `--output-format
+ *  json` result (stdout) to the shared-workspace result file and recording
+ *  the exit code in a sibling `.rc` file — so a detached run's outcome is
+ *  collectable host-side once its tmux session ends. stderr (Claude's
+ *  progress) stays on the pane so an attached tab can watch the run live. */
+export function composeAutonomousCaptureLine(
+  adapter: AgentAdapter,
+  proxyUrl: string,
+  opts: AgentLaunchOpts,
+  paths: Pick<AgentResultPaths, 'guestJson' | 'guestRc' | 'guestDir'>
+): string {
+  const assigns = launchEnvAssigns(adapter, proxyUrl);
+  const argv = adapter
+    .launchArgv({ ...opts, mode: 'autonomous' })
+    .map(shQuote)
+    .join(' ');
+  return (
+    `cd ${GUEST_WORKSPACE}; mkdir -p ${shQuote(paths.guestDir)}; ` +
+    `env ${assigns} ${argv} > ${shQuote(paths.guestJson)}; ` +
+    `echo $? > ${shQuote(paths.guestRc)}`
+  );
+}
+
+/** The classified outcome of an autonomous run. `done` only when the agent
+ *  exited 0 AND the adapter parsed a non-error result; a non-zero exit, an
+ *  unparseable stream, or an `is_error` result is `error` (docs §6). */
+export interface AutonomousResult {
+  status: 'done' | 'error';
+  exitCode: number | null;
+  summary?: string;
+}
+
+/** Classify an autonomous run from its exit code + captured stdout. Pure
+ *  (unit-tested): the single source of truth both the `--wait` path and the
+ *  detached reconcile finalizer run through. */
+export function classifyAutonomousResult(
+  exitCode: number | null,
+  stdout: string,
+  adapter: AgentAdapter
+): AutonomousResult {
+  const parsed = adapter.parseResult?.(stdout);
+  const ok = exitCode === 0 && parsed?.ok === true;
+  const summary = parsed?.summary ?? (ok ? 'completed' : `no result captured (exit ${exitCode ?? 'unknown'})`);
+  return { status: ok ? 'done' : 'error', exitCode, summary };
+}
+
+/** Read + classify a detached autonomous run's captured result from the
+ *  shared workspace. Returns null when the JSON result file isn't present
+ *  yet (the run produced nothing) so the caller can fall back to `exited`
+ *  rather than inventing an outcome. NEVER throws on a missing/corrupt
+ *  file. */
+export function readAutonomousResultFromFiles(
+  hostJson: string,
+  hostRc: string,
+  adapter: AgentAdapter
+): AutonomousResult | null {
+  let stdout: string;
+  try {
+    stdout = fs.readFileSync(hostJson, 'utf-8');
+  } catch {
+    return null; // no result file → not finalized; caller treats as exited
+  }
+  let exitCode: number | null = null;
+  try {
+    const n = Number.parseInt(fs.readFileSync(hostRc, 'utf-8').trim(), 10);
+    if (Number.isInteger(n)) exitCode = n;
+  } catch {
+    // rc missing — leave null; classify maps a missing code to `error`
+  }
+  return classifyAutonomousResult(exitCode, stdout, adapter);
 }
 
 /** Read the proxy URL the guest should use from `appliance-vm egress
@@ -360,21 +489,41 @@ export interface RunAgentOpts {
    *  minting one — lets a caller (the CLI `--session`, the desktop tab)
    *  pre-allocate the agent's session id. */
   sessionId?: string;
+  /** Autonomous: block until the run completes, capturing the result
+   *  in-band over the one-shot sentinel path, instead of detaching. */
+  wait?: boolean;
+}
+
+/** What a launch produced. `result` is set only for a blocking (`--wait`)
+ *  autonomous run; `resultPath` is the host path a DETACHED autonomous run
+ *  writes its captured JSON result to (read later by reconcile). */
+export interface RunAgentResult {
+  sessionId: string;
+  vm: string;
+  mode: 'interactive' | 'autonomous';
+  resultPath?: string;
+  result?: AutonomousResult;
 }
 
 /**
- * Launch a coding agent in a reattachable `agent-<id>` tmux session as
- * the appliance user, wired through the host credential broker. Boots/
- * ensures the sandbox VM, requires the host key, configures the broker,
- * installs the agent on first use, and spawns the detached session.
- * Returns the session id (attach with `appliance vm shell <vm>
- * --session <id>`).
+ * Launch a coding agent as the appliance user, wired through the host
+ * credential broker. Boots/ensures the sandbox VM, requires the host key,
+ * configures the broker, and installs the agent on first use. Then either:
+ *
+ *   • interactive / detached-autonomous (default): spawns the reattachable
+ *     `agent-<id>` tmux session and returns immediately (attach with
+ *     `appliance vm shell <vm> --session <id>`). Autonomous redirects its
+ *     result to the shared workspace so reconcile can finalize it.
+ *   • autonomous + `wait`: runs the headless task to completion over the
+ *     vsock one-shot sentinel path, capturing stdout + the exit code, and
+ *     returns the classified `result`.
  */
-export async function runAgent(opts: RunAgentOpts = {}): Promise<string> {
+export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult> {
   const adapter = opts.adapter ?? claudeCodeAdapter;
   const mode = opts.mode ?? 'interactive';
   const vm = opts.vm ?? targetVm();
   const projectDir = path.resolve(opts.projectDir ?? process.cwd());
+  const wait = mode === 'autonomous' && opts.wait === true;
 
   // Fail fast before booting anything if the host key isn't configured —
   // the proxy fails closed, so the agent would only hit a 502 otherwise.
@@ -393,8 +542,26 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<string> {
 
   const proxyUrl = resolveProxyUrl(vm);
   const sessionId = opts.sessionId ? ensureAgentSessionId(opts.sessionId) : mintAgentSessionId();
+  const paths = agentResultPaths(projectDir, sessionId);
+
+  // --wait: run the headless task to completion as a captured one-shot over
+  // the vsock sentinel path (shell.rs) — stdout (the JSON result) and the
+  // agent's real exit code come back in-band. Non-exec so the sentinel can
+  // fire after claude; install joined with `&&` so a failed install aborts.
+  if (wait) {
+    const line = composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task }, false);
+    const script = `(${adapter.installCmd}) && (${line})`;
+    console.log(chalk.cyan(`» running ${adapter.type} headless to completion (--wait) — capturing the result`));
+    const r = vmRunScript(vm, script);
+    const result = classifyAutonomousResult(r.status, r.stdout, adapter);
+    return { sessionId, vm, mode, result };
+  }
+
   const tmuxSession = `appliance-${sessionId}`;
-  const launchLine = composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task });
+  const launchLine =
+    mode === 'autonomous'
+      ? composeAutonomousCaptureLine(adapter, proxyUrl, { mode, task: opts.task }, paths)
+      : composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task });
 
   // One in-guest invocation (runs as the appliance user via the vsock
   // one-shot path): install-on-first-use, then create the DETACHED tmux
@@ -421,5 +588,8 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<string> {
   const bin = path.basename(vmBinary());
   console.log(`  Attach:  appliance vm shell --name ${vm} --session ${sessionId}`);
   console.log(chalk.dim(`           (or ${bin} shell ${vm} --session ${sessionId})`));
-  return sessionId;
+  if (mode === 'autonomous') {
+    console.log(chalk.dim('  Result:  appliance agent list   (status flips to done/error on completion)'));
+  }
+  return { sessionId, vm, mode, resultPath: mode === 'autonomous' ? paths.hostJson : undefined };
 }

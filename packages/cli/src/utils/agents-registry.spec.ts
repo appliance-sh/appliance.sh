@@ -7,6 +7,7 @@ import {
   type AgentRecord,
   agentIdFromSession,
   findAgent,
+  projectRootFor,
   reconcileStatuses,
   readRegistry,
   registryFileFor,
@@ -75,6 +76,16 @@ describe('agents-registry persistence', () => {
     expect(readRegistry(root).map((a) => a.id)).toEqual(['ok']);
   });
 
+  it('rejects an entry whose status is not in the AgentStatus union', () => {
+    const file = registryFileFor(root);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // The `status: "bogus"` record is structurally a record but carries an
+    // invalid status — it must be dropped, not surfaced as a live agent.
+    const bad = { ...rec({ id: 'bad', sessionId: 'agent-bad' }), status: 'bogus' };
+    fs.writeFileSync(file, JSON.stringify({ agents: [bad, rec({ id: 'ok', sessionId: 'agent-ok' })] }));
+    expect(readRegistry(root).map((a) => a.id)).toEqual(['ok']);
+  });
+
   it('updateAgentStatus + removeAgent operate by id', () => {
     upsertAgent(rec({ id: 'one', sessionId: 'agent-one' }), root);
     expect(updateAgentStatus('one', 'exited', root)?.status).toBe('exited');
@@ -136,5 +147,56 @@ describe('reconcileStatuses', () => {
     const { agents, changed } = reconcileStatuses([done], live, vmOf);
     expect(changed).toBe(false);
     expect(agents[0].status).toBe('done');
+  });
+
+  it('finalizes an ended run via the finalize hook instead of plain exited (A6)', () => {
+    const live = new Map<string, Set<string> | null>([['appliance-sbx', new Set<string>()]]);
+    const a = rec({
+      sessionId: 'agent-auto',
+      mode: 'autonomous',
+      resultPath: '/w/.appliance/agent-results/agent-auto.json',
+    });
+    const finalize = (rec_: AgentRecord): Partial<AgentRecord> | null =>
+      rec_.mode === 'autonomous' ? { status: 'done', summary: 'shipped', exitCode: 0, endedAt: 'now' } : null;
+    const { agents, changed } = reconcileStatuses([a], live, vmOf, finalize);
+    expect(changed).toBe(true);
+    expect(agents[0].status).toBe('done');
+    expect(agents[0].summary).toBe('shipped');
+    expect(agents[0].exitCode).toBe(0);
+  });
+
+  it('falls through to exited when the finalize hook claims nothing', () => {
+    const live = new Map<string, Set<string> | null>([['appliance-sbx', new Set<string>()]]);
+    const a = rec({ sessionId: 'agent-int', mode: 'interactive' });
+    const { agents, changed } = reconcileStatuses([a], live, vmOf, () => null);
+    expect(changed).toBe(true);
+    expect(agents[0].status).toBe('exited');
+  });
+});
+
+describe('projectRootFor (A3 nit: walk-up registry root)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-root-'));
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('resolves the project root from a subdirectory when a link.json exists', () => {
+    fs.mkdirSync(path.join(root, '.appliance'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.appliance', 'link.json'),
+      JSON.stringify({ projectName: 'p', environmentName: 'e' })
+    );
+    const sub = path.join(root, 'packages', 'cli');
+    fs.mkdirSync(sub, { recursive: true });
+    expect(projectRootFor(sub)).toBe(root);
+  });
+
+  it('falls back to the resolved dir when no .appliance/ exists above it', () => {
+    const sub = path.join(root, 'nested');
+    fs.mkdirSync(sub, { recursive: true });
+    expect(projectRootFor(sub)).toBe(sub);
   });
 });

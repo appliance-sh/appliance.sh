@@ -5,8 +5,9 @@ import { password } from '@inquirer/prompts';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 
 import {
-  type AgentAdapter,
-  claudeCodeAdapter,
+  type AutonomousResult,
+  type RunAgentResult,
+  adapterForType,
   forgetAgentKey,
   readAgentKey,
   runAgent,
@@ -18,6 +19,7 @@ import {
   type AgentStatus,
   agentIdFromSession,
   findAgent,
+  projectRootFor,
   readRegistry,
   reconcileRegistry,
   updateAgentStatus,
@@ -30,13 +32,8 @@ import {
 //
 // This file is the A1 runner surface + the A2 host key store / `print-key`
 // helper + the A3 command group (start/list/stop/attach) backed by the A4
-// registry (.appliance/agents.json, utils/agents-registry.ts).
-
-/** Map an agent-type to its adapter. Claude Code is the only one today;
- *  codex/aider/etc. are future adapter objects (docs §8b). */
-function adapterForType(type: string): AgentAdapter | null {
-  return type === 'claude-code' ? claudeCodeAdapter : null;
-}
+// registry (.appliance/agents.json, utils/agents-registry.ts) + the A6
+// autonomous result capture/surfacing (start --autonomous [--wait]).
 
 ensureHelperBinOnPath();
 
@@ -52,6 +49,11 @@ program
   .option('--type <type>', 'agent adapter type', 'claude-code')
   .option('--autonomous', 'run one prompt headless to completion (claude -p) instead of an interactive TTY', false)
   .option('--task <prompt>', 'the task prompt (required for --autonomous; optional label otherwise)')
+  .option(
+    '--wait',
+    'autonomous: block until the run completes, capturing + printing the result (default: detached)',
+    false
+  )
   .option('--session <id>', 'use this session id instead of minting one (normalized to the agent- prefix)')
   .option('--no-attach', 'launch + record without attaching the interactive session afterwards')
   .action(
@@ -63,6 +65,7 @@ program
         type: string;
         autonomous: boolean;
         task?: string;
+        wait: boolean;
         session?: string;
         attach: boolean;
       }
@@ -70,6 +73,9 @@ program
       if (opts.autonomous && !opts.task) {
         console.error(chalk.red('--autonomous requires --task "<prompt>".'));
         process.exit(1);
+      }
+      if (opts.wait && !opts.autonomous) {
+        console.error(chalk.yellow('--wait only applies to --autonomous; ignoring it.'));
       }
       const adapter = adapterForType(opts.type);
       if (!adapter) {
@@ -89,35 +95,74 @@ program
       }
 
       const projectDir = path.resolve(project ?? opts.dir ?? process.cwd());
+      // Record into the project's walk-up `.appliance/` root (beside
+      // link.json) so running `start` from a subdirectory doesn't drop a
+      // stray agents.json in the subdir (A3 nit).
+      const root = projectRootFor(projectDir);
       const vm = opts.vm ?? targetVm();
       const mode: 'interactive' | 'autonomous' = opts.autonomous ? 'autonomous' : 'interactive';
+      const wait = opts.autonomous && opts.wait;
 
       // runAgent (A1) ensures the VM is booted, configures the broker, and
-      // launches the detached `agent-<id>` tmux session.
-      const sessionId = await runAgent({ vm, projectDir, adapter, mode, task: opts.task, sessionId: opts.session });
+      // either launches the detached `agent-<id>` tmux session or, for
+      // autonomous --wait, runs the task to completion and returns the
+      // captured result. A clean message (not a stack) on any failure.
+      let run: RunAgentResult;
+      try {
+        run = await runAgent({ vm, projectDir, adapter, mode, task: opts.task, sessionId: opts.session, wait });
+      } catch (err) {
+        console.error(chalk.red(`agent launch failed: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+      }
 
-      // Record it in the per-project registry (.appliance/agents.json
-      // beside link.json). list/stop/attach + the desktop badge read this;
-      // liveness reconciles against the live tmux sessions.
-      upsertAgent(
-        {
-          id: agentIdFromSession(sessionId),
-          type: adapter.type,
-          task: opts.task,
-          status: 'running',
-          sessionId,
-          launchedAt: new Date().toISOString(),
-          vm,
-          mode,
-        },
-        projectDir
-      );
+      const base = {
+        id: agentIdFromSession(run.sessionId),
+        type: adapter.type,
+        task: opts.task,
+        sessionId: run.sessionId,
+        launchedAt: new Date().toISOString(),
+        vm,
+        mode,
+      };
+
+      // Autonomous --wait: the blocking run already completed — record the
+      // terminal result + surface the summary, and exit non-zero on error
+      // so scripts can gate on it (A6).
+      if (mode === 'autonomous' && wait && run.result) {
+        const r = run.result;
+        upsertAgent(
+          {
+            ...base,
+            status: r.status,
+            summary: r.summary,
+            exitCode: r.exitCode ?? null,
+            endedAt: new Date().toISOString(),
+            resultPath: run.resultPath,
+          },
+          root
+        );
+        printAutonomousSummary(base.id, r, projectDir);
+        process.exit(r.status === 'done' ? 0 : 1);
+      }
+
+      // Record `running`. A detached autonomous run carries `resultPath` so
+      // `appliance agent list` can finalize done/error by reading the
+      // captured result off the shared workspace once the session ends.
+      upsertAgent({ ...base, status: 'running', resultPath: run.resultPath }, root);
+
+      // Autonomous detached default → leave it running; `agent list` flips
+      // it to done/error on completion.
+      if (mode === 'autonomous') {
+        console.log(
+          chalk.dim(`Run \`appliance agent list\` to watch ${chalk.bold(base.id)} flip to done/error on completion.`)
+        );
+        return;
+      }
 
       // Interactive default → attach the just-launched session so the user
-      // lands in the agent. Autonomous → leave it running headless (result
-      // capture is A6); the session can still be attached later to watch.
-      if (mode === 'interactive' && opts.attach) {
-        process.exit(runVm(['shell', vm, '--session', sessionId]));
+      // lands in the agent.
+      if (opts.attach) {
+        process.exit(runVm(['shell', vm, '--session', run.sessionId]));
       }
     }
   );
@@ -146,11 +191,15 @@ program
     const idW = Math.max(2, ...agents.map((a) => a.id.length));
     const typeW = Math.max(4, ...agents.map((a) => a.type.length));
     const statusW = Math.max(6, ...agents.map((a) => a.status.length));
-    console.log(chalk.dim(`${'ID'.padEnd(idW)}  ${'TYPE'.padEnd(typeW)}  ${'STATUS'.padEnd(statusW)}  TASK`));
+    console.log(chalk.dim(`${'ID'.padEnd(idW)}  ${'TYPE'.padEnd(typeW)}  ${'STATUS'.padEnd(statusW)}  TASK / RESULT`));
     for (const a of agents) {
       const status = colorStatus(a.status.padEnd(statusW), a.status, live[a.sessionId]);
-      const task = a.task ? truncate(a.task, 48) : chalk.dim('—');
-      console.log(`${a.id.padEnd(idW)}  ${a.type.padEnd(typeW)}  ${status}  ${task}`);
+      // For a finished autonomous run, surface the captured result summary
+      // in place of the prompt (A6); otherwise show the task/label.
+      const terminal = a.status === 'done' || a.status === 'error';
+      const label = terminal && a.summary ? a.summary : a.task;
+      const cell = label ? truncate(label.replace(/\s+/g, ' ').trim(), 56) : chalk.dim('—');
+      console.log(`${a.id.padEnd(idW)}  ${a.type.padEnd(typeW)}  ${status}  ${cell}`);
     }
   });
 
@@ -256,6 +305,24 @@ function colorStatus(text: string, status: AgentStatus, live: boolean | null | u
 /** Truncate a label with an ellipsis for single-line table display. */
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/** Surface a completed autonomous run (A6): a done/error headline, the
+ *  captured result text, and a pointer to review the changes the agent made
+ *  to the shared workspace. */
+function printAutonomousSummary(id: string, result: AutonomousResult, workspaceDir: string): void {
+  if (result.status === 'done') {
+    console.log(`${chalk.green('✓')} agent ${chalk.bold(id)} ${chalk.green('done')}`);
+  } else {
+    const code = result.exitCode != null ? chalk.dim(` (exit ${result.exitCode})`) : '';
+    console.log(`${chalk.red('✗')} agent ${chalk.bold(id)} ${chalk.red('error')}${code}`);
+  }
+  if (result.summary) {
+    console.log();
+    console.log(result.summary);
+  }
+  console.log();
+  console.log(chalk.dim(`Review the changes in ${workspaceDir}  (e.g. \`git -C ${workspaceDir} diff\`).`));
 }
 
 function readStdin(): Promise<string> {

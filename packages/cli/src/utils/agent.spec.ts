@@ -1,11 +1,18 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import {
   ANTHROPIC_HOST,
   ANTHROPIC_PLACEHOLDER_KEY,
+  adapterForType,
+  agentResultPaths,
+  classifyAutonomousResult,
   claudeCodeAdapter,
+  composeAutonomousCaptureLine,
   composeLaunchLine,
   printKeyHelperCommand,
+  readAutonomousResultFromFiles,
 } from './agent.js';
 
 const PROXY = 'http://192.168.64.1:5053';
@@ -74,6 +81,103 @@ describe('composeLaunchLine', () => {
     // The autonomous flags are present and quoted.
     expect(auto).toContain("'--output-format' 'json'");
     expect(auto).toContain("'--dangerously-skip-permissions'");
+  });
+});
+
+describe('adapterForType', () => {
+  it('resolves the claude-code adapter and rejects unknown types', () => {
+    expect(adapterForType('claude-code')).toBe(claudeCodeAdapter);
+    expect(adapterForType('aider')).toBeNull();
+  });
+});
+
+describe('autonomous result capture (A6)', () => {
+  it('agentResultPaths puts host + guest results under .appliance/agent-results', () => {
+    const p = agentResultPaths('/work/proj', 'agent-7f3c');
+    expect(p.hostJson).toBe(path.join('/work/proj', '.appliance', 'agent-results', 'agent-7f3c.json'));
+    expect(p.hostRc).toBe(path.join('/work/proj', '.appliance', 'agent-results', 'agent-7f3c.rc'));
+    expect(p.guestJson).toBe('/persist/workspace/.appliance/agent-results/agent-7f3c.json');
+    expect(p.guestRc).toBe('/persist/workspace/.appliance/agent-results/agent-7f3c.rc');
+    expect(p.guestDir).toBe('/persist/workspace/.appliance/agent-results');
+  });
+
+  it('composeAutonomousCaptureLine redirects the JSON result + records the exit code (no exec)', () => {
+    const paths = agentResultPaths('/work/proj', 'agent-7f3c');
+    const line = composeAutonomousCaptureLine(claudeCodeAdapter, PROXY, { mode: 'autonomous', task: 'fix it' }, paths);
+    // Non-exec: the shell must outlive claude to write the rc file.
+    expect(line).not.toContain('exec ');
+    expect(line.startsWith('cd /persist/workspace; mkdir -p ')).toBe(true);
+    // The headless argv is quoted, stdout is redirected to the result file,
+    // and `$?` is recorded to the sibling rc file.
+    expect(line).toContain("'claude' '-p' 'fix it' '--output-format' 'json' '--dangerously-skip-permissions'");
+    expect(line).toContain(`> '${paths.guestJson}'`);
+    expect(line).toContain(`echo $? > '${paths.guestRc}'`);
+    // Still wired through the broker env.
+    expect(line).toContain(`HTTPS_PROXY=${PROXY}`);
+    expect(line).toContain(`ANTHROPIC_API_KEY=${ANTHROPIC_PLACEHOLDER_KEY}`);
+  });
+
+  it('composeLaunchLine(exec=false) drops the exec so the sentinel can fire after the agent', () => {
+    const line = composeLaunchLine(claudeCodeAdapter, PROXY, { mode: 'autonomous', task: 'go' }, false);
+    expect(line.startsWith('cd /persist/workspace; env ')).toBe(true);
+    expect(line).not.toContain('exec env');
+    expect(line).toContain("'claude' '-p' 'go'");
+  });
+
+  it('classifyAutonomousResult: done only on exit 0 + a non-error parse', () => {
+    const done = classifyAutonomousResult(0, '{"is_error":false,"result":"all green"}', claudeCodeAdapter);
+    expect(done).toEqual({ status: 'done', exitCode: 0, summary: 'all green' });
+
+    // is_error result → error even on a zero exit.
+    const flagged = classifyAutonomousResult(0, '{"is_error":true,"result":"Invalid API key"}', claudeCodeAdapter);
+    expect(flagged).toEqual({ status: 'error', exitCode: 0, summary: 'Invalid API key' });
+
+    // Non-zero exit → error, with a synthesized summary when nothing parsed.
+    const crashed = classifyAutonomousResult(1, 'boom, not json', claudeCodeAdapter);
+    expect(crashed.status).toBe('error');
+    expect(crashed.exitCode).toBe(1);
+    expect(crashed.summary).toContain('exit 1');
+
+    // Missing exit code (rc file absent) → error.
+    expect(classifyAutonomousResult(null, '', claudeCodeAdapter).status).toBe('error');
+  });
+});
+
+describe('readAutonomousResultFromFiles (A6)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads the captured JSON + rc and classifies done', () => {
+    const json = path.join(dir, 'r.json');
+    const rc = path.join(dir, 'r.rc');
+    fs.writeFileSync(json, '{"is_error":false,"result":"shipped"}\n');
+    fs.writeFileSync(rc, '0\n');
+    expect(readAutonomousResultFromFiles(json, rc, claudeCodeAdapter)).toEqual({
+      status: 'done',
+      exitCode: 0,
+      summary: 'shipped',
+    });
+  });
+
+  it('classifies error from a non-zero rc even with a parseable result', () => {
+    const json = path.join(dir, 'r.json');
+    const rc = path.join(dir, 'r.rc');
+    fs.writeFileSync(json, '{"is_error":false,"result":"partial"}');
+    fs.writeFileSync(rc, '7');
+    const res = readAutonomousResultFromFiles(json, rc, claudeCodeAdapter);
+    expect(res?.status).toBe('error');
+    expect(res?.exitCode).toBe(7);
+  });
+
+  it('returns null when the result file is absent (run produced nothing)', () => {
+    expect(
+      readAutonomousResultFromFiles(path.join(dir, 'missing.json'), path.join(dir, 'missing.rc'), claudeCodeAdapter)
+    ).toBeNull();
   });
 });
 
