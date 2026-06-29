@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 
 import {
@@ -98,7 +99,11 @@ const AGENT_NO_PROXY =
 
 export const claudeCodeAdapter: AgentAdapter = {
   type: 'claude-code',
-  installCmd: 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1',
+  // Surface install stderr (only stdout is suppressed) so a failed
+  // `npm install` is visible rather than silently producing a dead
+  // session — runAgent also joins this with `&&` so a failure aborts
+  // before the tmux session is created.
+  installCmd: 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null',
   launchArgv(opts: AgentLaunchOpts): string[] {
     if (opts.mode === 'autonomous') {
       // --dangerously-skip-permissions is why the non-root user exists
@@ -233,25 +238,59 @@ export function targetVm(): string {
   return readSandboxVm() ?? DEFAULT_SANDBOX_VM;
 }
 
-/** Resolve the ABSOLUTE host command the proxy runs to fetch the key,
- *  pinning the `appliance` binary path (never PATH-relative). Under a
- *  bun-compiled single binary `execPath` IS `appliance`; under node it's
- *  the interpreter, so we qualify it with the resolved script path. */
+/** POSIX-single-quote a token for safe embedding in an `sh -c` command.
+ *  Wraps in single quotes and rewrites any embedded single quote as the
+ *  classic `'\''` sequence (close-quote, escaped quote, reopen) so the
+ *  token can neither be split on whitespace nor break out of the quoting
+ *  — and so a wrapper that itself single-quotes the whole line (runAgent →
+ *  `tmux new-session`) nests correctly. */
+function shQuote(token: string): string {
+  return `'${token.replace(/'/g, `'\\''`)}'`;
+}
+
+/** The runnable agent subcommand entry (`appliance-agent.js`), resolved
+ *  relative to THIS module so it's stable no matter how the process was
+ *  launched. The umbrella dispatcher (appliance.ts) rewrites
+ *  `process.argv[1]` to the literal `appliance-agent` before importing
+ *  this module, so the helper path must NOT be derived from argv[1] (that
+ *  yields a bogus cwd-relative path → `print-key` exits non-zero → every
+ *  brokered request fail-closes to 502 under a node invocation). */
+function nodeAgentEntry(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'appliance-agent.js');
+}
+
+/** Resolve the ABSOLUTE host command the proxy runs (via `sh -c`) to
+ *  fetch the key, pinning the entry path (never PATH-relative).
+ *
+ *  Shipping path: the CLI runs as the Bun-compiled single binary
+ *  (`bin/appliance.js` exec's `appliance-bin` / `dist/appliance`), so
+ *  `execPath` IS the umbrella binary and `<exe> agent print-key` works.
+ *
+ *  Dev/test (node or bun-as-interpreter): `execPath` is the interpreter,
+ *  so we run the agent subcommand entry DIRECTLY from a module-relative
+ *  path — independent of the dispatcher-clobbered `process.argv[1]`. */
 export function printKeyHelperCommand(): string {
   const exe = process.execPath;
   const base = path.basename(exe).toLowerCase();
   if (base.startsWith('appliance')) {
-    return `'${exe}' agent print-key`;
+    return `${shQuote(exe)} agent print-key`;
   }
-  // node/bun-as-interpreter: `<interp> <script> agent print-key`.
-  const script = process.argv[1] ? path.resolve(process.argv[1]) : exe;
-  return `'${exe}' '${script}' agent print-key`;
+  // `<interpreter> <appliance-agent.js> print-key` — the entry's own
+  // program (`appliance agent`) dispatches `print-key`.
+  return `${shQuote(exe)} ${shQuote(nodeAgentEntry())} print-key`;
 }
 
 /** Compose the in-session launch line: cd to the workspace then exec the
- *  agent under the proxy/CA/placeholder env. Values are metachar-free
- *  (URLs, fixed strings), so they need no quoting — which keeps this a
- *  single-quoted argument to `tmux new-session` upstream. */
+ *  agent under the proxy/CA/placeholder env.
+ *
+ *  The agent argv — including the user-controlled autonomous `--task`
+ *  prompt — is shell-quoted PER TOKEN, and `runAgent` then wraps the whole
+ *  line with the POSIX `'\''` trick before handing it to
+ *  `tmux new-session`. So a multi-word task no longer mis-parses
+ *  (`claude -p fix the test` would otherwise take only `fix`) and a single
+ *  quote in the task can't break out of the wrapper into arbitrary
+ *  in-guest exec. The env values are fixed/metachar-free (URLs, constant
+ *  paths), so they're left unquoted. */
 export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts: AgentLaunchOpts): string {
   const env: Record<string, string> = {
     HTTP_PROXY: proxyUrl,
@@ -267,7 +306,7 @@ export function composeLaunchLine(adapter: AgentAdapter, proxyUrl: string, opts:
   const assigns = Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
     .join(' ');
-  const argv = adapter.launchArgv(opts).join(' ');
+  const argv = adapter.launchArgv(opts).map(shQuote).join(' ');
   return `cd ${GUEST_WORKSPACE}; exec env ${assigns} ${argv}`;
 }
 
@@ -347,13 +386,18 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<string> {
 
   // One in-guest invocation (runs as the appliance user via the vsock
   // one-shot path): install-on-first-use, then create the DETACHED tmux
-  // session running the launch line directly. `has-session ||` keeps it
-  // idempotent; tmux daemonizes, so the session survives this client.
+  // session running the launch line directly. The install is joined with
+  // `&&` (in a subshell, so its own internal `||` is contained) so a
+  // failed install ABORTS instead of leaving a dead session; `has-session
+  // ||` keeps the launch idempotent; tmux daemonizes, so the session
+  // survives this client. The launch line is shQuote-wrapped (POSIX
+  // `'\''`) so its already-per-token-quoted argv nests safely as a single
+  // `tmux new-session` argument.
   const tmux = `tmux -L appliance -f /etc/appliance/tmux.conf`;
   const script =
-    `${adapter.installCmd}; ` +
-    `${tmux} has-session -t ${tmuxSession} 2>/dev/null || ` +
-    `${tmux} new-session -d -s ${tmuxSession} '${launchLine}'`;
+    `(${adapter.installCmd}) && ` +
+    `(${tmux} has-session -t ${tmuxSession} 2>/dev/null || ` +
+    `${tmux} new-session -d -s ${tmuxSession} ${shQuote(launchLine)})`;
 
   console.log(chalk.cyan(`» launching ${adapter.type} in session ${chalk.bold(sessionId)} (${mode})`));
   const r = vmRunScript(vm, script);

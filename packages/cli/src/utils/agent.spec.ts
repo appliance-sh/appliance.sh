@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import {
   ANTHROPIC_HOST,
@@ -43,17 +44,13 @@ describe('composeLaunchLine', () => {
 
   it('cds to the workspace and execs claude under the proxy + placeholder env', () => {
     expect(line.startsWith('cd /persist/workspace; exec env ')).toBe(true);
-    expect(line.endsWith(' claude')).toBe(true);
+    // The agent argv is shell-quoted per token (interactive is just
+    // `claude`) so it nests safely inside runAgent's tmux wrapper.
+    expect(line.endsWith(" 'claude'")).toBe(true);
     expect(line).toContain(`HTTPS_PROXY=${PROXY}`);
     expect(line).toContain(`https_proxy=${PROXY}`);
     expect(line).toContain('CLAUDE_CODE_CERT_STORE=bundled,system');
     expect(line).toContain(`ANTHROPIC_API_KEY=${ANTHROPIC_PLACEHOLDER_KEY}`);
-  });
-
-  it('embeds no single quote, so it stays a single quoted tmux argument', () => {
-    // The launch line is wrapped in single quotes for `tmux new-session`;
-    // a stray single quote would break that out and the launch.
-    expect(line.includes("'")).toBe(false);
   });
 
   it('bypasses the proxy only for loopback + cluster-internal hosts', () => {
@@ -61,14 +58,53 @@ describe('composeLaunchLine', () => {
     // api.anthropic.com must NOT be in NO_PROXY — it must traverse the broker.
     expect(line).not.toContain(ANTHROPIC_HOST);
   });
+
+  it('shell-quotes a multi-word + embedded-single-quote autonomous task', () => {
+    // Regression: the old code spliced the task unquoted, so a multi-word
+    // prompt mis-parsed (`claude -p fix the test` → only `fix`) and a `'`
+    // broke out of the tmux wrapper into arbitrary in-guest exec.
+    const task = "fix the test; it's broken";
+    const auto = composeLaunchLine(claudeCodeAdapter, PROXY, { mode: 'autonomous', task });
+    // The whole prompt is ONE quoted `-p` argument — not split on spaces,
+    // not terminated early by the `;`.
+    expect(auto).toContain("'-p' 'fix the test; it'\\''s broken'");
+    // The embedded single quote is rendered via the POSIX '\'' trick, so
+    // it cannot break out of the wrapper.
+    expect(auto).toContain("'\\''");
+    // The autonomous flags are present and quoted.
+    expect(auto).toContain("'--output-format' 'json'");
+    expect(auto).toContain("'--dangerously-skip-permissions'");
+  });
 });
 
 describe('printKeyHelperCommand', () => {
-  it('pins an absolute path and ends with `agent print-key`', () => {
+  it('pins the absolute interpreter + a stable agent entry, ending in print-key', () => {
     const cmd = printKeyHelperCommand();
-    expect(cmd.endsWith('agent print-key')).toBe(true);
-    // Absolute: the first quoted token is an absolute path.
+    expect(cmd.endsWith('print-key')).toBe(true);
+    // First quoted token is the absolute interpreter (execPath).
     const firstQuoted = cmd.match(/^'([^']+)'/)?.[1];
+    expect(firstQuoted).toBe(process.execPath);
     expect(firstQuoted?.startsWith('/')).toBe(true);
+    // The node/interpreter path targets the runnable agent entry directly.
+    expect(cmd).toContain('appliance-agent.js');
+  });
+
+  it('ignores a dispatcher-clobbered process.argv[1]', () => {
+    // appliance.ts rewrites process.argv[1] to the literal 'appliance-agent'
+    // before importing the agent module. The helper must resolve a stable
+    // module-relative entry, NOT a bogus cwd-relative path from argv[1]
+    // (which would exit non-zero → every brokered request 502s under node).
+    const saved = process.argv;
+    try {
+      process.argv = [process.execPath, 'appliance-agent', 'print-key'];
+      const cmd = printKeyHelperCommand();
+      // Not the bogus cwd-resolved literal.
+      expect(cmd).not.toContain(`'${path.resolve('appliance-agent')}'`);
+      // The stable, runnable entry instead.
+      expect(cmd).toContain('appliance-agent.js');
+      expect(cmd.endsWith('print-key')).toBe(true);
+    } finally {
+      process.argv = saved;
+    }
   });
 });
