@@ -223,26 +223,35 @@ pub fn intercept(
         crate::traffic::record(name, host, port, method, Some(path), "mitm");
     }
 
+    // Load the credential config ONCE for this intercepted request and
+    // thread it through both capture and injection — no per-phase re-read.
+    let cfg = crate::creds::load_config(name);
+
     // Credential capture: lift a configured credential header off the
     // request into the host-side secret store (best-effort). The broker
     // rule for api.anthropic.com is capture:false, so the in-guest
     // placeholder x-api-key is never lifted into egress-secrets.json.
-    crate::creds::capture_from_head(name, host, &head);
+    crate::creds::capture_from_head(&cfg, name, host, &head);
 
     // Resolve the credential to inject BEFORE dialing upstream so we can
-    // fail CLOSED: a host that HAS an inject rule but whose credential
-    // can't be resolved (host helper failed / Anthropic key not
-    // configured / Keychain locked) must NEVER forward the in-guest
-    // placeholder credential to the real upstream. Refuse with a clear,
-    // actionable error and dial no upstream — the placeholder leaves the
-    // host zero times.
-    let injection = crate::creds::injection_for(name, host);
-    if injection.is_none() && crate::creds::has_inject_rule(name, host) {
-        if log {
-            eprintln!("egress mitm: {host} :: credential not configured — refusing (fail closed)");
+    // fail CLOSED, atomically: classifying "no rule" vs "rule but
+    // unresolved" vs "resolved" from the SAME single config load avoids a
+    // TOCTOU where the rule is seen but the value isn't (or vice versa). A
+    // host that HAS an inject rule but whose credential can't be resolved
+    // (host helper failed / Anthropic key not configured / Keychain
+    // locked) must NEVER forward the in-guest placeholder credential to
+    // the real upstream — refuse with a clear, actionable error and dial
+    // no upstream, so the placeholder leaves the host zero times.
+    let injection = match crate::creds::resolve_injection(&cfg, name, host) {
+        crate::creds::Injection::Resolved(header, value) => Some((header, value)),
+        crate::creds::Injection::RuleButUnresolved => {
+            if log {
+                eprintln!("egress mitm: {host} :: credential not configured — refusing (fail closed)");
+            }
+            return write_cred_unconfigured(&mut client_tls, host);
         }
-        return write_cred_unconfigured(&mut client_tls, host);
-    }
+        crate::creds::Injection::NoRule => None,
+    };
 
     // Only now dial upstream — no wasted connection on a dead client.
     let upstream_tcp = TcpStream::connect((host, port)).with_context(|| format!("connect {host}:{port}"))?;

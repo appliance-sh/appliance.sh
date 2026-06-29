@@ -250,14 +250,9 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
         let allowed = policy.allows(&target);
         let (host, port) = split_host_port(&target);
         // Scope TLS interception to hosts that actually carry a
-        // credential rule. Decrypting *every* allowed HTTPS host forces
-        // one request per CONNECT (the interceptor sends
-        // `Connection: close`), which breaks keep-alive + streaming —
-        // Anthropic's SSE and the npm registry both suffer. Confining
-        // MITM to brokered hosts keeps every other allowed host a blind,
-        // streaming-preserving tunnel while still letting the proxy
-        // inject the Anthropic key on api.anthropic.com.
-        let intercept = allowed && policy.mitm && crate::creds::has_cred_rule(&ctx.name, &host);
+        // credential rule, and only once this VM's guest-IP lease is
+        // known (see should_intercept).
+        let intercept = should_intercept(&ctx.name, allowed, policy.mitm, &host);
         if log {
             let action = if !allowed {
                 "deny"
@@ -405,6 +400,27 @@ fn peer_allowed(peer: std::net::IpAddr, name: &str) -> bool {
             [o[0], o[1], o[2]] == subnet
         }
     }
+}
+
+/// Should this allowed CONNECT be TLS-intercepted (decrypted, so the
+/// proxy can broker the credential)?
+///
+/// Two gates beyond `allowed && mitm`:
+///   * the host must carry a credential rule — decrypting *every* allowed
+///     HTTPS host forces one request per CONNECT (the interceptor sends
+///     `Connection: close`), breaking keep-alive + streaming (Anthropic's
+///     SSE, the npm registry). Confining MITM to brokered hosts keeps
+///     every other allowed host a blind, streaming-preserving tunnel.
+///   * this VM's guest-IP lease must be KNOWN. Until it is (the ~120s
+///     early-boot window), `peer_allowed` falls back to a coarse /24 match
+///     — so a co-resident sibling VM sharing the vz /24 could reach this
+///     proxy and have THIS VM's brokered Anthropic key injected into the
+///     sibling's request (billing/usage theft; the key itself never
+///     escapes). Refusing to intercept until the lease pins `peer_allowed`
+///     to this VM's exact address closes that window: brokered hosts stay
+///     blind tunnels (no inject) until the peer can be exactly attributed.
+fn should_intercept(name: &str, allowed: bool, mitm: bool, host: &str) -> bool {
+    allowed && mitm && guest_ip_v4(name).is_some() && crate::creds::has_cred_rule(name, host)
 }
 
 /// This VM's leased guest IPv4, when known (written by the engine at
@@ -647,6 +663,43 @@ mod tests {
         assert!(peer_allowed("127.0.0.1".parse().unwrap(), name)); // loopback always
         assert!(!peer_allowed("192.168.64.8".parse().unwrap(), name)); // sibling VM
         assert!(!peer_allowed("192.168.64.1".parse().unwrap(), name)); // the gateway/host
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_intercept_until_lease_known() {
+        // A brokered host with mitm on must NOT be intercepted while this
+        // VM's guest-IP lease is unknown — otherwise a sibling VM on the
+        // coarse-/24 pre-lease peer gate could drive an injection of this
+        // VM's brokered key. Interception (and inject) resumes only once
+        // the lease pins peer_allowed to the exact address.
+        let name = "egress-intercept-prelease";
+        let dir = VmPaths::for_name(name).dir;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        crate::creds::upsert_rule(
+            name,
+            crate::creds::CredentialRule {
+                host: "api.anthropic.com".into(),
+                capture: false,
+                inject: true,
+                header: "x-api-key".into(),
+                helper: Some("printf real-key".into()),
+            },
+        )
+        .unwrap();
+
+        // Pre-lease (no guest-ip file): brokered host stays a blind tunnel.
+        assert!(!should_intercept(name, true, true, "api.anthropic.com"));
+
+        // Lease known: interception (and key injection) resumes.
+        std::fs::write(VmPaths::for_name(name).guest_ip(), "192.168.64.7\n").unwrap();
+        assert!(should_intercept(name, true, true, "api.anthropic.com"));
+        // ...but only for a brokered host, and only when allowed + mitm.
+        assert!(!should_intercept(name, true, true, "example.com"));
+        assert!(!should_intercept(name, false, true, "api.anthropic.com"));
+        assert!(!should_intercept(name, true, false, "api.anthropic.com"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
