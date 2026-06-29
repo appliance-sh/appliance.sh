@@ -155,6 +155,9 @@ it is handed out** (indeed a-priori, since we allocate it per VM).
 `EgressPolicy` allowlist for the queried name, and for **allowed** names
 forwards to the host's real resolver (host `getaddrinfo` / system DNS),
 returning the answer to the guest; **denied** names get `NXDOMAIN`/refused.
+**It MUST also drop answers that resolve into private/internal/host-LAN
+ranges (anti-SSRF, §8.1 #1)** and bound the upstream lookup with a short
+timeout — this is the pre-F2 blocker.
 
 **DNS's role — defense-in-depth + UX, NOT the boundary.** DNS filtering
 is bypassable on its own (a guest can hardcode IPs or speak DoH to an
@@ -170,10 +173,13 @@ came from (§4). The hard boundary is still the TCP terminator.
 
 The netstack accepts **every** guest TCP SYN to **any** destination
 IP:port and terminates it locally (smoltcp listening socket on the catch-
-all). On accept we know `dst_ip:dst_port`; we then classify and feed
-**allowed** flows into the existing `egress.rs` core (reused wholesale —
-`EgressPolicy::allows()`/`host_matches()`, `mitm.rs` SNI extraction at
-`mitm.rs:135`, `creds.rs`):
+all); **non-TCP / non-DNS traffic — UDP, ICMP, all IPv6, custom
+EtherTypes — is dropped, not forwarded** (§8.1 #2). On accept we know
+`dst_ip:dst_port`; we then classify (**fail-closed** — un-parseable ⇒
+deny, §8.1 #4) and feed **allowed** flows into the existing `egress.rs`
+core (reused wholesale — `EgressPolicy::allows()`/`host_matches()`,
+`mitm.rs` SNI extraction at `mitm.rs:135`, `creds.rs`), connecting to the
+**re-resolved validated name, never the guest's `dst_ip`** (§8.1 #3):
 
 - **443 / TLS ports** — peek the TLS ClientHello, extract **SNI**
   (`hello.server_name()`, `mitm.rs:135`). Allowlist by SNI. Allowed →
@@ -183,14 +189,17 @@ all). On accept we know `dst_ip:dst_port`; we then classify and feed
 - **80 / HTTP** — read the request head, take the **Host** header,
   allowlist by Host, feed the plain-HTTP forward path.
 - **Raw IP / non-TLS / non-HTTP / other ports** — **default-deny.**
-  Three escape hatches, all opt-in: (a) the dst IP matches an A/AAAA we
-  resolved for an _allowlisted_ name within a short TTL (the legitimate
-  "app dialed the IP our DNS just gave it" case); (b) an explicit
-  **IP/CIDR allow rule** in `EgressPolicy.allow`; otherwise refuse.
-- **UDP (non-DNS)** — **default-deny in F2.** This denies QUIC/HTTP-3 on
-  UDP/443; well-behaved clients fall back to TCP/443 (which we _can_
-  SNI-inspect), so this is a feature, not a regression. Revisit as a
-  policy knob in F5. DNS to the gateway (`.1:53`) is the one allowed UDP.
+  Two opt-in hatches, **both private-range-rejected (§8.1 #1)**: (a) the
+  dst IP matches an A/AAAA we resolved for an _allowlisted_ name within a
+  short TTL (the legitimate "app dialed the IP our DNS just gave it"
+  case); (b) an explicit **IP/CIDR allow rule** in `EgressPolicy.allow`.
+  Both reject any private/internal/host-LAN target; otherwise refuse.
+- **UDP (non-DNS)** — **default-deny in F2** (and dropped at the
+  netstack, §8.1 #2). This denies QUIC/HTTP-3 on UDP/443 (clients fall
+  back to TCP/443, which we _can_ SNI-inspect) and also UDP-only services
+  like **NTP/123** — clock sync must use the host path, not in-guest NTP
+  (§8.1 #6). Revisit as a policy knob in F5. DNS to the gateway
+  (`.1:53`) is the one allowed UDP.
 
 This is the load-bearing reuse: the netstack's accept path is a new
 _front door_ onto the **same** allow/deny + MITM/creds core that
@@ -282,17 +291,26 @@ escape hatch.
   lease → writes `guest-ip`, **deletes the `dhcpd_leases` scrape**),
   forwarding DNS, and transparent TCP terminate-and-forward upstream with
   **every flow allowed**; re-home `net.rs` inbound forwards through the
-  netstack `connect`. Gated `net_link=Netstack`. **Accept:** boot, DNS,
+  netstack `connect`. Gated `net_link=Netstack`. **F1 GATE (§8.1 #5):**
+  exactly one network device (no residual NAT attachment / second NIC),
+  and frame-parser robustness (bounded reads, no panic on malformed
+  frames) + per-VM netstack panic isolation — the hostile-frame parser is
+  in the data path a release before F5 fuzzing. **Accept:** boot, DNS,
   k3s `Ready`, kubeconfig handoff, and published ports are identical to
   NAT — zero breakage.
-- **F2 — Default-deny + allowlist filtering.** Flip
+- **F2 — Default-deny + allowlist filtering.** **PRE-F2 BLOCKER (§8.1
+  #1):** resolver SSRF / private-range filtering MUST land first — the
+  DNS resolver and both raw-IP hatches reject private/internal/host-LAN
+  targets, host-resolver calls are timeout-bounded. Then flip
   `EgressPolicy::default()` → `Deny`; bake the §5 allowlist + exclusions;
   classify SNI(443)/Host(80)/IP(raw) on the accept path through
-  `EgressPolicy::allows()`; non-TLS/non-HTTP/raw-IP → default-deny (+ the
-  DNS-backref & IP/CIDR opt-ins); DNS resolver enforces the allowlist as
-  fast-fail. **Accept:** allowlisted endpoints (apk/npm/pip/cargo/git/
-  docker/anthropic) succeed; everything else is refused, including raw-IP
-  and a proxy-env-dropping process.
+  `EgressPolicy::allows()`, connecting to the **re-resolved validated
+  name, never `dst_ip`** (§8.1 #3) and **failing closed** on un-parseable
+  SNI/Host (§8.1 #4); drop all non-allowlisted-TCP / non-DNS L3/L4 incl.
+  UDP/ICMP/IPv6 (§8.1 #2). **Accept:** allowlisted endpoints (apk/npm/pip/
+  cargo/git/docker/anthropic) succeed; everything else is refused —
+  raw-IP, a proxy-env-dropping process, a name-resolves-internal rebind,
+  and a `SNI=allowed` → `dst_ip=evil` flow.
 - **F3 — Unify the policy core.** Extract `serve_tunnel(name, host, port,
 stream)` / `serve_http(name, host, stream)` from
   `egress.rs::handle_conn` so the netstack accept-path and the legacy
@@ -305,9 +323,10 @@ stream)` / `serve_http(name, host, stream)` from
   selectable for one release; `doctor`/`up` surface the active link.
   **BYO-k8s + cloud paths stay on their current networking, untouched.**
 - **F5 — Hardening + observability.** Checksum/MTU/offload handling,
-  socketpair buffer tuning, fuzz the hostile-frame parser, per-VM
-  netstack panic isolation, deny/allow events into the existing `traffic`
-  view, finalize UDP/QUIC policy, throughput validation, then retire NAT.
+  socketpair buffer tuning, **fuzz** the hostile-frame parser (whose
+  baseline robustness + panic isolation already gated F1, §8.1 #5),
+  deny/allow events into the existing `traffic` view, finalize the
+  UDP/QUIC policy knob, throughput validation, then retire NAT.
 
 **Untouched (must not regress):**
 
@@ -348,10 +367,87 @@ is our smoltcp instance. There is **no NAT, no second NIC, no host route**
 from the guest subnet to anything. A rooted/jailbroken guest can forge
 arbitrary Ethernet/IP/TCP frames, drop the proxy env, use `--network
 host`, dial a raw IP, or speak a custom protocol — and every one of those
-frames still arrives in our userspace netstack, which **forwards a flow
-only after `EgressPolicy::allows()` returns true** for its SNI/Host/IP.
-Default-deny means the unclassifiable cases fail closed. **There is no
-other path off-box**, which is the property the brief requires.
+frames still arrives in our userspace netstack, which **originates an
+upstream flow only after `EgressPolicy::allows()` returns true** for its
+validated SNI/Host/IP, and **drops everything else**. **There is no other
+path off-box**, which is the property the brief requires.
+
+### 8.1 Security invariants (review must-adds — the contract F1/F5 build to)
+
+Sasha's conditional clearance turns on these six. **#1 is a hard pre-F2
+blocker; #5 is an F1 acceptance gate.** They refine §3 (DNS), §4
+(classification) and the F1/F2/F5 contracts (§7).
+
+1. **(pre-F2 BLOCKER) Resolver SSRF / private-range filtering.** The
+   forwarding DNS resolver MUST drop/refuse any resolved answer that
+   falls in a private/internal range — `10/8`, `172.16/12`,
+   `192.168/16`, `100.64/10` (CGNAT), `169.254/16` (link-local), `::1`,
+   `fc00::/7` (ULA), `fe80::/10` (v6 link-local), **and the host's own
+   LAN** — treating an allowlisted name that resolves to such an address
+   as **DENIED**, not forwarded. The two raw-IP hatches (the explicit
+   `IP/CIDR` allow rule **and** the DNS→IP back-reference set) likewise
+   **REJECT** any private/internal/host-LAN target: the netstack **never
+   originates an upstream connection — nor admits a back-ref allow — to a
+   non-public address.** Bound the host-resolver lookup with a short
+   timeout so it cannot serve as an internal-host **timing oracle**.
+   (Cluster CIDRs `10.42`/`10.43`/`172.17` are switched inside the guest
+   and never cross `host_fd`, so they need no upstream path and are
+   unaffected.) Without this, DNS rebinding turns the internet-confinement
+   boundary into a pivot into the operator's LAN (SSRF).
+
+2. **Boundary invariant — originate only allowlisted TCP (+ local DNS);
+   drop the rest.** The netstack originates an upstream flow for **only
+   allowlisted TCP** connections, plus DNS via the local gateway
+   resolver. **Every other L3/L4/EtherType is dropped at the netstack**,
+   never forwarded: non-DNS **UDP** (incl. QUIC on UDP/443 and NTP),
+   **ICMP / ICMPv6**, **all unclassified IPv6** (SLAAC/RA, link-local,
+   global v6), ARP to anything but the gateway, and any custom
+   protocol/EtherType. The rest of this doc is IPv4-centric; **IPv6 and
+   ICMP are explicitly in the drop set** — a v6 path must never silently
+   bypass the v4 allowlist.
+
+3. **Connect to the name, re-resolved host-side — never the guest's
+   `dst_ip`.** An allowed TLS(443)/HTTP(80) flow connects to the
+   **validated hostname, re-resolved on the host**, never the
+   guest-supplied `dst_ip`. Otherwise a guest sends `SYN → evil_ip:443`
+   carrying `SNI: api.anthropic.com` and rides an allowed label to an
+   arbitrary IP. `dst_ip` is the connect target **only** in the two
+   opt-in raw `IP/CIDR` hatches — which are themselves private-range-
+   rejected per #1.
+
+4. **Fail-closed classification.** A bounded read with a timeout; an
+   **un-parseable / incomplete / absent** ClientHello SNI (443) or `Host`
+   header (80) ⇒ **DENY**, never a blind forward. A flow that will not
+   classify is refused, not passed through.
+
+5. **(F1 acceptance gate — NOT deferred to F5) One device + parser
+   robustness + panic isolation.** Exactly **one** network device is
+   configured on the VM — no residual `VZNATNetworkDeviceAttachment`, no
+   second NIC — so there is provably one path off-box. And because F1
+   already puts the hostile-frame parser in the data path (a release
+   before F5's fuzzing), **minimal frame-parser robustness (bounded
+   reads, no panics on malformed L2/L3/L4) and per-VM netstack panic
+   isolation are F1 gates.** A malformed frame from a rooted guest must
+   fail the flow, never the host process; a panic is contained to that
+   VM's own thread.
+
+6. **Doc honesty — default-deny shrinks, does not eliminate, exfil.** The
+   baked default allowlist (§5) includes **write-capable exfil
+   channels**: `github.com` suffix-matches `gist.github.com` (anonymous
+   gist creation), and any allowed/brokered model API has a **writable
+   request body**. So default-deny **shrinks but does not eliminate**
+   exfil for a compromised agent — it controls **WHERE** traffic may go,
+   not **WHAT** leaves; this is **not DLP**. The registry/CDN defaults
+   (apk/npm/pip/cargo/docker) are **read-mostly**, an asymmetry worth
+   leaning on. **Trimming the allowlist is the operator's exfil lever**:
+   for an untrusted-code agent, **drop `github.com` (or pin a single git
+   remote)** and keep only the package mirrors the task needs — the
+   recommended hardening. Note the functional cost too: denying non-DNS
+   UDP (#2) breaks UDP-only services such as **NTP (123)**, so clock sync
+   must ride the host path (`shell::spawn_clock_sync`) or a TCP/allowlisted
+   alternative, not in-guest NTP.
+
+### 8.2 Structural bonus + remaining residual risks
 
 A structural bonus: because each VM has its **own** netstack and its
 **own** link, a sibling VM cannot reach this VM's egress proxy at all —
@@ -359,28 +455,16 @@ the cross-VM brokered-key-theft window that `peer_allowed` /
 `should_intercept` defend against (`egress.rs:386-424`) closes by
 construction once F3 moves the proxy off `0.0.0.0` to per-VM in-process.
 
-**Residual risks (for Sasha to gate):**
+Remaining residual risks (after the six invariants above):
 
-1. **Covert/allowed-channel exfil.** Allowlisting controls _where_, not
-   _what_. An agent can still tunnel data out through an allowed host
-   (a GitHub gist, an Anthropic request body) or via timing. MITM/creds
-   only inspect _brokered_ hosts; allowed-but-blind hosts are opaque
-   tunnels by design (to preserve streaming/keep-alive). This firewall
-   shrinks the egress surface to a known allowlist; it is not DLP.
-2. **DNS / IP back-reference.** The `name→IP` back-ref (§4) is a
-   deliberate, time-boxed hole so raw-IP connects to allowlisted hosts
-   work; a guest that races the TTL could ride it to a non-allowlisted IP
-   that briefly shared a resolved address. Keep the TTL short; treat IP
-   allow as coarse.
-3. **The host process is now in the data path.** A netstack bug is a
-   confinement bug. smoltcp's track record mitigates, but the frame
-   parser ingests hostile input from a rooted guest — it must be fuzzed
-   (F5). A panic is a per-VM DoS (per-VM thread), not host compromise,
-   but note it.
-4. **QUIC/UDP.** Denied by default (good — we can't easily SNI-inspect
-   QUIC); if a future policy allows UDP/443, inspection is weaker than
-   TCP. Decision deferred to F5 as an explicit knob.
-5. **The gateway resolver reaches the host's DNS.** The guest's only
-   nameserver is ours, which forwards to the host resolver — scope what
-   the host resolver itself can reach so the forwarder isn't an oracle
-   for the host's internal network.
+1. **Covert/allowed-channel exfil** (see #6). MITM/creds only inspect
+   _brokered_ hosts; allowed-but-blind hosts are opaque tunnels by design
+   (to preserve streaming/keep-alive). WHERE-not-WHAT; trim the allowlist
+   to shrink it further.
+2. **DNS→IP back-reference TTL race.** Even with the #1 private-range
+   reject, a guest could race the TTL to ride a back-ref allow to a
+   public-but-non-allowlisted IP that briefly shared a resolved address.
+   Keep the TTL short; treat IP allow as coarse.
+3. **Netstack in the data path.** A logic bug is a confinement bug even
+   with #5 robustness; smoltcp's track record plus F5 fuzzing mitigate,
+   but the parser ingests hostile input from a rooted guest.
