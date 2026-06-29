@@ -62,6 +62,7 @@ program
         deploy: opts.deploy,
         yes: opts.yes,
         timeout: Number.parseInt(opts.timeout, 10),
+        profile: opts.profile,
       });
     }
   );
@@ -75,10 +76,22 @@ interface LocalInitOptions {
   deploy: boolean;
   yes: boolean;
   timeout: number;
+  profile?: string;
 }
 
 async function runLocalInit(opts: LocalInitOptions): Promise<void> {
   const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+  // `--profile` only steers the remote/cloud credential flow; local
+  // onboarding always adopts the microVM's own profile, so a passed
+  // `--profile` is a no-op here — say so rather than silently ignore it.
+  if (opts.profile !== undefined) {
+    console.log(
+      chalk.dim(
+        `Note: --profile is ignored in local onboarding — the microVM owns the ${profileForVm(opts.name)} profile.`
+      )
+    );
+  }
 
   // 1. Preflight + safe auto-fixes (pull api-server image for the host
   //    arch, start a stopped colima, install missing helper binaries).
@@ -92,12 +105,9 @@ async function runLocalInit(opts: LocalInitOptions): Promise<void> {
     report = await runPreflight();
   }
 
-  // 2. macOS dev-binary signing — PROMPTED, not blind. A published
-  //    binary is already signed (no-op); only a repo build is unsigned.
-  await maybeSignDevBinary({ yes: opts.yes, isTTY });
-
-  // 3. Fail-fast on any hard failure auto-fix couldn't clear, before we
-  //    touch the VM.
+  // 2. Fail-fast on any hard failure auto-fix couldn't clear — BEFORE we
+  //    prompt to sign or touch the VM, so signing is only ever offered
+  //    once bring-up will actually proceed.
   if (!report.ok) {
     console.log();
     console.error(
@@ -106,11 +116,18 @@ async function runLocalInit(opts: LocalInitOptions): Promise<void> {
     process.exit(1);
   }
 
-  // 4. Boot + adopt — the same runUp `appliance vm up` uses. Idempotent:
-  //    re-running keeps existing credentials when they still authenticate.
+  // 3. macOS dev-binary signing — PROMPTED, not blind. A published
+  //    binary is already signed (no-op); only a repo build is unsigned.
+  await maybeSignDevBinary({ yes: opts.yes, isTTY });
+
+  // 4. Boot + adopt — the same runUp `appliance vm up` uses, with its
+  //    closing deploy hint suppressed so the hand-off below is the single
+  //    next command. Idempotent: re-running keeps existing credentials
+  //    when they still authenticate.
   console.log();
+  console.log(chalk.bold(`Starting microVM '${opts.name}'…`));
   try {
-    await runUp(opts.name, undefined, opts.timeout, {});
+    await runUp(opts.name, undefined, opts.timeout, {}, { showDeployHint: false });
   } catch (err) {
     console.error(chalk.red(err instanceof Error ? err.message : String(err)));
     process.exit(1);
@@ -169,7 +186,11 @@ async function maybeSignDevBinary(ctx: { yes: boolean; isTTY: boolean }): Promis
   // signed.
   if (!/packages\/vm\/target\/(?:debug|release)\/appliance-vm$/.test(bin)) return;
   if (hasVirtualizationEntitlement(bin)) return;
-  const signScript = path.resolve('packages/vm/scripts/sign-dev.sh');
+  // Derive the signer from the binary, not the cwd: `init` runs from the
+  // user's app dir, so a cwd-relative resolve would silently miss the
+  // repo build's sibling script. bin is .../packages/vm/target/<profile>/
+  // appliance-vm → script is .../packages/vm/scripts/sign-dev.sh.
+  const signScript = path.resolve(path.dirname(bin), '..', '..', 'scripts', 'sign-dev.sh');
   // Not in a repo checkout (or the script moved) — nothing we can run.
   if (!fs.existsSync(signScript)) return;
   const profileFlag = bin.includes('/release/') ? ['--release'] : [];
@@ -213,6 +234,22 @@ function isDeployableDir(cwd: string): boolean {
   return ['appliance.json', 'appliance.ts', 'appliance.js', 'Dockerfile'].some((f) => fs.existsSync(path.join(cwd, f)));
 }
 
+/** A human label for the deploy target: the manifest `name` when a JSON
+ *  manifest exposes one, else the directory basename. Best-effort and
+ *  cosmetic — used only to make the deploy prompt concrete. */
+function detectTargetName(cwd: string): string {
+  try {
+    const manifestPath = path.join(cwd, 'appliance.json');
+    if (fs.existsSync(manifestPath)) {
+      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as { name?: unknown };
+      if (typeof parsed.name === 'string' && parsed.name.trim()) return parsed.name.trim();
+    }
+  } catch {
+    // Unreadable/invalid manifest — fall back to the basename.
+  }
+  return path.basename(cwd);
+}
+
 async function handOff(ctx: { name: string; deploy: boolean; yes: boolean; isTTY: boolean }): Promise<void> {
   const profile = profileForVm(ctx.name);
   const deployCmd = `appliance deploy --profile ${profile}`;
@@ -235,8 +272,9 @@ async function handOff(ctx: { name: string; deploy: boolean; yes: boolean; isTTY
     return;
   }
 
-  // Interactive + deployable: offer to run the first deploy now.
-  const go = await confirm({ message: 'Deploy this project now?', default: true });
+  // Interactive + deployable: offer to run the first deploy now, naming
+  // the target so the prompt is concrete.
+  const go = await confirm({ message: `Deploy ${detectTargetName(process.cwd())} now?`, default: true });
   if (!go) {
     console.log(`  ${chalk.cyan('→')} when you're ready: ${chalk.bold(deployCmd)}`);
     return;

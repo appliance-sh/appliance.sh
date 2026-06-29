@@ -54,8 +54,9 @@ export function vmDir(name: string): string {
 }
 
 /** Read a VM's forwarded host ports from its persisted spec, falling
- *  back to the canonical defaults when the spec isn't written yet. */
-export function vmPorts(name: string): {
+ *  back to the canonical defaults when the spec isn't written yet.
+ *  Module-private: only `runUp` below consumes it. */
+function vmPorts(name: string): {
   hostPort: number;
   apiPort: number;
   registryPort: number;
@@ -115,7 +116,8 @@ export function runVm(args: string[]): number {
   return r.status ?? 1;
 }
 
-export const printProgress = (event: ProgressEvent) => {
+// Module-private: only this file's bring-up steps render progress events.
+const printProgress = (event: ProgressEvent) => {
   const prefix = event.type === 'error' ? chalk.red('✗') : event.type === 'done' ? chalk.green('✓') : chalk.cyan('»');
   console.log(`${prefix} ${chalk.dim(event.tool)} ${event.message}`);
 };
@@ -124,7 +126,11 @@ export async function runUp(
   name: string,
   imageOverride: string | undefined,
   timeout: number,
-  resources: { cpus?: number; memory?: number; dev?: boolean; mount?: string } = {}
+  resources: { cpus?: number; memory?: number; dev?: boolean; mount?: string } = {},
+  // `showDeployHint` controls the banner's closing `Deploy:` line.
+  // `appliance vm up` leaves it on; `appliance init` suppresses it so its
+  // own hand-off prints the single, unambiguous next command.
+  opts: { showDeployHint?: boolean } = {}
 ): Promise<void> {
   const profile = profileForVm(name);
   const ports = vmPorts(name);
@@ -225,7 +231,9 @@ export async function runUp(
   console.log(`  API server:  ${apiServerUrl}`);
   console.log(`  Ingress:     http://*.appliance.localhost:${ports.hostPort}`);
   console.log(`  Profile:     ${profile}`);
-  console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${profile}`);
+  if (opts.showDeployHint ?? true) {
+    console.log(`  Deploy:      appliance deploy <project> <environment> --profile ${profile}`);
+  }
   if (resources.dev) {
     const nameFlag = name === DEFAULT_VM_NAME ? '' : ` --name ${name}`;
     const workspace = resources.mount
