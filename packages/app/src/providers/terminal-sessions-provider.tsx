@@ -91,10 +91,19 @@ interface TerminalSessionsContextValue {
   /** Open a new session, or focus an existing one with the same key.
    *  Returns the session id. */
   openSession(opts: OpenTerminalOptions): string;
+  /** Open another concurrent session against the same target as `id` (a
+   *  fresh, independent PTY — not a focus of the source). Powers the dock's
+   *  "+" / new-shell affordance, which has no VM context of its own and so
+   *  forks from an existing tab. Returns the new id, or null if `id` is
+   *  unknown. */
+  duplicateSession(id: string): string | null;
   /** Explicitly destroy a session: kill the PTY, dispose xterm, and sweep
    *  any debugger pod a host/dev shell left behind. The only path that
    *  closes a PTY. */
   closeSession(id: string): void;
+  /** Rename a tab's title (local chrome only in E3.3; E3.4 backs this with
+   *  tmux `rename-session`). A blank title is ignored. */
+  renameSession(id: string, title: string): void;
   /** Show a session's view (set it active). */
   focusSession(id: string): void;
   /** Hide the active view without closing the session — the PTY stays
@@ -146,6 +155,15 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
   const focusSession = React.useCallback((id: string) => {
     if (liveRef.current.has(id)) setActiveId(id);
   }, []);
+
+  const renameSession = React.useCallback(
+    (id: string, title: string) => {
+      const next = title.trim();
+      if (!next) return; // a blank rename keeps the existing title
+      patchMeta(id, { title: next });
+    },
+    [patchMeta]
+  );
 
   const hide = React.useCallback(() => setActiveId(null), []);
 
@@ -255,6 +273,25 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
     [host, patchMeta]
   );
 
+  // Fork a sibling session from an existing tab. The dock's "+" has no VM
+  // of its own to target, so a new shell is always opened "like" a live
+  // one — same target/engine/mode, but a unique key so it's a genuinely
+  // separate concurrent PTY rather than a focus of the source tab.
+  const duplicateSession = React.useCallback(
+    (id: string): string | null => {
+      const live = liveRef.current.get(id);
+      if (!live) return null;
+      return openSession({
+        target: live.target,
+        engine: live.engine,
+        clusterName: live.clusterName,
+        mode: live.mode,
+        sessionKey: `dup:${++nextSessionSeq}`,
+      });
+    },
+    [openSession]
+  );
+
   const closeSession = React.useCallback(
     (id: string) => {
       const live = liveRef.current.get(id);
@@ -317,8 +354,18 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
   );
 
   const value = React.useMemo<TerminalSessionsContextValue>(
-    () => ({ sessions, activeId, openSession, closeSession, focusSession, hide, attachView }),
-    [sessions, activeId, openSession, closeSession, focusSession, hide, attachView]
+    () => ({
+      sessions,
+      activeId,
+      openSession,
+      duplicateSession,
+      closeSession,
+      renameSession,
+      focusSession,
+      hide,
+      attachView,
+    }),
+    [sessions, activeId, openSession, duplicateSession, closeSession, renameSession, focusSession, hide, attachView]
   );
 
   return (

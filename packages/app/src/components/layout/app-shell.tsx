@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
+import { TerminalDock } from './terminal-dock';
 
 type NavItem = {
   to: string;
@@ -38,8 +39,11 @@ export function AppShell() {
     // Below `sm` the sidebar collapses to an icon rail so narrow
     // windows (small desktop panes, phones) keep a usable content
     // column instead of a crushed two-column squeeze.
-    <div className="grid h-full grid-cols-[56px_1fr] grid-rows-[auto_1fr] sm:grid-cols-[220px_1fr]">
-      <aside className="row-span-2 flex flex-col border-r border-[var(--color-border)] bg-[var(--color-muted)]">
+    // The third (auto) row holds the persistent terminal dock; it collapses
+    // to zero height until a shell is open (TerminalDock renders null), so
+    // the chrome is unchanged when no terminals exist.
+    <div className="grid h-full grid-cols-[56px_1fr] grid-rows-[auto_1fr_auto] sm:grid-cols-[220px_1fr]">
+      <aside className="row-span-3 flex flex-col border-r border-[var(--color-border)] bg-[var(--color-muted)]">
         {/* Brand — height + divider align with the content header so the
             top-left corner reads as one clean grid, not two strips. */}
         <div className="flex h-[57px] items-center gap-2.5 border-b border-[var(--color-border)] px-4">
@@ -78,9 +82,14 @@ export function AppShell() {
         <div className="flex items-center gap-2">{/* search / notifications slot */}</div>
       </header>
 
-      <main className="col-start-2 overflow-auto p-6">
+      <main className="col-start-2 min-h-0 overflow-auto p-6">
         <Outlet />
       </main>
+
+      {/* Terminal dock — a tab strip for ALL live shells, in the grid row
+          below `<main>` and OUTSIDE the `<Outlet/>`. Reachable from every
+          route, so a running-but-hidden shell is never orphaned. */}
+      <TerminalDock />
 
       {/* Persistent terminal layer — OUTSIDE the `<Outlet/>` so navigating
           never unmounts the active shell. Its sessions live in
