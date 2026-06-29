@@ -361,16 +361,18 @@ function RecentActivity({
 
 // ---- first-run (no cluster) ----------------------------------------------
 
-// The very first launch: one decision, one button. "Set up local
-// runtime" provisions + connects in a single press (sandboxed in a
-// microVM by default), so a new operator is running in seconds without
-// reading a menu. "Set up later" and "More options" fall back to the
-// full GetStarted menu for everything else.
+// The very first launch: one decision, one button. "Get started"
+// provisions + connects in a single press (sandboxed in a microVM by
+// default), routing straight into the live bring-up phase ladder
+// (/bootstrap/run) so a new operator watches the VM boot through each
+// stage and lands ready — no menu to read, no further clicks. "Set up
+// later" and "More options" fall back to the full GetStarted menu.
 function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () => void }) {
   const navigate = useNavigate();
-  const setup = () => {
-    // The local runtime is a microVM. /bootstrap/run boots it and
-    // connects automatically — no further clicks.
+  const getStarted = () => {
+    // The local runtime is a microVM. /bootstrap/run boots the default
+    // VM with live phases (media → booting → network → cluster → ready)
+    // and connects automatically once it's ready.
     const values: WizardValues = { mode: 'microvm' };
     navigate('/bootstrap/run', { state: values });
   };
@@ -382,13 +384,14 @@ function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () 
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Run apps on a local cluster on this machine. We’ll set up a local runtime sandboxed in its own virtual machine
-          — the recommended, isolated default. It connects automatically once it’s ready.
+          Run apps on a local cluster on this machine. One click boots a local runtime sandboxed in its own virtual
+          machine — the recommended, isolated default. You’ll watch it come up stage by stage, and it connects
+          automatically once it’s ready.
         </p>
       </div>
       <div className="flex flex-col items-center gap-3">
-        <Button size="lg" className="w-full sm:w-auto sm:min-w-56" onClick={setup}>
-          Set up local runtime
+        <Button size="lg" className="w-full sm:w-auto sm:min-w-56" onClick={getStarted}>
+          Get started
         </Button>
         <Button variant="ghost" onClick={onLater}>
           Set up later

@@ -2,6 +2,7 @@ import * as React from 'react';
 import { useLocation, useNavigate, Navigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { ApplianceBaseType } from '@appliance.sh/sdk/models';
+import { Check, Circle, Loader2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import type {
@@ -10,6 +11,7 @@ import type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
+  MicroVmPhase,
 } from '@/lib/host';
 import type { AwsWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
 import { microVmClusterId } from '@/lib/host';
@@ -348,12 +350,30 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 // ============================================================
 // Local Runtime (microVM) bootstrap
 //
-// A tiny version of the AWS progress UI on top of a single `vm.up()`
-// call: one "phase" node, an event log fed by the streamed boot
-// lines, and an "Open dashboard" CTA once the VM is up and its
-// cluster registered.
+// One "Get started" press lands here and boots the default VM. The
+// engine already publishes structured bring-up phases
+// (media → booting → network → cluster → ready / failed, mirrored by
+// MicroVmStatus.phase), so instead of a single opaque node we render a
+// five-rung ladder driven by polled status().phase: each rung goes
+// pending → running (spinner) → completed (check). The streamed boot
+// lines live underneath as a collapsible detail, and a `failed` phase
+// fails fast — the in-flight rung turns red and the error is surfaced
+// with a Retry. Lands on a clean "ready" state with an "Open dashboard"
+// CTA (E5.3 swaps that for "Deploy your first app").
 // ============================================================
-type LocalPhase = 'starting' | 'running' | 'failed';
+
+// The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
+// `failed` is terminal but isn't a rung — it paints whichever rung was
+// in flight red rather than adding a sixth step.
+const MICROVM_LADDER: { phase: Exclude<MicroVmPhase, 'failed'>; label: string; detail: string }[] = [
+  { phase: 'media', label: 'Boot media', detail: 'Preparing the VM kernel and disk image.' },
+  { phase: 'booting', label: 'Booting guest', detail: 'Starting the virtual machine.' },
+  { phase: 'network', label: 'Guest network', detail: 'Bringing up networking and the egress proxy.' },
+  { phase: 'cluster', label: 'Starting k3s', detail: 'First boot pulls images — this can take a few minutes.' },
+  { phase: 'ready', label: 'Cluster ready', detail: 'Delivering the api-server and registering the cluster.' },
+];
+
+type MicroVmOutcome = 'running' | 'ready' | 'failed';
 
 function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   const host = useHost();
@@ -362,10 +382,15 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   const name = values.name?.trim() || 'appliance';
   const vmHost = host.vm;
 
-  const [phase, setPhase] = React.useState<LocalPhase>('starting');
+  // `reached` is the high-water rung index the engine has reported;
+  // `outcome` is the terminal verdict. The two together derive every
+  // rung's state, so a stale/late status poll can never rewind the UI.
+  const [reached, setReached] = React.useState(-1);
+  const [outcome, setOutcome] = React.useState<MicroVmOutcome>('running');
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [retrying, setRetrying] = React.useState(false);
+  const [showLog, setShowLog] = React.useState(true);
   const startedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
 
@@ -374,34 +399,69 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     setLogs((prev) => [...prev, { id: logIdRef.current, level, message }]);
   }, []);
 
+  // Fold a polled engine phase into the ladder. Forward rungs only
+  // advance the high-water mark; `failed` flips the outcome without
+  // choosing a rung — the rung in flight stays the one painted red.
+  const applyPhase = React.useCallback((phase: MicroVmPhase) => {
+    const idx = MICROVM_LADDER.findIndex((r) => r.phase === phase);
+    if (idx >= 0) setReached((prev) => Math.max(prev, idx));
+    else if (phase === 'failed') setOutcome((prev) => (prev === 'running' ? 'failed' : prev));
+  }, []);
+
   const start = React.useCallback(async () => {
     if (!vmHost) {
       setError('The microVM engine is only available in the desktop app.');
-      setPhase('failed');
+      setOutcome('failed');
       return;
     }
     setError(null);
-    setPhase('starting');
-    setRetrying(true);
+    setOutcome('running');
+    setReached(-1);
     setLogs([]);
+    setShowLog(true);
+    setRetrying(true);
+    const instance = vmHost.instance(name);
+
+    // Poll the structured phase alongside the streamed log: the engine
+    // publishes media→…→ready via status().phase, so the ladder advances
+    // even though up() itself only yields free-text lines. Transient
+    // errors (binary installing, VM not up yet) are swallowed — the
+    // up() promise is the source of truth for success/failure.
+    let live = true;
+    const poll = async () => {
+      try {
+        const s = await instance.status();
+        if (s.phase) applyPhase(s.phase);
+      } catch {
+        // keep polling
+      }
+    };
+    const timer = setInterval(() => {
+      if (live) void poll();
+    }, 1500);
+    void poll();
+
     try {
       appendLog('info', `Booting microVM "${name}" and bootstrapping its api-server…`);
       // up() streams the same lines the CLI prints, installs the engine
       // binary if missing, and registers the VM as a cluster on success.
-      await vmHost.instance(name).up((e) => appendLog('info', e.message));
+      await instance.up((e) => appendLog('info', e.message));
       appendLog('info', `microVM "${name}" is up and registered as a cluster.`);
-      setPhase('running');
+      setReached(MICROVM_LADDER.length - 1);
+      setOutcome('ready');
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       await queryClient.invalidateQueries({ queryKey: ['microvm'] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendLog('error', message);
       setError(message);
-      setPhase('failed');
+      setOutcome('failed');
     } finally {
+      live = false;
+      clearInterval(timer);
       setRetrying(false);
     }
-  }, [vmHost, name, appendLog, queryClient]);
+  }, [vmHost, name, appendLog, applyPhase, queryClient]);
 
   React.useEffect(() => {
     if (startedRef.current) return;
@@ -413,6 +473,23 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     return <Navigate to="/bootstrap" replace />;
   }
 
+  // The rung currently in focus: the high-water mark, defaulting to the
+  // first rung before any phase has been reported so the ladder never
+  // looks stalled (engines predating phase reporting just spin rung 0
+  // until up() resolves, then every rung checks).
+  const cur = reached < 0 ? 0 : reached;
+  const rungState = (i: number): PhaseState => {
+    if (outcome === 'ready') return 'completed';
+    if (outcome === 'failed') {
+      if (i < cur) return 'completed';
+      if (i === cur) return 'failed';
+      return 'pending';
+    }
+    if (i < cur) return 'completed';
+    if (i === cur) return 'running';
+    return 'pending';
+  };
+
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div className="space-y-1">
@@ -423,43 +500,55 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 gap-3">
-        <PhaseCard
-          phase={'phase1' as BootstrapPhase /* glyph reuse — the VM boot is a single node */}
-          label="VM boot + api-server"
-          state={phase === 'starting' ? 'running' : phase === 'running' ? 'completed' : 'failed'}
-          canRetry={phase === 'failed' && !retrying}
-          onRetry={() => void start()}
-        />
+      <div className="space-y-2">
+        {MICROVM_LADDER.map((rung, i) => (
+          <MicroVmPhaseStep
+            key={rung.phase}
+            label={rung.label}
+            detail={rung.detail}
+            state={rungState(i)}
+            active={i === cur && outcome === 'running'}
+          />
+        ))}
       </div>
 
+      {/* The raw streamed boot lines, collapsible underneath the ladder. */}
       <div className="rounded-md border border-[var(--color-border)] bg-black/30">
-        <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
-          Event log
-        </div>
-        <div className="h-80 overflow-auto font-mono text-xs leading-relaxed">
-          {logs.length === 0 ? (
-            <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
-          ) : (
-            logs.map((l) => (
-              <div
-                key={l.id}
-                className={cn(
-                  'whitespace-pre-wrap px-3 py-0.5',
-                  l.level === 'warn' && 'text-yellow-400',
-                  l.level === 'error' && 'text-red-400'
-                )}
-              >
-                {l.message}
-              </div>
-            ))
-          )}
-        </div>
+        <button
+          type="button"
+          onClick={() => setShowLog((s) => !s)}
+          className="flex w-full items-center justify-between px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+        >
+          <span>Bring-up log</span>
+          <span>{showLog ? 'Hide' : 'Show'}</span>
+        </button>
+        {showLog ? (
+          <div className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed">
+            {logs.length === 0 ? (
+              <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
+            ) : (
+              logs.map((l) => (
+                <div
+                  key={l.id}
+                  className={cn(
+                    'whitespace-pre-wrap px-3 py-0.5',
+                    l.level === 'warn' && 'text-yellow-400',
+                    l.level === 'error' && 'text-red-400'
+                  )}
+                >
+                  {l.message}
+                </div>
+              ))
+            )}
+          </div>
+        ) : null}
       </div>
 
-      {phase === 'running' ? (
+      {outcome === 'ready' ? (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-green-400">✓ Local runtime ready</div>
+          <div className="flex items-center gap-2 text-sm font-medium text-green-400">
+            <Check className="h-4 w-4" /> Local runtime ready
+          </div>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
             <dt className="text-[var(--color-muted-foreground)]">Sandbox</dt>
             <dd>virtual machine ({name})</dd>
@@ -475,10 +564,10 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         </div>
       ) : null}
 
-      {error ? (
+      {outcome === 'failed' ? (
         <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
-          <div className="font-medium text-red-400">Start failed</div>
-          <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div>
+          <div className="font-medium text-red-400">Start failed — {MICROVM_LADDER[cur].label}</div>
+          {error ? <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div> : null}
           <div className="mt-3 flex gap-2">
             <Button onClick={() => void start()} disabled={retrying}>
               {retrying ? 'Retrying…' : 'Retry'}
@@ -489,6 +578,56 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// One rung of the microVM bring-up ladder: a status glyph (spinner while
+// active, check when done, ✗ on failure), the stage label, and a one-line
+// description. The active rung gets a stronger border so the eye lands on
+// what's happening now.
+function MicroVmPhaseStep({
+  label,
+  detail,
+  state,
+  active,
+}: {
+  label: string;
+  detail: string;
+  state: PhaseState;
+  active: boolean;
+}) {
+  const tone =
+    state === 'completed'
+      ? 'text-green-400'
+      : state === 'running'
+        ? 'text-cyan-400'
+        : state === 'failed'
+          ? 'text-red-400'
+          : 'text-[var(--color-muted-foreground)]';
+  const icon =
+    state === 'completed' ? (
+      <Check className="h-4 w-4" />
+    ) : state === 'running' ? (
+      <Loader2 className="h-4 w-4 animate-spin" />
+    ) : state === 'failed' ? (
+      <X className="h-4 w-4" />
+    ) : (
+      <Circle className="h-3 w-3" />
+    );
+  return (
+    <div
+      className={cn(
+        'flex items-start gap-3 rounded-md border p-3 transition-colors',
+        active ? 'border-[var(--color-border-strong)] bg-[var(--color-surface)]' : 'border-[var(--color-border)]'
+      )}
+    >
+      <div className={cn('mt-0.5 flex h-4 w-4 items-center justify-center', tone)}>{icon}</div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">{label}</div>
+        <div className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">{detail}</div>
+      </div>
+      <div className={cn('text-xs uppercase tracking-wide', tone)}>{state}</div>
     </div>
   );
 }
