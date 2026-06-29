@@ -365,12 +365,24 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 // The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
 // `failed` is terminal but isn't a rung — it paints whichever rung was
 // in flight red rather than adding a sixth step.
-const MICROVM_LADDER: { phase: Exclude<MicroVmPhase, 'failed'>; label: string; detail: string }[] = [
+const MICROVM_LADDER: {
+  phase: Exclude<MicroVmPhase, 'failed'>;
+  label: string;
+  // Shown while the rung is in flight, when the resting `label` would
+  // read as a contradiction (e.g. "Cluster ready" next to a spinner).
+  runningLabel?: string;
+  detail: string;
+}[] = [
   { phase: 'media', label: 'Boot media', detail: 'Preparing the VM kernel and disk image.' },
   { phase: 'booting', label: 'Booting guest', detail: 'Starting the virtual machine.' },
-  { phase: 'network', label: 'Guest network', detail: 'Bringing up networking and the egress proxy.' },
+  { phase: 'network', label: 'Guest network', detail: 'Connecting the VM to the network.' },
   { phase: 'cluster', label: 'Starting k3s', detail: 'First boot pulls images — this can take a few minutes.' },
-  { phase: 'ready', label: 'Cluster ready', detail: 'Delivering the api-server and registering the cluster.' },
+  {
+    phase: 'ready',
+    label: 'Cluster ready',
+    runningLabel: 'Registering cluster',
+    detail: 'Delivering the api-server and registering the cluster.',
+  },
 ];
 
 type MicroVmOutcome = 'running' | 'ready' | 'failed';
@@ -393,6 +405,13 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   const [showLog, setShowLog] = React.useState(true);
   const startedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
+  // The poll loop's liveness flag and interval handle, hoisted to refs so
+  // an unmount (navigating away mid-boot) can tear the interval down — and
+  // so an in-flight poll can re-check liveness after its await. Without
+  // this the 1.5s interval outlives the component and fires
+  // setReached/setOutcome post-unmount.
+  const liveRef = React.useRef(false);
+  const timerRef = React.useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
     logIdRef.current += 1;
@@ -427,17 +446,24 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     // even though up() itself only yields free-text lines. Transient
     // errors (binary installing, VM not up yet) are swallowed — the
     // up() promise is the source of truth for success/failure.
-    let live = true;
+    //
+    // Liveness/handle live in refs so unmount cleanup can tear this down.
+    // Clear any prior interval first so a Retry can never leave two poll
+    // loops racing.
+    liveRef.current = true;
+    clearInterval(timerRef.current);
     const poll = async () => {
       try {
         const s = await instance.status();
-        if (s.phase) applyPhase(s.phase);
+        // Re-check liveness after the await: a poll already in flight when
+        // the run settles (or the page unmounts) must not apply a phase.
+        if (liveRef.current && s.phase) applyPhase(s.phase);
       } catch {
         // keep polling
       }
     };
-    const timer = setInterval(() => {
-      if (live) void poll();
+    timerRef.current = setInterval(() => {
+      if (liveRef.current) void poll();
     }, 1500);
     void poll();
 
@@ -449,6 +475,9 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
       appendLog('info', `microVM "${name}" is up and registered as a cluster.`);
       setReached(MICROVM_LADDER.length - 1);
       setOutcome('ready');
+      // Collapse the bring-up log once we're green — the ladder tells the
+      // success story, the raw lines are just there for failures.
+      setShowLog(false);
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
       await queryClient.invalidateQueries({ queryKey: ['microvm'] });
     } catch (err) {
@@ -457,8 +486,9 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
       setError(message);
       setOutcome('failed');
     } finally {
-      live = false;
-      clearInterval(timer);
+      liveRef.current = false;
+      clearInterval(timerRef.current);
+      timerRef.current = undefined;
       setRetrying(false);
     }
   }, [vmHost, name, appendLog, applyPhase, queryClient]);
@@ -468,6 +498,17 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     startedRef.current = true;
     void start();
   }, [start]);
+
+  // Tear the poll loop down if the user navigates away mid-boot. Killing
+  // liveRef also neutralises any poll already awaiting status(), so the
+  // ladder can't be advanced after unmount.
+  React.useEffect(
+    () => () => {
+      liveRef.current = false;
+      clearInterval(timerRef.current);
+    },
+    []
+  );
 
   if (!vmHost) {
     return <Navigate to="/bootstrap" replace />;
@@ -490,6 +531,19 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     return 'pending';
   };
 
+  // A single spoken sentence for the visually-hidden live region, so screen
+  // readers hear the ladder advance / settle without parsing the rungs.
+  const announce = (() => {
+    if (outcome === 'ready') return 'Local runtime ready.';
+    if (outcome === 'failed') {
+      // Mirror the visible header: don't name a stage we never reached.
+      return reached < 0 ? 'Start failed.' : `Start failed at the ${MICROVM_LADDER[cur].label} step.`;
+    }
+    if (reached < 0) return 'Starting local runtime…';
+    const rung = MICROVM_LADDER[cur];
+    return `${rung.runningLabel ?? rung.label} in progress…`;
+  })();
+
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div className="space-y-1">
@@ -500,16 +554,28 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         </p>
       </div>
 
+      {/* Visually-hidden running commentary for assistive tech. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {announce}
+      </div>
+
       <div className="space-y-2">
-        {MICROVM_LADDER.map((rung, i) => (
-          <MicroVmPhaseStep
-            key={rung.phase}
-            label={rung.label}
-            detail={rung.detail}
-            state={rungState(i)}
-            active={i === cur && outcome === 'running'}
-          />
-        ))}
+        {MICROVM_LADDER.map((rung, i) => {
+          const st = rungState(i);
+          // While a rung is in flight its resting label can read as a
+          // contradiction next to a spinner — swap in the action-oriented
+          // one. The failed rung keeps the strong-border highlight too.
+          const label = st === 'running' && rung.runningLabel ? rung.runningLabel : rung.label;
+          return (
+            <MicroVmPhaseStep
+              key={rung.phase}
+              label={label}
+              detail={rung.detail}
+              state={st}
+              active={st === 'running' || st === 'failed'}
+            />
+          );
+        })}
       </div>
 
       {/* The raw streamed boot lines, collapsible underneath the ladder. */}
@@ -517,6 +583,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         <button
           type="button"
           onClick={() => setShowLog((s) => !s)}
+          aria-expanded={showLog}
           className="flex w-full items-center justify-between px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
         >
           <span>Bring-up log</span>
@@ -566,7 +633,12 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
 
       {outcome === 'failed' ? (
         <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
-          <div className="font-medium text-red-400">Start failed — {MICROVM_LADDER[cur].label}</div>
+          <div className="font-medium text-red-400">
+            {/* Only blame a stage once one has actually been observed — an
+                up() failure before any phase publishes (binary install,
+                handshake, missing engine) isn't the "Boot media" step. */}
+            {reached < 0 ? 'Start failed' : `Start failed — ${MICROVM_LADDER[cur].label}`}
+          </div>
           {error ? <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div> : null}
           <div className="mt-3 flex gap-2">
             <Button onClick={() => void start()} disabled={retrying}>
@@ -605,15 +677,21 @@ function MicroVmPhaseStep({
         : state === 'failed'
           ? 'text-red-400'
           : 'text-[var(--color-muted-foreground)]';
+  // A plain-language state for assistive tech — the raw enum word and the
+  // glyph below are both decorative as far as screen readers are concerned.
+  const stateLabel =
+    state === 'completed' ? 'done' : state === 'running' ? 'in progress' : state === 'failed' ? 'failed' : 'pending';
+  // The glyphs carry no text, so they're hidden from AT — except the spinner,
+  // which is a live status. State is conveyed by the sr-only text instead.
   const icon =
     state === 'completed' ? (
-      <Check className="h-4 w-4" />
+      <Check className="h-4 w-4" aria-hidden="true" />
     ) : state === 'running' ? (
-      <Loader2 className="h-4 w-4 animate-spin" />
+      <Loader2 className="h-4 w-4 animate-spin" role="status" aria-label={`${label}: in progress`} />
     ) : state === 'failed' ? (
-      <X className="h-4 w-4" />
+      <X className="h-4 w-4" aria-hidden="true" />
     ) : (
-      <Circle className="h-3 w-3" />
+      <Circle className="h-3 w-3" aria-hidden="true" />
     );
   return (
     <div
@@ -627,7 +705,11 @@ function MicroVmPhaseStep({
         <div className="text-sm font-medium">{label}</div>
         <div className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">{detail}</div>
       </div>
-      <div className={cn('text-xs uppercase tracking-wide', tone)}>{state}</div>
+      <div className={cn('text-xs uppercase tracking-wide', tone)} aria-hidden="true">
+        {state}
+      </div>
+      {/* AT-readable state for non-spinner rungs (the spinner self-announces). */}
+      {state !== 'running' ? <span className="sr-only">{`${label}: ${stateLabel}`}</span> : null}
     </div>
   );
 }
