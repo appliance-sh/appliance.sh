@@ -223,9 +223,35 @@ pub fn intercept(
         crate::traffic::record(name, host, port, method, Some(path), "mitm");
     }
 
+    // Load the credential config ONCE for this intercepted request and
+    // thread it through both capture and injection — no per-phase re-read.
+    let cfg = crate::creds::load_config(name);
+
     // Credential capture: lift a configured credential header off the
-    // request into the host-side secret store (best-effort).
-    crate::creds::capture_from_head(name, host, &head);
+    // request into the host-side secret store (best-effort). The broker
+    // rule for api.anthropic.com is capture:false, so the in-guest
+    // placeholder x-api-key is never lifted into egress-secrets.json.
+    crate::creds::capture_from_head(&cfg, name, host, &head);
+
+    // Resolve the credential to inject BEFORE dialing upstream so we can
+    // fail CLOSED, atomically: classifying "no rule" vs "rule but
+    // unresolved" vs "resolved" from the SAME single config load avoids a
+    // TOCTOU where the rule is seen but the value isn't (or vice versa). A
+    // host that HAS an inject rule but whose credential can't be resolved
+    // (host helper failed / Anthropic key not configured / Keychain
+    // locked) must NEVER forward the in-guest placeholder credential to
+    // the real upstream — refuse with a clear, actionable error and dial
+    // no upstream, so the placeholder leaves the host zero times.
+    let injection = match crate::creds::resolve_injection(&cfg, name, host) {
+        crate::creds::Injection::Resolved(header, value) => Some((header, value)),
+        crate::creds::Injection::RuleButUnresolved => {
+            if log {
+                eprintln!("egress mitm: {host} :: credential not configured — refusing (fail closed)");
+            }
+            return write_cred_unconfigured(&mut client_tls, host);
+        }
+        crate::creds::Injection::NoRule => None,
+    };
 
     // Only now dial upstream — no wasted connection on a dead client.
     let upstream_tcp = TcpStream::connect((host, port)).with_context(|| format!("connect {host}:{port}"))?;
@@ -237,7 +263,7 @@ pub fn intercept(
     // injection (if configured) sets the header on the outbound copy,
     // so the workload need never hold the secret itself.
     let mut rewritten = force_connection_close(&head);
-    if let Some((header, value)) = crate::creds::injection_for(name, host) {
+    if let Some((header, value)) = injection {
         rewritten = crate::creds::set_header(&rewritten, &header, &value);
     }
     up_tls.write_all(rewritten.as_bytes())?;
@@ -292,6 +318,24 @@ fn force_connection_close(head: &str) -> String {
     }
     out.push_str("Connection: close\r\n\r\n");
     out
+}
+
+/// Fail-closed response for an intercepted host that has a
+/// credential-injection rule the broker can't satisfy (host helper
+/// failed / the key isn't configured). Writes a clear, actionable HTTP
+/// error back to the guest over the already-terminated TLS — and
+/// crucially returns WITHOUT dialing the real upstream, so the in-guest
+/// placeholder credential never crosses the host boundary. The message
+/// never contains a credential.
+fn write_cred_unconfigured<W: Write>(client_tls: &mut W, host: &str) -> Result<()> {
+    let body = format!("Anthropic key not configured for {host} (run `appliance agent login`).\n");
+    let resp = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    client_tls.write_all(resp.as_bytes())?;
+    client_tls.flush().ok();
+    Ok(())
 }
 
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -432,6 +476,19 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         copy_request_body(&mut reader, &mut out, head).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cred_unconfigured_is_actionable_and_keyless() {
+        let mut out: Vec<u8> = Vec::new();
+        write_cred_unconfigured(&mut out, "api.anthropic.com").unwrap();
+        let resp = String::from_utf8(out).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(resp.contains("Connection: close\r\n"));
+        assert!(resp.contains("appliance agent login"));
+        assert!(resp.contains("api.anthropic.com"));
+        // A well-formed Content-Length so the client frames the body.
+        assert!(resp.contains("Content-Length: "));
     }
 
     #[test]

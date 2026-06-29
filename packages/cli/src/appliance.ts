@@ -32,6 +32,10 @@ interface SubcommandDef {
 }
 
 const SUBCOMMANDS: Record<string, SubcommandDef> = {
+  agent: {
+    description: 'run a coding agent (Claude Code) inside the microVM sandbox',
+    load: () => import('./appliance-agent.js'),
+  },
   app: {
     description: 'manage applications (setup, status, list)',
     aliases: ['application'],

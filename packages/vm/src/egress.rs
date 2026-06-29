@@ -248,7 +248,11 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
     if method.eq_ignore_ascii_case("CONNECT") {
         // target is `host:port`.
         let allowed = policy.allows(&target);
-        let intercept = allowed && policy.mitm;
+        let (host, port) = split_host_port(&target);
+        // Scope TLS interception to hosts that actually carry a
+        // credential rule, and only once this VM's guest-IP lease is
+        // known (see should_intercept).
+        let intercept = should_intercept(&ctx.name, allowed, policy.mitm, &host);
         if log {
             let action = if !allowed {
                 "deny"
@@ -259,7 +263,6 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
             };
             eprintln!("egress: CONNECT {target} -> {action}");
         }
-        let (host, port) = split_host_port(&target);
         if !allowed {
             crate::traffic::record(&ctx.name, &host, port, "CONNECT", None, "deny");
             return refuse(&mut client, &target);
@@ -373,9 +376,13 @@ fn target_path(target: &str) -> String {
 }
 
 /// May this peer use the proxy? Loopback (local testing) always; the
-/// guest otherwise — its address shares the VM subnet's /24 (the host
-/// sits on the `.1`). Everything else (the wider LAN) is refused so a
-/// gateway/0.0.0.0 bind can't become an open forward proxy.
+/// guest otherwise. Once this VM's leased guest IP is known we gate on
+/// the EXACT address — a sibling VM sharing the vz /24 must not be able
+/// to borrow this VM's brokered Anthropic key (the proxy injects on
+/// behalf of whichever peer connects, so cross-VM reach = cross-VM key
+/// theft). Until the lease is known (very early boot) we fall back to
+/// the /24 subnet match — still tight enough to keep the wider LAN out
+/// of a gateway/0.0.0.0-bound open proxy.
 fn peer_allowed(peer: std::net::IpAddr, name: &str) -> bool {
     if peer.is_loopback() {
         return true;
@@ -383,17 +390,51 @@ fn peer_allowed(peer: std::net::IpAddr, name: &str) -> bool {
     let std::net::IpAddr::V4(peer) = peer else {
         return false; // vz NAT is IPv4-only
     };
-    let subnet = guest_subnet_v3(name);
-    let o = peer.octets();
-    [o[0], o[1], o[2]] == subnet
+    match guest_ip_v4(name) {
+        // Steady state: only this VM's own guest IP.
+        Some(ip) => peer == ip,
+        // Pre-lease window only: coarse /24 match.
+        None => {
+            let subnet = guest_subnet_v3(name);
+            let o = peer.octets();
+            [o[0], o[1], o[2]] == subnet
+        }
+    }
+}
+
+/// Should this allowed CONNECT be TLS-intercepted (decrypted, so the
+/// proxy can broker the credential)?
+///
+/// Two gates beyond `allowed && mitm`:
+///   * the host must carry a credential rule — decrypting *every* allowed
+///     HTTPS host forces one request per CONNECT (the interceptor sends
+///     `Connection: close`), breaking keep-alive + streaming (Anthropic's
+///     SSE, the npm registry). Confining MITM to brokered hosts keeps
+///     every other allowed host a blind, streaming-preserving tunnel.
+///   * this VM's guest-IP lease must be KNOWN. Until it is (the ~120s
+///     early-boot window), `peer_allowed` falls back to a coarse /24 match
+///     — so a co-resident sibling VM sharing the vz /24 could reach this
+///     proxy and have THIS VM's brokered Anthropic key injected into the
+///     sibling's request (billing/usage theft; the key itself never
+///     escapes). Refusing to intercept until the lease pins `peer_allowed`
+///     to this VM's exact address closes that window: brokered hosts stay
+///     blind tunnels (no inject) until the peer can be exactly attributed.
+fn should_intercept(name: &str, allowed: bool, mitm: bool, host: &str) -> bool {
+    allowed && mitm && guest_ip_v4(name).is_some() && crate::creds::has_cred_rule(name, host)
+}
+
+/// This VM's leased guest IPv4, when known (written by the engine at
+/// boot). `None` until the lease is discovered.
+fn guest_ip_v4(name: &str) -> Option<std::net::Ipv4Addr> {
+    std::fs::read_to_string(VmPaths::for_name(name).guest_ip())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<std::net::Ipv4Addr>().ok())
 }
 
 /// First three octets of the VM's subnet, from the guest's leased IP
 /// (defaults to vz's 192.168.64.x when not yet known).
 fn guest_subnet_v3(name: &str) -> [u8; 3] {
-    std::fs::read_to_string(VmPaths::for_name(name).guest_ip())
-        .ok()
-        .and_then(|raw| raw.trim().parse::<std::net::Ipv4Addr>().ok())
+    guest_ip_v4(name)
         .map(|ip| {
             let o = ip.octets();
             [o[0], o[1], o[2]]
@@ -607,6 +648,59 @@ mod tests {
         assert!(!peer_allowed("10.0.0.5".parse().unwrap(), name));
         // Non-loopback IPv6 isn't on the vz NAT.
         assert!(!peer_allowed("fd00::1".parse().unwrap(), name));
+    }
+
+    #[test]
+    fn peer_guard_pins_exact_guest_ip_when_known() {
+        // With the lease known, only this VM's exact guest IP is allowed:
+        // a sibling VM sharing the /24 (which the old subnet gate let
+        // through) must be refused so it can't borrow the brokered key.
+        let name = "egress-peer-test-exact";
+        let dir = VmPaths::for_name(name).dir;
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(VmPaths::for_name(name).guest_ip(), "192.168.64.7\n").unwrap();
+        assert!(peer_allowed("192.168.64.7".parse().unwrap(), name)); // this VM
+        assert!(peer_allowed("127.0.0.1".parse().unwrap(), name)); // loopback always
+        assert!(!peer_allowed("192.168.64.8".parse().unwrap(), name)); // sibling VM
+        assert!(!peer_allowed("192.168.64.1".parse().unwrap(), name)); // the gateway/host
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_intercept_until_lease_known() {
+        // A brokered host with mitm on must NOT be intercepted while this
+        // VM's guest-IP lease is unknown — otherwise a sibling VM on the
+        // coarse-/24 pre-lease peer gate could drive an injection of this
+        // VM's brokered key. Interception (and inject) resumes only once
+        // the lease pins peer_allowed to the exact address.
+        let name = "egress-intercept-prelease";
+        let dir = VmPaths::for_name(name).dir;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        crate::creds::upsert_rule(
+            name,
+            crate::creds::CredentialRule {
+                host: "api.anthropic.com".into(),
+                capture: false,
+                inject: true,
+                header: "x-api-key".into(),
+                helper: Some("printf real-key".into()),
+            },
+        )
+        .unwrap();
+
+        // Pre-lease (no guest-ip file): brokered host stays a blind tunnel.
+        assert!(!should_intercept(name, true, true, "api.anthropic.com"));
+
+        // Lease known: interception (and key injection) resumes.
+        std::fs::write(VmPaths::for_name(name).guest_ip(), "192.168.64.7\n").unwrap();
+        assert!(should_intercept(name, true, true, "api.anthropic.com"));
+        // ...but only for a brokered host, and only when allowed + mitm.
+        assert!(!should_intercept(name, true, true, "example.com"));
+        assert!(!should_intercept(name, false, true, "api.anthropic.com"));
+        assert!(!should_intercept(name, true, false, "api.anthropic.com"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

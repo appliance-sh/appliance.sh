@@ -47,6 +47,24 @@ export function statusDotClass(status: TerminalStatus): string {
         : 'bg-[var(--color-muted-foreground)]';
 }
 
+/** Agent-tab metadata (Phase 5, A5). When present on a session it is a
+ *  coding agent rather than a plain shell: the dock tab renders an agent
+ *  icon + status, and rehydrate brings the session back as an agent tab.
+ *  The transport is still the reattachable host shell, attached to the
+ *  agent's `agent-<id>` tmux session. */
+export interface AgentTabMeta {
+  /** Adapter key, e.g. `claude-code`. */
+  type: string;
+  /** Lifecycle for the badge. Interactive observe stays `running`;
+   *  `done`/`error` are autonomous-result states (A6). */
+  status: 'running' | 'done' | 'error';
+  /** How the agent runs. Drives the `running` badge glyph: an interactive
+   *  agent is an attached live TTY (steady glyph), while an autonomous run
+   *  is genuinely working (spinner). Absent → treated as autonomous so the
+   *  spinner is the conservative default. */
+  mode?: 'interactive' | 'autonomous';
+}
+
 /** Args to open or focus a terminal session. */
 export interface OpenTerminalOptions {
   /** kubectl/shell target — a pod name, or the VM name for a host shell. */
@@ -77,6 +95,10 @@ export interface OpenTerminalOptions {
    *  but the view stays hidden. Used by rehydrate so reconnecting N shells
    *  on launch doesn't flash N modals — the user clicks a tab to view it. */
   background?: boolean;
+  /** Mark this session as a coding agent (Phase 5, A5). The launcher
+   *  pre-mints the `agent-<id>` (passed as `sessionId`) and spawns the
+   *  agent before calling here; this only types the resulting tab. */
+  agent?: AgentTabMeta;
 }
 
 /** Light, render-safe projection of a session for the chrome. */
@@ -89,6 +111,9 @@ export interface TerminalSessionMeta {
   subtitle: string;
   mode?: 'dev' | 'host';
   engine?: 'microvm';
+  /** Set when this tab is a coding agent (Phase 5, A5) — the tab bar
+   *  renders an agent icon + status badge distinct from a plain shell. */
+  agent?: AgentTabMeta;
 }
 
 // The heavy, route-independent objects. Held in a ref Map, never in React
@@ -116,6 +141,9 @@ interface LiveSession {
    *  used to (a) de-dupe a rehydrated tab against its live session and (b)
    *  destroy the guest session on an explicit close. Absent for pod-exec. */
   sessionId?: string;
+  /** Agent-tab metadata (Phase 5, A5), when this session is a coding
+   *  agent rather than a plain shell. */
+  agent?: AgentTabMeta;
 }
 
 interface TerminalSessionsContextValue {
@@ -159,6 +187,8 @@ const TerminalSessionsContext = React.createContext<TerminalSessionsContextValue
 
 function deriveTitle(opts: OpenTerminalOptions): string {
   if (opts.title) return opts.title;
+  // An agent tab reads as the agent, not the host shell it rides on.
+  if (opts.agent) return `Agent · ${opts.agent.type}`;
   const base = opts.engine === 'microvm' ? 'Terminal · microVM' : 'Terminal';
   if (opts.mode === 'dev') return `${base} · dev workspace`;
   if (opts.mode === 'host') return `${base} · host`;
@@ -181,9 +211,44 @@ function mintSessionId(mode: 'dev' | 'host'): string {
 }
 
 /** Recover the mode a reattached session was opened in from its id prefix.
- *  Unknown / legacy ids fall back to 'host' (a raw shell). */
+ *  Unknown / legacy ids fall back to 'host' (a raw shell). An `agent-`
+ *  session rides the 'host' transport (see isAgentSessionId). */
 function modeFromSessionId(id: string): 'dev' | 'host' {
   return id.startsWith('dev-') ? 'dev' : 'host';
+}
+
+/** Whether a guest session id belongs to a coding agent (Phase 5, A5).
+ *  The CLI/desktop mint agent sessions as `agent-<uuid>` (utils/agent.ts
+ *  mintAgentSessionId), so the prefix is how rehydrate tells an agent tab
+ *  from a plain shell — the registry only enriches its type/task/status. */
+export function isAgentSessionId(id: string): boolean {
+  return id.startsWith('agent-');
+}
+
+/** Mint an `agent-<uuid>` guest session id (mirrors the CLI's
+ *  mintAgentSessionId + satisfies validate_session_id in shell.rs). The
+ *  launcher pre-mints this, hands it to `agent.start`, then opens the
+ *  observe tab against it. */
+export function mintAgentSessionId(): string {
+  return `agent-${crypto.randomUUID()}`;
+}
+
+/** De-dupe namespace for an agent tab. An agent rides the `mode:'host'`
+ *  transport with no caller `sessionKey`, so its derived host-side key
+ *  would collide with a plain "Open shell" on the same VM and let one
+ *  steal/focus the other. Pin agents to their own `agent:<sessionId>`
+ *  key — used by BOTH the launcher and the rehydrate path. */
+export function agentSessionKey(sessionId: string): string {
+  return `agent:${sessionId}`;
+}
+
+/** Project the registry's agent status (which carries a 4th `exited`
+ *  state) onto the three-way badge status. `exited` (the run was stopped)
+ *  folds into `done` — it is no longer active — so the badge never spins
+ *  for a finished agent. Shared by rehydrate enrichment and the live
+ *  status poll so the mapping can't drift. */
+export function agentBadgeStatus(status: string | undefined): AgentTabMeta['status'] {
+  return status === 'done' || status === 'exited' ? 'done' : status === 'error' ? 'error' : 'running';
 }
 
 let nextSessionSeq = 0;
@@ -274,6 +339,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         subtitle,
         mode: opts.mode,
         engine: opts.engine,
+        agent: opts.agent,
       };
       setSessions((prev) => [...prev, meta]);
       if (!opts.background) setActiveId(id);
@@ -329,6 +395,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         clusterName: opts.clusterName,
         mode: opts.mode,
         sessionId,
+        agent: opts.agent,
       };
       liveRef.current.set(id, live);
 
@@ -423,7 +490,17 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       // an explicit tab-close must also destroy that session — otherwise it
       // would linger and silently rehydrate on the next launch.
       void live.session?.close();
-      if (live.sessionId && live.engine === 'microvm') {
+      if (live.agent && live.sessionId && live.engine === 'microvm') {
+        // An agent owns a registry row alongside its tmux session. The
+        // desktop's agent-stop path kills the session AND flips the row to
+        // `exited` in one shot — so route the agent's close through it
+        // rather than a bare `terminal.kill` (which would leave a stale
+        // `running` row behind). Best-effort, like the shell kill below.
+        void host.vm
+          ?.instance(live.clusterName)
+          .agent.stop(live.sessionId)
+          .catch(() => {});
+      } else if (live.sessionId && live.engine === 'microvm') {
         void host.terminal?.kill?.(live.clusterName, live.sessionId).catch(() => {});
       }
       live.term.dispose();
@@ -502,7 +579,38 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         if (!vm.running) continue;
         const found = await listSessions(vm.name).catch(() => []);
         if (cancelled) return;
+        // Enrich any reattached agent sessions with their registry
+        // type/task/status (best-effort — an `agent-` session still comes
+        // back as an agent tab even when the registry read yields nothing).
+        const agents = found.some((s) => isAgentSessionId(s.id))
+          ? await vmHost
+              .instance(vm.name)
+              .agent.list()
+              .catch(() => [])
+          : [];
+        if (cancelled) return;
+        const agentBySession = new Map(agents.map((a) => [a.sessionId, a]));
         for (const s of found) {
+          if (isAgentSessionId(s.id)) {
+            const info = agentBySession.get(s.id);
+            const type = info?.type ?? 'claude-code';
+            const status = agentBadgeStatus(info?.status);
+            openSessionRef.current({
+              target: vm.name,
+              engine: 'microvm',
+              clusterName: vm.name,
+              // Agents ride the reattachable host-shell transport, but get
+              // their own de-dupe namespace so a plain "Open shell" on the
+              // same VM can't focus/steal this reattached agent tab.
+              mode: 'host',
+              sessionKey: agentSessionKey(s.id),
+              sessionId: s.id,
+              agent: { type, status, mode: info?.mode },
+              title: info?.task ? `Agent · ${info.task}` : `Agent · ${type} (reattached)`,
+              background: true,
+            });
+            continue;
+          }
           const mode = modeFromSessionId(s.id);
           openSessionRef.current({
             target: vm.name,
@@ -523,6 +631,82 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
     // `openSession` is reached through `openSessionRef`, so reconnect runs
     // exactly once on launch.
   }, [host]);
+
+  // Live agent-status poll (Phase 5, A5/A6). The rehydrate path enriches a
+  // reattached agent tab's status once, but an autonomous run can finish
+  // (running → done/error) while its tab is open and detached. Re-read each
+  // VM's registry (`agent.list`) on a light interval and flip the badge, so
+  // a completed/failed run is reflected without a relaunch. Only runs while
+  // ≥1 agent tab is still `running` (done/error/exited are terminal), and
+  // patches only on an actual change to avoid render churn.
+  // Narrow signal for the poll effect: the SET of still-running agent tabs
+  // (their ids), not the whole `sessions` array. `sessions`' identity
+  // changes on every unrelated tab open/close/rename/focus, which would tear
+  // down + re-subscribe the 5s interval each time (Quinn/Devon). This
+  // primitive changes only when an agent tab enters/leaves the running set,
+  // so the poll re-subscribes exactly when the thing it watches changes.
+  const runningAgentKey = React.useMemo(
+    () =>
+      sessions
+        .filter((m) => m.agent?.status === 'running')
+        .map((m) => m.id)
+        .sort()
+        .join('|'),
+    [sessions]
+  );
+  // The poll effect reads the live `sessions` through a ref so it can key off
+  // the narrow signal above without taking `sessions` as a dependency.
+  const sessionsRef = React.useRef(sessions);
+  sessionsRef.current = sessions;
+  React.useEffect(() => {
+    const vmHost = host.vm;
+    if (!vmHost) return;
+    const runningAgents = sessionsRef.current.filter((m) => m.agent && m.agent.status === 'running');
+    if (runningAgents.length === 0) return;
+    // VMs (clusterName) hosting a still-running agent tab — read each once
+    // per tick and fan the result back out to its tabs by guest session id.
+    const vmNames = new Set<string>();
+    for (const m of runningAgents) {
+      const live = liveRef.current.get(m.id);
+      if (live?.clusterName) vmNames.add(live.clusterName);
+    }
+    if (vmNames.size === 0) return;
+
+    let cancelled = false;
+    const tick = async () => {
+      for (const vmName of vmNames) {
+        const agents = await vmHost
+          .instance(vmName)
+          .agent.list()
+          .catch(() => []);
+        if (cancelled) return;
+        const bySession = new Map(agents.map((a) => [a.sessionId, a]));
+        for (const m of runningAgents) {
+          const live = liveRef.current.get(m.id);
+          if (!live || live.clusterName !== vmName || !live.sessionId) continue;
+          const info = bySession.get(live.sessionId);
+          if (!info) continue;
+          const next = agentBadgeStatus(info.status);
+          if (next !== 'running' && m.agent?.status !== next) {
+            // Keep the heavy LiveSession copy in step with the meta so a
+            // later read (e.g. another tick) sees the settled status too.
+            live.agent = { ...(live.agent ?? { type: info.type }), status: next };
+            patchMeta(m.id, {
+              agent: { type: m.agent?.type ?? info.type, status: next, mode: m.agent?.mode ?? info.mode },
+            });
+          }
+        }
+      }
+    };
+    const interval = window.setInterval(() => void tick(), 5_000);
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+    // Keyed on the running-agent SET (not `sessions`) so an unrelated tab
+    // change doesn't churn the interval. `sessions` is read via `sessionsRef`.
+  }, [runningAgentKey, host, patchMeta]);
 
   const value = React.useMemo<TerminalSessionsContextValue>(
     () => ({

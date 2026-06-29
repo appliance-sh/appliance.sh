@@ -1,9 +1,10 @@
 import * as React from 'react';
-import { Plus, X } from 'lucide-react';
+import { Bot, Check, CircleX, Loader2, Plus, Radio, X } from 'lucide-react';
 import {
   useTerminalSessions,
   statusLabel,
   statusDotClass,
+  type AgentTabMeta,
   type TerminalSessionMeta,
 } from '@/providers/terminal-sessions-provider';
 import { useConfirm } from '@/components/ui/confirm-dialog';
@@ -24,6 +25,30 @@ import { cn } from '@/lib/utils';
 // not colour-only) — this dot is decorative for assistive tech.
 function StatusDot({ status }: { status: TerminalSessionMeta['status'] }) {
   return <span aria-hidden className={cn('h-1.5 w-1.5 shrink-0 rounded-full', statusDotClass(status))} />;
+}
+
+/** Plain-language label for an agent's *run* status (distinct from the PTY
+ *  connection status). Folded into the tab's accessible name so the badge —
+ *  which is colour/glyph-only and aria-hidden — isn't the only signal. An
+ *  interactive agent reads as `attached` (a live TTY), not `running` (which
+ *  would imply an autonomous task is churning). */
+function agentStatusLabel(status: AgentTabMeta['status'], mode?: AgentTabMeta['mode']): string {
+  if (status === 'done') return 'finished';
+  if (status === 'error') return 'failed';
+  return mode === 'interactive' ? 'attached' : 'running';
+}
+
+/** The agent's run status, rendered as a glyph badge DISTINCT from the PTY
+ *  connection dot (`StatusDot`): a check when it finished, an x when it
+ *  errored, and for a live run a STEADY "live" glyph for an interactive
+ *  (attached TTY) agent vs a spinner for a genuinely-working autonomous run.
+ *  An interactive agent isn't "working on a task", so a perpetual spinner
+ *  would mislead it as stuck (Devon). */
+function AgentStatusBadge({ status, mode }: { status: AgentTabMeta['status']; mode?: AgentTabMeta['mode'] }) {
+  if (status === 'done') return <Check aria-hidden className="h-3 w-3 shrink-0 text-green-400" />;
+  if (status === 'error') return <CircleX aria-hidden className="h-3 w-3 shrink-0 text-red-400" />;
+  if (mode === 'interactive') return <Radio aria-hidden className="h-3 w-3 shrink-0 text-cyan-300" />;
+  return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-cyan-300" />;
 }
 
 function TerminalTab({
@@ -49,6 +74,9 @@ function TerminalTab({
   // A self-exited / failed shell is dead weight — dim it so the live tabs
   // read first, but keep it present (and closable) per Devon's nit.
   const dead = session.status === 'closed' || session.status === 'error';
+  // A coding agent (Phase 5, A5) reads distinctly from a plain shell: a
+  // bot glyph + an agent-typed tooltip, and a cyan accent when active.
+  const agent = session.agent;
 
   React.useEffect(() => {
     if (editing) {
@@ -82,11 +110,32 @@ function TerminalTab({
         active
           ? 'border-[var(--color-border-strong)] bg-[var(--color-accent)] text-[var(--color-foreground)]'
           : 'border-[var(--color-border)] bg-transparent text-[var(--color-muted-foreground)] hover:bg-[var(--color-accent)]',
+        // Agent tabs carry a faint cyan ring so they stand apart from the
+        // shells in the same strip, even before you read the glyph. A `ring`
+        // (box-shadow) is used rather than a border colour so it can't lose
+        // the cascade to the active tab's `border-…-strong` (both would be
+        // `border-color` utilities, and source order — not class order —
+        // would decide the winner).
+        agent && !dead && 'ring-1 ring-inset ring-cyan-500/50',
         dead && 'opacity-60'
       )}
-      title={`${session.title} — ${session.subtitle} (${statusLabel(session.status)})`}
+      title={
+        agent
+          ? `${session.title} — ${agent.type} agent on ${session.subtitle} · run ${agentStatusLabel(
+              agent.status,
+              agent.mode
+            )} (shell ${statusLabel(session.status)})`
+          : `${session.title} — ${session.subtitle} (${statusLabel(session.status)})`
+      }
     >
       <StatusDot status={session.status} />
+      {agent ? (
+        <Bot
+          aria-hidden
+          className={cn('h-3.5 w-3.5 shrink-0', dead ? 'text-[var(--color-muted-foreground)]' : 'text-cyan-300')}
+        />
+      ) : null}
+      {agent ? <AgentStatusBadge status={agent.status} mode={agent.mode} /> : null}
       {editing ? (
         <input
           ref={inputRef}
@@ -127,10 +176,18 @@ function TerminalTab({
           }}
           className="min-w-0 flex-1 truncate text-left"
           aria-pressed={active}
-          // Fold the status word into the accessible name so a screen-reader
-          // / keyboard user can tell a live tab from a dead one — the dot is
+          // Fold the status word (and agent type) into the accessible name
+          // so a screen-reader / keyboard user can tell a live tab from a
+          // dead one, and an agent from a shell — the dot + bot glyph are
           // colour-only and aria-hidden.
-          aria-label={`${session.title} (${statusLabel(session.status)})`}
+          aria-label={
+            agent
+              ? `${session.title}, ${agent.type} agent, run ${agentStatusLabel(
+                  agent.status,
+                  agent.mode
+                )} (shell ${statusLabel(session.status)})`
+              : `${session.title} (${statusLabel(session.status)})`
+          }
           aria-keyshortcuts="F2"
           title="Double-click or press F2 to rename"
         >
@@ -145,7 +202,7 @@ function TerminalTab({
         }}
         className="shrink-0 rounded p-0.5 text-[var(--color-muted-foreground)] opacity-60 hover:bg-[var(--color-destructive)]/20 hover:text-red-400 group-hover:opacity-100"
         aria-label={dead ? `Remove ${session.title}` : `End ${session.title}`}
-        title={dead ? 'Remove ended tab' : 'End shell'}
+        title={dead ? 'Remove ended tab' : agent ? 'End agent' : 'End shell'}
       >
         <X className="h-3 w-3" />
       </button>
@@ -162,11 +219,19 @@ export function TerminalTabBar() {
   const handleClose = React.useCallback(
     async (session: TerminalSessionMeta) => {
       if (session.status === 'open' || session.status === 'connecting') {
-        const ok = await confirm({
-          title: 'End this shell?',
-          description: 'The running process will be terminated.',
-          confirmLabel: 'End shell',
-        });
+        const ok = await confirm(
+          session.agent
+            ? {
+                title: 'End this agent?',
+                description: "The agent's session and its running process will be terminated.",
+                confirmLabel: 'End agent',
+              }
+            : {
+                title: 'End this shell?',
+                description: 'The running process will be terminated.',
+                confirmLabel: 'End shell',
+              }
+        );
         if (!ok) return;
       }
       closeSession(session.id);
@@ -185,10 +250,11 @@ export function TerminalTabBar() {
 
   return (
     <div className="flex items-center gap-2">
-      {/* "Shells" label and "+" sit OUTSIDE the scroll strip so they stay
-          pinned when the tabs overflow horizontally. */}
+      {/* "Sessions" label and "+" sit OUTSIDE the scroll strip so they stay
+          pinned when the tabs overflow horizontally. The strip now mixes
+          plain shells and agent tabs, so it's labelled for both. */}
       <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-[var(--color-muted-foreground)]">
-        Shells
+        Sessions
       </span>
       <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
         {sessions.map((session) => (

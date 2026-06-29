@@ -77,6 +77,16 @@ export function vmShellCapture(vm: string, command: string[]): { status: number;
   return runVmCapture(['shell', vm, '--', ...command]);
 }
 
+/** Run a single in-guest shell SCRIPT as the appliance user over the
+ *  vsock one-shot path, capturing stdout. Passing the script as ONE
+ *  element makes the engine's space-join a no-op, so the guest login
+ *  shell parses it verbatim (multi-element commands lose their quoting).
+ *  The agent runner (utils/agent.ts) uses this to install-on-first-use +
+ *  spawn the detached `agent-<id>` tmux session in one invocation. */
+export function vmRunScript(vm: string, script: string): { status: number; stdout: string } {
+  return vmShellCapture(vm, [script]);
+}
+
 // ---- VM spec / state ---------------------------------------------------
 
 interface VmSpecOnDisk {

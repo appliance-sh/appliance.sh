@@ -363,6 +363,10 @@ export interface MicroVmStatus {
   /** Whether this VM is provisioned as a development environment
    *  (`appliance vm dev up`) — drives the dev-shell affordance. */
   dev: boolean;
+  /** Host folder shared into `/persist/workspace` (`devMount`), when one
+   *  is mounted. The agent launcher gates on this — an agent runs in (and
+   *  writes its registry to) the shared workspace. */
+  devMount?: string;
   apiServerUrl: string;
   message?: string;
 }
@@ -439,6 +443,55 @@ export interface MicroVmCredsHost {
   forget(): Promise<void>;
 }
 
+/** A coding agent recorded in a project's `.appliance/agents.json`
+ *  registry (Phase 5), reconciled against the VM's live tmux sessions.
+ *  Mirrors AgentInfo in the desktop's lib.rs (the CLI's `appliance agent
+ *  list --json` row). Surfaced so a rehydrated agent tab can show its
+ *  type / task / status. */
+export interface AgentInfo {
+  /** Host id — the `agent-` prefix stripped from `sessionId`. */
+  id: string;
+  /** Adapter key, e.g. `claude-code`. */
+  type: string;
+  /** Autonomous: the prompt. Interactive: an optional label. */
+  task?: string;
+  status: 'running' | 'done' | 'error' | 'exited';
+  /** The `agent-<uuid>` tmux session id — the terminal tab attaches to it. */
+  sessionId: string;
+  mode?: 'interactive' | 'autonomous';
+  /** Reconciled liveness: true/false, or null when the VM was unreachable. */
+  live?: boolean | null;
+}
+
+/** Launch a coding agent in a VM (Phase 5, A5). The desktop pre-mints the
+ *  `agent-<uuid>` session id so it can open the observe tab against a
+ *  known id the moment the launch returns. */
+export interface AgentLaunchInput {
+  /** Adapter type. Defaults to `claude-code`. */
+  type?: string;
+  /** Optional task prompt (interactive label / autonomous prompt). */
+  task?: string;
+  /** Pre-minted `agent-<uuid>` session id to launch under. */
+  sessionId: string;
+}
+
+/** Launch + list coding agents in one microVM (Phase 5, A5). Backed by
+ *  the bundled `appliance agent` CLI + its per-project registry. */
+export interface MicroVmAgentHost {
+  /** Shell `appliance agent start … --no-attach`: spawn a detached,
+   *  broker-wired `agent-<id>` tmux session. Resolves once the session
+   *  exists (so the caller can attach an observe tab); rejects with the
+   *  CLI's stderr (e.g. a missing Anthropic key). */
+  start(input: AgentLaunchInput): Promise<void>;
+  /** The VM's recorded agents, reconciled against live sessions. */
+  list(): Promise<AgentInfo[]>;
+  /** Shell `appliance agent stop <id>`: kill the agent's tmux session and
+   *  mark its registry record `exited`. Called when an agent tab closes so
+   *  no stale `running` row lingers. `id` is the `agent-<uuid>` session id
+   *  (the CLI matches it with or without the prefix). Best-effort. */
+  stop(id: string): Promise<void>;
+}
+
 /** One microVM as reported by the engine — its allocated host ports,
  *  running state, and the desktop cluster id it registers under.
  *  Mirrors MicroVmSummary in the desktop's lib.rs. */
@@ -481,6 +534,8 @@ export interface MicroVmInstanceHost {
   egress: MicroVmEgressHost;
   /** Per-host credential capture/injection (apiKeyHelper). */
   creds: MicroVmCredsHost;
+  /** Launch + observe coding agents in this VM (Phase 5, A5). */
+  agent: MicroVmAgentHost;
 }
 
 export interface MicroVmHost {

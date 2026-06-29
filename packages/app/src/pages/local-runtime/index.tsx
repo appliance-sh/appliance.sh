@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
+  Bot,
   Check,
   Copy,
   Download,
@@ -21,7 +22,7 @@ import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/c
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
-import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
+import { useTerminalSessions, mintAgentSessionId, agentSessionKey } from '@/providers/terminal-sessions-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
@@ -643,6 +644,19 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
                   <TerminalIcon className="h-4 w-4" /> {status.dev ? 'Open dev shell' : 'Open shell'}
                 </Button>
               ) : null}
+              {host.terminal && host.vm ? (
+                <LaunchAgentButton
+                  name={name}
+                  // Agents run in (and write their registry to) the shared
+                  // workspace, so a VM without one can't host them. Rather
+                  // than omit the control (and make the feature undiscoverable),
+                  // render it disabled with the reason — start the VM as a dev
+                  // environment with a shared folder to enable it.
+                  disabledReason={
+                    status.devMount ? null : 'VM has no shared workspace — start it as a dev environment to run agents'
+                  }
+                />
+              ) : null}
               <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
                 <Rocket className="h-4 w-4" /> Deploy application
               </Button>
@@ -656,6 +670,143 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
       {clusterServing ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
     </EngineCard>
+  );
+}
+
+// "Launch agent" (Phase 5, A5): spawn a Claude Code agent into the VM's
+// shared workspace and attach it as an agent-typed dock tab to observe +
+// steer it. The Anthropic key is brokered host-side and never enters the
+// VM — run `appliance agent login` once to store it. The detached,
+// broker-wired `agent-<id>` tmux session is created first (so it exists),
+// then the observe tab attaches to it via the reattachable host-shell
+// transport. Only rendered for dev VMs with a shared workspace folder.
+function LaunchAgentButton({ name, disabledReason }: { name: string; disabledReason?: string | null }) {
+  const host = useHost();
+  const terminals = useTerminalSessions();
+  const [open, setOpen] = React.useState(false);
+  const [task, setTask] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  // Synchronous re-entrancy latch: the `busy` state in the keydown closure
+  // is stale within the same tick, so a rapid double-Enter could fire two
+  // launches before the first re-render disables the input. The ref flips
+  // before any await, so the second Enter is dropped.
+  const launchingRef = React.useRef(false);
+
+  const launch = async () => {
+    if (launchingRef.current) return;
+    launchingRef.current = true;
+    setBusy(true);
+    setErr(null);
+    try {
+      const sessionId = mintAgentSessionId();
+      const t = task.trim() || undefined;
+      // Spawn the agent FIRST so its tmux session exists, then attach the
+      // observe tab — attaching first would create an empty shell session
+      // under the agent id instead of reattaching the agent.
+      await host.vm!.instance(name).agent.start({ type: 'claude-code', task: t, sessionId });
+      terminals.openSession({
+        target: name,
+        engine: 'microvm',
+        clusterName: name,
+        mode: 'host',
+        // Distinct de-dupe namespace so a plain "Open shell" on this VM
+        // can't focus/steal the agent tab (and vice versa).
+        sessionKey: agentSessionKey(sessionId),
+        sessionId,
+        // The desktop launcher only spawns interactive agents — tag the mode
+        // so the tab badge shows a steady "attached" glyph instead of the
+        // perpetual "working" spinner reserved for autonomous runs.
+        agent: { type: 'claude-code', status: 'running', mode: 'interactive' },
+        title: t ? `Agent · ${t}` : 'Agent · claude-code',
+      });
+      setOpen(false);
+      setTask('');
+    } catch (e) {
+      // Surfaces the CLI's stderr verbatim — most often "No Anthropic key
+      // configured" (run `appliance agent login`).
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      launchingRef.current = false;
+    }
+  };
+
+  if (!open) {
+    // Gating-off: when the VM has no shared workspace the agent can't run,
+    // but keep the control visible (disabled) so the feature stays
+    // discoverable rather than silently absent — AND make the reason
+    // genuinely reachable (Devon). `buttonVariants` sets
+    // `disabled:pointer-events-none`, so a disabled button swallows hover:
+    // its native `title` tooltip never fires and it can't be focused or
+    // announced. So (a) wrap it in a `<span title>` that keeps
+    // pointer-events (the tooltip now fires on the span), and (b) render
+    // the reason as adjacent muted text so it reaches everyone regardless.
+    if (disabledReason) {
+      return (
+        <span className="inline-flex items-center gap-2" title={disabledReason}>
+          <Button variant="outline" size="sm" disabled>
+            <Bot className="h-4 w-4" /> Run agent
+          </Button>
+          <span role="note" className="max-w-[18rem] text-[11px] leading-snug text-[var(--color-muted-foreground)]">
+            {disabledReason}
+          </span>
+        </span>
+      );
+    }
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+        title="Run a Claude Code agent in the workspace and observe it in a tab"
+      >
+        <Bot className="h-4 w-4" /> Run agent
+      </Button>
+    );
+  }
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <div className="flex items-center gap-2">
+        <input
+          autoFocus
+          type="text"
+          value={task}
+          onChange={(e) => setTask(e.target.value)}
+          placeholder="task (optional) — e.g. fix the failing test"
+          className="w-64 rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1 text-xs"
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void launch();
+            if (e.key === 'Escape') setOpen(false);
+          }}
+        />
+        <Button size="sm" onClick={() => void launch()} disabled={busy}>
+          <Bot className={cn('h-3.5 w-3.5', busy && 'animate-pulse')} /> {busy ? 'Starting…' : 'Run'}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)} disabled={busy}>
+          Cancel
+        </Button>
+      </div>
+      {/* The login pointer stays visible ALONGSIDE an error (a missing key is
+          the most common failure, and the fix is exactly this command) —
+          they're no longer mutually exclusive. The error is an alert. */}
+      {err ? (
+        <p role="alert" className="max-w-[28rem] font-mono text-[10px] text-red-300">
+          {err}
+        </p>
+      ) : null}
+      <p className="text-[10px] text-[var(--color-muted-foreground)]">
+        Runs <code className="font-mono">claude</code> in the shared workspace. Store your key once with{' '}
+        <code className="font-mono">appliance agent login</code> — it&rsquo;s brokered in and never enters the VM.
+      </p>
+      {/* Honest-limits caveat (Parker): the key is brokered, but the
+          workspace is not. Surface the blast radius where the user launches
+          so a throwaway sandbox isn't mistaken for a security jail. */}
+      <p className="text-[10px] text-amber-300/90">
+        ⚠ Sandbox is throwaway, not a jail — the agent can read/write your mounted workspace.
+      </p>
+    </div>
   );
 }
 

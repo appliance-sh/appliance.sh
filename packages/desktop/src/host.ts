@@ -9,6 +9,8 @@ import type {
   UpdateProgress,
   MicroVmStatus,
   MicroVmSummary,
+  AgentInfo,
+  AgentLaunchInput,
   AddClusterInput,
   ApiServerUpdateInput,
   ApiServerUpdateOptions,
@@ -277,6 +279,31 @@ export const tauriHost: ConsoleHost = {
           },
           async forget() {
             await invoke('microvm_creds_forget', { name: vm });
+          },
+        },
+        agent: {
+          // Shell `appliance agent start … --no-attach` (the Rust side
+          // resolves the VM's mounted workspace for --dir + the registry).
+          // The caller pre-mints `sessionId` so it can attach the observe
+          // tab the moment this resolves.
+          async start(input: AgentLaunchInput) {
+            await invoke('microvm_agent_start', {
+              input: {
+                name: vm,
+                type: input.type ?? 'claude-code',
+                task: input.task ?? null,
+                sessionId: input.sessionId,
+              },
+            });
+          },
+          list() {
+            return invoke<AgentInfo[]>('microvm_agent_list', { name: vm });
+          },
+          // Shell `appliance agent stop <id>` (the Rust side resolves the
+          // VM's mounted workspace for the registry). Kills the agent's
+          // tmux session and flips its registry row to `exited`.
+          async stop(id: string) {
+            await invoke('microvm_agent_stop', { name: vm, id });
           },
         },
       };
