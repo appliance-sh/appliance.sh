@@ -105,31 +105,49 @@ pub struct SessionInfo {
     pub last_activity: Option<i64>,
 }
 
-/// List the VM's reattachable sessions on the appliance-user socket. A
-/// short-lived connection: send the `list` verb, read the agent's
+/// The agent's `kill` verb echoes one of these so the host can report the
+/// real outcome over the status-less byte pipe: `KILL_MARK` when `tmux
+/// kill-session` actually removed a session (exit 0), the no-session
+/// marker otherwise. Kept in sync with `guest.rs`'s SHELL_AGENT.
+const KILL_MARK: &str = "__APPLIANCE_VM_KILLED__";
+
+/// List the VM's reattachable sessions. `root` enumerates the separate
+/// root-owned `appliance-root` tmux socket — where `vm shell --root
+/// --session <id>` lands — instead of the default non-root `appliance`
+/// one; the two privilege levels never share a socket. A short-lived
+/// connection: send the `[root] list` verb, read the agent's
 /// `appliance-<id> <activity>` lines to EOF, parse them clean. No raw
 /// mode, no sentinel — the connection closing is the whole protocol.
-pub fn list_sessions(name: &str) -> Result<Vec<SessionInfo>> {
+pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
     let mut stream = connect(name)?;
     let (rows, cols) = term_size();
-    writeln!(stream, "rows {rows} cols {cols} list")?;
+    // Grammar is `rows R cols C [root] [verb]`: the root token precedes the
+    // verb, matching the agent's parse order (verb stripped first, then root).
+    writeln!(stream, "rows {rows} cols {cols}{} list", if root { " root" } else { "" })?;
     stream.shutdown(Shutdown::Write)?;
     let mut out = String::new();
     stream.read_to_string(&mut out)?;
     Ok(parse_session_list(&out))
 }
 
-/// Kill one reattachable session by id on the appliance-user socket.
-pub fn kill_session(name: &str, id: &str) -> Result<()> {
+/// Kill one reattachable session by id. `root` targets the separate
+/// root-owned `appliance-root` socket instead of the non-root `appliance`
+/// one. Returns whether a session was actually killed: the agent runs
+/// `tmux kill-session` and echoes a marker keyed on its exit status, so
+/// killing a non-existent id reports honestly rather than a blanket
+/// success.
+pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
     validate_session_id(id)?;
     let mut stream = connect(name)?;
     let (rows, cols) = term_size();
-    writeln!(stream, "rows {rows} cols {cols} kill {id}")?;
+    writeln!(stream, "rows {rows} cols {cols}{} kill {id}", if root { " root" } else { "" })?;
     stream.shutdown(Shutdown::Write)?;
-    // Drain to EOF so the kill actually runs before we drop the socket.
+    // Drain to EOF so the kill actually runs before we drop the socket, and
+    // read back the agent's marker: `KILL_MARK` only when tmux removed a
+    // real session (exit 0).
     let mut sink = Vec::new();
     stream.read_to_end(&mut sink)?;
-    Ok(())
+    Ok(String::from_utf8_lossy(&sink).contains(KILL_MARK))
 }
 
 /// Parse the agent's `list` output — one `appliance-<id> <activity>` line

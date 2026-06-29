@@ -359,16 +359,22 @@ sessions
   .command('list')
   .description("list the VM's reattachable shell sessions as JSON")
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
-  .action((opts: { name: string }) => {
-    process.exit(runVm(['sessions', 'list', opts.name]));
+  .option('--root', 'list root sessions (the separate root-owned socket) instead of the non-root ones', false)
+  .action((opts: { name: string; root: boolean }) => {
+    const args = ['sessions', 'list', opts.name];
+    if (opts.root) args.push('--root');
+    process.exit(runVm(args));
   });
 
 sessions
   .command('kill <id>')
   .description('kill a reattachable shell session by id')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
-  .action((id: string, opts: { name: string }) => {
-    process.exit(runVm(['sessions', 'kill', id, '--name', opts.name]));
+  .option('--root', 'kill a root session (the separate root-owned socket) instead of a non-root one', false)
+  .action((id: string, opts: { name: string; root: boolean }) => {
+    const args = ['sessions', 'kill', id, '--name', opts.name];
+    if (opts.root) args.push('--root');
+    process.exit(runVm(args));
   });
 
 function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {

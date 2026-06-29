@@ -560,11 +560,21 @@ stty echo 2>/dev/null
 # interactive attach/new path — list/kill stay non-login so profile output
 # can't corrupt the machine-readable session list.
 if [ -n "$__VERB" ]; then
+  # Defense-in-depth: $__SID rides verbatim into `sh -c` below. The host
+  # already validates it (validate_session_id), but reject anything outside
+  # [A-Za-z0-9._-] here too — belt-and-suspenders, since the vsock is
+  # host-only. `list` carries an empty id, which passes (no offending char).
+  case "$__SID" in
+    *[!A-Za-z0-9._-]*) echo "appliance-shell: invalid session id" >&2; exit 1;;
+  esac
   if [ "$__ROOT" = 1 ]; then __L=appliance-root; else __L=appliance; fi
   __TMUX="tmux -L $__L -f /etc/appliance/tmux.conf"
   case "$__VERB" in
     list) __TCMD="$__TMUX list-sessions -F '#{session_name} #{session_activity}' 2>/dev/null"; __LOGIN='';;
-    kill) __TCMD="$__TMUX kill-session -t appliance-$__SID 2>/dev/null"; __LOGIN='';;
+    # Echo a marker keyed on tmux's exit status so the host can report the
+    # real outcome ("killed" vs "no such session") over the status-less
+    # byte pipe — kill-session exits non-zero when the id doesn't exist.
+    kill) __TCMD="if $__TMUX kill-session -t appliance-$__SID 2>/dev/null; then echo __APPLIANCE_VM_KILLED__; else echo __APPLIANCE_VM_NO_SESSION__; fi"; __LOGIN='';;
     *)    __TCMD="exec $__TMUX new-session -A -s appliance-$__SID"; __LOGIN='-l';;
   esac
   if [ "$__ROOT" = 1 ]; then
@@ -1091,6 +1101,15 @@ mod tests {
         // tmux on its own socket (no su).
         assert!(agent.contains("exec su -s /bin/sh $__LOGIN -c \"$__TCMD\" appliance"));
         assert!(agent.contains("exec sh -c \"$__TCMD\""));
+
+        // kill reports the real outcome: it echoes a marker keyed on tmux's
+        // exit status so the host can say "killed" vs "no such session"
+        // over the status-less byte pipe.
+        assert!(agent.contains("__APPLIANCE_VM_KILLED__"), "kill echoes a success marker");
+        assert!(agent.contains("__APPLIANCE_VM_NO_SESSION__"), "kill echoes a no-session marker");
+        // Defense-in-depth guest-side id guard: reject anything outside the
+        // host-validated charset before $__SID rides into `sh -c`.
+        assert!(agent.contains("*[!A-Za-z0-9._-]*)"), "guest-side session-id charset guard");
 
         // CRITICAL: the verb block is gated on a verb being present, so the
         // no-verb one-shot/login path is byte-for-byte the legacy behavior.

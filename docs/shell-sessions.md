@@ -133,8 +133,9 @@ rows R cols C [root] [attach <id> | new <id> | list | kill <id>]
 - **`attach <id>` / `new <id>`** → the agent execs, as the appliance user, the
   attach-or-create:
   `su -s /bin/sh -l appliance -c 'exec tmux -L appliance -f <conf> new-session -A -s appliance-<id>'`.
-  `new` forces a fresh session (`new-session -d -s … ; attach`); `attach` ==
-  attach-or-create. `--root` swaps the socket to `-L appliance-root` and skips
+  Both `new` and `attach` are attach-or-create (`new-session -A`): the impl
+  collapsed them onto the safer primitive so a stale id never errors out.
+  `--root` swaps the socket to `-L appliance-root` and skips
   the `su` drop (root-owned socket, mode 0600, so a non-root client can never
   attach a root session and vice-versa).
 - **`list`** → `tmux -L appliance list-sessions -F '#{session_name}\t#{session_activity}'`,

@@ -171,6 +171,11 @@ enum SessionsCmd {
     List {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+        /// List root sessions (the separate root-owned tmux socket) instead
+        /// of the default non-root `appliance` sessions. Root sessions are
+        /// the ones created with `vm shell --root --session <id>`.
+        #[arg(long, default_value_t = false)]
+        root: bool,
     },
     /// Kill a reattachable shell session by id.
     Kill {
@@ -178,6 +183,10 @@ enum SessionsCmd {
         id: String,
         #[arg(long, default_value = DEFAULT_VM)]
         name: String,
+        /// Kill a root session (the separate root-owned tmux socket) instead
+        /// of a default non-root `appliance` session.
+        #[arg(long, default_value_t = false)]
+        root: bool,
     },
 }
 
@@ -724,14 +733,20 @@ fn run() -> Result<()> {
 
 fn run_sessions(action: SessionsCmd) -> Result<()> {
     match action {
-        SessionsCmd::List { name } => {
-            let sessions = shell::list_sessions(&name)?;
+        SessionsCmd::List { name, root } => {
+            let sessions = shell::list_sessions(&name, root)?;
             println!("{}", serde_json::to_string_pretty(&sessions)?);
             Ok(())
         }
-        SessionsCmd::Kill { id, name } => {
-            shell::kill_session(&name, &id)?;
-            println!("killed session '{id}' in VM '{name}'");
+        SessionsCmd::Kill { id, name, root } => {
+            // Report the real outcome: the agent echoes a marker keyed on
+            // tmux's exit status, so killing a bogus id says so instead of
+            // claiming a phantom success (mirrors `creds rm`'s no-op path).
+            if shell::kill_session(&name, &id, root)? {
+                println!("killed session '{id}' in VM '{name}'");
+            } else {
+                println!("no such session '{id}' in VM '{name}'");
+            }
             Ok(())
         }
     }
