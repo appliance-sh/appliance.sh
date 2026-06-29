@@ -232,6 +232,14 @@ export function mintAgentSessionId(): string {
   return `agent-${globalThis.crypto.randomUUID()}`;
 }
 
+/** Normalize a caller-supplied session id to the `agent-<…>` convention
+ *  the rehydrate path + registry key off (so `--session <id>` accepts the
+ *  bare or prefixed form). Mints nothing — just ensures the prefix. */
+export function ensureAgentSessionId(id: string): string {
+  const trimmed = id.trim();
+  return trimmed.startsWith('agent-') ? trimmed : `agent-${trimmed}`;
+}
+
 /** The sandbox VM the cwd project targets: the linked VM, else the shared
  *  default sandbox VM. */
 export function targetVm(): string {
@@ -348,6 +356,10 @@ export interface RunAgentOpts {
   adapter?: AgentAdapter;
   mode?: 'interactive' | 'autonomous';
   task?: string;
+  /** Use this session id (normalized to the `agent-` prefix) instead of
+   *  minting one — lets a caller (the CLI `--session`, the desktop tab)
+   *  pre-allocate the agent's session id. */
+  sessionId?: string;
 }
 
 /**
@@ -380,7 +392,7 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<string> {
   configureBroker(vm, adapter);
 
   const proxyUrl = resolveProxyUrl(vm);
-  const sessionId = mintAgentSessionId();
+  const sessionId = opts.sessionId ? ensureAgentSessionId(opts.sessionId) : mintAgentSessionId();
   const tmuxSession = `appliance-${sessionId}`;
   const launchLine = composeLaunchLine(adapter, proxyUrl, { mode, task: opts.task });
 
