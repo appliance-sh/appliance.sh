@@ -2,6 +2,7 @@
 
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 import * as sdk from '@appliance.sh/sdk';
+import { userArgs } from './utils/argv.js';
 
 // Prepend ~/.appliance/bin to PATH so any downstream spawns (docker,
 // kubectl, crane) resolve helper-installed binaries when the system
@@ -165,27 +166,6 @@ const ALIAS_MAP: Record<string, string> = (() => {
   }
   return m;
 })();
-
-/**
- * The "user-supplied" tail of argv. Two invocation shapes to handle:
- *
- *   Node / Bun-as-interpreter: [interpreter, /path/to/script.js, ...userArgs]
- *   Bun-compiled binary:       [binary, /$bunfs/root/appliance, ...userArgs]
- *
- * In both cases argv[1] is a "script-like" path that isn't part of
- * what the user typed. We detect it via the `/$bunfs/` prefix (Bun's
- * embedded-fs convention) or a JS-source extension and slice from
- * argv[2..]. Falls back to `argv[1..]` for unusual cases (e.g. a
- * harness that strips the script slot entirely).
- */
-function userArgs(): string[] {
-  const first = process.argv[1];
-  if (first) {
-    if (first.startsWith('/$bunfs/')) return process.argv.slice(2);
-    if (/\.(?:js|cjs|mjs|ts)$/.test(first)) return process.argv.slice(2);
-  }
-  return process.argv.slice(1);
-}
 
 function showHelp(): void {
   console.log('Usage: appliance <command> [options]');
