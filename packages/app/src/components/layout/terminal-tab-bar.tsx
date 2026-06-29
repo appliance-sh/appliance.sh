@@ -58,6 +58,10 @@ function TerminalTab({
   }, [editing]);
 
   const startEdit = () => {
+    // Clear the cancel latch up front: it's a plain ref (not reset on
+    // re-render), so a prior Escape-cancel could leave it set and make the
+    // next edit's first blur silently drop instead of commit.
+    skipBlurRef.current = false;
     setDraft(session.title);
     setEditing(true);
   };
@@ -127,6 +131,7 @@ function TerminalTab({
           // / keyboard user can tell a live tab from a dead one — the dot is
           // colour-only and aria-hidden.
           aria-label={`${session.title} (${statusLabel(session.status)})`}
+          aria-keyshortcuts="F2"
           title="Double-click or press F2 to rename"
         >
           {session.title}
