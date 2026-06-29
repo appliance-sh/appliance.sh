@@ -299,6 +299,12 @@ export const tauriHost: ConsoleHost = {
           list() {
             return invoke<AgentInfo[]>('microvm_agent_list', { name: vm });
           },
+          // Shell `appliance agent stop <id>` (the Rust side resolves the
+          // VM's mounted workspace for the registry). Kills the agent's
+          // tmux session and flips its registry row to `exited`.
+          async stop(id: string) {
+            await invoke('microvm_agent_stop', { name: vm, id });
+          },
         },
       };
     },

@@ -228,6 +228,24 @@ export function mintAgentSessionId(): string {
   return `agent-${crypto.randomUUID()}`;
 }
 
+/** De-dupe namespace for an agent tab. An agent rides the `mode:'host'`
+ *  transport with no caller `sessionKey`, so its derived host-side key
+ *  would collide with a plain "Open shell" on the same VM and let one
+ *  steal/focus the other. Pin agents to their own `agent:<sessionId>`
+ *  key — used by BOTH the launcher and the rehydrate path. */
+export function agentSessionKey(sessionId: string): string {
+  return `agent:${sessionId}`;
+}
+
+/** Project the registry's agent status (which carries a 4th `exited`
+ *  state) onto the three-way badge status. `exited` (the run was stopped)
+ *  folds into `done` — it is no longer active — so the badge never spins
+ *  for a finished agent. Shared by rehydrate enrichment and the live
+ *  status poll so the mapping can't drift. */
+export function agentBadgeStatus(status: string | undefined): AgentTabMeta['status'] {
+  return status === 'done' || status === 'exited' ? 'done' : status === 'error' ? 'error' : 'running';
+}
+
 let nextSessionSeq = 0;
 
 export function TerminalSessionsProvider({ children }: { children: React.ReactNode }) {
@@ -467,7 +485,17 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       // an explicit tab-close must also destroy that session — otherwise it
       // would linger and silently rehydrate on the next launch.
       void live.session?.close();
-      if (live.sessionId && live.engine === 'microvm') {
+      if (live.agent && live.sessionId && live.engine === 'microvm') {
+        // An agent owns a registry row alongside its tmux session. The
+        // desktop's agent-stop path kills the session AND flips the row to
+        // `exited` in one shot — so route the agent's close through it
+        // rather than a bare `terminal.kill` (which would leave a stale
+        // `running` row behind). Best-effort, like the shell kill below.
+        void host.vm
+          ?.instance(live.clusterName)
+          .agent.stop(live.sessionId)
+          .catch(() => {});
+      } else if (live.sessionId && live.engine === 'microvm') {
         void host.terminal?.kill?.(live.clusterName, live.sessionId).catch(() => {});
       }
       live.term.dispose();
@@ -561,14 +589,16 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
           if (isAgentSessionId(s.id)) {
             const info = agentBySession.get(s.id);
             const type = info?.type ?? 'claude-code';
-            const status: AgentTabMeta['status'] =
-              info?.status === 'done' || info?.status === 'error' ? info.status : 'running';
+            const status = agentBadgeStatus(info?.status);
             openSessionRef.current({
               target: vm.name,
               engine: 'microvm',
               clusterName: vm.name,
-              // Agents ride the reattachable host-shell transport.
+              // Agents ride the reattachable host-shell transport, but get
+              // their own de-dupe namespace so a plain "Open shell" on the
+              // same VM can't focus/steal this reattached agent tab.
               mode: 'host',
+              sessionKey: agentSessionKey(s.id),
               sessionId: s.id,
               agent: { type, status },
               title: info?.task ? `Agent · ${info.task}` : `Agent · ${type} (reattached)`,
@@ -596,6 +626,59 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
     // `openSession` is reached through `openSessionRef`, so reconnect runs
     // exactly once on launch.
   }, [host]);
+
+  // Live agent-status poll (Phase 5, A5/A6). The rehydrate path enriches a
+  // reattached agent tab's status once, but an autonomous run can finish
+  // (running → done/error) while its tab is open and detached. Re-read each
+  // VM's registry (`agent.list`) on a light interval and flip the badge, so
+  // a completed/failed run is reflected without a relaunch. Only runs while
+  // ≥1 agent tab is still `running` (done/error/exited are terminal), and
+  // patches only on an actual change to avoid render churn.
+  React.useEffect(() => {
+    const vmHost = host.vm;
+    if (!vmHost) return;
+    const runningAgents = sessions.filter((m) => m.agent && m.agent.status === 'running');
+    if (runningAgents.length === 0) return;
+    // VMs (clusterName) hosting a still-running agent tab — read each once
+    // per tick and fan the result back out to its tabs by guest session id.
+    const vmNames = new Set<string>();
+    for (const m of runningAgents) {
+      const live = liveRef.current.get(m.id);
+      if (live?.clusterName) vmNames.add(live.clusterName);
+    }
+    if (vmNames.size === 0) return;
+
+    let cancelled = false;
+    const tick = async () => {
+      for (const vmName of vmNames) {
+        const agents = await vmHost
+          .instance(vmName)
+          .agent.list()
+          .catch(() => []);
+        if (cancelled) return;
+        const bySession = new Map(agents.map((a) => [a.sessionId, a]));
+        for (const m of runningAgents) {
+          const live = liveRef.current.get(m.id);
+          if (!live || live.clusterName !== vmName || !live.sessionId) continue;
+          const info = bySession.get(live.sessionId);
+          if (!info) continue;
+          const next = agentBadgeStatus(info.status);
+          if (next !== 'running' && m.agent?.status !== next) {
+            // Keep the heavy LiveSession copy in step with the meta so a
+            // later read (e.g. another tick) sees the settled status too.
+            live.agent = { ...(live.agent ?? { type: info.type }), status: next };
+            patchMeta(m.id, { agent: { type: m.agent?.type ?? info.type, status: next } });
+          }
+        }
+      }
+    };
+    const interval = window.setInterval(() => void tick(), 5_000);
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [sessions, host, patchMeta]);
 
   const value = React.useMemo<TerminalSessionsContextValue>(
     () => ({

@@ -577,6 +577,15 @@ export function createMockHost(): ConsoleHost {
               await sleep(80);
               return vm.agents.map((a) => ({ ...a }));
             },
+            async stop(id: string) {
+              await sleep(120);
+              const bare = id.replace(/^agent-/, '');
+              const agent = vm.agents.find((a) => a.id === bare || a.sessionId === id);
+              if (agent) {
+                agent.status = 'exited';
+                agent.live = false;
+              }
+            },
           },
         };
       },

@@ -3839,6 +3839,40 @@ async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<
     }
 }
 
+/// Stop an agent by shelling `appliance agent stop <id>` with the CWD set
+/// to the VM's mounted workspace (where the `.appliance/agents.json`
+/// registry lives). The CLI kills the agent's tmux session and flips its
+/// registry row to `exited`, so closing an agent tab leaves no stale
+/// `running` record. Called as the agent-tab close path; best-effort, so
+/// a non-dev VM / already-dead session yields Ok rather than surfacing an
+/// error on tab close.
+#[tauri::command]
+async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) -> Result<(), String> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("an agent id is required to stop an agent".to_string());
+    }
+    let vm = vm_name(name);
+    let Some(dir) = vm_dev_mount(&vm) else {
+        return Ok(()); // no mounted project → no registry → nothing to stop
+    };
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
+        .current_dir(dir)
+        .args(["agent".to_string(), "stop".to_string(), id]);
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+    // Drain to completion (so the kill + registry write finish) but tolerate
+    // a non-zero exit: `agent stop` exits non-zero when the tmux session was
+    // already gone, yet still marks the registry `exited` — which is exactly
+    // the outcome we want on a tab close.
+    while rx.recv().await.is_some() {}
+    Ok(())
+}
+
 // ============================================================
 // Build + deploy from a local source folder.
 //
@@ -4449,6 +4483,7 @@ pub fn run() {
             microvm_dev_cleanup,
             microvm_agent_start,
             microvm_agent_list,
+            microvm_agent_stop,
             microvm_stop,
             microvm_delete,
             microvm_egress_get,

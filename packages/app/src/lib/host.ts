@@ -485,6 +485,11 @@ export interface MicroVmAgentHost {
   start(input: AgentLaunchInput): Promise<void>;
   /** The VM's recorded agents, reconciled against live sessions. */
   list(): Promise<AgentInfo[]>;
+  /** Shell `appliance agent stop <id>`: kill the agent's tmux session and
+   *  mark its registry record `exited`. Called when an agent tab closes so
+   *  no stale `running` row lingers. `id` is the `agent-<uuid>` session id
+   *  (the CLI matches it with or without the prefix). Best-effort. */
+  stop(id: string): Promise<void>;
 }
 
 /** One microVM as reported by the engine — its allocated host ports,

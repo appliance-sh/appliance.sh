@@ -1,9 +1,10 @@
 import * as React from 'react';
-import { Bot, Plus, X } from 'lucide-react';
+import { Bot, Check, CircleX, Loader2, Plus, X } from 'lucide-react';
 import {
   useTerminalSessions,
   statusLabel,
   statusDotClass,
+  type AgentTabMeta,
   type TerminalSessionMeta,
 } from '@/providers/terminal-sessions-provider';
 import { useConfirm } from '@/components/ui/confirm-dialog';
@@ -24,6 +25,23 @@ import { cn } from '@/lib/utils';
 // not colour-only) — this dot is decorative for assistive tech.
 function StatusDot({ status }: { status: TerminalSessionMeta['status'] }) {
   return <span aria-hidden className={cn('h-1.5 w-1.5 shrink-0 rounded-full', statusDotClass(status))} />;
+}
+
+/** Plain-language label for an agent's *run* status (distinct from the PTY
+ *  connection status). Folded into the tab's accessible name so the badge —
+ *  which is colour/glyph-only and aria-hidden — isn't the only signal. */
+function agentStatusLabel(status: AgentTabMeta['status']): string {
+  return status === 'done' ? 'finished' : status === 'error' ? 'failed' : 'running';
+}
+
+/** The agent's run status, rendered as a glyph badge DISTINCT from the PTY
+ *  connection dot (`StatusDot`): a spinner while the run is live, a check
+ *  when it finished, an x when it errored. Lets a detached autonomous agent
+ *  read as done/failed instead of looking identical to a live one. */
+function AgentStatusBadge({ status }: { status: AgentTabMeta['status'] }) {
+  if (status === 'done') return <Check aria-hidden className="h-3 w-3 shrink-0 text-green-400" />;
+  if (status === 'error') return <CircleX aria-hidden className="h-3 w-3 shrink-0 text-red-400" />;
+  return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-cyan-300" />;
 }
 
 function TerminalTab({
@@ -86,13 +104,19 @@ function TerminalTab({
           ? 'border-[var(--color-border-strong)] bg-[var(--color-accent)] text-[var(--color-foreground)]'
           : 'border-[var(--color-border)] bg-transparent text-[var(--color-muted-foreground)] hover:bg-[var(--color-accent)]',
         // Agent tabs carry a faint cyan ring so they stand apart from the
-        // shells in the same strip, even before you read the glyph.
-        agent && !dead && 'border-cyan-500/40',
+        // shells in the same strip, even before you read the glyph. A `ring`
+        // (box-shadow) is used rather than a border colour so it can't lose
+        // the cascade to the active tab's `border-…-strong` (both would be
+        // `border-color` utilities, and source order — not class order —
+        // would decide the winner).
+        agent && !dead && 'ring-1 ring-inset ring-cyan-500/50',
         dead && 'opacity-60'
       )}
       title={
         agent
-          ? `${session.title} — ${agent.type} agent on ${session.subtitle} (${statusLabel(session.status)})`
+          ? `${session.title} — ${agent.type} agent on ${session.subtitle} · run ${agentStatusLabel(
+              agent.status
+            )} (shell ${statusLabel(session.status)})`
           : `${session.title} — ${session.subtitle} (${statusLabel(session.status)})`
       }
     >
@@ -103,6 +127,7 @@ function TerminalTab({
           className={cn('h-3.5 w-3.5 shrink-0', dead ? 'text-[var(--color-muted-foreground)]' : 'text-cyan-300')}
         />
       ) : null}
+      {agent ? <AgentStatusBadge status={agent.status} /> : null}
       {editing ? (
         <input
           ref={inputRef}
@@ -149,7 +174,9 @@ function TerminalTab({
           // colour-only and aria-hidden.
           aria-label={
             agent
-              ? `${session.title}, ${agent.type} agent (${statusLabel(session.status)})`
+              ? `${session.title}, ${agent.type} agent, run ${agentStatusLabel(agent.status)} (shell ${statusLabel(
+                  session.status
+                )})`
               : `${session.title} (${statusLabel(session.status)})`
           }
           aria-keyshortcuts="F2"
@@ -214,10 +241,11 @@ export function TerminalTabBar() {
 
   return (
     <div className="flex items-center gap-2">
-      {/* "Shells" label and "+" sit OUTSIDE the scroll strip so they stay
-          pinned when the tabs overflow horizontally. */}
+      {/* "Sessions" label and "+" sit OUTSIDE the scroll strip so they stay
+          pinned when the tabs overflow horizontally. The strip now mixes
+          plain shells and agent tabs, so it's labelled for both. */}
       <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-[var(--color-muted-foreground)]">
-        Shells
+        Sessions
       </span>
       <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
         {sessions.map((session) => (
