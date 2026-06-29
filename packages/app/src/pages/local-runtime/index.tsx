@@ -21,10 +21,10 @@ import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/c
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
+import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
-import { TerminalDrawer } from './terminal-drawer';
 import type {
   EgressEvent,
   EgressPolicy,
@@ -315,6 +315,7 @@ function NewVmButton({ existing, onAdd }: { existing: string[]; onAdd: (name: st
 // switcher, and workload views treat it like any other target.
 function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummary }) {
   const host = useHost();
+  const terminals = useTerminalSessions();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
@@ -339,7 +340,6 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
   const [devMode, setDevMode] = React.useState(false);
   // Host folder to share into /persist/workspace on the next dev boot.
   const [mountPath, setMountPath] = React.useState<string | null>(null);
-  const [shellOpen, setShellOpen] = React.useState(false);
   const logRef = React.useRef<HTMLPreElement | null>(null);
 
   React.useEffect(() => {
@@ -625,7 +625,14 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setShellOpen(true)}
+                  onClick={() =>
+                    terminals.openSession({
+                      target: name,
+                      engine: 'microvm',
+                      clusterName: name,
+                      mode: status.dev ? 'dev' : 'host',
+                    })
+                  }
                   disabled={busy !== null}
                   title={
                     status.dev
@@ -648,16 +655,6 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
       {clusterServing ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
-
-      {shellOpen ? (
-        <TerminalDrawer
-          target={name}
-          engine="microvm"
-          clusterName={name}
-          mode={status?.dev ? 'dev' : 'host'}
-          onClose={() => setShellOpen(false)}
-        />
-      ) : null}
     </EngineCard>
   );
 }
@@ -1414,9 +1411,9 @@ function PreflightRow({
 
 function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: string }) {
   const host = useHost();
+  const terminals = useTerminalSessions();
   const queryClient = useQueryClient();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
-  const [shellPod, setShellPod] = React.useState<LocalPodInfo | null>(null);
 
   // Workloads + pod logs now read through the in-VM api-server (the same
   // signed ApplianceClient that powers projects/deployments) instead of
@@ -1484,7 +1481,15 @@ function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: str
         ) : data ? (
           <div className="space-y-5">
             <DeploymentsTable deployments={data.deployments} />
-            <PodsTable pods={data.pods} onLogs={setActivePod} onShell={host.terminal ? setShellPod : undefined} />
+            <PodsTable
+              pods={data.pods}
+              onLogs={setActivePod}
+              onShell={
+                host.terminal
+                  ? (pod) => terminals.openSession({ target: pod.name, engine: 'microvm', clusterName: vmName })
+                  : undefined
+              }
+            />
             <ServicesTable services={data.services} />
           </div>
         ) : null}
@@ -1492,14 +1497,6 @@ function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: str
 
       {activePod && client ? (
         <PodLogsDrawer pod={activePod} client={client} onClose={() => setActivePod(null)} />
-      ) : null}
-      {shellPod ? (
-        <TerminalDrawer
-          target={shellPod.name}
-          engine="microvm"
-          clusterName={vmName}
-          onClose={() => setShellPod(null)}
-        />
       ) : null}
     </>
   );

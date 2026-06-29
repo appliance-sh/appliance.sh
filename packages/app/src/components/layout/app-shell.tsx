@@ -3,6 +3,7 @@ import { NavLink, Outlet } from 'react-router';
 import { LayoutDashboard, Folder, Box, Rocket, Settings, Server } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
+import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 
 type NavItem = {
@@ -80,6 +81,11 @@ export function AppShell() {
       <main className="col-start-2 overflow-auto p-6">
         <Outlet />
       </main>
+
+      {/* Persistent terminal layer — OUTSIDE the `<Outlet/>` so navigating
+          never unmounts the active shell. Its sessions live in
+          `TerminalSessionsProvider`; this only shows/hides the view. */}
+      <TerminalLayer />
     </div>
   );
 }
