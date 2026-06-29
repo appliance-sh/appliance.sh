@@ -15,24 +15,44 @@ use std::net::Shutdown;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-/// Connect to the VM's shell socket and run a shell. With `command`,
-/// run it and exit; otherwise an interactive login shell. `root` lands a
-/// root shell (the escape hatch) instead of dropping to the non-root
-/// `appliance` user. Returns the process exit code to propagate.
-pub fn run_client(name: &str, command: Option<&str>, root: bool) -> Result<i32> {
+/// Connect to a VM's shell socket, or a clear error when the relay isn't
+/// up (VM down, or booted by a non-vsock engine).
+fn connect(name: &str) -> Result<UnixStream> {
     let sock = VmPaths::for_name(name).shell_sock();
-    let mut stream = UnixStream::connect(&sock).map_err(|e| {
+    UnixStream::connect(&sock).map_err(|e| {
         anyhow!(
             "no shell channel for VM '{name}' ({e}).\n\
              Is it running? (appliance vm up) — the vsock shell needs a VM booted with this engine."
         )
-    })?;
+    })
+}
+
+/// Connect to the VM's shell socket and run a shell. With `command`,
+/// run it and exit; otherwise an interactive login shell. `root` lands a
+/// root shell (the escape hatch) instead of dropping to the non-root
+/// `appliance` user. `session` attaches to (or creates) a reattachable
+/// tmux session `<id>` that survives this client disconnecting — an
+/// interactive-only addition, so it's silently dropped when a one-shot
+/// `command` is given (that path must stay the byte-for-byte sentinel
+/// shell). Returns the process exit code to propagate.
+pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option<&str>) -> Result<i32> {
+    let mut stream = connect(name)?;
 
     // The agent applies this as the guest PTY size before the shell. A
     // trailing `root` token requests a root shell; the agent strips it
-    // and skips the `su` drop to the appliance user.
+    // and skips the `su` drop to the appliance user. An optional `attach
+    // <id>` verb (interactive only) routes to a reattachable tmux session
+    // instead — never on the one-shot path, which keeps the pristine
+    // sentinel shell.
     let (rows, cols) = term_size();
-    writeln!(stream, "rows {rows} cols {cols}{}", if root { " root" } else { "" })?;
+    let verb = match (command, session) {
+        (None, Some(id)) => {
+            validate_session_id(id)?;
+            format!(" attach {id}")
+        }
+        _ => String::new(),
+    };
+    writeln!(stream, "rows {rows} cols {cols}{}{}", if root { " root" } else { "" }, verb)?;
     if let Some(cmd) = command {
         // The vsock relay is a raw byte pipe with no status channel, so
         // carry the command's exit code back in-band: run it, print a
@@ -73,6 +93,85 @@ pub fn run_client(name: &str, command: Option<&str>, root: bool) -> Result<i32> 
     }
     let _ = std::io::copy(&mut sock_to_out, &mut out);
     Ok(0)
+}
+
+/// A reattachable tmux session, as reported by `sessions list`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SessionInfo {
+    /// The host-minted id (the in-guest `appliance-` prefix stripped).
+    pub id: String,
+    /// tmux `session_activity` (Unix epoch seconds), when parseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<i64>,
+}
+
+/// List the VM's reattachable sessions on the appliance-user socket. A
+/// short-lived connection: send the `list` verb, read the agent's
+/// `appliance-<id> <activity>` lines to EOF, parse them clean. No raw
+/// mode, no sentinel — the connection closing is the whole protocol.
+pub fn list_sessions(name: &str) -> Result<Vec<SessionInfo>> {
+    let mut stream = connect(name)?;
+    let (rows, cols) = term_size();
+    writeln!(stream, "rows {rows} cols {cols} list")?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut out = String::new();
+    stream.read_to_string(&mut out)?;
+    Ok(parse_session_list(&out))
+}
+
+/// Kill one reattachable session by id on the appliance-user socket.
+pub fn kill_session(name: &str, id: &str) -> Result<()> {
+    validate_session_id(id)?;
+    let mut stream = connect(name)?;
+    let (rows, cols) = term_size();
+    writeln!(stream, "rows {rows} cols {cols} kill {id}")?;
+    stream.shutdown(Shutdown::Write)?;
+    // Drain to EOF so the kill actually runs before we drop the socket.
+    let mut sink = Vec::new();
+    stream.read_to_end(&mut sink)?;
+    Ok(())
+}
+
+/// Parse the agent's `list` output — one `appliance-<id> <activity>` line
+/// per session — into clean `SessionInfo`s. The PTY translates `\n` to
+/// `\r\n`, so trim the carriage return; lines without the `appliance-`
+/// prefix (a blank line, a stray banner) are dropped.
+fn parse_session_list(raw: &str) -> Vec<SessionInfo> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r').trim();
+            let (sess_name, activity) = match line.split_once(' ') {
+                Some((n, a)) => (n, Some(a)),
+                None => (line, None),
+            };
+            let id = sess_name.strip_prefix("appliance-")?;
+            if id.is_empty() {
+                return None;
+            }
+            Some(SessionInfo {
+                id: id.to_string(),
+                last_activity: activity.and_then(|s| s.trim().parse::<i64>().ok()),
+            })
+        })
+        .collect()
+}
+
+/// Session ids ride verbatim into the single-line handshake and the
+/// in-guest `appliance-<id>` tmux session name. Restrict the charset so a
+/// stray space (which would split the handshake) or newline (which would
+/// inject a second line onto the agent's stdin) can never get through.
+/// Host-minted ids — desktop tab uuids, CLI names — already satisfy this.
+fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("session id must not be empty");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid session id '{id}': use only letters, digits, '-', '_', '.'");
+    }
+    Ok(())
 }
 
 /// Marker the one-shot command appends as `\n<RC_MARK><n>__END__\n`.
@@ -233,5 +332,54 @@ mod tests {
         let code = pump_until_sentinel(&mut &b""[..], &mut out);
         assert_eq!(code, 255);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parses_session_list_stripping_prefix_and_cr() {
+        // PTY output: `appliance-<id> <activity>\r\n` per session.
+        let raw = "appliance-build 1700000000\r\nappliance-notes 1700000123\r\n";
+        let got = parse_session_list(raw);
+        assert_eq!(
+            got,
+            vec![
+                SessionInfo { id: "build".into(), last_activity: Some(1_700_000_000) },
+                SessionInfo { id: "notes".into(), last_activity: Some(1_700_000_123) },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_list_drops_noise_and_tolerates_missing_activity() {
+        // Blank lines, a non-appliance banner, and a bare name (no
+        // activity field) must not crash or leak — only real sessions
+        // survive, with a missing activity left as None.
+        let raw = "\nno server running on /tmp/tmux-1000/appliance\nappliance-solo\n\r\n";
+        let got = parse_session_list(raw);
+        assert_eq!(got, vec![SessionInfo { id: "solo".into(), last_activity: None }]);
+        // Empty input → empty list.
+        assert!(parse_session_list("").is_empty());
+    }
+
+    #[test]
+    fn session_info_serializes_compactly() {
+        // The desktop/CLI consume this as JSON; a missing activity is
+        // omitted rather than serialized as null.
+        let with = serde_json::to_string(&SessionInfo { id: "a".into(), last_activity: Some(42) }).unwrap();
+        assert_eq!(with, r#"{"id":"a","last_activity":42}"#);
+        let without = serde_json::to_string(&SessionInfo { id: "a".into(), last_activity: None }).unwrap();
+        assert_eq!(without, r#"{"id":"a"}"#);
+    }
+
+    #[test]
+    fn validates_session_ids() {
+        // Safe ids: uuids, names, dotted/underscored.
+        for ok in ["build", "tab-1", "a_b.c", "550e8400-e29b-41d4-a716-446655440000"] {
+            assert!(validate_session_id(ok).is_ok(), "{ok} should be valid");
+        }
+        // Rejected: empty, and anything that could break the single-line
+        // handshake (space, newline) or the tmux target (slash, colon).
+        for bad in ["", "has space", "two\nlines", "a/b", "a:b", "semi;rm"] {
+            assert!(validate_session_id(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

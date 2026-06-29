@@ -385,7 +385,7 @@ PROFILE
   rm -f /persist/.dev-ready
   apk update --no-progress >/dev/null 2>&1 || true
   if apk add --no-progress \
-      bash bash-completion git git-lfs curl wget vim nano less tmux htop \
+      bash bash-completion git git-lfs curl wget vim nano less htop \
       jq ripgrep tar gzip coreutils findutils grep sed gawk procps \
       openssh-client ca-certificates build-base python3 py3-pip nodejs npm; then
     echo "appliance-dev: toolchain ready"
@@ -519,16 +519,60 @@ fi
 /// login shell `su` execs inherits the same PTY stdin/stdout, so the
 /// host's trailing `printf '…__APPLIANCE_VM_RC__%d__END__…' "$?"` still
 /// runs in that shell with the command's real `$?`.
+///
+/// An optional trailing **verb** extends the grammar to
+/// `rows R cols C [root] [attach <id> | new <id> | list | kill <id>]`,
+/// routing to a reattachable tmux session instead of a raw login shell.
+/// The verb is stripped *before* the `root` token, so with no verb the
+/// parsing — and therefore the one-shot sentinel + clock-sync `root`
+/// paths — is byte-for-byte what it was. attach/new attach-or-create the
+/// per-id session `appliance-<id>`; list/kill enumerate/remove. Non-root
+/// sessions run as the `appliance` user on the `tmux -L appliance` socket;
+/// `root` swaps to a separate root-owned `tmux -L appliance-root` socket,
+/// so the two privilege levels can never cross-attach. The vsock relay
+/// stays a dumb per-connect byte pipe — the durable state is this in-guest
+/// tmux server, which is what survives a disconnect / desktop restart.
 const SHELL_AGENT: &str = r#"#!/bin/sh
 # appliance-vm shell agent — one login shell per vsock connection.
 # Runs as root (socat EXEC), sizes the PTY, then drops to `appliance`
 # unless the caller appended a `root` token to the size line.
 stty -echo 2>/dev/null
 IFS= read -r __SZ
+# Optional trailing session verb (attach/new/list/kill). Parsed first so
+# the grammar is `rows R cols C [root] [verb …]`; with NO verb this whole
+# block is a no-op and the legacy one-shot/login path below is unchanged.
+__VERB=''; __SID=''
+case "$__SZ" in
+  *" attach "*) __SID="${__SZ##* attach }"; __SZ="${__SZ% attach *}"; __VERB=attach;;
+  *" new "*)    __SID="${__SZ##* new }";    __SZ="${__SZ% new *}";    __VERB=new;;
+  *" kill "*)   __SID="${__SZ##* kill }";   __SZ="${__SZ% kill *}";   __VERB=kill;;
+  *" list")     __SZ="${__SZ% list}";       __VERB=list;;
+esac
 __ROOT=0
 case "$__SZ" in *" root") __ROOT=1; __SZ="${__SZ% root}";; esac
 [ -n "$__SZ" ] && stty $__SZ 2>/dev/null
 stty echo 2>/dev/null
+# Reattachable sessions: a verb routes to the tmux multiplexer. Non-root
+# sessions run as `appliance` on the `appliance` socket; root keeps a
+# separate `appliance-root` socket. attach/new exec tmux (replacing this
+# agent), so a disconnect detaches but leaves the session running; list/
+# kill are one-shots that print/act and close. login (`-l`) only on the
+# interactive attach/new path — list/kill stay non-login so profile output
+# can't corrupt the machine-readable session list.
+if [ -n "$__VERB" ]; then
+  if [ "$__ROOT" = 1 ]; then __L=appliance-root; else __L=appliance; fi
+  __TMUX="tmux -L $__L -f /etc/appliance/tmux.conf"
+  case "$__VERB" in
+    list) __TCMD="$__TMUX list-sessions -F '#{session_name} #{session_activity}' 2>/dev/null"; __LOGIN='';;
+    kill) __TCMD="$__TMUX kill-session -t appliance-$__SID 2>/dev/null"; __LOGIN='';;
+    *)    __TCMD="exec $__TMUX new-session -A -s appliance-$__SID"; __LOGIN='-l';;
+  esac
+  if [ "$__ROOT" = 1 ]; then
+    exec sh -c "$__TCMD"
+  else
+    exec su -s /bin/sh $__LOGIN -c "$__TCMD" appliance
+  fi
+fi
 if command -v bash >/dev/null 2>&1; then __SH=/bin/bash; else __SH=/bin/sh; fi
 if [ "$__ROOT" = 1 ]; then
   cd /persist/workspace 2>/dev/null || cd /root 2>/dev/null || cd /
@@ -538,6 +582,18 @@ fi
 # (=/persist/workspace). Same PTY stdin/stdout → the one-shot sentinel
 # still runs here with the command's real $?. (busybox su supports -s/-l.)
 exec su -s "$__SH" -l appliance
+"#;
+
+/// Transparent tmux config the shell agent points `-f` at for every
+/// reattachable session. No status bar (the desktop owns the chrome), a
+/// short escape-time so key passthrough feels raw, a large scrollback that
+/// survives detach/reattach, and `destroy-unattached off` so a session
+/// lives on while no client is attached — the whole point of reattach.
+const TMUX_CONF: &str = r#"set -g status off
+set -g default-terminal "tmux-256color"
+set -g escape-time 10
+set -g history-limit 50000
+set -g destroy-unattached off
 "#;
 
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
@@ -580,10 +636,14 @@ fn build_apkovl(
     // sudo gives the non-root `appliance` user passwordless escalation
     // (wheel + /etc/sudoers.d); the diskless init installs it from the
     // network repo before appliance.start provisions the user.
+    // tmux backs the reattachable shell sessions (appliance vm shell
+    // --session / sessions): an in-guest multiplexer whose named sessions
+    // survive a client disconnect + desktop restart. Unconditional, like
+    // the shell agent itself — every VM, not just dev VMs.
     file(
         "etc/apk/world",
         0o644,
-        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\n",
+        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\ntmux\n",
     )?;
     file(
         "etc/apk/repositories",
@@ -625,6 +685,8 @@ fn build_apkovl(
     // The vsock shell agent (socat EXEC target). Always present — every
     // VM gets a k3s-independent host shell.
     file("usr/local/bin/appliance-shell-agent", 0o755, SHELL_AGENT.as_bytes())?;
+    // Transparent tmux config for the agent's reattachable sessions.
+    file("etc/appliance/tmux.conf", 0o644, TMUX_CONF.as_bytes())?;
 
     // The per-VM egress CA, trusted node-wide by appliance.start's
     // update-ca-certificates step. Placed even when interception is
@@ -983,6 +1045,64 @@ mod tests {
         // directly, not via su.
         assert!(agent.contains("*\" root\")"), "root token is stripped from the size line");
         assert!(agent.contains("exec \"$__SH\" -l"), "root branch keeps a root login shell");
+    }
+
+    #[test]
+    fn tmux_is_in_the_base_world_set() {
+        // The reattachable-session multiplexer ships on EVERY VM (not just
+        // dev VMs), next to socat/sudo — the feature is unconditional.
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
+        assert!(world.lines().any(|l| l == "tmux"), "tmux must be in the base world set");
+    }
+
+    #[test]
+    fn transparent_tmux_conf_is_baked_in() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let conf = apkovl_file(&ovl, "etc/appliance/tmux.conf").expect("tmux.conf present");
+        // Invisible multiplexer: no status bar, short escape passthrough,
+        // large scrollback, and sessions outlive a detach.
+        assert!(conf.contains("status off"));
+        assert!(conf.contains("history-limit 50000"));
+        assert!(conf.contains("destroy-unattached off"));
+        // The agent points `-f` at exactly this path.
+        let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
+        assert!(agent.contains("-f /etc/appliance/tmux.conf"));
+    }
+
+    #[test]
+    fn shell_agent_routes_session_verbs_to_tmux() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
+
+        // The four verbs are parsed off the size line.
+        assert!(agent.contains("*\" attach \"*)"), "attach verb parsed");
+        assert!(agent.contains("*\" new \"*)"), "new verb parsed");
+        assert!(agent.contains("*\" kill \"*)"), "kill verb parsed");
+        assert!(agent.contains("*\" list\")"), "list verb parsed");
+        // attach/new is attach-or-create on the named per-id session.
+        assert!(agent.contains("new-session -A -s appliance-$__SID"));
+        assert!(agent.contains("list-sessions"));
+        assert!(agent.contains("kill-session -t appliance-$__SID"));
+        // Two owner-isolated sockets: appliance (default) vs appliance-root.
+        assert!(agent.contains("__L=appliance-root"));
+        assert!(agent.contains("else __L=appliance"));
+        // Non-root sessions drop to the appliance user; root keeps a root
+        // tmux on its own socket (no su).
+        assert!(agent.contains("exec su -s /bin/sh $__LOGIN -c \"$__TCMD\" appliance"));
+        assert!(agent.contains("exec sh -c \"$__TCMD\""));
+
+        // CRITICAL: the verb block is gated on a verb being present, so the
+        // no-verb one-shot/login path is byte-for-byte the legacy behavior.
+        assert!(agent.contains("if [ -n \"$__VERB\" ]; then"));
+        // The verb parse sits before the `root` parse (grammar order) and
+        // before the legacy shell selection, so a verb-less line lands on
+        // the unchanged path.
+        let verb_at = agent.find("__VERB=''").unwrap();
+        let root_at = agent.find("case \"$__SZ\" in *\" root\")").unwrap();
+        let legacy_su_at = agent.find("exec su -s \"$__SH\" -l appliance").unwrap();
+        assert!(verb_at < root_at, "verb parse precedes the root-token parse");
+        assert!(root_at < legacy_su_at, "legacy drop-to-appliance is still the fall-through");
     }
 
     #[test]

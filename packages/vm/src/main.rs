@@ -125,9 +125,20 @@ enum Cmd {
         /// Land a root shell instead of dropping to the `appliance` user.
         #[arg(long, default_value_t = false)]
         root: bool,
+        /// Attach to (or create) a reattachable named session `<id>`
+        /// (tmux): it survives this client disconnecting and a desktop
+        /// restart while the VM runs. Interactive only — ignored when a
+        /// trailing command is given.
+        #[arg(long, short = 's')]
+        session: Option<String>,
         /// Command to run instead of an interactive shell.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+    /// List or kill reattachable shell sessions (tmux) inside the VM.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsCmd,
     },
     /// Print the VM's console log (boot log, kernel messages).
     Console {
@@ -151,6 +162,22 @@ enum Cmd {
     Creds {
         #[command(subcommand)]
         action: CredsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsCmd {
+    /// List the VM's reattachable shell sessions as JSON.
+    List {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Kill a reattachable shell session by id.
+    Kill {
+        /// Session id (as shown by `sessions list`).
+        id: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
     },
 }
 
@@ -647,11 +674,13 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        Cmd::Shell { name, root, command } => {
+        Cmd::Shell { name, root, command, session } => {
             let cmd = (!command.is_empty()).then(|| command.join(" "));
-            let code = shell::run_client(&name, cmd.as_deref(), root)?;
+            let code = shell::run_client(&name, cmd.as_deref(), root, session.as_deref())?;
             std::process::exit(code);
         }
+
+        Cmd::Sessions { action } => run_sessions(action),
 
         Cmd::Console { name, follow } => {
             let paths = VmPaths::for_name(&name);
@@ -690,6 +719,21 @@ fn run() -> Result<()> {
         Cmd::Egress { action } => run_egress(action),
 
         Cmd::Creds { action } => run_creds(action),
+    }
+}
+
+fn run_sessions(action: SessionsCmd) -> Result<()> {
+    match action {
+        SessionsCmd::List { name } => {
+            let sessions = shell::list_sessions(&name)?;
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            Ok(())
+        }
+        SessionsCmd::Kill { id, name } => {
+            shell::kill_session(&name, &id)?;
+            println!("killed session '{id}' in VM '{name}'");
+            Ok(())
+        }
     }
 }
 

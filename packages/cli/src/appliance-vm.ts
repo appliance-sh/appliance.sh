@@ -279,12 +279,18 @@ function shellSock(name: string): string {
  *  (`appliance-vm shell`, no k3s, no debugger pod) when its relay socket
  *  is up, and falling back to the kubectl-debug host shell otherwise
  *  (older VMs, or while the guest agent is still starting). `fallback`
- *  is the chroot argv used on the kubectl path. */
-function runInteractiveShell(name: string, fallback: string[], root = false): number {
+ *  is the chroot argv used on the kubectl path. `session`, when set,
+ *  attaches to (or creates) a reattachable tmux session over the vsock
+ *  path; it has no equivalent on the kubectl fallback, so it's dropped
+ *  there. */
+function runInteractiveShell(name: string, fallback: string[], root = false, session?: string): number {
   if (fs.existsSync(shellSock(name))) {
     // The vsock agent drops to the non-root `appliance` user by default;
     // `--root` lands a root shell via the agent's escape hatch.
-    const args = root ? ['shell', name, '--root'] : ['shell', name];
+    // `--session` rides the agent's tmux attach-or-create path.
+    const args = ['shell', name];
+    if (root) args.push('--root');
+    if (session) args.push('--session', session);
     const r = spawnSync(vmBinary(), args, { stdio: 'inherit' });
     return r.status ?? 1;
   }
@@ -326,18 +332,43 @@ function hostExec(name: string, command: string): { status: number; stdout: stri
 program
   .command('shell')
   .description(
-    'open a shell inside the VM as the non-root appliance user (--root for root; or run one command: appliance vm shell -- uname -a)'
+    'open a shell inside the VM as the non-root appliance user (--root for root; --session <id> for a reattachable session; or run one command: appliance vm shell -- uname -a)'
   )
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--root', 'land a root shell instead of the non-root appliance user', false)
+  .option(
+    '-s, --session <id>',
+    'attach to (or create) a reattachable named session that survives this client disconnecting'
+  )
   .argument('[command...]', 'command to run instead of an interactive shell')
-  .action((command: string[], opts: { name: string; root: boolean }) => {
+  .action((command: string[], opts: { name: string; root: boolean; session?: string }) => {
     // One-shot commands go through kubectl-debug `sh -c` (clean output +
-    // an exit code); an interactive shell prefers the fast vsock path.
+    // an exit code); an interactive shell prefers the fast vsock path,
+    // and only that path carries a reattachable --session.
     if (command.length) {
       process.exit(runHostShell(opts.name, ['/bin/sh', '-c', command.join(' ')]));
     }
-    process.exit(runInteractiveShell(opts.name, ['/bin/sh'], opts.root));
+    process.exit(runInteractiveShell(opts.name, ['/bin/sh'], opts.root, opts.session));
+  });
+
+// ---- sessions (reattachable shell sessions) ----------------------------
+
+const sessions = program.command('sessions').description('manage reattachable shell sessions (tmux) inside the VM');
+
+sessions
+  .command('list')
+  .description("list the VM's reattachable shell sessions as JSON")
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['sessions', 'list', opts.name]));
+  });
+
+sessions
+  .command('kill <id>')
+  .description('kill a reattachable shell session by id')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((id: string, opts: { name: string }) => {
+    process.exit(runVm(['sessions', 'kill', id, '--name', opts.name]));
   });
 
 function cleanupNodeDebuggerPods(kubeconfig: string, nodeName: string): void {
