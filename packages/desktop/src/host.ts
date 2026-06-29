@@ -36,6 +36,7 @@ import type {
   StateDemotionOptions,
   StatePromotionInput,
   StatePromotionOptions,
+  TeardownInput,
   EgressPolicy,
   EgressEvent,
   CredentialsState,
@@ -154,6 +155,11 @@ export const tauriHost: ConsoleHost = {
     },
     async listAwsProfiles(): Promise<AwsProfile[]> {
       return invoke<AwsProfile[]>('list_aws_profiles');
+    },
+    async teardown(input: TeardownInput, onEvent: (event: BootstrapEvent) => void): Promise<void> {
+      const channel = new Channel<BootstrapEvent>();
+      channel.onmessage = onEvent;
+      await invoke('teardown_cluster', { input: { input }, onEvent: channel });
     },
   },
 

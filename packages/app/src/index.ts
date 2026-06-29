@@ -7,6 +7,7 @@ export type {
   Cluster,
   AddClusterInput,
   AwsProfile,
+  TeardownInput,
   BootstrapHost,
   BootstrapInput,
   BootstrapOptions,

@@ -1,3 +1,5 @@
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   latestGhcrTag,
   runApiServerUpdate,
@@ -5,6 +7,7 @@ import {
   runBootstrap,
   runStateDemotion,
   runStatePromotion,
+  runTeardown,
   type ApiServerUpdateInput,
   type ApiServerUpdateOptions,
   type BaselineUpdateInput,
@@ -59,6 +62,14 @@ type SidecarInput =
   | {
       kind: 'latest-version';
       input?: LatestGhcrTagInput;
+    }
+  | {
+      kind: 'teardown';
+      // Teardown operates on the installer state in the cache dir, not
+      // on a specific cluster record — the only knob is the AWS profile
+      // to authenticate the destroy with. `cacheDir` defaults to
+      // ~/.appliance (the desktop never overrides it).
+      input?: { awsProfile?: string; cacheDir?: string };
     };
 
 async function readStdin(): Promise<string> {
@@ -134,6 +145,17 @@ async function main(): Promise<void> {
       case 'latest-version': {
         const version = await latestGhcrTag(parsed.input ?? {});
         emit({ type: 'result', result: { version } });
+        break;
+      }
+      case 'teardown': {
+        // Mirror the CLI's default: the desktop's installer state lives
+        // in ~/.appliance unless explicitly overridden.
+        await runTeardown({
+          cacheDir: parsed.input?.cacheDir ?? path.join(os.homedir(), '.appliance'),
+          awsProfile: parsed.input?.awsProfile,
+          emit: onEvent,
+        });
+        emit({ type: 'result', result: {} });
         break;
       }
       default: {

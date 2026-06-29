@@ -161,6 +161,7 @@ $RECYCLE.BIN/
 # only when the team agrees on a recommended set).
 .vscode/
 .history/
+venv/
 
 # Nx
 .nx/cache

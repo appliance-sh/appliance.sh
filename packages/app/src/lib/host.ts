@@ -125,6 +125,19 @@ export interface BootstrapHost {
    */
   latestApiServerVersion?(input?: LatestGhcrTagInput): Promise<{ version: string }>;
   /**
+   * Destroy the installer stack this device bootstrapped — the inverse
+   * of `run`. Runs `pulumi destroy` against the installer state cached
+   * in `~/.appliance` and archives the local state, tearing down the
+   * base AWS infrastructure (Route53 zone, CloudFront, ACM cert, edge
+   * router Lambda, S3 state + data buckets, ECR repo, IAM roles).
+   * Does NOT destroy user-deployed appliances — those live in a
+   * separate Pulumi project and must be destroyed first or their AWS
+   * resources are orphaned. Optional — only the desktop host (which
+   * can drive the Node sidecar + local Pulumi) implements it; the UI
+   * hides the destroy affordance when it's absent.
+   */
+  teardown?(input: TeardownInput, onEvent: (event: BootstrapEvent) => void): Promise<void>;
+  /**
    * Enumerate AWS profiles from `~/.aws/config` + `~/.aws/credentials`
    * for the wizard's profile picker. Optional — hosts without
    * filesystem access (web shell) can omit it; the wizard then
@@ -139,6 +152,15 @@ export interface AwsProfile {
   isSso: boolean;
   /** Which file the profile was found in. */
   source: 'config' | 'credentials';
+}
+
+export interface TeardownInput {
+  /**
+   * AWS profile to authenticate the destroy with (matches the profile
+   * used at bootstrap time). Empty/omitted → the shell's ambient AWS
+   * environment.
+   */
+  awsProfile?: string;
 }
 
 /** A pending self-update the updater feed advertised — the running app

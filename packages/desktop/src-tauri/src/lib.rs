@@ -1337,6 +1337,35 @@ async fn latest_api_server_version(
     invoke_sidecar(serde_json::Value::Object(payload), on_event).await
 }
 
+/// Destroy the installer stack this device bootstrapped (the inverse of
+/// `run_bootstrap`). The sidecar runs `pulumi destroy` against the
+/// installer state in `~/.appliance` and archives the local state. This
+/// only tears down the base AWS infrastructure — user-deployed
+/// appliances live in a separate Pulumi project and must be destroyed
+/// first. The frontend forgets the local cluster registration once this
+/// resolves.
+#[tauri::command]
+async fn teardown_cluster(
+    input: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut payload = match input {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => {
+            return Err(format!(
+                "teardown_cluster expected an object or null input, got: {}",
+                other
+            ))
+        }
+    };
+    payload.insert(
+        "kind".to_string(),
+        serde_json::Value::String("teardown".to_string()),
+    );
+    invoke_sidecar(serde_json::Value::Object(payload), on_event).await
+}
+
 // Default cluster name + namespace the desktop's runtime-config
 // resolution falls back to. `appliance-local` doubles as the
 // "unset cluster name" sentinel kube_target_args maps to the
@@ -4503,6 +4532,7 @@ pub fn run() {
             update_api_server,
             update_baseline,
             latest_api_server_version,
+            teardown_cluster,
             local_helper_install,
             local_preflight,
             start_container_runtime,

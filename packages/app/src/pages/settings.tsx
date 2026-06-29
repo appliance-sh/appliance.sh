@@ -151,6 +151,7 @@ function ClusterRow({
 }) {
   const host = useHost();
   const canPromote = Boolean(host.bootstrap?.promoteState);
+  const canTeardown = Boolean(host.bootstrap?.teardown);
 
   return (
     <li className="px-3 py-2">
@@ -188,6 +189,11 @@ function ClusterRow({
           <UpdateApiServerPanel cluster={cluster} />
           <StateMigrationPanel cluster={cluster} direction="promote" />
           <StateMigrationPanel cluster={cluster} direction="demote" />
+          {/* Teardown reads installer state from this device's
+              ~/.appliance cache, so it's only meaningful for clusters
+              bootstrapped here (lastBootstrapInput is the signal). A
+              Connect-added cluster has no local state to destroy. */}
+          {canTeardown && cluster.lastBootstrapInput ? <DestroyClusterPanel cluster={cluster} /> : null}
         </>
       ) : canPromote ? (
         <div className="ml-7 mt-2 rounded-md border border-dashed border-[var(--color-border)] p-3 text-xs text-[var(--color-muted-foreground)]">
@@ -859,6 +865,149 @@ async function setClusterStateBackendIfPossible(
     // Best-effort: caching the URL is convenience, not correctness.
     // Failure here doesn't affect the state migration that succeeded.
   }
+}
+
+/**
+ * Destroy the cluster's base AWS infrastructure from the desktop — the
+ * inverse of the bootstrap wizard. Drives `host.bootstrap.teardown`,
+ * which runs `pulumi destroy` against the installer state cached in
+ * `~/.appliance`. Gated (by the caller) to clusters this device
+ * bootstrapped. On success the local registration is forgotten so the
+ * dead cluster drops off the list.
+ */
+function DestroyClusterPanel({ cluster }: { cluster: Cluster }) {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
+  const [status, setStatus] = React.useState<RunStatus>('idle');
+  const [logs, setLogs] = React.useState<string[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const [awsProfile, setAwsProfile] = React.useState('');
+
+  const profilesQuery = useQuery({
+    queryKey: ['aws-profiles'],
+    enabled: Boolean(host.bootstrap?.listAwsProfiles),
+    queryFn: () => host.bootstrap!.listAwsProfiles!(),
+  });
+  const profiles = profilesQuery.data ?? [];
+  const canEnumerateProfiles = Boolean(host.bootstrap?.listAwsProfiles);
+
+  const handleEvent = React.useCallback((e: BootstrapEvent) => {
+    switch (e.type) {
+      case 'log':
+        setLogs((prev) => [...prev, e.message]);
+        break;
+      case 'phase-failed':
+        setLogs((prev) => [...prev, `phase failed: ${e.error}`]);
+        break;
+      case 'resource':
+        if (e.op === 'same') return;
+        setLogs((prev) => [...prev, `${e.op.padEnd(7)} ${e.resourceType}  ${e.name}`]);
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const onRun = async () => {
+    if (!host.bootstrap?.teardown) return;
+    const ok = await confirm({
+      title: `Destroy cluster "${cluster.name}"?`,
+      description:
+        'This runs pulumi destroy against the installer stack and tears down every base AWS resource it created ' +
+        '(Route53 zone, CloudFront distribution, ACM certificate, edge router Lambda, S3 state + data buckets, ECR ' +
+        'repository, IAM roles). User-deployed appliances live in a separate project and are NOT destroyed — destroy ' +
+        'them first or their AWS resources will be orphaned. This cannot be undone.',
+      confirmLabel: 'Destroy cluster',
+    });
+    if (!ok) return;
+    setStatus('running');
+    setLogs([]);
+    setError(null);
+    try {
+      await host.bootstrap.teardown({ awsProfile: awsProfile || undefined }, handleEvent);
+      setStatus('succeeded');
+      toast(`Cluster "${cluster.name}" destroyed`);
+      // The infra is gone, so the local (URL, key) registration is now
+      // stale — forget it so the dead cluster drops off the list. Best
+      // effort: a failure to forget doesn't undo the successful destroy.
+      try {
+        await host.removeCluster(cluster.id);
+        await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      } catch {
+        // Leave the row in place; the user can remove it manually.
+      }
+    } catch (err) {
+      setStatus('failed');
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="ml-7 mt-2 space-y-2 rounded-md border border-red-500/40 p-3">
+      <div>
+        <div className="text-sm font-medium text-red-400">Destroy cluster</div>
+        <div className="text-xs text-[var(--color-muted-foreground)]">
+          Tear down this cluster&apos;s base AWS infrastructure (the inverse of bootstrap) using the installer state on
+          this device. Destroy any deployed appliances first — they live in a separate Pulumi project and would
+          otherwise be orphaned. The local Pulumi state is archived, so the operation is reversible if something was
+          torn down by mistake.
+        </div>
+      </div>
+
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">AWS profile</span>
+        {canEnumerateProfiles ? (
+          <select
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 text-sm disabled:opacity-50"
+          >
+            <option value="">— shell environment —</option>
+            {profiles.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+                {p.isSso ? '  (SSO)' : ''}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            value={awsProfile}
+            onChange={(e) => setAwsProfile(e.target.value)}
+            placeholder="leave empty to use shell env"
+            disabled={status === 'running'}
+            className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+          />
+        )}
+      </label>
+
+      <div className="flex items-center gap-2">
+        <Button variant="destructive" size="sm" onClick={onRun} disabled={status === 'running'}>
+          <Trash2 className="h-4 w-4" />
+          {status === 'running' ? 'Destroying…' : 'Destroy cluster'}
+        </Button>
+        {status === 'succeeded' ? <span className="text-xs text-green-400">✓ Cluster destroyed</span> : null}
+        {status === 'failed' ? <span className="text-xs text-red-400">Failed</span> : null}
+      </div>
+
+      {logs.length > 0 || error ? (
+        <div className="rounded-md border border-[var(--color-border)] bg-black/30">
+          <div className="max-h-48 overflow-auto px-2 py-1.5 font-mono text-xs leading-relaxed">
+            {logs.map((l, i) => (
+              <div key={i} className="whitespace-pre-wrap">
+                {l}
+              </div>
+            ))}
+            {error ? <div className={cn('whitespace-pre-wrap', 'text-red-400')}>{error}</div> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 type UpdatePhase = 'idle' | 'checking' | 'available' | 'up-to-date' | 'downloading' | 'ready' | 'failed';

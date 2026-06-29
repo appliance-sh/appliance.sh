@@ -303,6 +303,16 @@ export function createMockHost(): ConsoleHost {
           { name: 'work-sso', isSso: true, source: 'config' as const },
         ];
       },
+      async teardown(_input, onEvent) {
+        const emit = (event: BootstrapEvent) => onEvent(event);
+        emit({ type: 'log', level: 'info', message: 'mock: destroying installer stack' });
+        await sleep(500);
+        emit({ type: 'resource', op: 'delete', resourceType: 'aws:s3/bucket:Bucket', name: 'state' });
+        await sleep(400);
+        emit({ type: 'resource', op: 'delete', resourceType: 'aws:cloudfront/distribution:Distribution', name: 'cdn' });
+        await sleep(400);
+        emit({ type: 'log', level: 'info', message: 'mock: stack destroyed' });
+      },
     },
 
     local: {
