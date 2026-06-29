@@ -223,11 +223,11 @@ export interface ConsoleHost {
   notify?(opts: { title: string; body?: string }): Promise<void>;
   bootstrap?: BootstrapHost;
   /**
-   * Local-runtime lifecycle for `appliance-base-local` clusters. The
-   * desktop drives k3d (start/stop/delete) so the api-server's
-   * LocalContainerDeploymentService can apply k8s manifests against
-   * a running cluster. Optional — the web shell has no shell access
-   * to k3d, so it can omit this entirely.
+   * Local-runtime support surface: preflight, prerequisite installs,
+   * container-runtime start, the appliance build/deploy file-picker
+   * bits, and engine-routed workload/log reads for the microVM. The
+   * microVM lifecycle itself lives under `vm`. Optional — the web
+   * shell has no shell access, so it can omit this entirely.
    */
   local?: LocalRuntimeHost;
   /**
@@ -257,7 +257,7 @@ export interface TerminalOpenOptions {
   target: string;
   namespace?: string;
   clusterName?: string;
-  /** 'microvm' routes through the microVM kubeconfig; omitted → k3d. */
+  /** 'microvm' routes through the microVM's kubeconfig. */
   engine?: 'microvm';
   /** Shell target. Absent → `kubectl exec` into the `target` pod. 'dev'
    *  → a shell in the microVM's dev workspace; 'host' → a raw root
@@ -269,6 +269,12 @@ export interface TerminalOpenOptions {
   container?: string;
   cols: number;
   rows: number;
+  /** Reattachable guest tmux session id (E3.4). Only the vsock host/dev
+   *  shell honours it — the argv gains `--session <id>` so the PTY attaches
+   *  to (or creates) the named guest tmux session `appliance-<id>`, which
+   *  survives this client disconnecting and a desktop restart. Absent for
+   *  pod-exec shells (no tmux behind them) — they stay non-reattachable. */
+  sessionId?: string;
 }
 
 /** A live PTY session. Output arrives on the `onEvent` callback passed
@@ -280,17 +286,34 @@ export interface TerminalSession {
   close(): Promise<void>;
 }
 
+/** One reattachable guest tmux session, as reported by `terminal.list`.
+ *  Mirrors SessionInfo in packages/vm/src/shell.rs (the `appliance-`
+ *  prefix stripped). */
+export interface TerminalSessionInfo {
+  /** Host-minted id — the desktop tab's session id (`<mode>-<uuid>`). */
+  id: string;
+  /** tmux `session_activity` (Unix epoch seconds), when known. */
+  lastActivity?: number;
+}
+
 export interface TerminalHost {
   open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession>;
+  /** Enumerate the VM's live reattachable guest tmux sessions, so the
+   *  store can rehydrate dock tabs on app launch (E3.4). Optional — a host
+   *  without reattachable sessions omits it. */
+  list?(vmName?: string): Promise<TerminalSessionInfo[]>;
+  /** Destroy a guest tmux session by id (the explicit tab-close path).
+   *  Closing the PTY only *detaches*; this is what actually tears the
+   *  in-guest session down. Optional, paired with `list`. */
+  kill?(vmName: string | undefined, id: string): Promise<void>;
 }
 
 /**
- * Stable cluster ids for the two local engines. They double as the
- * CLI profile names in ~/.appliance/profiles.json — mirror
- * LOCAL_RUNTIME_CLUSTER_ID / MICROVM_CLUSTER_ID in the desktop's
- * lib.rs and MICROVM_PROFILE in the CLI.
+ * Stable cluster id for the microVM engine. Doubles as the CLI
+ * profile name in ~/.appliance/profiles.json — mirrors
+ * MICROVM_CLUSTER_ID in the desktop's lib.rs and MICROVM_PROFILE in
+ * the CLI.
  */
-export const LOCAL_RUNTIME_CLUSTER_ID = 'local-runtime';
 export const MICROVM_CLUSTER_ID = 'microvm';
 
 /** The canonical (default) microVM name — keeps the bare `microvm`
@@ -471,75 +494,15 @@ export interface MicroVmHost {
   instance(name?: string): MicroVmInstanceHost;
 }
 
-export interface LocalClusterInput {
-  clusterName?: string;
-  hostPort?: number;
-}
-
-export interface LocalClusterStatus {
-  exists: boolean;
-  running: boolean;
-  clusterName: string;
-  /** Populated when the status check itself failed (k3d/docker missing). */
-  message?: string;
-}
-
-// Runtime-level input — covers the cluster, the api-server sidecar,
-// the bound data dir, and the host-side api port. All optional;
-// host defaults match the demo script (cluster `appliance-local`,
-// namespace `appliance`, host port 8081, api port 3030,
-// data dir = appDataDir/local-runtime).
+// Engine-routed input for the kubectl-level reads (workloads, pod
+// logs) the desktop exposes. microVM-only now that bare k3d is gone.
 export interface LocalRuntimeInput {
-  clusterName?: string;
-  namespace?: string;
-  hostPort?: number;
-  dataDir?: string;
-  /** Host-side port the k3d-attached registry publishes on. Falls
-   *  back to the Tauri-side default (5050) when omitted. */
-  registryPort?: number;
-  /** Which local engine kubectl-level reads (workloads, pod logs)
-   *  address: omitted → the k3d context, 'microvm' → the microVM's
-   *  kubeconfig. Lifecycle calls ignore it. */
+  /** Which local engine the read addresses — microVM only, routed
+   *  through the microVM's kubeconfig. */
   engine?: 'microvm';
-}
-
-export interface ResolvedRuntimeConfig {
-  clusterName: string;
-  namespace: string;
-  hostPort: number;
-  dataDir: string;
-  apiServerUrl: string;
-  nodePortMin: number;
-  nodePortMax: number;
-  /** Host-side URL of the k3d-attached registry (e.g.
-   *  `localhost:5050`). Build-side code pushes here; the cluster
-   *  pulls through the `--registry-use` mirror. Optional —
-   *  undefined when no matching registry container exists for the
-   *  cluster (pre-Phase-3 runtimes, or after a manual registry
-   *  delete). Wizard checks for undefined and falls back to
-   *  `k3d image import`. */
-  registryUrl?: string;
-  registryPort: number;
-}
-
-export interface ApiServerStatus {
-  running: boolean;
-  pid?: number;
-  port?: number;
-  startedAt?: string;
-  logPath?: string;
-  /** Surfaces "api-server exited" or "reachable but unmanaged" hints. */
-  message?: string;
-}
-
-export interface LocalRuntimeStatus {
-  cluster: LocalClusterStatus;
-  apiServer: ApiServerStatus;
-  config: ResolvedRuntimeConfig;
-  /** Persisted cluster id under which the runtime is auto-registered,
-   *  so the Console can select it like any cloud cluster. Absent until
-   *  the first successful start. */
-  clusterId?: string;
+  /** The microVM name whose kubeconfig to read; several VMs run
+   *  concurrently, so the name selects which one. */
+  clusterName?: string;
 }
 
 export interface LocalDeploymentInfo {
@@ -568,22 +531,6 @@ export interface LocalServiceInfo {
   targetPort?: number;
 }
 
-export interface LocalWorkloads {
-  deployments: LocalDeploymentInfo[];
-  pods: LocalPodInfo[];
-  services: LocalServiceInfo[];
-}
-
-export interface LocalPodLogsInput {
-  podName: string;
-  container?: string;
-  tailLines?: number;
-  clusterName?: string;
-  namespace?: string;
-  /** See LocalRuntimeInput.engine. */
-  engine?: 'microvm';
-}
-
 /** Parsed contents of an appliance manifest (json or sandbox-evaluated ts/js). */
 export interface LocalApplianceManifest {
   manifest?: string;
@@ -604,14 +551,12 @@ export interface LocalBuildAndImportInput {
   imageTag: string;
   /** Optional docker --platform override (e.g. "linux/amd64"). */
   platform?: string;
-  /** k3d cluster to import into; defaults to the active local runtime cluster. */
-  clusterName?: string;
-  /** Host-side registry URL the cluster pulls through (e.g.
-   *  `localhost:5050`). When set, the image is tagged
-   *  `<registryUrl>/<imageTag>` and pushed via `docker push` instead
-   *  of `k3d image import`. The resolved Promise then resolves with
-   *  the registry-qualified ref so callers can hand it straight to
-   *  api-server. Read from `LocalRuntimeStatus.config.registryUrl`. */
+  /** Host-side registry URL the cluster pulls through (e.g. the
+   *  microVM's forwarded in-VM registry `localhost:5052`). The image
+   *  is tagged `<registryUrl>/<imageTag>` and pushed via `docker
+   *  push`; the resolved Promise resolves with the registry-qualified
+   *  ref so callers can hand it straight to api-server. Resolved from
+   *  the selected cluster's `/cluster-info`. */
   registryUrl?: string;
 }
 
@@ -630,7 +575,7 @@ export interface LocalLogEvent {
  * copy-paste install command instead of an opaque "spawn failed".
  */
 export interface LocalPreflightCheck {
-  /** Tool name as invoked on the command line (`docker`, `k3d`, …). */
+  /** Tool name as invoked on the command line (`docker`, `kubectl`, …). */
   tool: string;
   /** True iff `<tool> --version` exited 0. */
   installed: boolean;
@@ -650,8 +595,8 @@ export interface LocalPreflightCheck {
   /**
    * For docker only: whether a daemon is actually reachable, not just
    * whether the CLI is installed (`docker --version` exits 0 even with
-   * a stopped engine). Undefined for tools with no daemon (k3d,
-   * kubectl). `false` means "installed but not running".
+   * a stopped engine). Undefined for tools with no daemon (kubectl).
+   * `false` means "installed but not running".
    */
   daemonRunning?: boolean;
   /**
@@ -689,7 +634,7 @@ export interface LocalHelperProgressEvent {
 }
 
 export interface LocalRuntimeHost {
-  /** Probe the local-runtime prerequisites (docker, k3d, kubectl). */
+  /** Probe the local-runtime prerequisites (docker, kubectl). */
   preflight(): Promise<LocalPreflightCheck[]>;
   /**
    * Drive the helper to install missing prerequisites. `tools` is
@@ -711,27 +656,11 @@ export interface LocalRuntimeHost {
    * message for runtimes appliance can't auto-start.
    */
   startContainerRuntime?(): Promise<void>;
-  /** Legacy cluster-only status (kept for backwards compat). */
-  status(input?: LocalClusterInput): Promise<LocalClusterStatus>;
-  start(input?: LocalClusterInput): Promise<LocalClusterStatus>;
-  stop(input?: LocalClusterInput): Promise<LocalClusterStatus>;
-  /** Permanently delete the cluster + all of its state. */
-  delete(input?: LocalClusterInput): Promise<LocalClusterStatus>;
 
-  /** Combined cluster + api-server + persisted-cluster snapshot. */
-  runtimeStatus(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
-  /** Idempotently bring up cluster + api-server + auto-register the
-   *  resulting cluster so the Console can talk to it. */
-  startRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
-  /** Kill api-server + stop cluster. Data is preserved. */
-  stopRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
-  /** Kill api-server, delete cluster, forget the registered Console
-   *  cluster + key. The data dir itself is left on disk. */
-  deleteRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus>;
-  /** Snapshot of Deployments / Pods / Services in the appliance namespace. */
-  listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads>;
-  /** One-shot `kubectl logs --tail` for the named pod. */
-  tailPodLogs(input: LocalPodLogsInput): Promise<string>;
+  // Workloads + pod logs are no longer read here: the console reads them
+  // through the in-VM api-server via `ApplianceClient.listWorkloads()` /
+  // `getPodLogs()` / `streamPodLogs()` (control-plane.md §4), the same
+  // signed base-URL path that powers projects/deployments. No kubectl.
 
   /** Open a native folder picker. Returns null on cancel. */
   pickDirectory(): Promise<string | null>;
@@ -740,8 +669,9 @@ export interface LocalRuntimeHost {
    *  `.cjs`) are evaluated through the CLI's QuickJS sandbox via the
    *  sidecar. Errors if no manifest is found or the sandbox rejects. */
   readApplianceManifest(path: string): Promise<LocalApplianceManifest>;
-  /** docker build → k3d image import, streaming each command's output
-   *  to onEvent. Resolves with the resulting image tag on success. */
+  /** docker build → registry push, streaming each command's output to
+   *  onEvent. Resolves with the registry-qualified image ref on
+   *  success. */
   buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
   /** Apply the in-cluster api-server manifest to the local cluster
    *  (Deployment + Service + Ingress + RBAC + PVC), wait for it to
@@ -756,8 +686,8 @@ export interface LocalRuntimeHost {
 
 export interface BootstrapInClusterInput {
   /** Override the runtime input used to resolve cluster name / data
-   *  dir / registry. Defaults to the same resolution
-   *  `runtimeStatus()` uses. */
+   *  dir / namespace. Defaults to the baked-in runtime-config
+   *  defaults. */
   runtime?: LocalRuntimeInput;
   /** Override the api-server image reference. Defaults to
    *  `ghcr.io/appliance-sh/api-server:latest` (pulled from ghcr on

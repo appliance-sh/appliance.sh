@@ -13,7 +13,7 @@ import type { PreflightReport } from './preflight.js';
 
 // These tests cover the deterministic decision logic in the preflight
 // suite — the bits that don't depend on what's installed on the test
-// machine. Checks that shell out to docker/k3d are exercised through
+// machine. Checks that shell out to docker/kubectl are exercised through
 // their pure branches (e.g. the "docker unreachable" short-circuit)
 // rather than by provisioning real infra.
 
@@ -122,12 +122,14 @@ describe('runFixes', () => {
     };
   }
 
-  it('does nothing when the api-server image check already passes', () => {
-    expect(runFixes(reportWith('pass'))).toEqual([]);
+  it('does nothing when the api-server image check already passes', async () => {
+    expect(await runFixes(reportWith('pass'))).toEqual([]);
   });
 
-  it('skips the image pull when docker is unreachable rather than failing', () => {
-    const outcomes = runFixes(reportWith('warn', 'skipped — Docker daemon is not reachable'));
+  it('skips the image pull when docker is unreachable rather than failing', async () => {
+    // The report carries no `docker` check, so runFixes can't conclude
+    // the daemon is reachable and must skip the pull (never fail).
+    const outcomes = await runFixes(reportWith('warn', 'skipped — Docker daemon is not reachable'));
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0].status).toBe('skipped');
     expect(outcomes[0].detail).toMatch(/not reachable/i);

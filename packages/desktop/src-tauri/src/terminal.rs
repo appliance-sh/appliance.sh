@@ -151,8 +151,14 @@ pub fn resize(id: &str, cols: u16, rows: u16) -> Result<(), String> {
         .map_err(|e| format!("resize: {e}"))
 }
 
-/// Kill and forget a session. Idempotent — closing an already-exited
-/// terminal is a no-op.
+/// Kill and forget the *host* PTY session — the local child process
+/// streaming this terminal. For a reattachable vsock shell that child is
+/// `appliance-vm shell --session <id>`, so killing it merely *detaches*
+/// from the guest tmux session; the in-guest session (and its processes)
+/// keeps running, which is exactly what lets a desktop restart reconnect
+/// (E3.4). Destroying the guest session is a separate, explicit step
+/// (`terminal_kill_session` → `appliance-vm sessions kill`), not done here.
+/// Idempotent — closing an already-exited terminal is a no-op.
 pub fn close(id: &str) -> Result<(), String> {
     if let Some(mut session) = lock().remove(id) {
         let _ = session.child.kill();

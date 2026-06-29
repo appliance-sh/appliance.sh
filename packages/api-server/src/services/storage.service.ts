@@ -55,7 +55,7 @@ function createStorageService(): StorageService {
 
   const config = applianceBaseConfig.parse(JSON.parse(baseConfigJson));
 
-  // Kubernetes-driven bases (local k3d + generic external clusters)
+  // Kubernetes-driven bases (local microVM + generic external clusters)
   // both back state with a filesystem-mounted dataDir. The cloud
   // (AWS) path falls through to S3 below.
   const k8s = getKubernetesParams(config);

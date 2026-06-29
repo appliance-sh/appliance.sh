@@ -27,15 +27,9 @@ import type {
   LatestGhcrTagInput,
   LocalApplianceManifest,
   LocalBuildAndImportInput,
-  LocalClusterInput,
-  LocalClusterStatus,
   LocalHelperInstallResult,
   LocalLogEvent,
-  LocalPodLogsInput,
   LocalPreflightCheck,
-  LocalRuntimeInput,
-  LocalRuntimeStatus,
-  LocalWorkloads,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,
@@ -46,6 +40,7 @@ import type {
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
+  TerminalSessionInfo,
 } from '@appliance.sh/app';
 
 // Tauri host: each cluster's URL/name lives in a JSON config file
@@ -179,36 +174,6 @@ export const tauriHost: ConsoleHost = {
     async startContainerRuntime(): Promise<void> {
       await invoke('start_container_runtime');
     },
-    async status(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('local_cluster_status', { input: input ?? {} });
-    },
-    async start(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('start_local_cluster', { input: input ?? {} });
-    },
-    async stop(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('stop_local_cluster', { input: input ?? {} });
-    },
-    async delete(input?: LocalClusterInput): Promise<LocalClusterStatus> {
-      return invoke<LocalClusterStatus>('delete_local_cluster', { input: input ?? {} });
-    },
-    async runtimeStatus(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('local_runtime_status', { input: input ?? null });
-    },
-    async startRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('start_local_runtime', { input: input ?? null });
-    },
-    async stopRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('stop_local_runtime', { input: input ?? null });
-    },
-    async deleteRuntime(input?: LocalRuntimeInput): Promise<LocalRuntimeStatus> {
-      return invoke<LocalRuntimeStatus>('delete_local_runtime', { input: input ?? null });
-    },
-    async listWorkloads(input?: LocalRuntimeInput): Promise<LocalWorkloads> {
-      return invoke<LocalWorkloads>('list_local_workloads', { input: input ?? null });
-    },
-    async tailPodLogs(input: LocalPodLogsInput): Promise<string> {
-      return invoke<string>('tail_local_pod_logs', { input });
-    },
     async pickDirectory(): Promise<string | null> {
       // Tauri's dialog plugin returns the chosen folder path, or null
       // on cancel. multiple:false guarantees a single string back.
@@ -322,13 +287,25 @@ export const tauriHost: ConsoleHost = {
     async open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession> {
       const channel = new Channel<TerminalEvent>();
       channel.onmessage = onEvent;
+      // `opts` carries `sessionId` straight through; the Rust side appends
+      // `--session <id>` to the vsock host/dev argv so the PTY attaches to
+      // the named guest tmux session (E3.4).
       const id = await invoke<string>('terminal_open', { input: opts, onEvent: channel });
       return {
         id,
         write: (data: string) => invoke('terminal_write', { id, data }),
         resize: (cols: number, rows: number) => invoke('terminal_resize', { id, cols, rows }),
+        // Closing the PTY kills the local `appliance-vm shell` client, which
+        // only *detaches* from tmux — the guest session lives on. Explicit
+        // destruction goes through `kill`.
         close: () => invoke('terminal_close', { id }),
       };
+    },
+    list(vmName?: string): Promise<TerminalSessionInfo[]> {
+      return invoke<TerminalSessionInfo[]>('terminal_sessions', { name: vmName ?? null });
+    },
+    async kill(vmName: string | undefined, id: string): Promise<void> {
+      await invoke('terminal_kill_session', { name: vmName ?? null, id });
     },
   },
 

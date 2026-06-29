@@ -8,27 +8,27 @@ import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
-import { LOCAL_RUNTIME_CLUSTER_ID, microVmNameFromClusterId } from '@/lib/host';
+import { microVmNameFromClusterId } from '@/lib/host';
 import type { LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
-// Docker Desktop-style deploy wizard for the local engines (k3d
-// runtime and microVM). It deploys into the *selected* cluster —
-// both engines register as regular clusters — gating readiness and
-// routing the image registry per engine. Three steps:
+// Docker Desktop-style deploy wizard for the local runtime (a
+// microVM). It deploys into the *selected* cluster — each microVM
+// registers as a regular cluster — gating readiness on that VM and
+// routing the image to its in-VM registry. Three steps:
 //   1. Pick a folder containing an appliance.{json,ts,js} manifest
 //      + a Dockerfile. Programmatic .ts/.js manifests run in the
 //      CLI's QuickJS sandbox (sidecar invocation).
 //   2. Configure the deploy — project / environment names, env vars,
 //      optional runtime overrides (memory / timeout / storage).
-//   3. Run — streams docker build + k3d image import logs from the
+//   3. Run — streams docker build + registry push logs from the
 //      shell, then drives the api-server via the existing SDK for
 //      build registration + deploy + status polling.
 //
 // The wizard never talks to the api-server directly; it uses the
 // SDK client wired up by useApplianceClient(), which already holds
 // the selected cluster's signed credentials. That keeps the new
-// Rust-side surface small (just shell-outs to docker / k3d / kubectl).
+// Rust-side surface small (just shell-outs to docker / kubectl).
 
 type Phase = 'pick' | 'configure' | 'run';
 
@@ -57,32 +57,24 @@ export function LocalRuntimeDeployPage() {
   const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
 
   // The wizard deploys into the *selected* cluster (the SDK client is
-  // bound to it), so readiness gating has to match the engine behind
-  // that cluster: the k3d runtime and the microVM engine are separate
-  // lifecycles. Surface the target + its state up front — the wizard
-  // is reachable while an engine is down (deep links, or the user
-  // stopped it mid-session), and finding out at the end of step 3 is
-  // the worst place. Query keys are shared with the Runtimes page so
-  // the two views never disagree.
+  // bound to it). The local runtime is a microVM, so when the selection
+  // is a microVM we gate readiness on that VM being up — surfaced up
+  // front since the wizard is reachable while the VM is down (deep
+  // links, or the user stopped it mid-session). A non-microVM selection
+  // is a cloud / BYO cluster the client already targets. Query keys are
+  // shared with the Runtimes page so the two views never disagree.
   const { cluster: selectedCluster } = useSelectedCluster();
   const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
   const isMicroVmTarget = vmName !== null;
-  const runtimeQuery = useQuery({
-    queryKey: ['local-runtime', 'status'],
-    enabled: Boolean(local?.runtimeStatus) && !isMicroVmTarget,
-    queryFn: () => local!.runtimeStatus(),
-    refetchInterval: 5_000,
-  });
   const vmQuery = useQuery({
     queryKey: ['microvm', 'status', vmName],
     enabled: Boolean(host.vm) && isMicroVmTarget,
     queryFn: () => host.vm!.instance(vmName!).status(),
     refetchInterval: 5_000,
   });
-  const runtimeUp = Boolean(runtimeQuery.data?.cluster.running && runtimeQuery.data?.apiServer.running);
   const vmUp = Boolean(vmQuery.data?.running && vmQuery.data?.kubeconfigReady);
-  const targetUp = isMicroVmTarget ? vmUp : runtimeUp;
-  const targetLoading = isMicroVmTarget ? vmQuery.isLoading : runtimeQuery.isLoading;
+  const targetUp = isMicroVmTarget ? vmUp : Boolean(client);
+  const targetLoading = isMicroVmTarget ? vmQuery.isLoading : false;
   const readyToDeploy = targetUp && Boolean(client);
 
   const [phase, setPhase] = React.useState<Phase>('pick');
@@ -202,31 +194,21 @@ export function LocalRuntimeDeployPage() {
 
     try {
       // 1. Resolve the registry from the *selected cluster's* own
-      //    /cluster-info — engine-agnostic: the k3d runtime advertises
-      //    its sibling registry (localhost:5050), the microVM its
-      //    forwarded in-VM registry (localhost:5052). Asking the k3d
-      //    runtimeStatus here used to misroute microVM builds into the
-      //    k3d registry. Fall back to the k3d probe only when the
-      //    server predates /cluster-info.
+      //    /cluster-info — the microVM advertises its forwarded in-VM
+      //    registry (localhost:5052). Without it there's nowhere to
+      //    push the built image, so fail with an actionable hint.
       let registryUrl: string | undefined;
       const info = await client.getClusterInfo();
       if (info.success) {
         registryUrl = info.data.baseConfig.kubernetes?.registry?.url ?? undefined;
       }
       if (!registryUrl) {
-        // The k3d probe is only a valid fallback for the k3d cluster —
-        // answering with localhost:5050 for a microVM target would
-        // misroute the image into the wrong engine's registry.
-        if (isMicroVmTarget) {
-          throw new Error(
-            'the microVM api-server did not advertise its registry (/cluster-info) — run "appliance vm up" to reconcile it, then retry'
-          );
-        }
-        const runtime = await local.runtimeStatus();
-        registryUrl = runtime.config.registryUrl;
+        throw new Error(
+          'the api-server did not advertise its registry (/cluster-info) — run "appliance vm up" to reconcile it, then retry'
+        );
       }
 
-      // 2. docker build + push (or import fallback) — streams onto our log box.
+      // 2. docker build + registry push — streams onto our log box.
       const imageTag = `${manifest.name}:latest`;
       append({ stream: 'meta', message: `==> building image ${imageTag} from ${folderPath}` });
       const resolvedImageRef = await local.buildAndImportImage(
@@ -343,10 +325,6 @@ export function LocalRuntimeDeployPage() {
             {isMicroVmTarget ? (
               <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
                 microVM engine
-              </span>
-            ) : selectedCluster.id === LOCAL_RUNTIME_CLUSTER_ID ? (
-              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
-                k3d engine
               </span>
             ) : null}
             <span>· switch with the cluster menu in the top bar</span>

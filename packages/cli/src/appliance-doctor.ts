@@ -29,7 +29,7 @@ program
 
     let fixes: FixOutcome[] = [];
     if (opts.fix) {
-      fixes = runFixes(report);
+      fixes = await runFixes(report);
       // Re-run after fixes so the final report reflects the new state
       // (a pulled image flips from warn/fail to pass).
       if (fixes.some((f) => f.status === 'fixed')) {

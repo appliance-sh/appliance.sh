@@ -5,9 +5,8 @@ use anyhow::{bail, Result};
 /// Linux KVM backend — scaffold. Target shape is an embedded
 /// rust-vmm based VMM (virtio-mmio devices matching the guest
 /// contract: console, net, blk, vsock) speaking directly to /dev/kvm.
-/// Until that lands the backend reports itself unavailable with a
-/// pointer at the k3d path, so the CLI surface is already stable on
-/// Linux.
+/// Until that lands the backend reports itself unavailable, so the
+/// CLI surface is already stable on Linux.
 pub struct KvmBackend;
 
 impl VmBackend for KvmBackend {
@@ -19,7 +18,7 @@ impl VmBackend for KvmBackend {
         if !std::path::Path::new("/dev/kvm").exists() {
             bail!("/dev/kvm not present — KVM is unavailable on this machine");
         }
-        bail!("the KVM backend is not implemented yet — use `appliance local up` (k3d) on Linux for now");
+        bail!("the KVM backend is not implemented yet — the microVM runtime (`appliance vm`) does not yet support Linux hosts");
     }
 
     fn run_foreground(&self, _spec: &VmSpec) -> Result<()> {

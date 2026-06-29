@@ -7,3 +7,4 @@ export * from './environment-health';
 export * from './deployment';
 export * from './api-key';
 export * from './build';
+export * from './workloads';

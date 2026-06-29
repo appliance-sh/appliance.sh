@@ -27,17 +27,10 @@ describe('vmNameForProfile', () => {
 });
 
 describe('resolveClusterTarget', () => {
-  it('defaults to the k3d local context for the local-runtime profile', () => {
-    const t = resolveClusterTarget({ profile: 'local-runtime' });
-    expect(t.context).toBe('k3d-appliance-local');
-    expect(t.kubeconfig).toBeUndefined();
-    expect(t.namespace).toBe('appliance');
-    expect(t.source).toBe('local-runtime');
-  });
-
-  it('honors a namespace override', () => {
-    const t = resolveClusterTarget({ profile: 'local-runtime', namespace: 'custom-ns' });
+  it('honors a namespace override on an explicit context target', () => {
+    const t = resolveClusterTarget({ context: 'my-ctx', namespace: 'custom-ns' });
     expect(t.namespace).toBe('custom-ns');
+    expect(t.source).toBe('override');
   });
 
   it('uses an explicit context override without touching the profile mapping', () => {
@@ -54,6 +47,32 @@ describe('resolveClusterTarget', () => {
     // The default microVM is almost certainly not up in CI, so its
     // kubeconfig is absent — exercising the actionable error path.
     expect(() => resolveClusterTarget({ profile: 'microvm-definitely-not-running-xyz' })).toThrow(ClusterTargetError);
+  });
+
+  it('routes an unset / non-microVM profile to the default microVM, never a k3d context', () => {
+    // No k3d fallback context anymore: an unset / non-microVM profile
+    // resolves exactly like the default microVM. The outcome depends on
+    // whether that VM is up on this host (its kubeconfig present), so we
+    // assert the invariant that holds either way: it never returns a k3d
+    // context, and an unset profile behaves the same as a non-microVM one.
+    const resolveOrError = (opts: Parameters<typeof resolveClusterTarget>[0]) => {
+      try {
+        return resolveClusterTarget(opts);
+      } catch (err) {
+        return err;
+      }
+    };
+    const fromLegacy = resolveOrError({ profile: 'local-runtime' });
+    const fromUnset = resolveOrError({});
+    if (fromLegacy instanceof Error) {
+      expect(fromLegacy).toBeInstanceOf(ClusterTargetError);
+      expect(fromUnset).toBeInstanceOf(ClusterTargetError);
+    } else {
+      expect(fromLegacy.context).toBeUndefined();
+      expect(fromLegacy.kubeconfig).toBe(vmKubeconfigPath('appliance'));
+      expect(fromLegacy.source).toBe('microvm:appliance');
+      expect((fromUnset as typeof fromLegacy).source).toBe('microvm:appliance');
+    }
   });
 });
 
@@ -74,9 +93,9 @@ describe('kubectlBaseArgs', () => {
   });
 
   it('emits --context + namespace for a context target', () => {
-    expect(kubectlBaseArgs({ context: 'k3d-appliance-local', namespace: 'appliance', source: 'x' })).toEqual([
+    expect(kubectlBaseArgs({ context: 'my-context', namespace: 'appliance', source: 'x' })).toEqual([
       '--context',
-      'k3d-appliance-local',
+      'my-context',
       '-n',
       'appliance',
     ]);

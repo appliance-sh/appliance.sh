@@ -52,7 +52,7 @@ Sandbox up — myapp (compose)
 Logs: appliance logs -f       Stop: appliance down
 ```
 
-Host ports are assigned deterministically (stable per service across `up`s, persisted in state §5) so URLs don't churn. A clash reprints the `appliance local stop` hint verbatim (`docs/sandbox.md` §5).
+Host ports are assigned deterministically (stable per service across `up`s, persisted in state §5) so URLs don't churn. A clash reprints the `appliance vm stop` hint verbatim (`docs/sandbox.md` §5).
 
 ## 5. Project identity + state
 

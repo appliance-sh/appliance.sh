@@ -92,6 +92,15 @@ pub fn spawn_clock_sync(
     });
 }
 
+/// The size-line handshake clock-sync sends before its `date -s` command.
+/// The trailing `root` token keeps the guest shell as **root**: setting
+/// the system clock needs root, and dropping to the non-root appliance
+/// user would make the push fail silently (the command ends `|| true`)
+/// and resurrect the clock-skew 401 bug. The root path also works before
+/// the appliance user is fully provisioned, so the first push lands as
+/// early as possible. (docs/rootless-guest.md §2.2.)
+const CLOCK_SYNC_SIZE_LINE: &str = "rows 24 cols 80 root\n";
+
 /// Send the clock-set command over a connected shell vsock fd, then drain
 /// to EOF so the command actually runs before the connection closes.
 /// Takes ownership of `fd` and closes it on return.
@@ -105,7 +114,7 @@ fn push_clock(fd: RawFd) -> Result<(), String> {
     let mut sock = unsafe { std::fs::File::from_raw_fd(fd) };
     // The agent reads ONE leading `rows R cols C` line as the PTY size,
     // then exec's a login shell running whatever follows on stdin.
-    sock.write_all(b"rows 24 cols 80\n")
+    sock.write_all(CLOCK_SYNC_SIZE_LINE.as_bytes())
         .map_err(|e| format!("write size: {e}"))?;
     sock.write_all(cmd.as_bytes())
         .map_err(|e| format!("write command: {e}"))?;
@@ -257,5 +266,16 @@ mod tests {
         assert!(cmd.contains("date -u -s @1234567890 2>/dev/null"));
         assert!(cmd.contains("date -u -D '%Y-%m-%d %H:%M:%S' -s '2009-02-13 23:31:30' 2>/dev/null"));
         assert!(cmd.ends_with("|| true"));
+    }
+
+    #[test]
+    fn clock_sync_runs_as_root() {
+        // The handshake must carry the `root` token so `date -s` runs as
+        // root after the shell agent's default drop to the appliance user
+        // — otherwise the push fails silently and the clock-skew 401 bug
+        // returns. It must still be a well-formed `rows R cols C …` line.
+        assert!(CLOCK_SYNC_SIZE_LINE.starts_with("rows 24 cols 80"));
+        assert!(CLOCK_SYNC_SIZE_LINE.trim_end().ends_with(" root"));
+        assert!(CLOCK_SYNC_SIZE_LINE.ends_with('\n'));
     }
 }

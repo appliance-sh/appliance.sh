@@ -18,7 +18,6 @@ import { formatCpu, formatMemory, hasHealthSignal, healthDotStatus, healthLabel 
 import { EnvironmentHealthStatus, type EnvironmentHealth } from '@appliance.sh/sdk/models';
 import {
   localRuntimeCapabilities,
-  defaultSandbox,
   onboardingDismissed,
   dismissOnboarding,
   type LocalRuntimeCapabilities,
@@ -42,7 +41,6 @@ export function DashboardPage() {
     if (caps.any && !showAll && !onboardingDismissed()) {
       return (
         <FirstRunWelcome
-          caps={caps}
           onLater={() => {
             dismissOnboarding();
             setShowAll(true);
@@ -285,12 +283,24 @@ function summarizeHealth(
 }
 
 function EmptyProjects() {
+  const navigate = useNavigate();
+  // A freshly-onboarded user with no projects gets a button, not just a
+  // command to copy. The deploy wizard (/local-runtime/deploy) find-or-creates
+  // the project + environment and writes the link itself, so there's no
+  // separate "project setup" step — the CLI snippet stays as a secondary hint
+  // for terminal-first users.
   return (
     <div className="mx-auto max-w-md space-y-4 py-16 text-center">
       <h2 className="text-lg font-semibold">Deploy your first project</h2>
       <p className="text-sm text-[var(--color-muted-foreground)]">
-        Run this from an application directory with an <code className="font-mono">appliance.json</code> — it creates
-        the project, builds, and deploys in one step.
+        Pick an application folder with an <code className="font-mono">appliance.json</code> — the wizard creates the
+        project, builds, and deploys in one step.
+      </p>
+      <Button size="lg" onClick={() => navigate('/local-runtime/deploy')}>
+        Deploy your first app
+      </Button>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Prefer the terminal? Run this from your app directory instead:
       </p>
       <CommandSnippet command="appliance deploy" className="text-left" />
       <p className="text-xs text-[var(--color-muted-foreground)]">The deployed app appears here with its live URL.</p>
@@ -363,27 +373,19 @@ function RecentActivity({
 
 // ---- first-run (no cluster) ----------------------------------------------
 
-// The very first launch: one decision, one button. "Set up local
-// runtime" provisions + connects in a single press (sandboxed in a
-// microVM by default), so a new operator is running in seconds without
-// reading a menu. "Set up later" and "More options" fall back to the
-// full GetStarted menu for everything else.
-function FirstRunWelcome({
-  caps,
-  onLater,
-  onMore,
-}: {
-  caps: LocalRuntimeCapabilities;
-  onLater: () => void;
-  onMore: () => void;
-}) {
+// The very first launch: one decision, one button. "Get started"
+// provisions + connects in a single press (sandboxed in a microVM by
+// default), routing straight into the live bring-up phase ladder
+// (/bootstrap/run) so a new operator watches the VM boot through each
+// stage and lands ready — no menu to read, no further clicks. "Set up
+// later" and "More options" fall back to the full GetStarted menu.
+function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () => void }) {
   const navigate = useNavigate();
-  const sandbox = defaultSandbox(caps);
-  const setup = () => {
-    // Sandboxed by default; fall back to host-side k3d only when no
-    // microVM engine is available. /bootstrap/run boots it and connects
-    // automatically — no further clicks.
-    const values: WizardValues = sandbox ? { mode: 'microvm' } : { mode: 'local' };
+  const getStarted = () => {
+    // The local runtime is a microVM. /bootstrap/run boots the default
+    // VM with live phases (media → booting → network → cluster → ready)
+    // and connects automatically once it's ready.
+    const values: WizardValues = { mode: 'microvm' };
     navigate('/bootstrap/run', { state: values });
   };
   return (
@@ -394,16 +396,14 @@ function FirstRunWelcome({
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Run apps on a local cluster on this machine.{' '}
-          {sandbox
-            ? 'We’ll set up a local runtime sandboxed in its own virtual machine — the recommended, isolated default.'
-            : 'We’ll set up a local runtime on this host.'}{' '}
-          It connects automatically once it’s ready.
+          Run apps on a local cluster on this machine. One click boots a local runtime sandboxed in its own virtual
+          machine — the recommended, isolated default. You’ll watch it come up stage by stage, and it connects
+          automatically once it’s ready.
         </p>
       </div>
       <div className="flex flex-col items-center gap-3">
-        <Button size="lg" className="w-full sm:w-auto sm:min-w-56" onClick={setup}>
-          Set up local runtime
+        <Button size="lg" className="w-full sm:w-auto sm:min-w-56" onClick={getStarted}>
+          Get started
         </Button>
         <Button variant="ghost" onClick={onLater}>
           Set up later
@@ -440,11 +440,7 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
           <ActionCard
             icon={Laptop}
             title="Local runtime"
-            body={
-              caps.canSandbox
-                ? 'A cluster + api-server on this machine, sandboxed in a virtual machine by default. Apps publish at *.appliance.localhost. No cloud account needed.'
-                : 'A k3d cluster + api-server on this machine. Apps publish at *.appliance.localhost. No cloud account needed.'
-            }
+            body="A cluster + api-server on this machine, sandboxed in a virtual machine. Apps publish at *.appliance.localhost. No cloud account needed."
             cta="Set up"
             to="/bootstrap?mode=local"
             primary

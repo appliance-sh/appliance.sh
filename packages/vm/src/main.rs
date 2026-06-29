@@ -117,13 +117,28 @@ enum Cmd {
         name: String,
     },
     /// Open an interactive shell in the guest over vsock (no SSH, no
-    /// k3s) — or run a single command with `-- <cmd>`.
+    /// k3s) — or run a single command with `-- <cmd>`. Lands as the
+    /// non-root `appliance` user; `--root` lands a root shell.
     Shell {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+        /// Land a root shell instead of dropping to the `appliance` user.
+        #[arg(long, default_value_t = false)]
+        root: bool,
+        /// Attach to (or create) a reattachable named session `<id>`
+        /// (tmux): it survives this client disconnecting and a desktop
+        /// restart while the VM runs. Interactive only — ignored when a
+        /// trailing command is given.
+        #[arg(long, short = 's')]
+        session: Option<String>,
         /// Command to run instead of an interactive shell.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+    /// List or kill reattachable shell sessions (tmux) inside the VM.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsCmd,
     },
     /// Print the VM's console log (boot log, kernel messages).
     Console {
@@ -147,6 +162,31 @@ enum Cmd {
     Creds {
         #[command(subcommand)]
         action: CredsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsCmd {
+    /// List the VM's reattachable shell sessions as JSON.
+    List {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// List root sessions (the separate root-owned tmux socket) instead
+        /// of the default non-root `appliance` sessions. Root sessions are
+        /// the ones created with `vm shell --root --session <id>`.
+        #[arg(long, default_value_t = false)]
+        root: bool,
+    },
+    /// Kill a reattachable shell session by id.
+    Kill {
+        /// Session id (as shown by `sessions list`).
+        id: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+        /// Kill a root session (the separate root-owned tmux socket) instead
+        /// of a default non-root `appliance` session.
+        #[arg(long, default_value_t = false)]
+        root: bool,
     },
 }
 
@@ -643,11 +683,13 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        Cmd::Shell { name, command } => {
+        Cmd::Shell { name, root, command, session } => {
             let cmd = (!command.is_empty()).then(|| command.join(" "));
-            let code = shell::run_client(&name, cmd.as_deref())?;
+            let code = shell::run_client(&name, cmd.as_deref(), root, session.as_deref())?;
             std::process::exit(code);
         }
+
+        Cmd::Sessions { action } => run_sessions(action),
 
         Cmd::Console { name, follow } => {
             let paths = VmPaths::for_name(&name);
@@ -686,6 +728,27 @@ fn run() -> Result<()> {
         Cmd::Egress { action } => run_egress(action),
 
         Cmd::Creds { action } => run_creds(action),
+    }
+}
+
+fn run_sessions(action: SessionsCmd) -> Result<()> {
+    match action {
+        SessionsCmd::List { name, root } => {
+            let sessions = shell::list_sessions(&name, root)?;
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            Ok(())
+        }
+        SessionsCmd::Kill { id, name, root } => {
+            // Report the real outcome: the agent echoes a marker keyed on
+            // tmux's exit status, so killing a bogus id says so instead of
+            // claiming a phantom success (mirrors `creds rm`'s no-op path).
+            if shell::kill_session(&name, &id, root)? {
+                println!("killed session '{id}' in VM '{name}'");
+            } else {
+                println!("no such session '{id}' in VM '{name}'");
+            }
+            Ok(())
+        }
     }
 }
 

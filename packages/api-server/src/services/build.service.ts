@@ -65,11 +65,11 @@ export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
     const config = getBaseConfig();
 
-    // Kubernetes-base shortcut (local + generic k8s): only
+    // Kubernetes-base shortcut (local microVM + generic k8s): only
     // `remote-image` builds are supported (uploads have no S3 path).
     // Pass the stored source through as imageUri verbatim — the
     // KubernetesDeploymentService consumes the image reference
-    // directly (local k3d additionally handles k3d import host-side).
+    // directly (image delivery is registry-only).
     if (isKubernetesBase(config)) {
       const stored = await buildUploadService.get(buildId);
       if (!stored) throw new Error(`Build not found: ${buildId}`);

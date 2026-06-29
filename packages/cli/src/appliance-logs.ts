@@ -11,13 +11,13 @@ import { resolveEnvironment } from './utils/deployment-target.js';
 import { ClusterTargetError, kubectlBaseArgs, resolveClusterTarget, stackSelector } from './utils/cluster-target.js';
 
 // `appliance logs <project> <environment>` — stream container logs for
-// the active deployment's pods on a local engine (microVM or k3d).
+// the active deployment's pods on the local microVM engine.
 //
 // The api-server schedules each environment as a Deployment whose pods
 // carry `app.kubernetes.io/name: <stackName>`. We resolve the
 // environment's stackName via the SDK, resolve the cluster's kubeconfig
 // / context from the active profile (the same on-disk layout `appliance
-// vm` / `appliance local` use), then drive `kubectl logs -l <selector>`
+// vm` uses), then drive `kubectl logs -l <selector>`
 // — inheriting kubectl's streaming, `--follow`, and multi-pod fan-out
 // for free rather than reimplementing a log multiplexer over the SDK
 // (which exposes no log endpoint today).
@@ -187,7 +187,9 @@ program
     if (r.error) {
       const code = (r.error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') {
-        console.error(chalk.red('kubectl not found on PATH. Install it (e.g. `appliance local install kubectl`).'));
+        console.error(
+          chalk.red('kubectl not found on PATH. Install it (e.g. `brew install kubernetes-cli`), then retry.')
+        );
         process.exit(1);
       }
       console.error(chalk.red(`Failed to run kubectl: ${r.error.message}`));

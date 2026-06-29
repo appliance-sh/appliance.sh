@@ -8,6 +8,7 @@ import { buildRoutes } from './routes/builds';
 import { bootstrapRoutes } from './routes/bootstrap';
 import { keyRoutes } from './routes/keys';
 import { clusterInfoRoutes } from './routes/cluster-info';
+import { workloadsRoutes, environmentWorkloadsRoutes, podLogsRoutes } from './routes/workloads';
 import { internalRoutes } from './routes/internal';
 import { signatureAuth } from './middleware/auth';
 import { corsMiddleware } from './middleware/cors';
@@ -52,6 +53,10 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
     app.use('/api/v1/keys', signatureAuth, keyRoutes);
     app.use('/api/v1/builds', signatureAuth, buildRoutes);
     app.use('/api/v1/cluster-info', signatureAuth, clusterInfoRoutes);
+    // Cluster workloads + pod logs (Kubernetes bases only; 409 elsewhere).
+    app.use('/api/v1/workloads', signatureAuth, workloadsRoutes);
+    app.use('/api/v1/environments', signatureAuth, environmentWorkloadsRoutes);
+    app.use('/api/v1/pods', signatureAuth, podLogsRoutes);
   } else {
     // Worker internal routes reuse the data-plane signatureAuth: the
     // server re-signs each dispatch with the ORIGINAL caller's API key,

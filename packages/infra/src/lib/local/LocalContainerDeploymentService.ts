@@ -1,10 +1,13 @@
 import * as k8s from '@kubernetes/client-node';
 import * as fs from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { ApplianceBaseConfig, ApplianceBaseType, getKubernetesParams, isKubernetesBase } from '@appliance.sh/sdk';
-
-const execFileAsync = promisify(execFile);
+import { Writable } from 'node:stream';
+import {
+  ApplianceBaseConfig,
+  ApplianceBaseType,
+  getKubernetesParams,
+  isKubernetesBase,
+  Workloads,
+} from '@appliance.sh/sdk';
 
 // Egress confinement (see docs/microvm.md): the host (appliance-vm)
 // publishes the policy into this ConfigMap; the executor reflects it
@@ -19,12 +22,12 @@ export const DEFAULT_LOCAL_CLUSTER_NAME = 'appliance-local';
 export const DEFAULT_LOCAL_NAMESPACE = 'appliance';
 export const DEFAULT_LOCAL_HOST_PORT = 8081;
 
-// NodePort window the demo k3d cluster maps onto the host. Picked
-// small (51 ports) so the docker-proxy footprint on macOS stays
-// tractable — at ~2700 ports the colima daemon has been observed to
-// fall over. The deployment service derives a deterministic NodePort
-// from the stack name within this range so each appliance ends up
-// reachable on a stable host port.
+// NodePort window the local runtime maps onto the host. Picked small
+// (51 ports) so the docker-proxy footprint on macOS stays tractable —
+// at ~2700 ports the colima daemon has been observed to fall over. The
+// deployment service derives a deterministic NodePort from the stack
+// name within this range so each appliance ends up reachable on a stable
+// host port.
 export const DEFAULT_LOCAL_NODEPORT_MIN = 30000;
 export const DEFAULT_LOCAL_NODEPORT_MAX = 30050;
 
@@ -122,19 +125,19 @@ const ROLLOUT_POLL_INTERVAL_MS = 1_000;
 
 /**
  * Drives appliance deploys against an arbitrary Kubernetes cluster
- * (`appliance-base-local` k3d, or `appliance-base-kubernetes` for any
- * cluster reachable via URL + credentials). Maps each deploy to a
+ * (`appliance-base-local`, the deprecated alias, or
+ * `appliance-base-kubernetes` for any cluster reachable via URL +
+ * credentials — including the microVM runtime). Maps each deploy to a
  * Deployment + Service + Ingress trio in the configured namespace;
  * destroy tears the same trio down.
  *
  * Talks to the cluster via `@kubernetes/client-node` rather than
  * shelling out to `kubectl`, so the same code path works whether
- * api-server runs on the host pointing at k3d, in-cluster via a
- * ServiceAccount, or against a remote control plane.
+ * api-server runs in-cluster via a ServiceAccount or against a remote
+ * control plane.
  *
- * Cluster lifecycle (create/start/stop of the underlying k3d cluster)
- * remains the desktop's responsibility — see Tauri's
- * `start_local_cluster` etc.
+ * Cluster lifecycle (boot/stop of the underlying runtime) remains the
+ * microVM engine's (appliance-vm) responsibility.
  */
 export class KubernetesDeploymentService {
   private readonly cluster: ClusterConfig;
@@ -143,6 +146,7 @@ export class KubernetesDeploymentService {
   private readonly core: k8s.CoreV1Api;
   private readonly apps: k8s.AppsV1Api;
   private readonly metrics: k8s.Metrics;
+  private readonly logs: k8s.Log;
 
   constructor(private readonly baseConfig: ApplianceBaseConfig) {
     if (!isKubernetesBase(baseConfig)) {
@@ -160,6 +164,80 @@ export class KubernetesDeploymentService {
     // metrics-server is installed. getDeploymentHealth() tolerates it
     // being unreachable so health works on clusters without one.
     this.metrics = new k8s.Metrics(this.kc);
+    // Streams a pod's log over the k8s watch API (used by
+    // streamPodLogs); shares the same KubeConfig as every other client.
+    this.logs = new k8s.Log(this.kc);
+  }
+
+  /**
+   * Snapshot of the workloads in a namespace: Deployments, Pods, and
+   * Services, summarised to the columns the console renders. Read-only.
+   *
+   * Defaults to the configured namespace. Pass `labelSelector` to scope
+   * to a single appliance's stack — the deploy path labels every
+   * resource `app.kubernetes.io/name: <stackName>` (see renderManifest),
+   * so `app.kubernetes.io/name=<stackName>` filters to one environment.
+   *
+   * Mirrors the desktop's former `kubectl get deploy,pod,svc -o json`
+   * read; lists go through the same CoreV1/AppsV1 clients the deploy +
+   * health paths already use, so no new RBAC or wiring is required.
+   */
+  async listWorkloads(opts?: { namespace?: string; labelSelector?: string }): Promise<Workloads> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    const labelSelector = opts?.labelSelector;
+    const [deployments, pods, services] = await Promise.all([
+      this.apps.listNamespacedDeployment({ namespace, labelSelector }),
+      this.core.listNamespacedPod({ namespace, labelSelector }),
+      this.core.listNamespacedService({ namespace, labelSelector }),
+    ]);
+    return {
+      deployments: (deployments.items ?? []).map(summarizeWorkloadDeployment),
+      pods: (pods.items ?? []).map(summarizeWorkloadPod),
+      services: (services.items ?? []).map(summarizeWorkloadService),
+    };
+  }
+
+  /**
+   * Read a pod's logs as a single text blob (the tail). Drop-in for the
+   * desktop's former `kubectl logs` snapshot. `tailLines` bounds the
+   * read; `sinceSeconds` limits it to a recent window; `container`
+   * selects one of a multi-container pod's containers (required when the
+   * pod has more than one). RBAC for `pods/log` is already granted.
+   */
+  async getPodLogs(
+    podName: string,
+    opts?: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number }
+  ): Promise<string> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    return this.core.readNamespacedPodLog({
+      name: podName,
+      namespace,
+      container: opts?.container,
+      tailLines: opts?.tailLines,
+      sinceSeconds: opts?.sinceSeconds,
+    });
+  }
+
+  /**
+   * Follow a pod's logs, piping the k8s watch stream straight into the
+   * supplied Writable (e.g. the HTTP response) as raw chunked text.
+   * Returns the AbortController the watch is bound to — abort it (or
+   * end the destination) to tear the stream down. The caller owns the
+   * destination's lifecycle; this only opens and pipes the watch.
+   */
+  async streamPodLogs(
+    podName: string,
+    destination: Writable,
+    opts?: { container?: string; tailLines?: number; namespace?: string; sinceSeconds?: number }
+  ): Promise<AbortController> {
+    const namespace = opts?.namespace ?? this.cluster.namespace;
+    // The Log helper requires a container name positionally; '' lets the
+    // apiserver default to the pod's sole container (matching kubectl).
+    return this.logs.log(namespace, podName, opts?.container ?? '', destination, {
+      follow: true,
+      tailLines: opts?.tailLines,
+      sinceSeconds: opts?.sinceSeconds,
+    });
   }
 
   async deploy(
@@ -168,11 +246,10 @@ export class KubernetesDeploymentService {
     build: LocalResolvedBuild
   ): Promise<LocalDeploymentResult> {
     await this.ensureNamespace();
-    // Best-effort import: silently skips when the image is not in the
-    // host Docker daemon, the k3d CLI is missing, or the base is a
-    // generic (non-k3d) Kubernetes cluster. For those cases k8s falls
-    // back to a registry pull, which is the desired behaviour.
-    await this.maybeImportImage(build.imageUri);
+    // Image delivery is registry-only: the build pipeline pushes the
+    // image to a registry the cluster can reach (the microVM's in-VM
+    // registry, or a BYO cluster's). There is no host-side image import
+    // anymore — k8s pulls from the registry.
 
     const nodePort = deterministicNodePort(stackName);
     const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
@@ -450,31 +527,6 @@ export class KubernetesDeploymentService {
     });
   }
 
-  private async maybeImportImage(image: string): Promise<void> {
-    // Image-import is only meaningful for the k3d-on-laptop runtime.
-    // Generic Kubernetes bases must have the image already pushed to
-    // a registry the cluster can reach.
-    if (this.baseConfig.type !== ApplianceBaseType.ApplianceLocal) return;
-    // Only push host-built images into k3d. Anything with a registry
-    // host (a `.` or `:port` before the first slash) is treated as
-    // remote-pull territory and skipped.
-    if (isRegistryReference(image)) return;
-    try {
-      await execFileAsync('k3d', ['image', 'import', image, '-c', this.cluster.clusterName], {
-        maxBuffer: 64 * 1024 * 1024,
-      });
-    } catch (err) {
-      // k3d not installed, image missing from host daemon, etc. —
-      // let the deploy proceed: kubelet will surface ImagePullBackOff
-      // on the Pod which the rollout-wait will then time out on.
-      // Surfacing the import error here would hide unrelated failures.
-      const message = err instanceof Error ? err.message : String(err);
-      if (!/already in use|exists/.test(message)) {
-        console.warn(`k3d image import skipped: ${message}`);
-      }
-    }
-  }
-
   /**
    * `kubectl apply` equivalent for a single object: read existing,
    * replace on hit (preserving immutable fields like Service.clusterIP),
@@ -742,6 +794,59 @@ export function summarizePod(pod: k8s.V1Pod): PodHealth {
   };
 }
 
+/** RFC3339 creation timestamp off a resource's metadata, when present.
+ *  client-node surfaces it as a Date; normalise to an ISO string. */
+function creationTimestamp(meta: k8s.V1ObjectMeta | undefined): string | undefined {
+  const ts = meta?.creationTimestamp;
+  if (!ts) return undefined;
+  return ts instanceof Date ? ts.toISOString() : new Date(ts).toISOString();
+}
+
+/** Collapse a Deployment into the `kubectl get deploy` columns the
+ *  console renders (image + desired/ready/available replica counts). */
+export function summarizeWorkloadDeployment(dep: k8s.V1Deployment): Workloads['deployments'][number] {
+  return {
+    name: dep.metadata?.name ?? '',
+    image: dep.spec?.template?.spec?.containers?.[0]?.image ?? undefined,
+    desired: dep.spec?.replicas ?? 0,
+    ready: dep.status?.readyReplicas ?? 0,
+    available: dep.status?.availableReplicas ?? 0,
+    createdAt: creationTimestamp(dep.metadata),
+  };
+}
+
+/** Collapse a Pod into the `kubectl get pods` columns: phase, the READY
+ *  rollup (every container Ready), summed restarts, and the first
+ *  container's image. */
+export function summarizeWorkloadPod(pod: k8s.V1Pod): Workloads['pods'][number] {
+  const statuses = pod.status?.containerStatuses ?? [];
+  const restartCount = statuses.reduce((acc, c) => acc + (c.restartCount ?? 0), 0);
+  const ready = statuses.length > 0 && statuses.every((c) => c.ready === true);
+  return {
+    name: pod.metadata?.name ?? '',
+    phase: pod.status?.phase ?? 'Unknown',
+    ready,
+    restartCount,
+    containerImage: pod.spec?.containers?.[0]?.image ?? undefined,
+    createdAt: creationTimestamp(pod.metadata),
+  };
+}
+
+/** Collapse a Service into the `kubectl get svc` columns: type, cluster
+ *  IP, and the first port's nodePort/targetPort. A named (string)
+ *  targetPort is omitted — the console field is numeric-only. */
+export function summarizeWorkloadService(svc: k8s.V1Service): Workloads['services'][number] {
+  const firstPort = svc.spec?.ports?.[0];
+  const targetPort = typeof firstPort?.targetPort === 'number' ? firstPort.targetPort : undefined;
+  return {
+    name: svc.metadata?.name ?? '',
+    serviceType: svc.spec?.type ?? 'ClusterIP',
+    clusterIp: svc.spec?.clusterIP ?? undefined,
+    nodePort: typeof firstPort?.nodePort === 'number' ? firstPort.nodePort : undefined,
+    targetPort,
+  };
+}
+
 /**
  * Parse a Kubernetes CPU quantity into millicores. metrics-server
  * reports CPU as nanocores (`123456789n`) or millicores (`12m`); plain
@@ -806,11 +911,6 @@ function idempotentMessage(noop: boolean, hostnameUrl: string, nodePortUrl: stri
   return `Stack updated. URL: ${hostnameUrl}`;
 }
 
-function isRegistryReference(image: string): boolean {
-  const firstSegment = image.split('/')[0];
-  return firstSegment.includes('.') || firstSegment.includes(':');
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -821,7 +921,7 @@ export interface ManifestParams {
   image: string;
   port: number;
   /** Explicit NodePort the Service should bind. When omitted, k8s
-   *  picks any free port in 30000-32767. The demo cluster only
+   *  picks any free port in 30000-32767. The local runtime only
    *  publishes a small NodePort window, so the executor sets this
    *  deterministically per stack via deterministicNodePort(). */
   nodePort?: number;
@@ -830,7 +930,7 @@ export interface ManifestParams {
   /** Public hostname Traefik routes to this appliance via the
    *  generated Ingress. Typically `<stackName>.appliance.localhost`. */
   hostname: string;
-  /** IngressClass the Ingress declares (k3s/k3d ships `traefik`). */
+  /** IngressClass the Ingress declares (the local runtime ships `traefik`). */
   ingressClassName: string;
   /** Outbound-traffic confinement. When set, the workload is wired to
    *  route egress through the runtime's proxy (HTTP(S)_PROXY) so the

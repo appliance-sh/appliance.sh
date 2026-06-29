@@ -124,6 +124,12 @@ if ! mount -t ext4 /dev/vda "$PERSIST"; then
   echo "WARNING: data disk mount failed — falling back to tmpfs (no persistence, limited space)"
 fi
 
+# --- non-root appliance user ----------------------------------------
+# Substituted with the provisioning block below on EVERY VM (uid/gid
+# pinned at build time). Runs after the /persist mount so HOME +
+# workspace land on the persistent disk, and before the vsock shell
+# agent so the first shell connection can already `su` to a real user.
+__APP_USER_PROVISION__
 # --- vsock shell agent (appliance-vm shell) -------------------------
 # A PTY login shell served per connection on a fixed vsock port. The
 # host's resident process bridges a local Unix socket to this; no SSH,
@@ -243,6 +249,101 @@ mkdir -p /srv/handoff
 ) &
 "#;
 
+/// Non-root `appliance` user provisioning, substituted into
+/// `APPLIANCE_START` (the `__APP_USER_PROVISION__` marker) on EVERY VM.
+///
+/// Diskless Alpine rebuilds `/etc/passwd`, `/etc/group`, `/etc/shadow`
+/// and `/etc/sudoers.d` into tmpfs on every boot, so the user is
+/// (re)created each boot rather than once. The idempotency story is the
+/// **pinned uid/gid** (`__APP_UID__`/`__APP_GID__`, substituted at
+/// boot-media build time): stable ids keep ownership of files on the
+/// persistent `/persist` disk consistent across reboots, and the
+/// `|| true` guards make the re-runs harmless.
+///
+/// The user lands in `wheel` (passwordless sudo via `/etc/sudoers.d`)
+/// here; `docker` group membership is added in `DOCKER_PROVISION` (the
+/// group only exists after `apk add docker`). HOME is
+/// `/persist/workspace`, with an npm global prefix under HOME so
+/// `appliance up`'s `npm i -g @devcontainers/cli` installs unprivileged.
+const APP_USER_PROVISION: &str = r#"
+echo "appliance-user: provisioning the non-root appliance user"
+# uid/gid are PINNED (host uid/gid on --mount VMs, 1000 otherwise) so
+# /persist ownership stays stable across the diskless rebuild each boot.
+APP_USER=appliance
+APP_UID=__APP_UID__
+APP_GID=__APP_GID__
+APP_HOME=/persist/workspace
+
+mkdir -p "$APP_HOME"
+# Resolve the group that already owns $APP_GID. Alpine baselayout pins
+# several gids (e.g. gid 20 is `dialout`), and on a --mount VM $APP_GID is
+# the host's primary gid — `staff=20` on macOS — which collides. When a
+# group already owns the gid the appliance user joins IT as its primary
+# group; `addgroup -g <taken-gid>` would fail ("gid in use") and a
+# swallowed failure there leaves the user (and the vsock `su`) broken.
+# Only create a fresh `appliance` group when the gid is actually free.
+APP_GROUP=$(awk -F: -v g="$APP_GID" '$3==g{print $1; exit}' /etc/group)
+if [ -n "$APP_GROUP" ]; then
+  echo "appliance-user: gid $APP_GID already owned by group '$APP_GROUP' — using it as the primary group"
+else
+  addgroup -g "$APP_GID" "$APP_USER"
+  APP_GROUP="$APP_USER"
+fi
+# busybox adduser: -D no password, -H don't create home (it's on
+# /persist, made above), -h home, -s login shell, -G primary group,
+# -u uid. adduser/addgroup are busybox builtins (always present).
+adduser -D -H -u "$APP_UID" -G "$APP_GROUP" -h "$APP_HOME" -s /bin/sh "$APP_USER"
+# Verify loudly: a swallowed adduser failure (the gid collision used to
+# land exactly here) leaves the vsock shell unable to `su -l appliance`,
+# so surface it on the console instead of silently booting a broken shell.
+if id "$APP_USER" >/dev/null 2>&1; then
+  echo "appliance-user: created $APP_USER (uid=$(id -u "$APP_USER") gid=$(id -g "$APP_USER") group=$(id -gn "$APP_USER"))"
+else
+  echo "appliance-user: FATAL could not create $APP_USER (uid=$APP_UID gid=$APP_GID group=$APP_GROUP)"
+fi
+addgroup "$APP_USER" wheel 2>/dev/null || true
+# docker group membership is added in DOCKER_PROVISION (the group only
+# exists once the docker package is installed), not here.
+chown "$APP_UID:$APP_GID" "$APP_HOME" 2>/dev/null || true
+chmod 0755 "$APP_HOME" 2>/dev/null || true
+
+# Passwordless sudo for wheel via a drop-in (the diskless rebuild wipes
+# /etc/sudoers.d too, so rewrite it every boot).
+mkdir -p /etc/sudoers.d
+printf '%s\n' "$APP_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appliance
+chmod 0440 /etc/sudoers.d/appliance
+
+# Login env for the appliance user: npm global prefix under HOME so
+# global installs (appliance up) succeed unprivileged. /etc/profile.d/*.sh
+# is sourced by the login shell the agent's `su -l` starts.
+mkdir -p /etc/profile.d
+cat > /etc/profile.d/appliance-user.sh <<'PROFILE'
+export NPM_CONFIG_PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+PROFILE
+"#;
+
+/// Resolve the `appliance` user's uid/gid for the guest. On a
+/// VirtioFS-mounted (`--mount`) VM the host folder is shared at the
+/// user's HOME (`/persist/workspace`) and presents **host-side
+/// ownership**, so the guest user must carry the host user's uid/gid to
+/// read/write that tree as the host user does (a fixed 1000 would lose
+/// write access). Without a share there is no host ownership to match,
+/// so the conventional `1000` is used. Pure so the substitution logic is
+/// unit-tested without a live VM.
+fn resolve_app_ids(mount: bool, host_uid: u32, host_gid: u32) -> (u32, u32) {
+    // A host uid/gid of 0 means `appliance` is itself running as root;
+    // pinning (0,0) would make the supposedly "non-root" guest user uid 0
+    // and collapse the whole model. Fall back to the conventional
+    // 1000/1000 then — a root-owned share's writability stays a manual
+    // concern, but the guest user is never root.
+    if mount && host_uid != 0 && host_gid != 0 {
+        (host_uid, host_gid)
+    } else {
+        (1000, 1000)
+    }
+}
+
 /// Dev-environment provisioning, substituted into `APPLIANCE_START`
 /// (the `__DEV_PROVISION__` marker) only for VMs created with
 /// `appliance vm dev`. Two halves:
@@ -259,18 +360,21 @@ mkdir -p /srv/handoff
 ///     `vm dev status`.
 const DEV_PROVISION: &str = r#"
 echo "appliance-dev: provisioning development environment"
-mkdir -p /persist/workspace /persist/home /persist/apk-cache
+# HOME is /persist/workspace now (consolidated; the appliance user's
+# passwd entry points there), so no separate /persist/home.
+mkdir -p /persist/workspace /persist/apk-cache
 # Persist apk's download cache on the data disk so reprovisioning each
 # boot is fast and works offline once primed (the network repo is only
 # hit the first time, or for packages added later).
 ln -sfn /persist/apk-cache /etc/apk/cache
 __DEV_MOUNT__
-# Every login shell gets a stable HOME on the persistent disk; the
-# `dev shell` entry cd's into the workspace itself.
+# Mark the dev environment and extend PATH. HOME is NOT exported here:
+# the appliance user's passwd entry (HOME=/persist/workspace) is the one
+# source of truth, and `su -l` derives HOME from it — re-exporting it
+# would override the user's HOME and break /persist ownership.
 mkdir -p /etc/profile.d
 cat > /etc/profile.d/appliance-dev.sh <<'PROFILE'
 export APPLIANCE_DEV=1
-export HOME=/persist/home
 export PATH="$HOME/.local/bin:$PATH"
 PROFILE
 # Install the toolchain in the background: first boot pulls from the
@@ -281,7 +385,7 @@ PROFILE
   rm -f /persist/.dev-ready
   apk update --no-progress >/dev/null 2>&1 || true
   if apk add --no-progress \
-      bash bash-completion git git-lfs curl wget vim nano less tmux htop \
+      bash bash-completion git git-lfs curl wget vim nano less htop \
       jq ripgrep tar gzip coreutils findutils grep sed gawk procps \
       openssh-client ca-certificates build-base python3 py3-pip nodejs npm; then
     echo "appliance-dev: toolchain ready"
@@ -363,6 +467,14 @@ fi
   while :; do
     if apk add --no-progress docker docker-cli-compose; then
       echo "appliance-docker: docker package installed"
+      # The `docker` group is created by the docker apk package, so add
+      # the non-root appliance user to it now (the user-provisioning block
+      # couldn't — the group didn't exist yet). This lets `appliance up` /
+      # devcontainer exec reach root dockerd's socket (root:docker 0660)
+      # without sudo. dockerd stays a root daemon. No daemon restart
+      # needed: any fresh one-shot shell after .docker-ready picks up the
+      # group membership from /etc/group.
+      addgroup appliance docker 2>/dev/null || true
       # Egress env for dockerd's own traffic (registry pulls/builds). The
       # node-wide egress CA (trusted above via update-ca-certificates) lets
       # MITM'd TLS validate. NO_PROXY keeps daemon-local/bridge traffic and
@@ -396,17 +508,102 @@ fi
 /// Per-connection shell run by the vsock agent (socat EXEC target). The
 /// host `appliance-vm shell` client sends an initial "rows R cols C"
 /// line; we apply it as the PTY size (echo off so it isn't painted into
-/// the session), then exec a login shell — landing in the dev workspace
-/// when there is one. bash if the dev toolchain installed it, else sh.
+/// the session), then drop to the non-root `appliance` user with
+/// `su -l` — landing in the workspace (=HOME). bash if the dev toolchain
+/// installed it, else sh.
+///
+/// A trailing `root` token on the size line keeps the shell as root
+/// instead (the `--root` escape hatch, and the host clock-sync, which
+/// needs root for `date -s`). The drop is invisible to the one-shot
+/// exit-code sentinel: root sizes the PTY (it owns the tty), then the
+/// login shell `su` execs inherits the same PTY stdin/stdout, so the
+/// host's trailing `printf '…__APPLIANCE_VM_RC__%d__END__…' "$?"` still
+/// runs in that shell with the command's real `$?`.
+///
+/// An optional trailing **verb** extends the grammar to
+/// `rows R cols C [root] [attach <id> | new <id> | list | kill <id>]`,
+/// routing to a reattachable tmux session instead of a raw login shell.
+/// The verb is stripped *before* the `root` token, so with no verb the
+/// parsing — and therefore the one-shot sentinel + clock-sync `root`
+/// paths — is byte-for-byte what it was. attach/new attach-or-create the
+/// per-id session `appliance-<id>`; list/kill enumerate/remove. Non-root
+/// sessions run as the `appliance` user on the `tmux -L appliance` socket;
+/// `root` swaps to a separate root-owned `tmux -L appliance-root` socket,
+/// so the two privilege levels can never cross-attach. The vsock relay
+/// stays a dumb per-connect byte pipe — the durable state is this in-guest
+/// tmux server, which is what survives a disconnect / desktop restart.
 const SHELL_AGENT: &str = r#"#!/bin/sh
 # appliance-vm shell agent — one login shell per vsock connection.
+# Runs as root (socat EXEC), sizes the PTY, then drops to `appliance`
+# unless the caller appended a `root` token to the size line.
 stty -echo 2>/dev/null
 IFS= read -r __SZ
+# Optional trailing session verb (attach/new/list/kill). Parsed first so
+# the grammar is `rows R cols C [root] [verb …]`; with NO verb this whole
+# block is a no-op and the legacy one-shot/login path below is unchanged.
+__VERB=''; __SID=''
+case "$__SZ" in
+  *" attach "*) __SID="${__SZ##* attach }"; __SZ="${__SZ% attach *}"; __VERB=attach;;
+  *" new "*)    __SID="${__SZ##* new }";    __SZ="${__SZ% new *}";    __VERB=new;;
+  *" kill "*)   __SID="${__SZ##* kill }";   __SZ="${__SZ% kill *}";   __VERB=kill;;
+  *" list")     __SZ="${__SZ% list}";       __VERB=list;;
+esac
+__ROOT=0
+case "$__SZ" in *" root") __ROOT=1; __SZ="${__SZ% root}";; esac
 [ -n "$__SZ" ] && stty $__SZ 2>/dev/null
 stty echo 2>/dev/null
-[ -d /persist/home ] && export HOME=/persist/home
-cd /persist/workspace 2>/dev/null || cd "$HOME" 2>/dev/null || cd / || true
-if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi
+# Reattachable sessions: a verb routes to the tmux multiplexer. Non-root
+# sessions run as `appliance` on the `appliance` socket; root keeps a
+# separate `appliance-root` socket. attach/new exec tmux (replacing this
+# agent), so a disconnect detaches but leaves the session running; list/
+# kill are one-shots that print/act and close. login (`-l`) only on the
+# interactive attach/new path — list/kill stay non-login so profile output
+# can't corrupt the machine-readable session list.
+if [ -n "$__VERB" ]; then
+  # Defense-in-depth: $__SID rides verbatim into `sh -c` below. The host
+  # already validates it (validate_session_id), but reject anything outside
+  # [A-Za-z0-9._-] here too — belt-and-suspenders, since the vsock is
+  # host-only. `list` carries an empty id, which passes (no offending char).
+  case "$__SID" in
+    *[!A-Za-z0-9._-]*) echo "appliance-shell: invalid session id" >&2; exit 1;;
+  esac
+  if [ "$__ROOT" = 1 ]; then __L=appliance-root; else __L=appliance; fi
+  __TMUX="tmux -L $__L -f /etc/appliance/tmux.conf"
+  case "$__VERB" in
+    list) __TCMD="$__TMUX list-sessions -F '#{session_name} #{session_activity}' 2>/dev/null"; __LOGIN='';;
+    # Echo a marker keyed on tmux's exit status so the host can report the
+    # real outcome ("killed" vs "no such session") over the status-less
+    # byte pipe — kill-session exits non-zero when the id doesn't exist.
+    kill) __TCMD="if $__TMUX kill-session -t appliance-$__SID 2>/dev/null; then echo __APPLIANCE_VM_KILLED__; else echo __APPLIANCE_VM_NO_SESSION__; fi"; __LOGIN='';;
+    *)    __TCMD="exec $__TMUX new-session -A -s appliance-$__SID"; __LOGIN='-l';;
+  esac
+  if [ "$__ROOT" = 1 ]; then
+    exec sh -c "$__TCMD"
+  else
+    exec su -s /bin/sh $__LOGIN -c "$__TCMD" appliance
+  fi
+fi
+if command -v bash >/dev/null 2>&1; then __SH=/bin/bash; else __SH=/bin/sh; fi
+if [ "$__ROOT" = 1 ]; then
+  cd /persist/workspace 2>/dev/null || cd /root 2>/dev/null || cd /
+  exec "$__SH" -l
+fi
+# su -l: sets HOME/USER/SHELL from passwd, login shell, cd's to HOME
+# (=/persist/workspace). Same PTY stdin/stdout → the one-shot sentinel
+# still runs here with the command's real $?. (busybox su supports -s/-l.)
+exec su -s "$__SH" -l appliance
+"#;
+
+/// Transparent tmux config the shell agent points `-f` at for every
+/// reattachable session. No status bar (the desktop owns the chrome), a
+/// short escape-time so key passthrough feels raw, a large scrollback that
+/// survives detach/reattach, and `destroy-unattached off` so a session
+/// lives on while no client is attached — the whole point of reattach.
+const TMUX_CONF: &str = r#"set -g status off
+set -g default-terminal "tmux-256color"
+set -g escape-time 10
+set -g history-limit 50000
+set -g destroy-unattached off
 "#;
 
 /// Build the apkovl (Alpine "local backup" overlay tarball): openrc
@@ -446,10 +643,17 @@ fn build_apkovl(
     // lets containerd pull from TLS registries.
     // socat backs the vsock shell agent (appliance-vm shell); it's tiny
     // and gives every VM a k3s-independent host shell.
+    // sudo gives the non-root `appliance` user passwordless escalation
+    // (wheel + /etc/sudoers.d); the diskless init installs it from the
+    // network repo before appliance.start provisions the user.
+    // tmux backs the reattachable shell sessions (appliance vm shell
+    // --session / sessions): an in-guest multiplexer whose named sessions
+    // survive a client disconnect + desktop restart. Unconditional, like
+    // the shell agent itself — every VM, not just dev VMs.
     file(
         "etc/apk/world",
         0o644,
-        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\n",
+        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\ntmux\n",
     )?;
     file(
         "etc/apk/repositories",
@@ -465,6 +669,14 @@ fn build_apkovl(
         0o644,
         b"rc_cgroup_mode=\"unified\"\nrc_logger=\"YES\"\n",
     )?;
+    // The non-root appliance user is provisioned on every VM. uid/gid
+    // are pinned here: the host user's own ids on a VirtioFS-mounted VM
+    // (so the shared workspace stays writable), 1000 otherwise.
+    let (app_uid, app_gid) =
+        resolve_app_ids(mount, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let app_user_provision = APP_USER_PROVISION
+        .replace("__APP_UID__", &app_uid.to_string())
+        .replace("__APP_GID__", &app_gid.to_string());
     file(
         "etc/local.d/appliance.start",
         0o755,
@@ -473,6 +685,7 @@ fn build_apkovl(
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
             .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
+            .replace("__APP_USER_PROVISION__", &app_user_provision)
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
             .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
             .replace("__DOCKER_PROVISION__", if docker { DOCKER_PROVISION } else { "" })
@@ -482,6 +695,8 @@ fn build_apkovl(
     // The vsock shell agent (socat EXEC target). Always present — every
     // VM gets a k3s-independent host shell.
     file("usr/local/bin/appliance-shell-agent", 0o755, SHELL_AGENT.as_bytes())?;
+    // Transparent tmux config for the agent's reattachable sessions.
+    file("etc/appliance/tmux.conf", 0o644, TMUX_CONF.as_bytes())?;
 
     // The per-VM egress CA, trusted node-wide by appliance.start's
     // update-ca-certificates step. Placed even when interception is
@@ -622,12 +837,12 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
     fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
-    // Bind failures here are almost always the other engine (k3d's
-    // serverlb publishes the same 8081) — name the fix, don't let it
-    // surface as a generic timeout.
+    // Bind failures here are almost always another microVM already
+    // holding the port — name the fix, don't let it surface as a
+    // generic timeout.
     let bind_hint = |port: u16, what: &str| {
         format!(
-            "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. If the k3d runtime is running, stop it first (`appliance local stop`)."
+            "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. Stop the microVM holding it with `appliance vm stop`, or run `appliance doctor` to find what owns the port."
         )
     };
     crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
@@ -725,7 +940,9 @@ mod tests {
         let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
-        assert!(!start.contains("/persist/workspace"));
+        // The base user block references /persist/workspace on every VM,
+        // so assert on dev-only wiring instead.
+        assert!(!start.contains("appliance-dev: provisioning"));
         assert!(!start.contains("apk add"));
 
         // Dev: the workspace, persistent apk cache, login profile, and
@@ -741,6 +958,83 @@ mod tests {
     }
 
     #[test]
+    fn appliance_user_provisioned_on_every_vm() {
+        // The non-root user is unconditional — present even on a plain
+        // (non-dev, non-docker, non-mount) VM, just like the shell agent.
+        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
+        // User + primary group, pinned uid/gid, on the persistent home.
+        assert!(start.contains("APP_USER=appliance"));
+        assert!(start.contains("adduser -D -H -u \"$APP_UID\" -G \"$APP_GROUP\" -h \"$APP_HOME\" -s /bin/sh \"$APP_USER\""));
+        // The user's primary group is resolved from /etc/group so a host
+        // gid that collides with a baselayout group (e.g. staff=20 →
+        // dialout) reuses that group instead of failing `addgroup`.
+        assert!(start.contains("APP_GROUP=$(awk -F: -v g=\"$APP_GID\" '$3==g{print $1; exit}' /etc/group)"));
+        assert!(start.contains("addgroup -g \"$APP_GID\" \"$APP_USER\""));
+        assert!(start.contains("APP_HOME=/persist/workspace"));
+        // wheel (sudo) membership + a passwordless sudoers drop-in.
+        assert!(start.contains("addgroup \"$APP_USER\" wheel"));
+        assert!(start.contains("/etc/sudoers.d/appliance"));
+        assert!(start.contains("ALL=(ALL) NOPASSWD:ALL"));
+        // npm global prefix under HOME so `appliance up` installs the
+        // devcontainers CLI unprivileged.
+        assert!(start.contains("/etc/profile.d/appliance-user.sh"));
+        assert!(start.contains("NPM_CONFIG_PREFIX=\"$HOME/.local\""));
+        // sudo is in the base package set so it's installed before the
+        // bootstrap provisions the user.
+        let world = apkovl_file(&plain, "etc/apk/world").unwrap();
+        assert!(world.lines().any(|l| l == "sudo"));
+        // The provisioning runs after the /persist mount and before the
+        // shell agent listens (so the first connection can `su`).
+        let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
+        let user_at = start.find("provisioning the non-root appliance user").unwrap();
+        let agent_at = start.find("VSOCK-LISTEN:").unwrap();
+        assert!(mount_at < user_at && user_at < agent_at, "user block must sit between the persist mount and the shell agent");
+    }
+
+    #[test]
+    fn appliance_user_uid_gid_pinned_per_mount() {
+        // Pure resolver: a share matches the host ids; no share is 1000.
+        assert_eq!(resolve_app_ids(false, 501, 20), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
+
+        // A non-mount VM pins the conventional 1000/1000.
+        let plain = build_apkovl(5052, None, true, false, false, 5053).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains("APP_UID=1000"));
+        assert!(start.contains("APP_GID=1000"));
+
+        // A --mount VM pins the host user's own uid/gid so the shared
+        // workspace (host-side ownership over virtiofs) stays writable —
+        // except when the host is root, where the resolver falls back to
+        // 1000 (asserted separately), so derive the expected ids the same
+        // way and don't hard-code the live host's values.
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+        let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
+        let shared = build_apkovl(5052, None, true, true, false, 5053).unwrap();
+        let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains(&format!("APP_UID={exp_uid}")), "mounted VM must pin the resolved uid");
+        assert!(start.contains(&format!("APP_GID={exp_gid}")), "mounted VM must pin the resolved gid");
+    }
+
+    #[test]
+    fn resolve_app_ids_falls_back_when_host_is_root() {
+        // Running `appliance` as root must NOT mint a uid-0 "non-root"
+        // user: the mount path falls back to the conventional 1000/1000
+        // whenever the host uid or gid is 0.
+        assert_eq!(resolve_app_ids(true, 0, 0), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 0, 20), (1000, 1000));
+        assert_eq!(resolve_app_ids(true, 501, 0), (1000, 1000));
+        // A non-root host still carries its own ids onto the shared tree.
+        assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
+        // No share is always 1000/1000, root host or not.
+        assert_eq!(resolve_app_ids(false, 0, 0), (1000, 1000));
+        assert_eq!(resolve_app_ids(false, 501, 20), (1000, 1000));
+    }
+
+    #[test]
     fn vsock_shell_agent_is_baked_into_every_vm() {
         let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
         // socat backs the agent and is in the base package set.
@@ -751,10 +1045,83 @@ mod tests {
         assert!(!start.contains("__SHELL_VSOCK_PORT__"), "port marker must be substituted");
         assert!(start.contains(&format!("VSOCK-LISTEN:{SHELL_VSOCK_PORT}")));
         assert!(start.contains("/usr/local/bin/appliance-shell-agent"));
-        // The agent script is present and execs a login shell.
+        // The agent script is present, reads the size line, and drops to
+        // the non-root appliance user via a login `su` by default.
         let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
         assert!(agent.contains("read"));
-        assert!(agent.contains("exec bash -l") || agent.contains("exec sh -l"));
+        assert!(agent.contains("exec su -s \"$__SH\" -l appliance"), "default drop to appliance");
+        // The `root` token on the size line keeps a root login shell (the
+        // --root escape hatch + clock-sync); its branch execs the shell
+        // directly, not via su.
+        assert!(agent.contains("*\" root\")"), "root token is stripped from the size line");
+        assert!(agent.contains("exec \"$__SH\" -l"), "root branch keeps a root login shell");
+    }
+
+    #[test]
+    fn tmux_is_in_the_base_world_set() {
+        // The reattachable-session multiplexer ships on EVERY VM (not just
+        // dev VMs), next to socat/sudo — the feature is unconditional.
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
+        assert!(world.lines().any(|l| l == "tmux"), "tmux must be in the base world set");
+    }
+
+    #[test]
+    fn transparent_tmux_conf_is_baked_in() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let conf = apkovl_file(&ovl, "etc/appliance/tmux.conf").expect("tmux.conf present");
+        // Invisible multiplexer: no status bar, short escape passthrough,
+        // large scrollback, and sessions outlive a detach.
+        assert!(conf.contains("status off"));
+        assert!(conf.contains("history-limit 50000"));
+        assert!(conf.contains("destroy-unattached off"));
+        // The agent points `-f` at exactly this path.
+        let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
+        assert!(agent.contains("-f /etc/appliance/tmux.conf"));
+    }
+
+    #[test]
+    fn shell_agent_routes_session_verbs_to_tmux() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
+
+        // The four verbs are parsed off the size line.
+        assert!(agent.contains("*\" attach \"*)"), "attach verb parsed");
+        assert!(agent.contains("*\" new \"*)"), "new verb parsed");
+        assert!(agent.contains("*\" kill \"*)"), "kill verb parsed");
+        assert!(agent.contains("*\" list\")"), "list verb parsed");
+        // attach/new is attach-or-create on the named per-id session.
+        assert!(agent.contains("new-session -A -s appliance-$__SID"));
+        assert!(agent.contains("list-sessions"));
+        assert!(agent.contains("kill-session -t appliance-$__SID"));
+        // Two owner-isolated sockets: appliance (default) vs appliance-root.
+        assert!(agent.contains("__L=appliance-root"));
+        assert!(agent.contains("else __L=appliance"));
+        // Non-root sessions drop to the appliance user; root keeps a root
+        // tmux on its own socket (no su).
+        assert!(agent.contains("exec su -s /bin/sh $__LOGIN -c \"$__TCMD\" appliance"));
+        assert!(agent.contains("exec sh -c \"$__TCMD\""));
+
+        // kill reports the real outcome: it echoes a marker keyed on tmux's
+        // exit status so the host can say "killed" vs "no such session"
+        // over the status-less byte pipe.
+        assert!(agent.contains("__APPLIANCE_VM_KILLED__"), "kill echoes a success marker");
+        assert!(agent.contains("__APPLIANCE_VM_NO_SESSION__"), "kill echoes a no-session marker");
+        // Defense-in-depth guest-side id guard: reject anything outside the
+        // host-validated charset before $__SID rides into `sh -c`.
+        assert!(agent.contains("*[!A-Za-z0-9._-]*)"), "guest-side session-id charset guard");
+
+        // CRITICAL: the verb block is gated on a verb being present, so the
+        // no-verb one-shot/login path is byte-for-byte the legacy behavior.
+        assert!(agent.contains("if [ -n \"$__VERB\" ]; then"));
+        // The verb parse sits before the `root` parse (grammar order) and
+        // before the legacy shell selection, so a verb-less line lands on
+        // the unchanged path.
+        let verb_at = agent.find("__VERB=''").unwrap();
+        let root_at = agent.find("case \"$__SZ\" in *\" root\")").unwrap();
+        let legacy_su_at = agent.find("exec su -s \"$__SH\" -l appliance").unwrap();
+        assert!(verb_at < root_at, "verb parse precedes the root-token parse");
+        assert!(root_at < legacy_su_at, "legacy drop-to-appliance is still the fall-through");
     }
 
     #[test]
@@ -798,6 +1165,10 @@ mod tests {
         // Packaged from the Alpine community repo, cached on /persist.
         assert!(start.contains("apk add --no-progress docker docker-cli-compose"));
         assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
+        // The non-root appliance user joins the docker group (created by
+        // the docker package) so `appliance up` reaches dockerd without
+        // sudo — added after the install, where the group exists.
+        assert!(start.contains("addgroup appliance docker"));
         // Fully separate engine: own data-root, listening on the default
         // socket (in-guest CLI) + the stable /persist path (vsock relay).
         assert!(start.contains("--data-root /persist/docker"));

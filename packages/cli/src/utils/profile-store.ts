@@ -52,6 +52,15 @@ interface LegacyCredentials {
 const APPLIANCE_DIR = path.join(os.homedir(), '.appliance');
 const PROFILES_PATH = path.join(APPLIANCE_DIR, 'profiles.json');
 const LEGACY_PATH = path.join(APPLIANCE_DIR, 'credentials.json');
+const LOCK_PATH = path.join(APPLIANCE_DIR, 'profiles.json.lock');
+
+// A lock held longer than this is presumed orphaned (a crashed process)
+// and may be stolen, so a stale lock never wedges the CLI permanently.
+const LOCK_STALE_MS = 10_000;
+// Total time to wait for a contended lock before proceeding anyway. The
+// lock is advisory and best-effort: blocking the user is worse than the
+// small last-writer-wins window it guards.
+const LOCK_TIMEOUT_MS = 2_000;
 
 /** Default profile name used when migrating a legacy single-credentials file. */
 export const DEFAULT_PROFILE_NAME = 'default';
@@ -59,6 +68,70 @@ export const DEFAULT_PROFILE_NAME = 'default';
 function ensureDir(): void {
   if (!fs.existsSync(APPLIANCE_DIR)) {
     fs.mkdirSync(APPLIANCE_DIR, { recursive: true, mode: 0o700 });
+  }
+}
+
+/** Synchronous sleep (the store API is sync). Uses Atomics.wait so it
+ * doesn't busy-spin a CPU while waiting for the lock. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run `fn` while holding a cross-process advisory lock on profiles.json,
+ * so a CLI read-modify-write (e.g. `appliance keys rotate`) can't
+ * interleave with another `appliance` process's RMW and lose a write.
+ *
+ * Implemented as an O_EXCL lockfile (the portable primitive Node exposes
+ * without a native flock binding): create-exclusive wins the lock; on
+ * contention we retry, steal a stale lock (crashed holder), and after
+ * LOCK_TIMEOUT_MS give up and proceed unlocked rather than block the user.
+ *
+ * SCOPE: this serializes `appliance` processes against each other. The
+ * desktop (Rust) currently uses an in-process mutex + atomic temp-rename
+ * writes and does NOT yet take this lockfile, so a desktop↔CLI interleave
+ * is still last-writer-wins (both sides write atomically, so neither can
+ * read a half-written file). Having the desktop adopt the same lockfile
+ * is the remaining piece — see docs/control-plane.md §5.
+ */
+function withProfilesLock<T>(fn: () => T): T {
+  ensureDir();
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let fd: number | undefined;
+  for (;;) {
+    try {
+      fd = fs.openSync(LOCK_PATH, 'wx', 0o600);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        // Can't even attempt to lock (e.g. unwritable dir) — don't block
+        // the operation; fall through and run without the lock.
+        return fn();
+      }
+      try {
+        if (Date.now() - fs.statSync(LOCK_PATH).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(LOCK_PATH);
+          continue;
+        }
+      } catch {
+        // Lock vanished between open and stat — retry immediately.
+        continue;
+      }
+      if (Date.now() > deadline) {
+        return fn();
+      }
+      sleepSync(50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.closeSync(fd);
+      fs.unlinkSync(LOCK_PATH);
+    } catch {
+      // Best-effort release; a leftover lock is reaped as stale.
+    }
   }
 }
 
@@ -165,17 +238,19 @@ export function resolveProfile(file: ProfilesFile, opts: ResolveOptions = {}): R
  * is updated if the saved profile is now active.
  */
 export function upsertProfile(name: string, profile: Profile, opts: { makeActive?: boolean } = {}): void {
-  const file = readProfiles();
-  const existing = file.profiles[name];
-  file.profiles[name] = {
-    ...existing,
-    ...profile,
-    createdAt: existing?.createdAt ?? profile.createdAt ?? new Date().toISOString(),
-  };
-  if (opts.makeActive || file.activeProfile === null) {
-    file.activeProfile = name;
-  }
-  writeProfiles(file);
+  withProfilesLock(() => {
+    const file = readProfiles();
+    const existing = file.profiles[name];
+    file.profiles[name] = {
+      ...existing,
+      ...profile,
+      createdAt: existing?.createdAt ?? profile.createdAt ?? new Date().toISOString(),
+    };
+    if (opts.makeActive || file.activeProfile === null) {
+      file.activeProfile = name;
+    }
+    writeProfiles(file);
+  });
 }
 
 /**
@@ -183,24 +258,28 @@ export function upsertProfile(name: string, profile: Profile, opts: { makeActive
  * profile (or null when the store is now empty).
  */
 export function removeProfile(name: string): boolean {
-  const file = readProfiles();
-  if (!file.profiles[name]) return false;
-  delete file.profiles[name];
-  if (file.activeProfile === name) {
-    const next = Object.keys(file.profiles)[0] ?? null;
-    file.activeProfile = next;
-  }
-  writeProfiles(file);
-  return true;
+  return withProfilesLock(() => {
+    const file = readProfiles();
+    if (!file.profiles[name]) return false;
+    delete file.profiles[name];
+    if (file.activeProfile === name) {
+      const next = Object.keys(file.profiles)[0] ?? null;
+      file.activeProfile = next;
+    }
+    writeProfiles(file);
+    return true;
+  });
 }
 
 /** Switch the active profile. Returns false if the name doesn't exist. */
 export function setActiveProfile(name: string): boolean {
-  const file = readProfiles();
-  if (!file.profiles[name]) return false;
-  file.activeProfile = name;
-  writeProfiles(file);
-  return true;
+  return withProfilesLock(() => {
+    const file = readProfiles();
+    if (!file.profiles[name]) return false;
+    file.activeProfile = name;
+    writeProfiles(file);
+    return true;
+  });
 }
 
 export const PROFILES_FILE = PROFILES_PATH;

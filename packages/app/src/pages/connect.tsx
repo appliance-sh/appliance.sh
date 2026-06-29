@@ -122,7 +122,7 @@ export function ConnectPage() {
             <>
               {' '}
               Don&apos;t have a cluster yet? Run{' '}
-              <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance local up</code> for a local k3d
+              <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance vm up</code> for a local
               runtime, or <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance bootstrap</code> for
               AWS.
             </>

@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   Check,
@@ -17,62 +17,43 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
+import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
+import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
-import { TerminalDrawer } from './terminal-drawer';
 import type {
   EgressEvent,
   EgressPolicy,
   LocalDeploymentInfo,
   LocalPodInfo,
   LocalPreflightCheck,
-  LocalRuntimeStatus,
   LocalServiceInfo,
   MicroVmInstanceHost,
   MicroVmStatus,
   MicroVmSummary,
 } from '@/lib/host';
 
-// Docker Desktop-style overview page for the local k3d-backed
-// container runtime. Drives three things in one place:
-//   * Cluster + api-server lifecycle (Start / Stop / Delete).
-//   * Resolved configuration the runtime is using (cluster name,
-//     namespace, ports, data dir) for ops debugging.
-//   * Live workloads (Deployments / Pods / Services) in the
-//     appliance namespace, with per-pod log tails.
-//
-// All wiring goes through `host.local.*` — implemented today by the
-// Tauri shell (web host can't shell out to k3d/kubectl).
+// Docker Desktop-style overview page for the local runtime, sandboxed
+// in a microVM Appliance boots itself. Surfaces the prerequisite
+// preflight, then a card per microVM (lifecycle, egress, credentials,
+// and live workloads with per-pod log tails). All wiring goes through
+// `host.vm.*` + `host.local.*` — implemented by the Tauri shell (the
+// web host can't shell out).
 export function LocalRuntimePage() {
   const host = useHost();
-  const queryClient = useQueryClient();
-  const confirm = useConfirm();
   const local = host.local;
-  const supported = Boolean(local?.runtimeStatus);
+  const supported = Boolean(host.vm);
 
-  const statusQuery = useQuery({
-    queryKey: ['local-runtime', 'status'],
-    enabled: supported,
-    queryFn: () => local!.runtimeStatus(),
-    // Snappy refresh while a transition is in flight, lazier when idle.
-    refetchInterval: (q) => {
-      const data = q.state.data;
-      if (!data) return 3_000;
-      const running = data.cluster.running && data.apiServer.running;
-      return running ? 5_000 : 2_000;
-    },
-  });
-
-  // Preflight: ask the host which of docker/k3d/kubectl are installed.
-  // The runtime itself shells out to all three; if any are missing the
-  // first Start click would surface a cryptic "failed to spawn" error.
-  // We render an actionable install panel instead and disable Start
-  // until everything checks out. Polled lazily so installing a tool in
-  // a separate terminal is reflected within a few seconds without
-  // requiring a page reload.
+  // Preflight: ask the host which of docker/kubectl are installed.
+  // Image builds shell out to docker and workload/log reads to kubectl;
+  // if either is missing the relevant action would surface a cryptic
+  // "failed to spawn" error. We render an actionable install panel
+  // instead. Polled lazily so installing a tool in a separate terminal
+  // is reflected within a few seconds without requiring a page reload.
   const preflightQuery = useQuery({
     queryKey: ['local-runtime', 'preflight'],
     enabled: supported && Boolean(local?.preflight),
@@ -81,38 +62,16 @@ export function LocalRuntimePage() {
       const data = q.state.data;
       if (!data) return 5_000;
       // Keep polling while anything's not ready — including docker
-      // installed-but-daemon-down — so starting a tool or the runtime
-      // in another window clears the panel within a few seconds.
+      // installed-but-daemon-down — so starting a tool in another
+      // window clears the panel within a few seconds.
       return data.every(checkReady) ? false : 5_000;
     },
   });
   const preflightChecks = preflightQuery.data ?? [];
-  const preflightReady = preflightChecks.length === 0 || preflightChecks.every(checkReady);
 
-  const startMutation = useMutation({
-    mutationFn: () => local!.startRuntime(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['local-runtime'] }),
-  });
-  const stopMutation = useMutation({
-    mutationFn: () => local!.stopRuntime(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['local-runtime'] }),
-  });
-  const deleteMutation = useMutation({
-    mutationFn: () => local!.deleteRuntime(),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['local-runtime'] });
-      // Removing the auto-registered cluster also nudges host config.
-      queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
-    },
-  });
-
-  const status = statusQuery.data;
-  const phase = derivePhase(status, startMutation.isPending, stopMutation.isPending, deleteMutation.isPending);
-
-  // The header's Deploy button serves every engine — the wizard
-  // targets the selected cluster, so it's useful as soon as the k3d
-  // runtime or any microVM is up. The VM list drives both the deploy
-  // gate and the per-VM panels below.
+  // The header's Deploy button serves every microVM — the wizard
+  // targets the selected cluster, so it's useful as soon as any VM is
+  // up. The VM list drives both the deploy gate and the per-VM panels.
   const vmListQuery = useQuery({
     queryKey: ['microvm', 'list'],
     enabled: Boolean(host.vm),
@@ -121,91 +80,18 @@ export function LocalRuntimePage() {
   });
   const vms = vmListQuery.data ?? [];
   const anyVmRunning = vms.some((v) => v.running);
-  const canDeploy = phase === 'running' || anyVmRunning;
-  // The default VM shares host port 8081 with the k3d runtime — only
-  // one can hold it. Named VMs get their own ports, so they never
-  // conflict. Gate k3d Start on the *default* VM running.
-  const microVmHoldsPort = vms.some((v) => v.name === 'appliance' && v.running);
+  const canDeploy = anyVmRunning;
 
   if (!supported) {
     return (
       <div className="max-w-2xl space-y-4">
         <h1 className="text-xl font-semibold">Local Runtime</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          This shell can&rsquo;t drive a local k3d runtime — Local Runtime is only available in the desktop app.
+          This shell can&rsquo;t drive a local runtime — it&rsquo;s only available in the desktop app.
         </p>
       </div>
     );
   }
-
-  const onDelete = async () => {
-    const ok = await confirm({
-      title: 'Delete the local runtime?',
-      description:
-        'This stops the api-server, deletes the k3d cluster, and forgets the registered Console cluster + API key. The data dir is left on disk.',
-      confirmLabel: 'Delete runtime',
-    });
-    if (!ok) return;
-    deleteMutation.mutate();
-  };
-
-  // The host-side k3d runtime — the unsandboxed option, a peer of every
-  // sandboxed microVM card below it, not a privileged "primary runtime".
-  const k3dCard = (
-    <EngineCard
-      name={status?.config.clusterName ?? 'appliance-local'}
-      engine="k3d"
-      statusPill={<PhaseBadge phase={phase} />}
-      description="Runs k3d directly on this host via the docker provider — not sandboxed. Registers as a regular cluster."
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          onClick={() => startMutation.mutate()}
-          disabled={
-            !preflightReady ||
-            phase === 'running' ||
-            phase === 'starting' ||
-            startMutation.isPending ||
-            microVmHoldsPort
-          }
-          title={
-            !preflightReady
-              ? 'Install the prerequisites listed above to enable Start'
-              : microVmHoldsPort && phase !== 'running'
-                ? 'Stop the default microVM first — both engines publish on host port 8081'
-                : undefined
-          }
-        >
-          <Play className="h-4 w-4" /> {phase === 'running' ? 'Running' : phase === 'starting' ? 'Starting…' : 'Start'}
-        </Button>
-        <Button
-          variant="outline"
-          onClick={() => stopMutation.mutate()}
-          disabled={phase === 'stopped' || phase === 'stopping' || stopMutation.isPending}
-        >
-          <Square className="h-4 w-4" /> {phase === 'stopping' ? 'Stopping…' : 'Stop'}
-        </Button>
-        <Button variant="destructive" onClick={onDelete} disabled={deleteMutation.isPending}>
-          <Trash2 className="h-4 w-4" /> {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Refresh"
-          onClick={() => statusQuery.refetch()}
-          disabled={statusQuery.isFetching}
-        >
-          <RefreshCw className={cn('h-4 w-4', statusQuery.isFetching && 'animate-spin')} />
-        </Button>
-      </div>
-
-      <MutationErrors errors={[startMutation.error, stopMutation.error, deleteMutation.error]} />
-
-      {status ? <RuntimeOverview status={status} /> : null}
-
-      {status?.cluster.running && status?.apiServer.running ? <WorkloadsPanel /> : null}
-    </EngineCard>
-  );
 
   return (
     <div className="max-w-4xl space-y-6">
@@ -213,8 +99,8 @@ export function LocalRuntimePage() {
         <div>
           <h1 className="text-xl font-semibold">Local runtime</h1>
           <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Run appliances on this machine — sandboxed in a virtual machine (recommended) or directly on the host. Each
-            registers as a regular cluster you can deploy to and switch between.
+            Run appliances on this machine, sandboxed in a virtual machine. Each VM registers as a regular cluster you
+            can deploy to and switch between.
           </p>
         </div>
         {canDeploy ? (
@@ -251,14 +137,13 @@ export function LocalRuntimePage() {
         }}
       />
 
-      <EnginesSection showMicroVm={Boolean(host.vm)} vms={vms} loading={vmListQuery.isLoading} leadingPanel={k3dCard} />
+      <EnginesSection showMicroVm={Boolean(host.vm)} vms={vms} loading={vmListQuery.isLoading} />
     </div>
   );
 }
 
-// A consistent card shell for every local engine — k3d and each
-// microVM render with identical chrome (name + engine tag + status
-// pill), so no engine reads as more "primary" than another.
+// A consistent card shell for every microVM — name + engine tag +
+// status pill, rendered with identical chrome.
 function EngineCard({
   name,
   engine,
@@ -268,7 +153,7 @@ function EngineCard({
   children,
 }: {
   name: string;
-  engine: 'k3d' | 'microVM';
+  engine: 'microVM';
   statusPill: React.ReactNode;
   description?: React.ReactNode;
   headerTag?: React.ReactNode;
@@ -292,20 +177,16 @@ function EngineCard({
   );
 }
 
-// How the runtime is hosted — sandboxed in a VM vs directly on the
-// host. Informational framing of the one choice (sandbox or not),
-// never a hierarchy. The prop stays engine-keyed so callers don't have
-// to translate; only the label reflects the sandbox framing.
-function EngineTag({ engine }: { engine: 'k3d' | 'microVM' }) {
-  const label = engine === 'microVM' ? 'sandboxed' : 'on host';
-  return <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{label}</span>;
+// How the runtime is hosted — sandboxed in a VM. Informational framing;
+// the prop stays engine-keyed so callers don't have to translate.
+function EngineTag({ engine: _engine }: { engine: 'microVM' }) {
+  return <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">sandboxed</span>;
 }
 
-// ---- engines (k3d + microVMs, presented as peers) -----------------------
+// ---- engines (microVMs) -------------------------------------------------
 //
-// One unified list of local engines: the k3d runtime card first, then a
-// card per microVM. Appliance can run several microVMs at once — e.g.
-// one for interactive development and another dedicated to traffic
+// One card per microVM. Appliance can run several microVMs at once —
+// e.g. one for interactive development and another dedicated to traffic
 // testing — each its own isolated VM on its own host ports, registered
 // as its own cluster. The default "appliance" VM is always surfaced
 // (even before it's created) and a New VM control adds more.
@@ -313,12 +194,10 @@ function EnginesSection({
   vms,
   loading,
   showMicroVm,
-  leadingPanel,
 }: {
   vms: MicroVmSummary[];
   loading: boolean;
   showMicroVm: boolean;
-  leadingPanel: React.ReactNode;
 }) {
   // VMs added through the UI but not yet in `list` (their spec lands
   // only once Start boots them). Tracked locally so the panel appears
@@ -346,8 +225,6 @@ function EnginesSection({
         <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Runtimes</h2>
         {showMicroVm ? <NewVmButton existing={names} onAdd={(n) => setPending((p) => [...p, n])} /> : null}
       </header>
-
-      {leadingPanel}
 
       {showMicroVm ? (
         <>
@@ -435,11 +312,10 @@ function NewVmButton({ existing, onAdd }: { existing: string[]; onAdd: (name: st
 // instead of renting the docker provider's. Each VM registers as a
 // regular cluster (id "microvm" / "microvm-<name>" — also its CLI
 // profile name) on its own host ports, so the deploy wizard, cluster
-// switcher, and workload views treat it like any other target. Rendered
-// in the same EngineCard chrome as the k3d runtime — a peer, not an
-// add-on.
+// switcher, and workload views treat it like any other target.
 function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummary }) {
   const host = useHost();
+  const terminals = useTerminalSessions();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
@@ -456,19 +332,6 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
     },
   });
 
-  // Mirror of the page-level port gate, in the other direction: a
-  // running k3d cluster holds host port 8081, so the *default* microVM
-  // (which shares that port) can't boot until it stops. Named VMs get
-  // their own ports and aren't gated. Shares the page's query key
-  // (cache-deduped).
-  const k3dQuery = useQuery({
-    queryKey: ['local-runtime', 'status'],
-    enabled: isDefault && Boolean(host.local?.runtimeStatus),
-    queryFn: () => host.local!.runtimeStatus(),
-    refetchInterval: 30_000,
-  });
-  const k3dHoldsPort = isDefault && Boolean(k3dQuery.data?.cluster.running);
-
   const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -477,7 +340,6 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
   const [devMode, setDevMode] = React.useState(false);
   // Host folder to share into /persist/workspace on the next dev boot.
   const [mountPath, setMountPath] = React.useState<string | null>(null);
-  const [shellOpen, setShellOpen] = React.useState(false);
   const logRef = React.useRef<HTMLPreElement | null>(null);
 
   React.useEffect(() => {
@@ -557,6 +419,29 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
     }
   }, [microVmReady, queryClient]);
 
+  // Cluster-ready probe: the engine's `kubeconfigReady` says the VM's
+  // host process is up and k3s answers, but "ready" for the console
+  // means the in-VM api-server is actually serving — that's what every
+  // other view reads through. Probe its unauthenticated `/healthz` (a
+  // base-URL HTTP check, no kubectl) once the VM reports ready; the
+  // badge reads `running` only when both agree. healthz is unsigned, so
+  // a bare client over the VM's apiServerUrl suffices.
+  const healthClient = React.useMemo(
+    () => (status?.apiServerUrl ? createApplianceClient({ baseUrl: status.apiServerUrl }) : null),
+    [status?.apiServerUrl]
+  );
+  const healthzQuery = useQuery({
+    queryKey: ['microvm', name, 'healthz', status?.apiServerUrl ?? ''],
+    enabled: Boolean(healthClient) && microVmReady,
+    queryFn: async () => {
+      const res = await healthClient!.healthz();
+      return res.success;
+    },
+    // Poll quickly until the api-server answers, then back off.
+    refetchInterval: (q) => (q.state.data === true ? 15_000 : 3_000),
+  });
+  const clusterServing = microVmReady && healthzQuery.data === true;
+
   const state = !status
     ? 'checking…'
     : !status.available
@@ -569,11 +454,12 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
         ? 'starting…'
         : status.running
           ? // The host process being up is not the same as the cluster
-            // being ready: k3s may still be coming up, or bring-up may
-            // have errored. Reflect that instead of a blunt "running".
+            // being ready: k3s may still be coming up, the in-VM
+            // api-server may not be serving yet, or bring-up may have
+            // errored. Reflect that instead of a blunt "running".
             status.phase === 'failed'
             ? 'failed'
-            : status.kubeconfigReady
+            : clusterServing
               ? 'running'
               : 'starting…'
           : status.exists
@@ -641,12 +527,7 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
               const wantDev = devMode || status?.dev === true;
               void run('up', () => (wantDev ? vm.devUp(onLog, { mount: mountPath ?? undefined }) : vm.up(onLog)));
             }}
-            disabled={busy !== null || status?.running === true || (k3dHoldsPort && !status?.running)}
-            title={
-              k3dHoldsPort && !status?.running
-                ? 'Stop the k3d runtime first — both engines publish on host port 8081'
-                : undefined
-            }
+            disabled={busy !== null || status?.running === true}
           >
             <Play className="h-4 w-4" />{' '}
             {busy === 'up'
@@ -744,7 +625,14 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setShellOpen(true)}
+                  onClick={() =>
+                    terminals.openSession({
+                      target: name,
+                      engine: 'microvm',
+                      clusterName: name,
+                      mode: status.dev ? 'dev' : 'host',
+                    })
+                  }
                   disabled={busy !== null}
                   title={
                     status.dev
@@ -766,24 +654,13 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
 
       {status?.running && status.kubeconfigReady ? <EgressPanel vm={vm} name={name} /> : null}
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
-      {status?.running && status.kubeconfigReady ? <WorkloadsPanel engine="microvm" vmName={name} /> : null}
-
-      {shellOpen ? (
-        <TerminalDrawer
-          target={name}
-          engine="microvm"
-          clusterName={name}
-          mode={status?.dev ? 'dev' : 'host'}
-          onClose={() => setShellOpen(false)}
-        />
-      ) : null}
+      {clusterServing ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
     </EngineCard>
   );
 }
 
 // Compact at-a-glance facts for a running microVM — Kubernetes URL,
-// cluster id, and its allocated host ports — so a VM carries the same
-// weight of detail as the k3d runtime's overview cards.
+// cluster id, and its allocated host ports.
 function MicroVmFacts({
   apiServerUrl,
   clusterId,
@@ -1307,12 +1184,10 @@ function RuleList({ label, hosts, tone }: { label: string; hosts: string[]; tone
   );
 }
 
-type Phase = 'unknown' | 'starting' | 'running' | 'stopping' | 'stopped' | 'error' | 'partial';
-
 // A prerequisite is "ready" when it's installed AND — for docker — its
 // daemon is actually reachable. `daemonRunning` is undefined for tools
-// with no daemon (k3d, kubectl), so `!== false` leaves those as ready
-// on install alone.
+// with no daemon (kubectl), so `!== false` leaves those as ready on
+// install alone.
 function checkReady(c: LocalPreflightCheck): boolean {
   return c.installed && c.daemonRunning !== false;
 }
@@ -1371,7 +1246,7 @@ function PreflightPanel({
             <p className="mt-0.5 text-xs text-amber-200/80">
               {onlyDaemonDown
                 ? 'The local runtime needs a running Docker daemon. Start it below, then re-check.'
-                : 'The local runtime drives a real Docker + k3d + kubectl stack. Install the missing tools below, then re-check.'}
+                : 'Image builds need Docker; pod shells and deploys need kubectl. Install the missing tools below, then re-check.'}
             </p>
           </div>
         </div>
@@ -1534,143 +1409,29 @@ function PreflightRow({
   );
 }
 
-function derivePhase(
-  status: LocalRuntimeStatus | undefined,
-  starting: boolean,
-  stopping: boolean,
-  deleting: boolean
-): Phase {
-  if (starting) return 'starting';
-  if (stopping || deleting) return 'stopping';
-  if (!status) return 'unknown';
-  const clusterUp = status.cluster.exists && status.cluster.running;
-  const serverUp = status.apiServer.running;
-  if (clusterUp && serverUp) return 'running';
-  if (!clusterUp && !serverUp) return 'stopped';
-  if (status.cluster.message || status.apiServer.message) return 'error';
-  return 'partial';
-}
-
-function PhaseBadge({ phase }: { phase: Phase }) {
-  const meta: Record<Phase, { label: string; tone: string }> = {
-    unknown: { label: 'Unknown', tone: 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]' },
-    starting: { label: 'Starting', tone: 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/40' },
-    running: { label: 'Running', tone: 'bg-green-500/15 text-green-300 border border-green-500/40' },
-    stopping: { label: 'Stopping', tone: 'bg-amber-500/15 text-amber-300 border border-amber-500/40' },
-    stopped: { label: 'Stopped', tone: 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]' },
-    error: { label: 'Error', tone: 'bg-red-500/15 text-red-300 border border-red-500/40' },
-    partial: { label: 'Degraded', tone: 'bg-amber-500/15 text-amber-300 border border-amber-500/40' },
-  };
-  const m = meta[phase];
-  return (
-    <span className={cn('inline-flex items-center rounded-md px-2 py-1 text-xs font-medium', m.tone)}>{m.label}</span>
-  );
-}
-
-function MutationErrors({ errors }: { errors: Array<unknown> }) {
-  const visible = errors.filter(Boolean) as Error[];
-  if (visible.length === 0) return null;
-  return (
-    <div className="space-y-1 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
-      {visible.map((e, i) => (
-        <div key={i} className="whitespace-pre-wrap font-mono">
-          {e.message ?? String(e)}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function RuntimeOverview({ status }: { status: LocalRuntimeStatus }) {
-  const { cluster, apiServer, config, clusterId } = status;
-  return (
-    <section className="grid grid-cols-1 gap-3 md:grid-cols-2">
-      <Card title="Cluster">
-        <Row label="Status" value={cluster.running ? 'Running' : cluster.exists ? 'Stopped' : 'Not created'} />
-        <Row label="Name" value={<code className="font-mono text-xs">{cluster.clusterName}</code>} />
-        <Row label="Host port" value={<code className="font-mono text-xs">:{config.hostPort}</code>} />
-        <Row
-          label="NodePort range"
-          value={
-            <code className="font-mono text-xs">
-              {config.nodePortMin}-{config.nodePortMax}
-            </code>
-          }
-        />
-        {cluster.message ? (
-          <Row label="Message" value={<span className="text-amber-300">{cluster.message}</span>} />
-        ) : null}
-      </Card>
-
-      <Card title="API server">
-        <Row label="Status" value={apiServer.running ? 'Running' : 'Stopped'} />
-        <Row label="URL" value={<code className="font-mono text-xs">{config.apiServerUrl}</code>} />
-        {apiServer.pid !== undefined ? (
-          <Row label="PID" value={<code className="font-mono text-xs">{apiServer.pid}</code>} />
-        ) : null}
-        {apiServer.startedAt ? (
-          <Row
-            label="Started"
-            value={<span className="text-xs">{new Date(apiServer.startedAt).toLocaleString()}</span>}
-          />
-        ) : null}
-        {apiServer.logPath ? (
-          <Row label="Log" value={<code className="truncate font-mono text-xs">{apiServer.logPath}</code>} />
-        ) : null}
-        {apiServer.message ? (
-          <Row label="Message" value={<span className="text-amber-300">{apiServer.message}</span>} />
-        ) : null}
-      </Card>
-
-      <Card title="Storage">
-        <Row label="Data dir" value={<code className="break-all font-mono text-xs">{config.dataDir}</code>} />
-        <Row label="Namespace" value={<code className="font-mono text-xs">{config.namespace}</code>} />
-      </Card>
-
-      <Card title="Console wiring">
-        <Row
-          label="Cluster id"
-          value={
-            clusterId ? (
-              <code className="font-mono text-xs">{clusterId}</code>
-            ) : (
-              <span className="text-[var(--color-muted-foreground)]">Not registered yet — press Start</span>
-            )
-          }
-        />
-        <Row label="Bound to" value={<code className="font-mono text-xs">{config.apiServerUrl}</code>} />
-      </Card>
-    </section>
-  );
-}
-
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-      <h2 className="text-sm font-semibold">{title}</h2>
-      <dl className="space-y-2">{children}</dl>
-    </section>
-  );
-}
-
-function Row({ label, value }: { label: string; value: React.ReactNode }) {
-  return (
-    <div className="grid grid-cols-[7rem_1fr] items-baseline gap-3">
-      <dt className="text-xs text-[var(--color-muted-foreground)]">{label}</dt>
-      <dd className="min-w-0 text-sm">{value}</dd>
-    </div>
-  );
-}
-
-function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: string }) {
+function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: string }) {
   const host = useHost();
+  const terminals = useTerminalSessions();
+  const queryClient = useQueryClient();
   const [activePod, setActivePod] = React.useState<LocalPodInfo | null>(null);
-  const [shellPod, setShellPod] = React.useState<LocalPodInfo | null>(null);
-  // For the microVM engine, clusterName carries the VM name so the host
-  // resolves that VM's kubeconfig (multiple VMs run concurrently).
+
+  // Workloads + pod logs now read through the in-VM api-server (the same
+  // signed ApplianceClient that powers projects/deployments) instead of
+  // a kubectl shell-out. The client is bound to the *active* cluster, so
+  // we can only read this VM's workloads when it is the selected one;
+  // otherwise we'd surface another cluster's state under this card.
+  const client = useApplianceClient();
+  const { data: config } = useQuery({ queryKey: ['host', 'config'], queryFn: () => host.getConfig() });
+  const isActive = config?.selectedClusterId === clusterId;
+
   const workloadsQuery = useQuery({
-    queryKey: ['local-runtime', 'workloads', engine ?? 'k3d', vmName ?? ''],
-    queryFn: () => host.local!.listWorkloads(engine ? { engine, clusterName: vmName } : undefined),
+    queryKey: ['local-runtime', 'workloads', clusterId],
+    enabled: Boolean(client) && isActive,
+    queryFn: async () => {
+      const res = await client!.listWorkloads();
+      if (!res.success) throw res.error;
+      return res.data;
+    },
     refetchInterval: 5_000,
   });
 
@@ -1681,21 +1442,35 @@ function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: strin
     <>
       <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">
-            {engine === 'microvm' ? `Workloads · ${vmName ?? 'appliance'}` : 'Workloads'}
-          </h2>
+          <h2 className="text-sm font-semibold">Workloads · {vmName ?? 'appliance'}</h2>
           <Button
             variant="ghost"
             size="icon"
             aria-label="Refresh workloads"
             onClick={() => workloadsQuery.refetch()}
-            disabled={workloadsQuery.isFetching}
+            disabled={workloadsQuery.isFetching || !isActive}
           >
             <RefreshCw className={cn('h-4 w-4', workloadsQuery.isFetching && 'animate-spin')} />
           </Button>
         </div>
 
-        {workloadsQuery.isLoading ? (
+        {!isActive ? (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Select this microVM as the active cluster to read its workloads through the api-server.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                await host.selectCluster(clusterId);
+                queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+              }}
+            >
+              Select cluster
+            </Button>
+          </div>
+        ) : workloadsQuery.isLoading ? (
           <p className="text-xs text-[var(--color-muted-foreground)]">Loading…</p>
         ) : workloadsQuery.isError ? (
           <p className="text-xs text-red-300">{(workloadsQuery.error as Error).message}</p>
@@ -1706,17 +1481,22 @@ function WorkloadsPanel({ engine, vmName }: { engine?: 'microvm'; vmName?: strin
         ) : data ? (
           <div className="space-y-5">
             <DeploymentsTable deployments={data.deployments} />
-            <PodsTable pods={data.pods} onLogs={setActivePod} onShell={host.terminal ? setShellPod : undefined} />
+            <PodsTable
+              pods={data.pods}
+              onLogs={setActivePod}
+              onShell={
+                host.terminal
+                  ? (pod) => terminals.openSession({ target: pod.name, engine: 'microvm', clusterName: vmName })
+                  : undefined
+              }
+            />
             <ServicesTable services={data.services} />
           </div>
         ) : null}
       </section>
 
-      {activePod ? (
-        <PodLogsDrawer pod={activePod} engine={engine} vmName={vmName} onClose={() => setActivePod(null)} />
-      ) : null}
-      {shellPod ? (
-        <TerminalDrawer target={shellPod.name} engine={engine} clusterName={vmName} onClose={() => setShellPod(null)} />
+      {activePod && client ? (
+        <PodLogsDrawer pod={activePod} client={client} onClose={() => setActivePod(null)} />
       ) : null}
     </>
   );
@@ -1856,27 +1636,59 @@ function ServicesTable({ services }: { services: LocalServiceInfo[] }) {
   );
 }
 
-function PodLogsDrawer({
-  pod,
-  engine,
-  vmName,
-  onClose,
-}: {
-  pod: LocalPodInfo;
-  engine?: 'microvm';
-  vmName?: string;
-  onClose: () => void;
-}) {
-  const host = useHost();
-  const logsQuery = useQuery({
-    queryKey: ['local-runtime', 'logs', engine ?? 'k3d', vmName ?? '', pod.name],
-    queryFn: () => host.local!.tailPodLogs({ podName: pod.name, tailLines: 500, engine, clusterName: vmName }),
-  });
-  const logs = logsQuery.data ?? '';
+// Live pod-log tail. Opens a single chunked `follow` stream against the
+// api-server (`streamPodLogs`) — the last 500 lines, then new lines as
+// they arrive — instead of polling a snapshot. The stream is aborted on
+// unmount or when the viewed pod changes.
+const LOG_BUFFER_MAX = 5_000;
 
+function PodLogsDrawer({ pod, client, onClose }: { pod: LocalPodInfo; client: ApplianceClient; onClose: () => void }) {
+  const [lines, setLines] = React.useState<string[]>([]);
+  const [phase, setPhase] = React.useState<'connecting' | 'live' | 'ended' | 'error'>('connecting');
+  const [error, setError] = React.useState<string | null>(null);
+  const preRef = React.useRef<HTMLPreElement | null>(null);
+
+  React.useEffect(() => {
+    const controller = new AbortController();
+    setLines([]);
+    setError(null);
+    setPhase('connecting');
+    let started = false;
+    void client
+      .streamPodLogs(pod.name, { tailLines: 500, signal: controller.signal }, (line) => {
+        if (!started) {
+          started = true;
+          setPhase('live');
+        }
+        setLines((prev) => {
+          const next = prev.length >= LOG_BUFFER_MAX ? prev.slice(prev.length - LOG_BUFFER_MAX + 1) : prev.slice();
+          next.push(line);
+          return next;
+        });
+      })
+      .then((res) => {
+        if (controller.signal.aborted) return;
+        if (!res.success) {
+          setError(res.error.message);
+          setPhase('error');
+        } else {
+          setPhase('ended');
+        }
+      });
+    // Abort the follow on unmount / pod switch — the SDK treats an abort
+    // as a clean close, not a failure.
+    return () => controller.abort();
+  }, [client, pod.name]);
+
+  // Keep the newest lines in view as the stream appends.
+  React.useEffect(() => {
+    if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight;
+  }, [lines]);
+
+  const text = lines.join('\n');
   const copy = async () => {
     if (typeof navigator !== 'undefined' && navigator.clipboard) {
-      await navigator.clipboard.writeText(logs);
+      await navigator.clipboard.writeText(text);
     }
   };
 
@@ -1897,10 +1709,35 @@ function PodLogsDrawer({
             <div className="text-sm font-semibold">Pod logs</div>
             <div className="font-mono text-xs text-[var(--color-muted-foreground)]">{pod.name}</div>
           </div>
-          <div className="flex items-center gap-1">
-            <Button variant="outline" size="sm" onClick={() => logsQuery.refetch()} disabled={logsQuery.isFetching}>
-              <RefreshCw className={cn('h-3.5 w-3.5', logsQuery.isFetching && 'animate-spin')} /> Refresh
-            </Button>
+          <div className="flex items-center gap-2">
+            <span
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium',
+                phase === 'live'
+                  ? 'bg-green-500/15 text-green-300'
+                  : phase === 'error'
+                    ? 'bg-red-500/15 text-red-300'
+                    : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+              )}
+            >
+              <span
+                className={cn(
+                  'h-1.5 w-1.5 rounded-full',
+                  phase === 'live'
+                    ? 'animate-pulse bg-green-400'
+                    : phase === 'error'
+                      ? 'bg-red-400'
+                      : 'bg-[var(--color-muted-foreground)]'
+                )}
+              />
+              {phase === 'live'
+                ? 'Live'
+                : phase === 'connecting'
+                  ? 'Connecting…'
+                  : phase === 'error'
+                    ? 'Error'
+                    : 'Ended'}
+            </span>
             <Button variant="outline" size="sm" onClick={copy}>
               <Copy className="h-3.5 w-3.5" /> Copy
             </Button>
@@ -1909,12 +1746,19 @@ function PodLogsDrawer({
             </Button>
           </div>
         </header>
-        <pre className="flex-1 overflow-auto whitespace-pre-wrap bg-black/40 p-3 font-mono text-xs leading-relaxed">
-          {logsQuery.isLoading
-            ? 'Loading…'
-            : logsQuery.isError
-              ? (logsQuery.error as Error).message
-              : logs || <span className="text-[var(--color-muted-foreground)]">No log lines yet.</span>}
+        <pre
+          ref={preRef}
+          className="flex-1 overflow-auto whitespace-pre-wrap bg-black/40 p-3 font-mono text-xs leading-relaxed"
+        >
+          {phase === 'error' ? (
+            <span className="text-red-300">{error}</span>
+          ) : text ? (
+            text
+          ) : phase === 'connecting' ? (
+            'Connecting…'
+          ) : (
+            <span className="text-[var(--color-muted-foreground)]">No log lines yet.</span>
+          )}
         </pre>
       </div>
     </div>
