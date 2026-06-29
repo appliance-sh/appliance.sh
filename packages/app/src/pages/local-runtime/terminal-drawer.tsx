@@ -1,5 +1,9 @@
 import * as React from 'react';
+import { useLocation } from 'react-router';
 import { useTerminalSessions, type TerminalSessionMeta } from '@/providers/terminal-sessions-provider';
+import { Button } from '@/components/ui/button';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { cn } from '@/lib/utils';
 
 // View over a provider-owned terminal session (E3.2).
 //
@@ -10,28 +14,104 @@ import { useTerminalSessions, type TerminalSessionMeta } from '@/providers/termi
 // survive route changes. Here we only *mount the view*: we ask the provider
 // to reparent the session's xterm node into our container and keep it sized.
 //
-// Closing a session is an explicit user action (the Close button →
-// `closeSession`, which destroys the PTY). Dismissing the drawer (the
-// backdrop, or Hide) only hides it — the process keeps running.
+// Closing a session is an explicit user action (End shell → `closeSession`,
+// which destroys the PTY). Dismissing the drawer (the backdrop, Hide, or
+// Esc) only hides it — the process keeps running.
+
+// Status badge — mirrors `PodLogsDrawer`'s pulsing-dot badge so the two
+// live surfaces read the same: a pulsing green "Live" when connected,
+// plain-language states otherwise.
+function StatusPill({ status }: { status: TerminalSessionMeta['status'] }) {
+  const label =
+    status === 'open' ? 'Live' : status === 'connecting' ? 'Connecting…' : status === 'error' ? 'Error' : 'Ended';
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium',
+        status === 'open'
+          ? 'bg-green-500/15 text-green-300'
+          : status === 'error'
+            ? 'bg-red-500/15 text-red-300'
+            : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+      )}
+    >
+      <span
+        className={cn(
+          'h-1.5 w-1.5 rounded-full',
+          status === 'open'
+            ? 'animate-pulse bg-green-400'
+            : status === 'error'
+              ? 'bg-red-400'
+              : 'bg-[var(--color-muted-foreground)]'
+        )}
+      />
+      {label}
+    </span>
+  );
+}
+
 function TerminalDrawerView({ session }: { session: TerminalSessionMeta }) {
-  const terminals = useTerminalSessions();
+  // Destructure the stable callbacks: the whole context value gets a new
+  // identity on every status patch / sibling open / hide / focus, so an
+  // effect that depends on it would re-park + re-attach + re-fit + steal
+  // focus on unrelated changes. The callbacks themselves are stable.
+  const { attachView, hide, closeSession } = useTerminalSessions();
+  const confirm = useConfirm();
   const mountRef = React.useRef<HTMLDivElement | null>(null);
+  // The control that opened this shell — captured on mount (before xterm
+  // grabs focus in its rAF) so dismissing can hand focus back to it.
+  const openerRef = React.useRef<HTMLElement | null>(null);
 
   React.useEffect(() => {
     const el = mountRef.current;
     if (!el) return;
-    return terminals.attachView(session.id, el);
-  }, [terminals, session.id]);
+    return attachView(session.id, el);
+  }, [attachView, session.id]);
+
+  React.useEffect(() => {
+    const el = document.activeElement;
+    openerRef.current = el instanceof HTMLElement ? el : null;
+  }, []);
+
+  // Hide the modal (the PTY keeps running) and return focus to the opener.
+  const dismiss = React.useCallback(() => {
+    hide();
+    openerRef.current?.focus();
+  }, [hide]);
+
+  // End shell — the only path that destroys the PTY. Confirm first while
+  // the process is still live; a closed/error session closes silently.
+  const end = React.useCallback(async () => {
+    if (session.status === 'open') {
+      const ok = await confirm({
+        title: 'End this shell?',
+        description: 'The running process will be terminated.',
+        confirmLabel: 'End shell',
+      });
+      if (!ok) return;
+    }
+    closeSession(session.id);
+  }, [confirm, closeSession, session.id, session.status]);
 
   return (
     <div
       className="fixed inset-0 z-40 flex items-end justify-center bg-black/40 p-4 md:items-center"
-      onClick={() => terminals.hide()}
+      onClick={dismiss}
       role="presentation"
     >
       <div
         className="flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[#0a0a0a]"
         onClick={(e) => e.stopPropagation()}
+        // Capture phase so Esc dismisses the modal before xterm forwards
+        // the keystroke to the shell. Scoped to the dialog subtree, so an
+        // overlaid confirm dialog (focus on its own button, outside this
+        // node) keeps its own Esc handling.
+        onKeyDownCapture={(e) => {
+          if (e.key !== 'Escape') return;
+          e.preventDefault();
+          e.stopPropagation();
+          dismiss();
+        }}
         role="dialog"
         aria-label={`Terminal: ${session.subtitle}`}
       >
@@ -41,33 +121,16 @@ function TerminalDrawerView({ session }: { session: TerminalSessionMeta }) {
             <div className="font-mono text-xs text-[var(--color-muted-foreground)]">{session.subtitle}</div>
           </div>
           <div className="flex items-center gap-3">
-            <span
-              className={
-                session.status === 'open'
-                  ? 'text-xs text-green-300'
-                  : session.status === 'connecting'
-                    ? 'text-xs text-cyan-300'
-                    : 'text-xs text-[var(--color-muted-foreground)]'
-              }
-            >
-              {session.status === 'connecting' ? 'connecting…' : session.status}
-            </span>
-            {/* Hide keeps the session alive (the process keeps running); only
-                Close destroys the PTY. */}
-            <button
-              type="button"
-              onClick={() => terminals.hide()}
-              className="rounded px-2 py-1 text-xs hover:bg-[var(--color-muted)]"
-            >
+            <StatusPill status={session.status} />
+            {/* Hide is the primary, obvious action — it keeps the session
+                alive. End shell is destructive and confirmed: it's the only
+                control that kills the running process. */}
+            <Button size="sm" onClick={dismiss}>
               Hide
-            </button>
-            <button
-              type="button"
-              onClick={() => terminals.closeSession(session.id)}
-              className="rounded px-2 py-1 text-xs hover:bg-[var(--color-muted)]"
-            >
-              Close
-            </button>
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => void end()}>
+              End shell
+            </Button>
           </div>
         </header>
 
@@ -88,7 +151,19 @@ function TerminalDrawerView({ session }: { session: TerminalSessionMeta }) {
 // down the active session. It simply shows the active session's view (or
 // nothing when hidden); the session objects themselves live in the provider.
 export function TerminalLayer() {
-  const { sessions, activeId } = useTerminalSessions();
+  const { sessions, activeId, hide } = useTerminalSessions();
+  const { pathname } = useLocation();
+
+  // Spec §4.1: a route change HIDES the active terminal — it does not
+  // close it. The modal is full-screen (`fixed inset-0 z-40`), so leaving
+  // it up would cover the destination route and nav would appear to do
+  // nothing. Hiding keeps the PTY + scrollback alive; only End shell
+  // destroys the session. (This lives here, not in the provider, because
+  // the provider is mounted above the router and has no `useLocation`.)
+  React.useEffect(() => {
+    hide();
+  }, [pathname, hide]);
+
   const active = activeId ? sessions.find((s) => s.id === activeId) : undefined;
   if (!active) return null;
   return <TerminalDrawerView session={active} />;

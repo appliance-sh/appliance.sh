@@ -132,6 +132,11 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
   // Park a session's container in the off-screen holder (keeps it in the
   // DOM so xterm stays measurable, but invisible). Never removes it.
   const park = React.useCallback((live: LiveSession) => {
+    // A closed session has already been pulled from the registry and its
+    // container detached + disposed; re-parking it would re-append an
+    // orphaned node into the holder, leaking one <div> per Close. The
+    // attach cleanup still fires on that unmount, so no-op once it's gone.
+    if (!liveRef.current.has(live.id)) return;
     const holder = holderRef.current;
     if (holder && live.container.parentNode !== holder) {
       holder.appendChild(live.container);
@@ -253,7 +258,14 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
   const closeSession = React.useCallback(
     (id: string) => {
       const live = liveRef.current.get(id);
-      if (!live) return;
+      if (!live) {
+        // An inert web session (no PTY transport) has meta but never got a
+        // live handle, so the teardown below doesn't apply — still drop its
+        // meta so a closed/error session can't linger in the list.
+        setSessions((prev) => prev.filter((m) => m.id !== id));
+        setActiveId((cur) => (cur === id ? null : cur));
+        return;
+      }
       liveRef.current.delete(id);
       live.disposeInput?.();
       void live.session?.close();
