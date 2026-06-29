@@ -17,6 +17,27 @@ modes both; **MVP** = one agent per project/VM, observed via a tab
 
 ## 0. Headline
 
+> **Security caveat (read first).** The **microVM is the only real
+> isolation boundary** here. The agent sandbox is **NOT containment for
+> hostile code** — do not market it as such. The non-root `appliance`
+> user, the docker-group footgun-prevention, and the cooperative egress
+> proxy are convenience + a key-injection point, not a jail. Two
+> corollaries follow directly and must stay in view:
+>
+> 1. **A rooted/jailbroken guest can still spend the user's Anthropic
+>    billing.** It can't read the key (it's brokered host-side, §3/§9),
+>    but it can drive the proxy to make billed calls on the user's behalf
+>    for as long as it routes through the proxy.
+> 2. **Under the default-allow policy, a prompt-injected agent can
+>    exfiltrate the mounted `/persist/workspace`** to any host. Egress is
+>    cooperative (`HTTP(S)_PROXY` env), so even tightening it is
+>    bypassable while routing stays cooperative — the firewall follow-up
+>    (§9 fork 2) is the real mitigation.
+>
+> What the broker _does_ guarantee: the **Anthropic API key never enters
+> the VM** (§3), and the proxy **fails closed** — it never forwards the
+> in-guest placeholder upstream (§3, A2).
+
 The agent is a process in a **reattachable tmux session `agent-<id>`**,
 launched as the non-root `appliance` user in `/persist/workspace` — the
 exact Phase-4 vsock shell transport (`appliance-vm shell <vm> --session
@@ -173,9 +194,28 @@ add`) writes one rule to the VM's `egress-credentials.json`
    the key inside the VM, defeating the broker; host-side proxy injection is
    the whole point.)_
 
-**Net key flow:** Keychain (host) → helper stdout (host) → proxy
-`set_header` on the outbound TLS (host) → Anthropic. The key crosses the
-host↔guest boundary **zero times**.
+5. **Fail closed (A2 — implemented).** If the host helper yields nothing
+   for `api.anthropic.com` (Keychain locked, not logged in, helper
+   non-zero), the proxy must **never** forward the in-guest placeholder
+   upstream. `mitm::intercept` now resolves `injection_for` **before
+   dialing upstream**; when it's empty but the host has an inject rule
+   (`creds::has_inject_rule`), the proxy **refuses** with a clear
+   `502 — Anthropic key not configured (run \`appliance agent login\`)`and dials no upstream. The placeholder therefore crosses the host
+boundary **zero times**, even on the error path. The Anthropic rule is`capture:false`, so the placeholder is never lifted into
+`egress-secrets.json` either.
+
+6. **Helper TTL cache (A2 — implemented).** `run_helper`
+   (`creds.rs`) caches the resolved key for a short TTL (~15s) keyed on
+   the helper command, so streaming/keep-alive traffic doesn't fork
+   `sh -c` (`appliance agent print-key`) per request. The cached value is
+   a secret and is never logged. The cred rule pins the helper's
+   **absolute** binary path (not a PATH-relative `appliance`).
+
+**Net key flow:** Keychain (host) → helper stdout (host, TTL-cached) →
+proxy `set_header` on the outbound TLS (host) → Anthropic. The key
+crosses the host↔guest boundary **zero times**. The proxy logs the
+request **line only** (never headers), so a brokered key never reaches a
+log.
 
 ## 4. Proxy-into-the-shell — the gap, and how A2 closes it
 
@@ -236,6 +276,28 @@ default changes. The in-guest CA path, if a tool ever needs it directly, is
 >    `NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/appliance-egress.crt`
 >    only as a belt-and-suspenders fallback (it's harmless and additive,
 >    `LocalContainerDeploymentService.ts:982`).
+
+### 4c. MITM scope + cross-VM key isolation (A2 — `egress.rs` DOES change)
+
+> **Correction to the original design.** §3/§10 previously claimed A2
+> needs **no `egress.rs`/`mitm.rs` change** ("they already inject"). That
+> is **no longer true** — two security-driven changes land in A2:
+>
+> 1. **MITM scope (`egress.rs`).** `intercept = allowed && policy.mitm`
+>    was VM-global: it decrypted **all** allowed HTTPS and forced one
+>    request per `CONNECT` (`Connection: close`), breaking keep-alive +
+>    streaming for Anthropic SSE **and** the npm registry. A2 narrows it
+>    to `allowed && policy.mitm && creds::has_cred_rule(host)` — only
+>    hosts with a credential rule are decrypted; every other allowed host
+>    stays a blind, streaming-preserving tunnel.
+> 2. **Cross-VM key isolation (`egress.rs` `peer_allowed`).** The gate
+>    matched the whole vz `/24`, so a sibling VM on the same NAT could
+>    drive this VM's proxy and spend its brokered key. A2 pins it to this
+>    VM's **exact leased guest IP** once known (subnet match only in the
+>    pre-lease boot window).
+>
+> Plus the §3 fail-closed + helper-TTL changes in `mitm.rs`/`creds.rs`.
+> Net: A2 is **not** a pure config-over-existing-mechanics change.
 
 ## 5. In-guest agent provisioning (A1)
 
@@ -445,7 +507,11 @@ design (Devon) + product (Parker).
   - new host key store + `appliance agent login` / `print-key`
     (`packages/cli/src/appliance-agent.ts`; Keychain on macOS, mirroring
     `desktop/src-tauri/src/lib.rs` profile-store handling).
-  - _No change to `egress.rs`/`mitm.rs` mechanics — they already inject._
+  - **`egress.rs` + `mitm.rs` + `creds.rs` DO change** (superseding the
+    earlier "no change" note, see §4c): MITM scoped to cred-rule hosts +
+    `peer_allowed` pinned to the exact guest IP (`egress.rs`); fail-closed
+    refusal that never forwards the placeholder (`mitm.rs`); helper TTL
+    cache + `has_cred_rule`/`has_inject_rule` (`creds.rs`).
 
 - **A3 — CLI surface (Avery; Quinn gate).** `appliance agent` command group.
 

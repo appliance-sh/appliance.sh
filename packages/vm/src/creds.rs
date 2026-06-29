@@ -12,7 +12,10 @@
 //! Config + secrets live under the VM state dir on the host — the
 //! guest can't read them. Secrets are written 0600.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +201,25 @@ pub fn capture_from_head(name: &str, host: &str, head: &str) -> Option<String> {
     Some(rule.header.clone())
 }
 
+/// Does any credential rule (capture or inject) match this host? MITM is
+/// scoped to such hosts (`egress.rs`) so the proxy only decrypts the
+/// traffic it must broker — every other allowed HTTPS host stays a blind
+/// tunnel, preserving keep-alive + streaming. (The interceptor forces
+/// one request per CONNECT, which would otherwise break SSE/npm.)
+pub fn has_cred_rule(name: &str, host: &str) -> bool {
+    let cfg = load_config(name);
+    cfg.rules.iter().any(|r| host_matches(host, &r.host))
+}
+
+/// Does an *inject* rule match this host? Used to fail closed: a host
+/// with an inject rule whose credential can't be resolved (helper failed
+/// / key not configured / Keychain locked) must never forward the
+/// in-guest placeholder credential upstream — the proxy refuses instead.
+pub fn has_inject_rule(name: &str, host: &str) -> bool {
+    let cfg = load_config(name);
+    first_matching(&cfg, host, |r| r.inject).is_some()
+}
+
 /// Resolve the credential to inject for a host, if an inject rule
 /// matches: the helper's stdout (preferred) or the stored secret.
 /// Returns `(header, value)`.
@@ -211,14 +233,44 @@ pub fn injection_for(name: &str, host: &str) -> Option<(String, String)> {
     (!value.trim().is_empty()).then(|| (rule.header.clone(), value.trim().to_string()))
 }
 
-/// Run an apiKeyHelper command; stdout (trimmed) is the credential.
+/// Short TTL for the resolved-helper cache. The brokered key rotates
+/// rarely; a few-second cache is invisible to correctness and removes a
+/// per-request `sh -c` fork of the host helper (`appliance agent
+/// print-key`) on streaming/keep-alive traffic where one CONNECT carries
+/// many intercepted requests.
+const HELPER_TTL: Duration = Duration::from_secs(15);
+
+/// `helper command -> (resolved_at, value)`. Process-global so it spans
+/// the per-connection threads the proxy spawns. Never logged.
+fn helper_cache() -> &'static Mutex<HashMap<String, (Instant, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run an apiKeyHelper command; stdout (trimmed) is the credential. The
+/// result is cached for `HELPER_TTL` keyed on the command string so we
+/// don't fork `sh -c` per intercepted request. The value is a secret —
+/// it is never logged here or by callers.
 fn run_helper(cmd: &str) -> Option<String> {
+    {
+        let cache = helper_cache().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, value)) = cache.get(cmd) {
+            if at.elapsed() < HELPER_TTL {
+                return Some(value.clone());
+            }
+        }
+    }
     let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    if value.is_empty() {
+        return None;
+    }
+    let mut cache = helper_cache().lock().unwrap_or_else(|p| p.into_inner());
+    cache.insert(cmd.to_string(), (Instant::now(), value.clone()));
+    Some(value)
 }
 
 /// Rewrite an HTTP head to set `header: value`, replacing any existing
@@ -327,5 +379,61 @@ mod tests {
         let inj = injection_for(name, "h.test").unwrap();
         assert_eq!(inj.1, "Bearer from-helper");
         let _ = remove_rule(name, "h.test");
+    }
+
+    #[test]
+    fn inject_rule_present_but_helper_fails_yields_no_value() {
+        // Fail-closed input: an inject rule whose helper exits non-zero
+        // (or empty) must resolve to NO value — the proxy then refuses
+        // rather than forward the in-guest placeholder upstream.
+        let name = "creds-test-failclosed";
+        forget_secrets(name);
+        let _ = std::fs::create_dir_all(VmPaths::for_name(name).dir);
+        upsert_rule(
+            name,
+            CredentialRule {
+                host: "api.anthropic.com".into(),
+                capture: false,
+                inject: true,
+                header: "x-api-key".into(),
+                helper: Some("exit 7".into()),
+            },
+        )
+        .unwrap();
+        // The host has an inject rule (so the caller must fail closed)...
+        assert!(has_inject_rule(name, "api.anthropic.com"));
+        // ...and it also has *a* cred rule (so MITM is scoped to it)...
+        assert!(has_cred_rule(name, "api.anthropic.com"));
+        // ...but the credential can't be resolved.
+        assert!(injection_for(name, "api.anthropic.com").is_none());
+        // A host with no rule is neither intercepted nor inject-gated.
+        assert!(!has_cred_rule(name, "example.com"));
+        assert!(!has_inject_rule(name, "example.com"));
+        let _ = remove_rule(name, "api.anthropic.com");
+    }
+
+    #[test]
+    fn capture_false_never_stores_the_placeholder() {
+        // The Anthropic rule is capture:false, so an in-guest placeholder
+        // x-api-key must never be lifted into egress-secrets.json.
+        let name = "creds-test-no-capture";
+        forget_secrets(name);
+        let _ = std::fs::create_dir_all(VmPaths::for_name(name).dir);
+        upsert_rule(
+            name,
+            CredentialRule {
+                host: "api.anthropic.com".into(),
+                capture: false,
+                inject: true,
+                header: "x-api-key".into(),
+                helper: Some("printf real-key".into()),
+            },
+        )
+        .unwrap();
+        let head =
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-Api-Key: sk-ant-appliance-proxy\r\n\r\n";
+        assert!(capture_from_head(name, "api.anthropic.com", head).is_none());
+        assert!(list_secrets(name).is_empty());
+        let _ = remove_rule(name, "api.anthropic.com");
     }
 }
