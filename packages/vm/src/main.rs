@@ -6,6 +6,7 @@ mod guest;
 mod images;
 mod mitm;
 mod net;
+mod netstack;
 mod shell;
 mod spec;
 mod store;

@@ -17,17 +17,19 @@
 mod shell;
 
 use super::VmBackend;
-use crate::spec::{VmPaths, VmSpec};
+use crate::netstack::Netstack;
+use crate::spec::{NetLink, VmPaths, VmSpec};
 use anyhow::{anyhow, bail, Result};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSFileHandle, NSInteger, NSString, NSURL};
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment, VZFileSerialPortAttachment,
-    VZLinuxBootLoader, VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
-    VZSharedDirectory, VZSerialPortConfiguration, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
+    VZFileHandleNetworkDeviceAttachment, VZFileSerialPortAttachment, VZLinuxBootLoader, VZMACAddress,
+    VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZSharedDirectory,
+    VZSerialPortConfiguration, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
     VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
@@ -92,10 +94,21 @@ impl VmBackend for VzBackend {
         let _ = std::fs::remove_file(paths.kubeconfig());
         let _ = std::fs::remove_file(paths.guest_ip());
 
-        let config =
+        let built =
             build_configuration(spec, &image.kernel, &image.initramfs, &boot_media.image, &paths)?;
+        let config = built.config;
         unsafe { config.validateWithError() }
             .map_err(|e| anyhow!("invalid VM configuration: {}", error_text(&e)))?;
+
+        // On the host-mediated link, stand up this VM's smoltcp netstack
+        // on the socketpair's host end *before* the VM starts emitting
+        // frames (the guest DHCPs in initramfs). The netstack leases the
+        // guest its deterministic address and owns its only path off-box.
+        // Behaviour-neutral in F1: every flow is forwarded, no filtering.
+        let netstack: Option<Netstack> = built.host_fd.map(|fd| {
+            eprintln!("network: host-mediated smoltcp netstack (net_link=netstack)");
+            crate::netstack::start(fd, crate::netstack::LinkConfig::for_guest_mac(&spec.mac))
+        });
 
         let queue = DispatchQueue::new(&format!("sh.appliance.vm.{}", spec.name), None);
         let vm = unsafe {
@@ -130,8 +143,9 @@ impl VmBackend for VzBackend {
         {
             let spec = spec.clone();
             let paths_dir = paths.dir.clone();
+            let netstack = netstack.clone();
             std::thread::spawn(move || {
-                if let Err(err) = crate::guest::host_services(&spec, &paths_dir) {
+                if let Err(err) = crate::guest::host_services(&spec, &paths_dir, netstack.as_ref()) {
                     eprintln!("host services: {err:#}");
                     // Record the failure so `up` can stop waiting and
                     // report what broke instead of timing out blind.
@@ -164,13 +178,24 @@ impl VmBackend for VzBackend {
     }
 }
 
+/// The outcome of building a VM configuration: the config plus, when the
+/// guest runs on the host-mediated link (`net_link = Netstack`), the
+/// host end of the socketpair the netstack must own. `None` host fd means
+/// the framework NAT path (the host owns no link).
+struct BuiltConfig {
+    config: Retained<VZVirtualMachineConfiguration>,
+    host_fd: Option<std::os::fd::RawFd>,
+}
+
 fn build_configuration(
     spec: &VmSpec,
     kernel: &Path,
     initramfs: &Path,
     boot_media: &Path,
     paths: &VmPaths,
-) -> Result<Retained<VZVirtualMachineConfiguration>> {
+) -> Result<BuiltConfig> {
+    // The host end of the netstack link, set only on the Netstack path.
+    let mut host_fd: Option<std::os::fd::RawFd> = None;
     unsafe {
         let boot_loader =
             VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(kernel));
@@ -189,13 +214,37 @@ fn build_configuration(
         .map_err(|e| anyhow!("console attachment: {}", error_text(&e)))?;
         serial.setAttachment(Some(&attachment));
 
-        // Network: NAT through the host. DHCP inside the guest gets a
-        // 192.168.64.0/24-style lease from the framework's own server.
+        // Network: exactly ONE virtio-net device (the §8.1 #5 one-NIC
+        // invariant). Its attachment is either framework NAT (default) or
+        // the host-mediated socketpair link the smoltcp netstack owns.
         let net = VZVirtioNetworkDeviceConfiguration::new();
-        let nat = VZNATNetworkDeviceAttachment::new();
-        net.setAttachment(Some(&nat));
-        // Fixed MAC: the host finds the guest's address by looking this
-        // MAC up in macOS's DHCP lease table.
+        match spec.net_link() {
+            NetLink::Nat => {
+                // NAT through the host. DHCP inside the guest gets a
+                // 192.168.64.0/24-style lease from the framework's own server.
+                let nat = VZNATNetworkDeviceAttachment::new();
+                net.setAttachment(Some(&nat));
+            }
+            NetLink::Netstack => {
+                // Swap NAT → VZFileHandleNetworkDeviceAttachment over a
+                // socketpair(AF_UNIX, SOCK_DGRAM). The host end is the
+                // guest's ONLY path off-box; the framework owns the guest
+                // end (closeOnDealloc) and delivers one datagram per frame.
+                let (host, vz) = crate::netstack::make_link()
+                    .map_err(|e| anyhow!("netstack link socketpair: {e}"))?;
+                let nsfh =
+                    NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), vz, true);
+                let attach = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+                    VZFileHandleNetworkDeviceAttachment::alloc(),
+                    &nsfh,
+                );
+                attach.setMaximumTransmissionUnit(crate::netstack::LINK_MTU as NSInteger);
+                net.setAttachment(Some(&attach));
+                host_fd = Some(host);
+            }
+        }
+        // Fixed MAC: the netstack leases this MAC its deterministic
+        // address (NAT path: macOS finds it in the DHCP lease table).
         let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&spec.mac))
             .ok_or_else(|| anyhow!("invalid MAC address in spec: {}", spec.mac))?;
         net.setMACAddress(&mac);
@@ -240,6 +289,9 @@ fn build_configuration(
             serial,
         )
             as Retained<VZSerialPortConfiguration>]));
+        // EXACTLY ONE network device — a single-element array, NAT or
+        // netstack but never both, no residual second NIC (§8.1 #5): one
+        // provable path off-box.
         config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)
             as Retained<VZNetworkDeviceConfiguration>]));
         config.setStorageDevices(&NSArray::from_retained_slice(&[
@@ -279,7 +331,7 @@ fn build_configuration(
             ]));
         }
 
-        Ok(config)
+        Ok(BuiltConfig { config, host_fd })
     }
 }
 

@@ -828,14 +828,13 @@ pub fn guest_cmdline() -> String {
 ///
 /// Files written (guest-ip, kubeconfig.yaml) are the contract `up`
 /// polls on from the calling process.
-pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
-    use std::net::SocketAddr;
+pub fn host_services(
+    spec: &crate::spec::VmSpec,
+    vm_dir: &Path,
+    netstack: Option<&crate::netstack::Netstack>,
+) -> Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
-
-    let guest_ip = crate::net::discover_guest_ip(&spec.mac, Duration::from_secs(120))?;
-    eprintln!("guest address: {guest_ip}");
-    fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
     // Bind failures here are almost always another microVM already
     // holding the port — name the fix, don't let it surface as a
@@ -845,29 +844,60 @@ pub fn host_services(spec: &crate::spec::VmSpec, vm_dir: &Path) -> Result<()> {
             "cannot forward 127.0.0.1:{port} ({what}) — the port is taken. Stop the microVM holding it with `appliance vm stop`, or run `appliance doctor` to find what owns the port."
         )
     };
-    crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
-        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
-    crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))
-        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
-    crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
-        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+
+    // Discover the guest address and wire the inbound forwards. The two
+    // links differ only here: NAT routes `TcpStream::connect` over the
+    // framework subnet; the netstack assigns the lease (so the IP is
+    // known a-priori) and dials the guest *through* the userspace stack.
+    let (guest_ip, handoff_host, handoff_port) = match netstack {
+        Some(ns) => {
+            let guest_ip = IpAddr::V4(ns.guest_ip());
+            crate::net::spawn_proxy_netstack(spec.api_port, 6443, ns.clone())
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
+            crate::net::spawn_proxy_netstack(spec.host_port, 80, ns.clone())
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
+            crate::net::spawn_proxy_netstack(spec.registry_port, REGISTRY_NODEPORT, ns.clone())
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+            for port in 30000..=30050u16 {
+                let _ = crate::net::spawn_proxy_netstack(port, port, ns.clone());
+            }
+            // The kubeconfig handoff has no OS route under the netstack —
+            // forward it onto a loopback port and fetch from there.
+            let hport = crate::net::spawn_proxy_netstack_ephemeral(KUBECONFIG_PORT, ns.clone())?;
+            (guest_ip, IpAddr::V4(Ipv4Addr::LOCALHOST), hport)
+        }
+        None => {
+            let guest_ip = crate::net::discover_guest_ip(&spec.mac, Duration::from_secs(120))?;
+            crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
+            crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
+            crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
+                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+            // The deterministic-NodePort window KubernetesDeploymentService
+            // assigns from — forwarded so the "direct" URLs in deploy
+            // results work exactly as they do on k3d.
+            for port in 30000..=30050u16 {
+                let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
+            }
+            (guest_ip, guest_ip, KUBECONFIG_PORT)
+        }
+    };
+
+    eprintln!("guest address: {guest_ip}");
+    fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
+    crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
     eprintln!(
         "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT
     );
-    // The deterministic-NodePort window KubernetesDeploymentService
-    // assigns from — forwarded so the "direct" URLs in deploy results
-    // work exactly as they do on k3d.
-    for port in 30000..=30050u16 {
-        let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
-    }
 
     // The guest serves its kubeconfig only after k3s has written it —
     // first boot includes apk installs + image pulls, so be generous.
     crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{guest_ip}:{KUBECONFIG_PORT}/k3s.yaml");
+    let handoff = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
     crate::net::wait_http(&handoff, Duration::from_secs(600))?;
-    let kubeconfig = crate::net::fetch_kubeconfig(guest_ip, KUBECONFIG_PORT, spec.api_port)?;
+    let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
     eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
     crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);

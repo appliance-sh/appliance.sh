@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// How the guest NIC is wired to the host.
+///
+/// The egress-firewall epic swaps the framework NAT for a host-resident
+/// userspace netstack that owns the only path off-box. This is staged
+/// behind a per-VM flag so existing VMs keep NAT until recreated and the
+/// NAT path stays the escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetLink {
+    /// `VZNATNetworkDeviceAttachment` — the framework runs NAT and the
+    /// host never sees a packet. Default, fully working, unchanged.
+    #[default]
+    Nat,
+    /// Host-mediated link: the NIC is a `socketpair(AF_UNIX, SOCK_DGRAM)`
+    /// whose host end the in-process smoltcp netstack owns. The egress
+    /// boundary lives here (F2+); F1 is behaviour-neutral default-allow.
+    Netstack,
+}
+
 /// Persisted definition of one microVM. Lives at
 /// `~/.appliance/vm/<name>/vm.json`; everything else in that
 /// directory (disk image, console log, pidfile) is derived state.
@@ -64,6 +83,13 @@ pub struct VmSpec {
     /// default and absent from legacy specs (which parse to `vec![]`).
     #[serde(default)]
     pub published: Vec<PublishedPort>,
+    /// How the guest NIC attaches to the host. Defaults to `Nat`
+    /// (behaviour unchanged); `Netstack` swaps in the host-side smoltcp
+    /// terminator. Legacy specs lack the field and parse to `Nat`. A
+    /// global `APPLIANCE_NETSTACK=1` env override forces `Netstack`
+    /// regardless of the persisted value (see [`VmSpec::net_link`]).
+    #[serde(default)]
+    pub net_link: NetLink,
 }
 
 /// One published container port: the in-guest container port and the
@@ -143,7 +169,17 @@ impl VmSpec {
             dev_mount: None,
             docker: false,
             published: Vec::new(),
+            net_link: NetLink::Nat,
         }
+    }
+
+    /// The link this VM should actually use, honouring the global
+    /// `APPLIANCE_NETSTACK=1` override (CI/testing) over the persisted
+    /// per-VM value. The override only ever forces the netstack *on* — a
+    /// VM persisted as `Netstack` is never silently downgraded.
+    pub fn net_link(&self) -> NetLink {
+        let forced = std::env::var("APPLIANCE_NETSTACK").map(|v| v == "1").unwrap_or(false);
+        resolve_net_link(self.net_link, forced)
     }
 
     /// Resolve the four host ports for `name` so multiple VMs can run
@@ -223,6 +259,17 @@ impl VmSpec {
             }
         }
         Ok(changed)
+    }
+}
+
+/// Resolve the effective link: the `APPLIANCE_NETSTACK=1` override only
+/// forces the netstack *on*, never downgrades a VM persisted as
+/// `Netstack`. Pure so the precedence is unit-tested without touching
+/// the process environment.
+fn resolve_net_link(persisted: NetLink, forced: bool) -> NetLink {
+    match (persisted, forced) {
+        (_, true) => NetLink::Netstack,
+        (link, false) => link,
     }
 }
 
@@ -445,6 +492,36 @@ mod tests {
         // host as `host`.
         assert!(json.contains("\"host\":20000"));
         assert!(json.contains("\"container\":8080"));
+    }
+
+    #[test]
+    fn net_link_defaults_to_nat_for_legacy_and_fresh_specs() {
+        // A legacy spec predates the field — it must parse to Nat, the
+        // behaviour-neutral default, not fail or flip to Netstack.
+        let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
+        let spec: VmSpec = serde_json::from_str(legacy).unwrap();
+        assert_eq!(spec.net_link, NetLink::Nat);
+        // A fresh spec is Nat too.
+        assert_eq!(VmSpec::defaults("x").net_link, NetLink::Nat);
+
+        // The flag round-trips and serialises lowercase (wire form the
+        // desktop reads).
+        let mut spec = VmSpec::defaults("x");
+        spec.net_link = NetLink::Netstack;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"netLink\":\"netstack\""));
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.net_link, NetLink::Netstack);
+    }
+
+    #[test]
+    fn netstack_env_override_only_forces_on() {
+        // The global override forces Netstack regardless of the persisted
+        // value, but never downgrades a VM persisted as Netstack.
+        assert_eq!(resolve_net_link(NetLink::Nat, false), NetLink::Nat);
+        assert_eq!(resolve_net_link(NetLink::Nat, true), NetLink::Netstack);
+        assert_eq!(resolve_net_link(NetLink::Netstack, false), NetLink::Netstack);
+        assert_eq!(resolve_net_link(NetLink::Netstack, true), NetLink::Netstack);
     }
 
     #[test]
