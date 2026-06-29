@@ -41,7 +41,8 @@ import { readSandboxVm } from './link.js';
 export interface AgentLaunchOpts {
   /** Interactive TTY (`claude`) or one-shot autonomous (`claude -p …`). */
   mode: 'interactive' | 'autonomous';
-  /** Autonomous: the prompt. Interactive: an optional label (unused in argv). */
+  /** Autonomous: the prompt. Interactive: the initial prompt the user lands
+   *  on (passed as `claude "<task>"`), or just a tab label when omitted. */
   task?: string;
 }
 
@@ -110,7 +111,12 @@ export const claudeCodeAdapter: AgentAdapter = {
       // (agents refuse it as root, docs/rootless-guest.md §0).
       return ['claude', '-p', opts.task ?? '', '--output-format', 'json', '--dangerously-skip-permissions'];
     }
-    return ['claude'];
+    // Interactive: `claude "<prompt>"` starts the interactive TTY seeded
+    // with the user's task as the first prompt (verified against `claude
+    // --help`: the positional `[prompt]` arg with no `-p` stays
+    // interactive). Without a task it's a bare interactive session. The
+    // token is shQuoted by composeLaunchLine, so a multi-word task is safe.
+    return opts.task ? ['claude', opts.task] : ['claude'];
   },
   credHosts: [{ host: ANTHROPIC_HOST, inject: true, capture: false, header: 'x-api-key' }],
   placeholderEnv: { ANTHROPIC_API_KEY: ANTHROPIC_PLACEHOLDER_KEY },
@@ -585,6 +591,10 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult>
   }
 
   console.log(`${chalk.green('✓')} agent ${chalk.bold(sessionId)} running in VM '${vm}'`);
+  // Honest-limits caveat (Parker): the key is brokered, but the workspace
+  // is not. The sandbox is a throwaway VM, not a security jail — surface
+  // that where the user launches so the blast radius isn't a surprise.
+  console.log(chalk.yellow('  ⚠ Sandbox is throwaway, not a jail — the agent can read/write your mounted workspace.'));
   const bin = path.basename(vmBinary());
   console.log(`  Attach:  appliance vm shell --name ${vm} --session ${sessionId}`);
   console.log(chalk.dim(`           (or ${bin} shell ${vm} --session ${sessionId})`));

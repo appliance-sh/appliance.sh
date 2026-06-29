@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Bot, Check, CircleX, Loader2, Plus, X } from 'lucide-react';
+import { Bot, Check, CircleX, Loader2, Plus, Radio, X } from 'lucide-react';
 import {
   useTerminalSessions,
   statusLabel,
@@ -29,18 +29,25 @@ function StatusDot({ status }: { status: TerminalSessionMeta['status'] }) {
 
 /** Plain-language label for an agent's *run* status (distinct from the PTY
  *  connection status). Folded into the tab's accessible name so the badge —
- *  which is colour/glyph-only and aria-hidden — isn't the only signal. */
-function agentStatusLabel(status: AgentTabMeta['status']): string {
-  return status === 'done' ? 'finished' : status === 'error' ? 'failed' : 'running';
+ *  which is colour/glyph-only and aria-hidden — isn't the only signal. An
+ *  interactive agent reads as `attached` (a live TTY), not `running` (which
+ *  would imply an autonomous task is churning). */
+function agentStatusLabel(status: AgentTabMeta['status'], mode?: AgentTabMeta['mode']): string {
+  if (status === 'done') return 'finished';
+  if (status === 'error') return 'failed';
+  return mode === 'interactive' ? 'attached' : 'running';
 }
 
 /** The agent's run status, rendered as a glyph badge DISTINCT from the PTY
- *  connection dot (`StatusDot`): a spinner while the run is live, a check
- *  when it finished, an x when it errored. Lets a detached autonomous agent
- *  read as done/failed instead of looking identical to a live one. */
-function AgentStatusBadge({ status }: { status: AgentTabMeta['status'] }) {
+ *  connection dot (`StatusDot`): a check when it finished, an x when it
+ *  errored, and for a live run a STEADY "live" glyph for an interactive
+ *  (attached TTY) agent vs a spinner for a genuinely-working autonomous run.
+ *  An interactive agent isn't "working on a task", so a perpetual spinner
+ *  would mislead it as stuck (Devon). */
+function AgentStatusBadge({ status, mode }: { status: AgentTabMeta['status']; mode?: AgentTabMeta['mode'] }) {
   if (status === 'done') return <Check aria-hidden className="h-3 w-3 shrink-0 text-green-400" />;
   if (status === 'error') return <CircleX aria-hidden className="h-3 w-3 shrink-0 text-red-400" />;
+  if (mode === 'interactive') return <Radio aria-hidden className="h-3 w-3 shrink-0 text-cyan-300" />;
   return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-cyan-300" />;
 }
 
@@ -115,7 +122,8 @@ function TerminalTab({
       title={
         agent
           ? `${session.title} — ${agent.type} agent on ${session.subtitle} · run ${agentStatusLabel(
-              agent.status
+              agent.status,
+              agent.mode
             )} (shell ${statusLabel(session.status)})`
           : `${session.title} — ${session.subtitle} (${statusLabel(session.status)})`
       }
@@ -127,7 +135,7 @@ function TerminalTab({
           className={cn('h-3.5 w-3.5 shrink-0', dead ? 'text-[var(--color-muted-foreground)]' : 'text-cyan-300')}
         />
       ) : null}
-      {agent ? <AgentStatusBadge status={agent.status} /> : null}
+      {agent ? <AgentStatusBadge status={agent.status} mode={agent.mode} /> : null}
       {editing ? (
         <input
           ref={inputRef}
@@ -174,9 +182,10 @@ function TerminalTab({
           // colour-only and aria-hidden.
           aria-label={
             agent
-              ? `${session.title}, ${agent.type} agent, run ${agentStatusLabel(agent.status)} (shell ${statusLabel(
-                  session.status
-                )})`
+              ? `${session.title}, ${agent.type} agent, run ${agentStatusLabel(
+                  agent.status,
+                  agent.mode
+                )} (shell ${statusLabel(session.status)})`
               : `${session.title} (${statusLabel(session.status)})`
           }
           aria-keyshortcuts="F2"

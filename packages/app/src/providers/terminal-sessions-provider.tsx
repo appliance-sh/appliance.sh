@@ -58,6 +58,11 @@ export interface AgentTabMeta {
   /** Lifecycle for the badge. Interactive observe stays `running`;
    *  `done`/`error` are autonomous-result states (A6). */
   status: 'running' | 'done' | 'error';
+  /** How the agent runs. Drives the `running` badge glyph: an interactive
+   *  agent is an attached live TTY (steady glyph), while an autonomous run
+   *  is genuinely working (spinner). Absent → treated as autonomous so the
+   *  spinner is the conservative default. */
+  mode?: 'interactive' | 'autonomous';
 }
 
 /** Args to open or focus a terminal session. */
@@ -600,7 +605,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
               mode: 'host',
               sessionKey: agentSessionKey(s.id),
               sessionId: s.id,
-              agent: { type, status },
+              agent: { type, status, mode: info?.mode },
               title: info?.task ? `Agent · ${info.task}` : `Agent · ${type} (reattached)`,
               background: true,
             });
@@ -634,10 +639,29 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
   // a completed/failed run is reflected without a relaunch. Only runs while
   // ≥1 agent tab is still `running` (done/error/exited are terminal), and
   // patches only on an actual change to avoid render churn.
+  // Narrow signal for the poll effect: the SET of still-running agent tabs
+  // (their ids), not the whole `sessions` array. `sessions`' identity
+  // changes on every unrelated tab open/close/rename/focus, which would tear
+  // down + re-subscribe the 5s interval each time (Quinn/Devon). This
+  // primitive changes only when an agent tab enters/leaves the running set,
+  // so the poll re-subscribes exactly when the thing it watches changes.
+  const runningAgentKey = React.useMemo(
+    () =>
+      sessions
+        .filter((m) => m.agent?.status === 'running')
+        .map((m) => m.id)
+        .sort()
+        .join('|'),
+    [sessions]
+  );
+  // The poll effect reads the live `sessions` through a ref so it can key off
+  // the narrow signal above without taking `sessions` as a dependency.
+  const sessionsRef = React.useRef(sessions);
+  sessionsRef.current = sessions;
   React.useEffect(() => {
     const vmHost = host.vm;
     if (!vmHost) return;
-    const runningAgents = sessions.filter((m) => m.agent && m.agent.status === 'running');
+    const runningAgents = sessionsRef.current.filter((m) => m.agent && m.agent.status === 'running');
     if (runningAgents.length === 0) return;
     // VMs (clusterName) hosting a still-running agent tab — read each once
     // per tick and fan the result back out to its tabs by guest session id.
@@ -667,7 +691,9 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
             // Keep the heavy LiveSession copy in step with the meta so a
             // later read (e.g. another tick) sees the settled status too.
             live.agent = { ...(live.agent ?? { type: info.type }), status: next };
-            patchMeta(m.id, { agent: { type: m.agent?.type ?? info.type, status: next } });
+            patchMeta(m.id, {
+              agent: { type: m.agent?.type ?? info.type, status: next, mode: m.agent?.mode ?? info.mode },
+            });
           }
         }
       }
@@ -678,7 +704,9 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [sessions, host, patchMeta]);
+    // Keyed on the running-agent SET (not `sessions`) so an unrelated tab
+    // change doesn't churn the interval. `sessions` is read via `sessionsRef`.
+  }, [runningAgentKey, host, patchMeta]);
 
   const value = React.useMemo<TerminalSessionsContextValue>(
     () => ({

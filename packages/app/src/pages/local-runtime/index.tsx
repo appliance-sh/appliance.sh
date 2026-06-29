@@ -714,7 +714,10 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
         // can't focus/steal the agent tab (and vice versa).
         sessionKey: agentSessionKey(sessionId),
         sessionId,
-        agent: { type: 'claude-code', status: 'running' },
+        // The desktop launcher only spawns interactive agents — tag the mode
+        // so the tab badge shows a steady "attached" glyph instead of the
+        // perpetual "working" spinner reserved for autonomous runs.
+        agent: { type: 'claude-code', status: 'running', mode: 'interactive' },
         title: t ? `Agent · ${t}` : 'Agent · claude-code',
       });
       setOpen(false);
@@ -731,13 +734,24 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
 
   if (!open) {
     // Gating-off: when the VM has no shared workspace the agent can't run,
-    // but keep the control visible (disabled, reason in the tooltip) so the
-    // feature stays discoverable rather than silently absent.
+    // but keep the control visible (disabled) so the feature stays
+    // discoverable rather than silently absent — AND make the reason
+    // genuinely reachable (Devon). `buttonVariants` sets
+    // `disabled:pointer-events-none`, so a disabled button swallows hover:
+    // its native `title` tooltip never fires and it can't be focused or
+    // announced. So (a) wrap it in a `<span title>` that keeps
+    // pointer-events (the tooltip now fires on the span), and (b) render
+    // the reason as adjacent muted text so it reaches everyone regardless.
     if (disabledReason) {
       return (
-        <Button variant="outline" size="sm" disabled title={disabledReason}>
-          <Bot className="h-4 w-4" /> Run agent
-        </Button>
+        <span className="inline-flex items-center gap-2" title={disabledReason}>
+          <Button variant="outline" size="sm" disabled>
+            <Bot className="h-4 w-4" /> Run agent
+          </Button>
+          <span role="note" className="max-w-[18rem] text-[11px] leading-snug text-[var(--color-muted-foreground)]">
+            {disabledReason}
+          </span>
+        </span>
       );
     }
     return (
@@ -785,6 +799,12 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       <p className="text-[10px] text-[var(--color-muted-foreground)]">
         Runs <code className="font-mono">claude</code> in the shared workspace. Store your key once with{' '}
         <code className="font-mono">appliance agent login</code> — it&rsquo;s brokered in and never enters the VM.
+      </p>
+      {/* Honest-limits caveat (Parker): the key is brokered, but the
+          workspace is not. Surface the blast radius where the user launches
+          so a throwaway sandbox isn't mistaken for a security jail. */}
+      <p className="text-[10px] text-amber-300/90">
+        ⚠ Sandbox is throwaway, not a jail — the agent can read/write your mounted workspace.
       </p>
     </div>
   );

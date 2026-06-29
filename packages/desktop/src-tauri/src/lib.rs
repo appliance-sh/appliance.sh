@@ -3839,6 +3839,18 @@ async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<
     }
 }
 
+/// Tear down a guest tmux session by id DIRECTLY, bypassing the agent
+/// registry: `appliance-vm sessions kill <id> --name <vm>`. The agent's
+/// session id IS the tmux session key (`agent-<uuid>`), so this reaches the
+/// same session `appliance agent stop` would — without depending on the
+/// `.appliance/agents.json` registry being readable / the row resolving.
+/// Best-effort: killing an already-dead session is a harmless no-op.
+async fn kill_guest_session(vm: &str, id: &str) {
+    let Some(bin) = vm_binary() else { return };
+    let bin = bin.to_string_lossy().to_string();
+    let _ = run_status_command(&[&bin, "sessions", "kill", id, "--name", vm]).await;
+}
+
 /// Stop an agent by shelling `appliance agent stop <id>` with the CWD set
 /// to the VM's mounted workspace (where the `.appliance/agents.json`
 /// registry lives). The CLI kills the agent's tmux session and flips its
@@ -3846,6 +3858,15 @@ async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<
 /// `running` record. Called as the agent-tab close path; best-effort, so
 /// a non-dev VM / already-dead session yields Ok rather than surfacing an
 /// error on tab close.
+///
+/// The guest tmux teardown MUST NOT depend on registry resolution (Quinn):
+/// `appliance agent stop` only kills the session when it can read the
+/// project registry AND `findAgent` locates the row — if the VM has no
+/// shared workspace (no registry) or the row can't be resolved, the CLI
+/// exits without killing and the session would leak. So we fall back to a
+/// direct `sessions kill` whenever there's no mount, or the CLI stop exits
+/// non-zero (which covers both "row not found, never killed" and "session
+/// already gone" — the direct kill is idempotent either way).
 #[tauri::command]
 async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) -> Result<(), String> {
     let id = id.trim().to_string();
@@ -3854,22 +3875,35 @@ async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) ->
     }
     let vm = vm_name(name);
     let Some(dir) = vm_dev_mount(&vm) else {
-        return Ok(()); // no mounted project → no registry → nothing to stop
+        // No mounted project → the CLI can't resolve the registry row, so it
+        // would never kill the session. Tear it down directly so it can't leak.
+        kill_guest_session(&vm, &id).await;
+        return Ok(());
     };
     let sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .current_dir(dir)
-        .args(["agent".to_string(), "stop".to_string(), id]);
+        .args(["agent".to_string(), "stop".to_string(), id.clone()]);
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
-    // Drain to completion (so the kill + registry write finish) but tolerate
-    // a non-zero exit: `agent stop` exits non-zero when the tmux session was
-    // already gone, yet still marks the registry `exited` — which is exactly
-    // the outcome we want on a tab close.
-    while rx.recv().await.is_some() {}
+    // Drain to completion (so the kill + registry write finish). Capture the
+    // exit code: `agent stop` exits non-zero both when the tmux session was
+    // already gone (registry still flipped to `exited` — fine) AND when it
+    // couldn't find the registry row at all (NO kill happened — leak). We
+    // can't tell those apart from the code, so on ANY non-zero exit run the
+    // direct kill as a belt-and-suspenders teardown.
+    let mut exit_code: Option<i32> = None;
+    while let Some(event) = rx.recv().await {
+        if let CommandEvent::Terminated(payload) = event {
+            exit_code = payload.code;
+        }
+    }
+    if exit_code != Some(0) {
+        kill_guest_session(&vm, &id).await;
+    }
     Ok(())
 }
 
