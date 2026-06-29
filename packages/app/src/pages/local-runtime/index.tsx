@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
+  Bot,
   Check,
   Copy,
   Download,
@@ -21,7 +22,7 @@ import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/c
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
-import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
+import { useTerminalSessions, mintAgentSessionId } from '@/providers/terminal-sessions-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { cn } from '@/lib/utils';
 import { microVmClusterId } from '@/lib/host';
@@ -643,6 +644,7 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
                   <TerminalIcon className="h-4 w-4" /> {status.dev ? 'Open dev shell' : 'Open shell'}
                 </Button>
               ) : null}
+              {host.terminal && host.vm && status.devMount ? <LaunchAgentButton name={name} /> : null}
               <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
                 <Rocket className="h-4 w-4" /> Deploy application
               </Button>
@@ -656,6 +658,98 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
       {status?.running && status.kubeconfigReady ? <CredentialsPanel vm={vm} name={name} /> : null}
       {clusterServing ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
     </EngineCard>
+  );
+}
+
+// "Launch agent" (Phase 5, A5): spawn a Claude Code agent into the VM's
+// shared workspace and attach it as an agent-typed dock tab to observe +
+// steer it. The Anthropic key is brokered host-side and never enters the
+// VM — run `appliance agent login` once to store it. The detached,
+// broker-wired `agent-<id>` tmux session is created first (so it exists),
+// then the observe tab attaches to it via the reattachable host-shell
+// transport. Only rendered for dev VMs with a shared workspace folder.
+function LaunchAgentButton({ name }: { name: string }) {
+  const host = useHost();
+  const terminals = useTerminalSessions();
+  const [open, setOpen] = React.useState(false);
+  const [task, setTask] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const launch = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const sessionId = mintAgentSessionId();
+      const t = task.trim() || undefined;
+      // Spawn the agent FIRST so its tmux session exists, then attach the
+      // observe tab — attaching first would create an empty shell session
+      // under the agent id instead of reattaching the agent.
+      await host.vm!.instance(name).agent.start({ type: 'claude-code', task: t, sessionId });
+      terminals.openSession({
+        target: name,
+        engine: 'microvm',
+        clusterName: name,
+        mode: 'host',
+        sessionId,
+        agent: { type: 'claude-code', status: 'running' },
+        title: t ? `Agent · ${t}` : 'Agent · claude-code',
+      });
+      setOpen(false);
+      setTask('');
+    } catch (e) {
+      // Surfaces the CLI's stderr verbatim — most often "No Anthropic key
+      // configured" (run `appliance agent login`).
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen(true)}
+        title="Launch a Claude Code agent in the workspace and observe it in a tab"
+      >
+        <Bot className="h-4 w-4" /> Launch agent
+      </Button>
+    );
+  }
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <div className="flex items-center gap-2">
+        <input
+          autoFocus
+          type="text"
+          value={task}
+          onChange={(e) => setTask(e.target.value)}
+          placeholder="task (optional) — e.g. fix the failing test"
+          className="w-64 rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1 text-xs"
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !busy) void launch();
+            if (e.key === 'Escape') setOpen(false);
+          }}
+        />
+        <Button size="sm" onClick={() => void launch()} disabled={busy}>
+          <Bot className={cn('h-3.5 w-3.5', busy && 'animate-pulse')} /> {busy ? 'Launching…' : 'Launch'}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)} disabled={busy}>
+          Cancel
+        </Button>
+      </div>
+      {err ? (
+        <p className="max-w-[28rem] font-mono text-[10px] text-red-300">{err}</p>
+      ) : (
+        <p className="text-[10px] text-[var(--color-muted-foreground)]">
+          Runs <code className="font-mono">claude</code> in the shared workspace. Store your key once with{' '}
+          <code className="font-mono">appliance agent login</code> — it&rsquo;s brokered in and never enters the VM.
+        </p>
+      )}
+    </div>
   );
 }
 

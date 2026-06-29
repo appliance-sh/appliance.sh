@@ -2694,6 +2694,12 @@ struct MicroVmStatus {
     /// Whether this VM is provisioned as a development environment
     /// (`appliance vm dev up`). Drives the dev-shell affordance.
     dev: bool,
+    /// Host folder shared into `/persist/workspace` (`devMount` in the
+    /// VM's `vm.json`), when one is mounted. The agent launcher gates on
+    /// this: launching writes to + scopes the run to this folder, and
+    /// without it the CLI would restart the VM to remount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_mount: Option<String>,
     api_server_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
@@ -2800,6 +2806,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             kubeconfig_ready: false,
             phase: None,
             dev: false,
+            dev_mount: None,
             api_server_url,
             message: Some(if installable {
                 "The microVM engine isn't installed yet.".into()
@@ -2823,6 +2830,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
                 kubeconfig_ready: false,
                 phase: None,
                 dev: false,
+                dev_mount: None,
                 api_server_url,
                 message: Some(e),
             }
@@ -2837,6 +2845,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             kubeconfig_ready: false,
             phase: None,
             dev: false,
+            dev_mount: None,
             api_server_url,
             message: Some(stderr.trim().to_string()),
         };
@@ -2889,6 +2898,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         kubeconfig_ready,
         phase,
         dev: parsed.get("dev").and_then(|v| v.as_bool()).unwrap_or(false),
+        dev_mount: vm_dev_mount(&name),
         api_server_url,
         message: parsed
             .get("message")
@@ -3632,6 +3642,204 @@ async fn microvm_dev_cleanup(name: Option<String>) -> Result<(), String> {
 }
 
 // ============================================================
+// Coding agents (Phase 5, A5) — launch + observe.
+//
+// A "Launch agent" affordance shells the bundled `appliance` CLI's
+// `agent start … --no-attach` (A3) to spawn a Claude Code agent in a
+// detached `agent-<id>` tmux session inside the VM, broker-wired so the
+// Anthropic key is injected host-side and never enters the VM
+// (docs/agent-sandbox.md §3). The desktop then attaches that session as
+// an agent-typed terminal tab (the E3 reattachable-session machinery) to
+// observe/steer it. `agent list` surfaces the per-project registry so the
+// rehydrated tab can be labelled + status-dotted.
+// ============================================================
+
+/// The host workspace a VM has mounted at `/persist/workspace`
+/// (`devMount` in its `vm.json`), when it is a dev VM. An agent launch +
+/// its `.appliance/agents.json` registry are scoped to this dir, so
+/// `appliance agent start` reuses the running VM as-is instead of
+/// restarting it to remount a different workspace (ensureSandboxVm).
+fn vm_dev_mount(name: &str) -> Option<String> {
+    let spec = home_dir()?
+        .join(SHARED_PROFILES_DIR)
+        .join("vm")
+        .join(name)
+        .join("vm.json");
+    let raw = std::fs::read_to_string(spec).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed
+        .get("devMount")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn default_agent_type() -> String {
+    "claude-code".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentStartInput {
+    /// VM to launch in; null → the canonical `appliance` VM.
+    #[serde(default)]
+    name: Option<String>,
+    /// Adapter key — `claude-code` today.
+    #[serde(rename = "type", default = "default_agent_type")]
+    agent_type: String,
+    /// Optional task prompt (interactive label / autonomous prompt).
+    #[serde(default)]
+    task: Option<String>,
+    /// The pre-minted `agent-<uuid>` session id the observe tab attaches
+    /// to. Pre-minting lets the desktop open the tab against a known id
+    /// the moment the launch returns (the tmux session already exists).
+    session_id: String,
+}
+
+/// Launch a coding agent in the VM by shelling the bundled `appliance`
+/// CLI: `agent start --vm <vm> --type <t> --session <id> --no-attach
+/// [--task <t>] [--dir <devMount>]`. `--no-attach` records the agent +
+/// spawns its detached `agent-<id>` tmux session WITHOUT the CLI's
+/// interactive attach — the desktop attaches it itself as an agent tab.
+/// Surfaces the CLI's stderr (e.g. "No Anthropic key configured") on
+/// failure so the launcher can show it.
+#[tauri::command]
+async fn microvm_agent_start(app: AppHandle, input: AgentStartInput) -> Result<(), String> {
+    let vm = vm_name(input.name);
+    let session_id = input.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("a session id is required to launch an agent".to_string());
+    }
+    // Require a shared host workspace: the agent runs in /persist/workspace
+    // and writes its `.appliance/agents.json` registry there. Pinning
+    // `--dir` to the VM's existing mount also stops the CLI's
+    // ensureSandboxVm from restarting the running VM to remount.
+    let Some(dir) = vm_dev_mount(&vm) else {
+        return Err(format!(
+            "VM '{vm}' has no shared workspace folder — start it as a dev environment with a shared \
+             folder before launching an agent."
+        ));
+    };
+    let mut args: Vec<String> = vec![
+        "agent".into(),
+        "start".into(),
+        "--vm".into(),
+        vm.clone(),
+        "--type".into(),
+        input.agent_type,
+        "--session".into(),
+        session_id,
+        "--no-attach".into(),
+        "--dir".into(),
+        dir,
+    ];
+    if let Some(task) = input.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        args.push("--task".into());
+        args.push(task.to_string());
+    }
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
+        .args(args);
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+    let mut stderr_buf = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut spawn_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stderr(bytes) => {
+                stderr_buf.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            CommandEvent::Error(msg) => {
+                spawn_error = Some(msg);
+            }
+            CommandEvent::Terminated(payload) => {
+                exit_code = payload.code;
+            }
+            _ => {}
+        }
+    }
+    if let Some(msg) = spawn_error {
+        return Err(format!("appliance agent start error: {msg}"));
+    }
+    if exit_code != Some(0) {
+        let tail = stderr_buf.trim();
+        return Err(if tail.is_empty() {
+            format!("appliance agent start exited with code {exit_code:?}")
+        } else {
+            tail.to_string()
+        });
+    }
+    Ok(())
+}
+
+/// One agent as reported by `appliance agent list --json` — the registry
+/// record plus a reconciled `live` flag. Re-emitted to the frontend so a
+/// rehydrated agent tab can show its type/task/status.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInfo {
+    id: String,
+    #[serde(rename = "type")]
+    agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    status: String,
+    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live: Option<bool>,
+}
+
+/// List the agents recorded for a VM's mounted project
+/// (`.appliance/agents.json`), reconciled against live tmux sessions.
+/// Shells `appliance agent list --json` with the CWD set to the VM's
+/// mounted workspace (where the registry lives). Best-effort: an absent
+/// registry / non-dev VM / parse hiccup yields an empty list rather than
+/// an error, so rehydrate degrades to labelling agent tabs by their
+/// `agent-` id alone.
+#[tauri::command]
+async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<AgentInfo>, String> {
+    let vm = vm_name(name);
+    let Some(dir) = vm_dev_mount(&vm) else {
+        return Ok(Vec::new()); // no mounted project → no per-project registry
+    };
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
+        .current_dir(dir)
+        .args(["agent".to_string(), "list".to_string(), "--json".to_string()]);
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+    let mut stdout_buf = String::new();
+    let mut exit_code: Option<i32> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => stdout_buf.push_str(&String::from_utf8_lossy(&bytes)),
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
+        }
+    }
+    if exit_code != Some(0) {
+        return Ok(Vec::new()); // tolerate a missing/empty registry
+    }
+    // `agent list --json` prints a (pretty) JSON array and nothing else;
+    // parse from the first '[' and swallow any parse hiccup so a malformed
+    // registry never breaks tab rehydrate.
+    match stdout_buf.find('[') {
+        Some(i) => Ok(serde_json::from_str(stdout_buf[i..].trim_end()).unwrap_or_default()),
+        None => Ok(Vec::new()),
+    }
+}
+
+// ============================================================
 // Build + deploy from a local source folder.
 //
 // Driven by the desktop's deploy wizard: pick a folder containing an
@@ -4239,6 +4447,8 @@ pub fn run() {
             microvm_up,
             microvm_dev_up,
             microvm_dev_cleanup,
+            microvm_agent_start,
+            microvm_agent_list,
             microvm_stop,
             microvm_delete,
             microvm_egress_get,

@@ -1,5 +1,7 @@
 import type {
   AddClusterInput,
+  AgentInfo,
+  AgentLaunchInput,
   BootstrapEvent,
   BootstrapResult,
   Cluster,
@@ -413,6 +415,9 @@ export function createMockHost(): ConsoleHost {
               kubeconfigReady: vm.running,
               phase: vm.running ? ('ready' as const) : undefined,
               dev: vm.dev,
+              // Mock a shared workspace for dev VMs so the agent launcher
+              // (gated on devMount) is exercisable in the browser shell.
+              devMount: vm.dev ? `/Users/you/projects/${vm.name}` : undefined,
               apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
             };
           },
@@ -555,6 +560,24 @@ export function createMockHost(): ConsoleHost {
               vm.creds.secrets = [];
             },
           },
+          agent: {
+            async start(input: AgentLaunchInput) {
+              await sleep(400);
+              vm.agents.push({
+                id: input.sessionId.replace(/^agent-/, ''),
+                type: input.type ?? 'claude-code',
+                task: input.task,
+                status: 'running',
+                sessionId: input.sessionId,
+                mode: 'interactive',
+                live: true,
+              });
+            },
+            async list(): Promise<AgentInfo[]> {
+              await sleep(80);
+              return vm.agents.map((a) => ({ ...a }));
+            },
+          },
         };
       },
     },
@@ -580,6 +603,8 @@ interface MockVm {
     rules: Array<{ host: string; capture: boolean; inject: boolean; header: string; helper?: string }>;
     secrets: Array<{ host: string; header: string; masked: string }>;
   };
+  /** Coding agents launched into this VM (Phase 5, A5). */
+  agents: AgentInfo[];
 }
 
 const microVms: Record<string, MockVm> = {
@@ -597,6 +622,7 @@ const microVms: Record<string, MockVm> = {
       rules: [{ host: 'api.openai.com', capture: true, inject: true, header: 'authorization' }],
       secrets: [{ host: 'api.openai.com', header: 'authorization', masked: '••••k7Qx' }],
     },
+    agents: [],
   },
   traffic: {
     name: 'traffic',
@@ -615,6 +641,7 @@ const microVms: Record<string, MockVm> = {
       caPath: '~/.appliance/vm/traffic/egress-ca.pem',
     },
     creds: { rules: [], secrets: [] },
+    agents: [],
   },
 };
 
@@ -639,6 +666,7 @@ function mockVm(name: string): MockVm {
       egressPort: base + 3,
       egress: { default: 'allow', allow: [], deny: [], mitm: false },
       creds: { rules: [], secrets: [] },
+      agents: [],
     };
     microVms[name] = vm;
   }

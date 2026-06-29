@@ -47,6 +47,19 @@ export function statusDotClass(status: TerminalStatus): string {
         : 'bg-[var(--color-muted-foreground)]';
 }
 
+/** Agent-tab metadata (Phase 5, A5). When present on a session it is a
+ *  coding agent rather than a plain shell: the dock tab renders an agent
+ *  icon + status, and rehydrate brings the session back as an agent tab.
+ *  The transport is still the reattachable host shell, attached to the
+ *  agent's `agent-<id>` tmux session. */
+export interface AgentTabMeta {
+  /** Adapter key, e.g. `claude-code`. */
+  type: string;
+  /** Lifecycle for the badge. Interactive observe stays `running`;
+   *  `done`/`error` are autonomous-result states (A6). */
+  status: 'running' | 'done' | 'error';
+}
+
 /** Args to open or focus a terminal session. */
 export interface OpenTerminalOptions {
   /** kubectl/shell target — a pod name, or the VM name for a host shell. */
@@ -77,6 +90,10 @@ export interface OpenTerminalOptions {
    *  but the view stays hidden. Used by rehydrate so reconnecting N shells
    *  on launch doesn't flash N modals — the user clicks a tab to view it. */
   background?: boolean;
+  /** Mark this session as a coding agent (Phase 5, A5). The launcher
+   *  pre-mints the `agent-<id>` (passed as `sessionId`) and spawns the
+   *  agent before calling here; this only types the resulting tab. */
+  agent?: AgentTabMeta;
 }
 
 /** Light, render-safe projection of a session for the chrome. */
@@ -89,6 +106,9 @@ export interface TerminalSessionMeta {
   subtitle: string;
   mode?: 'dev' | 'host';
   engine?: 'microvm';
+  /** Set when this tab is a coding agent (Phase 5, A5) — the tab bar
+   *  renders an agent icon + status badge distinct from a plain shell. */
+  agent?: AgentTabMeta;
 }
 
 // The heavy, route-independent objects. Held in a ref Map, never in React
@@ -116,6 +136,9 @@ interface LiveSession {
    *  used to (a) de-dupe a rehydrated tab against its live session and (b)
    *  destroy the guest session on an explicit close. Absent for pod-exec. */
   sessionId?: string;
+  /** Agent-tab metadata (Phase 5, A5), when this session is a coding
+   *  agent rather than a plain shell. */
+  agent?: AgentTabMeta;
 }
 
 interface TerminalSessionsContextValue {
@@ -159,6 +182,8 @@ const TerminalSessionsContext = React.createContext<TerminalSessionsContextValue
 
 function deriveTitle(opts: OpenTerminalOptions): string {
   if (opts.title) return opts.title;
+  // An agent tab reads as the agent, not the host shell it rides on.
+  if (opts.agent) return `Agent · ${opts.agent.type}`;
   const base = opts.engine === 'microvm' ? 'Terminal · microVM' : 'Terminal';
   if (opts.mode === 'dev') return `${base} · dev workspace`;
   if (opts.mode === 'host') return `${base} · host`;
@@ -181,9 +206,26 @@ function mintSessionId(mode: 'dev' | 'host'): string {
 }
 
 /** Recover the mode a reattached session was opened in from its id prefix.
- *  Unknown / legacy ids fall back to 'host' (a raw shell). */
+ *  Unknown / legacy ids fall back to 'host' (a raw shell). An `agent-`
+ *  session rides the 'host' transport (see isAgentSessionId). */
 function modeFromSessionId(id: string): 'dev' | 'host' {
   return id.startsWith('dev-') ? 'dev' : 'host';
+}
+
+/** Whether a guest session id belongs to a coding agent (Phase 5, A5).
+ *  The CLI/desktop mint agent sessions as `agent-<uuid>` (utils/agent.ts
+ *  mintAgentSessionId), so the prefix is how rehydrate tells an agent tab
+ *  from a plain shell — the registry only enriches its type/task/status. */
+export function isAgentSessionId(id: string): boolean {
+  return id.startsWith('agent-');
+}
+
+/** Mint an `agent-<uuid>` guest session id (mirrors the CLI's
+ *  mintAgentSessionId + satisfies validate_session_id in shell.rs). The
+ *  launcher pre-mints this, hands it to `agent.start`, then opens the
+ *  observe tab against it. */
+export function mintAgentSessionId(): string {
+  return `agent-${crypto.randomUUID()}`;
 }
 
 let nextSessionSeq = 0;
@@ -274,6 +316,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         subtitle,
         mode: opts.mode,
         engine: opts.engine,
+        agent: opts.agent,
       };
       setSessions((prev) => [...prev, meta]);
       if (!opts.background) setActiveId(id);
@@ -329,6 +372,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         clusterName: opts.clusterName,
         mode: opts.mode,
         sessionId,
+        agent: opts.agent,
       };
       liveRef.current.set(id, live);
 
@@ -502,7 +546,36 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         if (!vm.running) continue;
         const found = await listSessions(vm.name).catch(() => []);
         if (cancelled) return;
+        // Enrich any reattached agent sessions with their registry
+        // type/task/status (best-effort — an `agent-` session still comes
+        // back as an agent tab even when the registry read yields nothing).
+        const agents = found.some((s) => isAgentSessionId(s.id))
+          ? await vmHost
+              .instance(vm.name)
+              .agent.list()
+              .catch(() => [])
+          : [];
+        if (cancelled) return;
+        const agentBySession = new Map(agents.map((a) => [a.sessionId, a]));
         for (const s of found) {
+          if (isAgentSessionId(s.id)) {
+            const info = agentBySession.get(s.id);
+            const type = info?.type ?? 'claude-code';
+            const status: AgentTabMeta['status'] =
+              info?.status === 'done' || info?.status === 'error' ? info.status : 'running';
+            openSessionRef.current({
+              target: vm.name,
+              engine: 'microvm',
+              clusterName: vm.name,
+              // Agents ride the reattachable host-shell transport.
+              mode: 'host',
+              sessionId: s.id,
+              agent: { type, status },
+              title: info?.task ? `Agent · ${info.task}` : `Agent · ${type} (reattached)`,
+              background: true,
+            });
+            continue;
+          }
           const mode = modeFromSessionId(s.id);
           openSessionRef.current({
             target: vm.name,

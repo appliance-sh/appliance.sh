@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Plus, X } from 'lucide-react';
+import { Bot, Plus, X } from 'lucide-react';
 import {
   useTerminalSessions,
   statusLabel,
@@ -49,6 +49,9 @@ function TerminalTab({
   // A self-exited / failed shell is dead weight — dim it so the live tabs
   // read first, but keep it present (and closable) per Devon's nit.
   const dead = session.status === 'closed' || session.status === 'error';
+  // A coding agent (Phase 5, A5) reads distinctly from a plain shell: a
+  // bot glyph + an agent-typed tooltip, and a cyan accent when active.
+  const agent = session.agent;
 
   React.useEffect(() => {
     if (editing) {
@@ -82,11 +85,24 @@ function TerminalTab({
         active
           ? 'border-[var(--color-border-strong)] bg-[var(--color-accent)] text-[var(--color-foreground)]'
           : 'border-[var(--color-border)] bg-transparent text-[var(--color-muted-foreground)] hover:bg-[var(--color-accent)]',
+        // Agent tabs carry a faint cyan ring so they stand apart from the
+        // shells in the same strip, even before you read the glyph.
+        agent && !dead && 'border-cyan-500/40',
         dead && 'opacity-60'
       )}
-      title={`${session.title} — ${session.subtitle} (${statusLabel(session.status)})`}
+      title={
+        agent
+          ? `${session.title} — ${agent.type} agent on ${session.subtitle} (${statusLabel(session.status)})`
+          : `${session.title} — ${session.subtitle} (${statusLabel(session.status)})`
+      }
     >
       <StatusDot status={session.status} />
+      {agent ? (
+        <Bot
+          aria-hidden
+          className={cn('h-3.5 w-3.5 shrink-0', dead ? 'text-[var(--color-muted-foreground)]' : 'text-cyan-300')}
+        />
+      ) : null}
       {editing ? (
         <input
           ref={inputRef}
@@ -127,10 +143,15 @@ function TerminalTab({
           }}
           className="min-w-0 flex-1 truncate text-left"
           aria-pressed={active}
-          // Fold the status word into the accessible name so a screen-reader
-          // / keyboard user can tell a live tab from a dead one — the dot is
+          // Fold the status word (and agent type) into the accessible name
+          // so a screen-reader / keyboard user can tell a live tab from a
+          // dead one, and an agent from a shell — the dot + bot glyph are
           // colour-only and aria-hidden.
-          aria-label={`${session.title} (${statusLabel(session.status)})`}
+          aria-label={
+            agent
+              ? `${session.title}, ${agent.type} agent (${statusLabel(session.status)})`
+              : `${session.title} (${statusLabel(session.status)})`
+          }
           aria-keyshortcuts="F2"
           title="Double-click or press F2 to rename"
         >
@@ -145,7 +166,7 @@ function TerminalTab({
         }}
         className="shrink-0 rounded p-0.5 text-[var(--color-muted-foreground)] opacity-60 hover:bg-[var(--color-destructive)]/20 hover:text-red-400 group-hover:opacity-100"
         aria-label={dead ? `Remove ${session.title}` : `End ${session.title}`}
-        title={dead ? 'Remove ended tab' : 'End shell'}
+        title={dead ? 'Remove ended tab' : agent ? 'End agent' : 'End shell'}
       >
         <X className="h-3 w-3" />
       </button>
@@ -162,11 +183,19 @@ export function TerminalTabBar() {
   const handleClose = React.useCallback(
     async (session: TerminalSessionMeta) => {
       if (session.status === 'open' || session.status === 'connecting') {
-        const ok = await confirm({
-          title: 'End this shell?',
-          description: 'The running process will be terminated.',
-          confirmLabel: 'End shell',
-        });
+        const ok = await confirm(
+          session.agent
+            ? {
+                title: 'End this agent?',
+                description: "The agent's session and its running process will be terminated.",
+                confirmLabel: 'End agent',
+              }
+            : {
+                title: 'End this shell?',
+                description: 'The running process will be terminated.',
+                confirmLabel: 'End shell',
+              }
+        );
         if (!ok) return;
       }
       closeSession(session.id);
