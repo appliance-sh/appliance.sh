@@ -51,7 +51,7 @@ function TerminalDrawerView({ session }: { session: TerminalSessionMeta }) {
   // identity on every status patch / sibling open / hide / focus, so an
   // effect that depends on it would re-park + re-attach + re-fit + steal
   // focus on unrelated changes. The callbacks themselves are stable.
-  const { attachView, hide, closeSession } = useTerminalSessions();
+  const { attachView, hide, closeSession, isFocused } = useTerminalSessions();
   const confirm = useConfirm();
   const mountRef = React.useRef<HTMLDivElement | null>(null);
   // The control that opened this shell — captured on mount (before xterm
@@ -98,12 +98,16 @@ function TerminalDrawerView({ session }: { session: TerminalSessionMeta }) {
       <div
         className="flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden rounded-md border border-[var(--color-border)] bg-[#0a0a0a]"
         onClick={(e) => e.stopPropagation()}
-        // Capture phase so Esc dismisses the modal before xterm forwards
-        // the keystroke to the shell. Scoped to the dialog subtree, so an
-        // overlaid confirm dialog (focus on its own button, outside this
-        // node) keeps its own Esc handling.
+        // Capture phase so Esc reaches us before xterm — but only hijack it
+        // when the terminal is NOT focused (e.g. focus on the Hide button).
+        // When the terminal holds focus, defer to xterm's custom key handler:
+        // a focused full-screen TUI (vim/less) gets raw Esc, while a normal
+        // prompt Hides the view there. This keeps reattachable TUIs usable
+        // (E3.4 / Devon) without losing Esc-to-Hide. Scoped to the dialog
+        // subtree, so an overlaid confirm dialog keeps its own Esc handling.
         onKeyDownCapture={(e) => {
           if (e.key !== 'Escape') return;
+          if (isFocused(session.id)) return;
           e.preventDefault();
           e.stopPropagation();
           dismiss();

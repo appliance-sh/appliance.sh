@@ -50,6 +50,7 @@ export type {
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
+  TerminalSessionInfo,
   UpdaterHost,
   AvailableUpdate,
   UpdateProgress,

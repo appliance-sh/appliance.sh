@@ -269,6 +269,12 @@ export interface TerminalOpenOptions {
   container?: string;
   cols: number;
   rows: number;
+  /** Reattachable guest tmux session id (E3.4). Only the vsock host/dev
+   *  shell honours it — the argv gains `--session <id>` so the PTY attaches
+   *  to (or creates) the named guest tmux session `appliance-<id>`, which
+   *  survives this client disconnecting and a desktop restart. Absent for
+   *  pod-exec shells (no tmux behind them) — they stay non-reattachable. */
+  sessionId?: string;
 }
 
 /** A live PTY session. Output arrives on the `onEvent` callback passed
@@ -280,8 +286,26 @@ export interface TerminalSession {
   close(): Promise<void>;
 }
 
+/** One reattachable guest tmux session, as reported by `terminal.list`.
+ *  Mirrors SessionInfo in packages/vm/src/shell.rs (the `appliance-`
+ *  prefix stripped). */
+export interface TerminalSessionInfo {
+  /** Host-minted id — the desktop tab's session id (`<mode>-<uuid>`). */
+  id: string;
+  /** tmux `session_activity` (Unix epoch seconds), when known. */
+  lastActivity?: number;
+}
+
 export interface TerminalHost {
   open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession>;
+  /** Enumerate the VM's live reattachable guest tmux sessions, so the
+   *  store can rehydrate dock tabs on app launch (E3.4). Optional — a host
+   *  without reattachable sessions omits it. */
+  list?(vmName?: string): Promise<TerminalSessionInfo[]>;
+  /** Destroy a guest tmux session by id (the explicit tab-close path).
+   *  Closing the PTY only *detaches*; this is what actually tears the
+   *  in-guest session down. Optional, paired with `list`. */
+  kill?(vmName: string | undefined, id: string): Promise<void>;
 }
 
 /**

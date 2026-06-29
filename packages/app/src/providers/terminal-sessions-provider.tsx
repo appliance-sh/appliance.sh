@@ -65,10 +65,18 @@ export interface OpenTerminalOptions {
    *  composite of engine/clusterName/mode/target.
    *
    *  NOTE: this is a *host-side* identity for the desktop tab. It is
-   *  distinct from the guest tmux session id that E3.4 will thread through
-   *  the transport (`vm shell --session <id>`); when that lands it can be
-   *  carried alongside this key. */
+   *  distinct from the guest tmux session id (`sessionId` below) that E3.4
+   *  threads through the transport (`vm shell --session <id>`). */
   sessionKey?: string;
+  /** Reattachable guest tmux session id (E3.4). Supplied by the rehydrate
+   *  path to *reattach* a specific still-running guest session; for a fresh
+   *  reattachable shell (microVM host/dev) one is minted automatically.
+   *  Absent for pod-exec shells — they have no tmux behind them. */
+  sessionId?: string;
+  /** Open without stealing focus (no modal): the tab appears in the dock
+   *  but the view stays hidden. Used by rehydrate so reconnecting N shells
+   *  on launch doesn't flash N modals — the user clicks a tab to view it. */
+  background?: boolean;
 }
 
 /** Light, render-safe projection of a session for the chrome. */
@@ -103,6 +111,11 @@ interface LiveSession {
   engine?: 'microvm';
   clusterName?: string;
   mode?: 'dev' | 'host';
+  /** The reattachable guest tmux session id (`<mode>-<uuid>`), when this is
+   *  a microVM host/dev shell. Threaded into the PTY as `--session <id>`;
+   *  used to (a) de-dupe a rehydrated tab against its live session and (b)
+   *  destroy the guest session on an explicit close. Absent for pod-exec. */
+  sessionId?: string;
 }
 
 interface TerminalSessionsContextValue {
@@ -134,6 +147,12 @@ interface TerminalSessionsContextValue {
    *  Returns a cleanup that parks the node back in the holder (it does NOT
    *  close the session). Used by the view; not for general callers. */
   attachView(id: string, host: HTMLElement): () => void;
+  /** Whether a session's xterm currently holds keyboard focus. The modal
+   *  uses this to decide whether to hijack Esc (E3.4 / Devon): when the
+   *  terminal is focused, Esc is left to xterm's custom key handler — so a
+   *  focused full-screen TUI (vim/less) gets raw Esc — and only dismisses
+   *  the modal when focus is elsewhere (e.g. on the Hide button). */
+  isFocused(id: string): boolean;
 }
 
 const TerminalSessionsContext = React.createContext<TerminalSessionsContextValue | null>(null);
@@ -144,6 +163,27 @@ function deriveTitle(opts: OpenTerminalOptions): string {
   if (opts.mode === 'dev') return `${base} · dev workspace`;
   if (opts.mode === 'host') return `${base} · host`;
   return base;
+}
+
+/** Only the microVM host/dev (vsock) shell is reattachable — pod-exec has
+ *  no tmux behind it (E3.0 design), so it never gets a guest session id. */
+function isReattachable(opts: { engine?: 'microvm'; mode?: 'dev' | 'host' }): boolean {
+  return opts.engine === 'microvm' && (opts.mode === 'dev' || opts.mode === 'host');
+}
+
+/** Mint a stable guest tmux session id for a reattachable shell. The mode
+ *  is encoded as a prefix so the rehydrate path can recover it (the vsock
+ *  argv is identical for dev/host, so the id is the only carrier of which
+ *  it was) for the dock title. The charset stays within the CLI's
+ *  `validate_session_id` (letters, digits, '-'). */
+function mintSessionId(mode: 'dev' | 'host'): string {
+  return `${mode}-${crypto.randomUUID()}`;
+}
+
+/** Recover the mode a reattached session was opened in from its id prefix.
+ *  Unknown / legacy ids fall back to 'host' (a raw shell). */
+function modeFromSessionId(id: string): 'dev' | 'host' {
+  return id.startsWith('dev-') ? 'dev' : 'host';
 }
 
 let nextSessionSeq = 0;
@@ -188,18 +228,41 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
 
   const hide = React.useCallback(() => setActiveId(null), []);
 
+  // xterm's custom key handler (set per-term in openSession) reaches for the
+  // *current* hide via this ref, so the handler closure never goes stale and
+  // terms never need re-creating when hide's identity changes.
+  const hideRef = React.useRef(hide);
+  hideRef.current = hide;
+
+  const isFocused = React.useCallback((id: string): boolean => {
+    const live = liveRef.current.get(id);
+    const el = live?.term.element;
+    return !!el && el.contains(document.activeElement);
+  }, []);
+
   const openSession = React.useCallback(
     (opts: OpenTerminalOptions): string => {
       const key =
         opts.sessionKey ?? [opts.engine ?? '', opts.clusterName ?? '', opts.mode ?? '', opts.target].join('|');
 
-      // De-dupe: reopening focuses the existing live session.
+      // De-dupe. A rehydrate / explicit guest id focuses the tab already
+      // bound to that in-guest session (so two distinct guest sessions on
+      // one target stay two distinct tabs); a fresh open focuses by the
+      // derived/explicit host-side key (so clicking "Open shell" twice
+      // reuses the one tab).
       for (const [id, live] of liveRef.current) {
-        if (live.key === key) {
-          setActiveId(id);
+        const match = opts.sessionId ? live.sessionId === opts.sessionId : live.key === key;
+        if (match) {
+          if (!opts.background) setActiveId(id);
           return id;
         }
       }
+
+      // Mint a stable guest tmux session id for a reattachable (microVM
+      // host/dev) shell, unless the caller supplied one (rehydrate). The id
+      // rides the transport as `--session <id>`; attach + reattach reuse it.
+      // Pod-exec shells get none — they stay non-reattachable.
+      const sessionId = opts.sessionId ?? (isReattachable(opts) && opts.mode ? mintSessionId(opts.mode) : undefined);
 
       const id = `term-${++nextSessionSeq}`;
       const subtitle = opts.target;
@@ -213,7 +276,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         engine: opts.engine,
       };
       setSessions((prev) => [...prev, meta]);
-      setActiveId(id);
+      if (!opts.background) setActiveId(id);
 
       if (!host.terminal) {
         // Web shell has no PTY transport — surface the same error the old
@@ -231,6 +294,21 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
+      // Raw Esc for full-screen TUIs (E3.4 / Devon). With reattachable
+      // shells, users live in vim/less far more — and the dock view's modal
+      // used to swallow Esc to Hide. Hand Esc to the running app whenever the
+      // shell is in tmux's alternate screen (a TUI is up); at a normal prompt
+      // Esc still Hides the view (reversible — the tab and PTY stay live).
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === 'keydown' && e.key === 'Escape') {
+          if (term.buffer.active.type === 'alternate') {
+            return true; // alt-screen TUI: forward raw Esc to the shell
+          }
+          hideRef.current(); // normal prompt: Hide the dock view…
+          return false; // …and don't also send Esc to the shell
+        }
+        return true;
+      });
       const container = document.createElement('div');
       container.style.height = '100%';
       container.style.width = '100%';
@@ -250,6 +328,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
         engine: opts.engine,
         clusterName: opts.clusterName,
         mode: opts.mode,
+        sessionId,
       };
       liveRef.current.set(id, live);
 
@@ -260,6 +339,7 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
             engine: opts.engine,
             clusterName: opts.clusterName,
             mode: opts.mode,
+            sessionId,
             cols: term.cols,
             rows: term.rows,
           },
@@ -283,7 +363,10 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
           const sub = term.onData((d) => void live.session?.write(d));
           live.disposeInput = () => sub.dispose();
           patchMeta(id, { status: 'open' });
-          term.focus();
+          // A background (rehydrated) session is parked off-screen — don't
+          // pull keyboard focus into an invisible terminal on launch. The
+          // user's click → attachView focuses it when they open the tab.
+          if (!opts.background) term.focus();
         })
         .catch((e) => {
           patchMeta(id, { status: 'error', error: e instanceof Error ? e.message : String(e) });
@@ -336,16 +419,30 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       }
       liveRef.current.delete(id);
       live.disposeInput?.();
+      // Closing the host PTY only *detaches* from the guest tmux session, so
+      // an explicit tab-close must also destroy that session — otherwise it
+      // would linger and silently rehydrate on the next launch.
       void live.session?.close();
+      if (live.sessionId && live.engine === 'microvm') {
+        void host.terminal?.kill?.(live.clusterName, live.sessionId).catch(() => {});
+      }
       live.term.dispose();
       live.container.remove();
-      // A host/dev shell rides `kubectl debug node/`, which leaves a
-      // debugger pod behind — sweep it when the session is destroyed.
+      // A host/dev shell can ride `kubectl debug node/`, which leaves a
+      // debugger pod behind. Forking a shell opens a *second* such session on
+      // the same VM, and `cleanupShell()` sweeps by VM — so sweeping on every
+      // close would tear down a still-open sibling's debugger pod (Quinn).
+      // Only sweep once the LAST host/dev shell on this VM closes.
       if (live.mode && live.engine === 'microvm') {
-        void host.vm
-          ?.instance(live.clusterName)
-          .cleanupShell()
-          .catch(() => {});
+        const siblingOnSameTarget = Array.from(liveRef.current.values()).some(
+          (s) => s.engine === 'microvm' && s.mode && s.clusterName === live.clusterName
+        );
+        if (!siblingOnSameTarget) {
+          void host.vm
+            ?.instance(live.clusterName)
+            .cleanupShell()
+            .catch(() => {});
+        }
       }
       setSessions((prev) => prev.filter((m) => m.id !== id));
       setActiveId((cur) => (cur === id ? null : cur));
@@ -384,6 +481,49 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
     [park]
   );
 
+  // Reconnect on app restart (E3.4 / spec §4.3). Closing the desktop only
+  // detached from the guest tmux sessions — they keep running while the VM
+  // is up. On launch, enumerate each running VM's live sessions and re-open
+  // a (background) dock tab for every one, attaching by its guest id; tmux
+  // replays the screen, so the user lands back in each still-running shell.
+  // Reached via a ref so this effect can run exactly once without taking
+  // openSession (whose identity changes as state updates) as a dependency.
+  const openSessionRef = React.useRef(openSession);
+  openSessionRef.current = openSession;
+  React.useEffect(() => {
+    const listSessions = host.terminal?.list;
+    const vmHost = host.vm;
+    if (!listSessions || !vmHost) return; // web shell / no reattach support
+    let cancelled = false;
+    void (async () => {
+      const vms = await vmHost.list().catch(() => []);
+      for (const vm of vms) {
+        if (cancelled) return;
+        if (!vm.running) continue;
+        const found = await listSessions(vm.name).catch(() => []);
+        if (cancelled) return;
+        for (const s of found) {
+          const mode = modeFromSessionId(s.id);
+          openSessionRef.current({
+            target: vm.name,
+            engine: 'microvm',
+            clusterName: vm.name,
+            mode,
+            sessionId: s.id,
+            title: `${deriveTitle({ target: vm.name, engine: 'microvm', mode })} (reattached)`,
+            background: true,
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Mount-only: `host` is stable for the app's lifetime, and the latest
+    // `openSession` is reached through `openSessionRef`, so reconnect runs
+    // exactly once on launch.
+  }, [host]);
+
   const value = React.useMemo<TerminalSessionsContextValue>(
     () => ({
       sessions,
@@ -395,8 +535,20 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
       focusSession,
       hide,
       attachView,
+      isFocused,
     }),
-    [sessions, activeId, openSession, duplicateSession, closeSession, renameSession, focusSession, hide, attachView]
+    [
+      sessions,
+      activeId,
+      openSession,
+      duplicateSession,
+      closeSession,
+      renameSession,
+      focusSession,
+      hide,
+      attachView,
+      isFocused,
+    ]
   );
 
   return (

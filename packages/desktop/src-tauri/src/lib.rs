@@ -3396,6 +3396,13 @@ struct TerminalOpenInput {
     container: Option<String>,
     cols: u16,
     rows: u16,
+    /// Reattachable guest tmux session id (E3.4). When present, the vsock
+    /// host/dev argv gains `--session <id>` so the PTY attaches to (or
+    /// creates) the named guest tmux session `appliance-<id>` — surviving a
+    /// client disconnect / desktop restart. Ignored on the kubectl-exec and
+    /// kubectl-debug fallback paths (no tmux behind them).
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// Interactive login for the dev workspace — mirrors DEV_SHELL_LOGIN in
@@ -3428,7 +3435,16 @@ async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result
             .join(vm)
             .join("shell.sock");
         if sock.exists() {
-            return Ok(vec![bin.to_string_lossy().into_owned(), "shell".to_string(), vm.to_string()]);
+            let mut argv = vec![bin.to_string_lossy().into_owned(), "shell".to_string(), vm.to_string()];
+            // Reattachable: attach to (or create) the named guest tmux
+            // session so this shell survives a disconnect / desktop restart.
+            // Only the vsock path is reattachable — the kubectl-debug
+            // fallback below has no tmux behind it.
+            if let Some(id) = input.session_id.as_deref().filter(|s| !s.is_empty()) {
+                argv.push("--session".to_string());
+                argv.push(id.to_string());
+            }
+            return Ok(argv);
         }
     }
 
@@ -3526,6 +3542,50 @@ async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), String>
 #[tauri::command]
 async fn terminal_close(id: String) -> Result<(), String> {
     terminal::close(&id)
+}
+
+/// One reattachable guest tmux session, surfaced to the store so it can
+/// rehydrate a dock tab on launch (E3.4). Parses the CLI's `sessions list`
+/// JSON (snake_case `last_activity`, via the alias) and re-emits camelCase
+/// for the frontend.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionInfo {
+    id: String,
+    #[serde(default, alias = "last_activity", skip_serializing_if = "Option::is_none")]
+    last_activity: Option<i64>,
+}
+
+/// List a VM's live reattachable shell sessions (the non-root `appliance`
+/// tmux socket, where the desktop's host/dev shells land). Shells out to
+/// `appliance-vm sessions list <vm>` and parses its JSON. On launch the
+/// store calls this to reconnect each still-running shell.
+#[tauri::command]
+async fn terminal_sessions(name: Option<String>) -> Result<Vec<TerminalSessionInfo>, String> {
+    let vm = vm_name(name);
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, stdout, stderr) = run_status_command(&[&bin, "sessions", "list", &vm]).await?;
+    if !ok {
+        return Err(format!("appliance-vm sessions list failed: {}", stderr.trim()));
+    }
+    serde_json::from_str(&stdout).map_err(|e| format!("could not parse session list: {e}"))
+}
+
+/// Destroy a guest tmux session by id — the explicit tab-close path.
+/// Closing the PTY only detaches; this runs `appliance-vm sessions kill`
+/// to actually tear the in-guest session (and its processes) down. `name`
+/// names the VM (the CLI takes it as `--name`).
+#[tauri::command]
+async fn terminal_kill_session(name: Option<String>, id: String) -> Result<(), String> {
+    let vm = vm_name(name);
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _stdout, stderr) = run_status_command(&[&bin, "sessions", "kill", &id, "--name", &vm]).await?;
+    if !ok {
+        return Err(format!("appliance-vm sessions kill failed: {}", stderr.trim()));
+    }
+    Ok(())
 }
 
 /// Sweep the `node-debugger-*` pods that `kubectl debug node/` leaves
@@ -4196,7 +4256,9 @@ pub fn run() {
             terminal_open,
             terminal_write,
             terminal_resize,
-            terminal_close
+            terminal_close,
+            terminal_sessions,
+            terminal_kill_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

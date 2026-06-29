@@ -40,6 +40,7 @@ import type {
   TerminalEvent,
   TerminalOpenOptions,
   TerminalSession,
+  TerminalSessionInfo,
 } from '@appliance.sh/app';
 
 // Tauri host: each cluster's URL/name lives in a JSON config file
@@ -286,13 +287,25 @@ export const tauriHost: ConsoleHost = {
     async open(opts: TerminalOpenOptions, onEvent: (event: TerminalEvent) => void): Promise<TerminalSession> {
       const channel = new Channel<TerminalEvent>();
       channel.onmessage = onEvent;
+      // `opts` carries `sessionId` straight through; the Rust side appends
+      // `--session <id>` to the vsock host/dev argv so the PTY attaches to
+      // the named guest tmux session (E3.4).
       const id = await invoke<string>('terminal_open', { input: opts, onEvent: channel });
       return {
         id,
         write: (data: string) => invoke('terminal_write', { id, data }),
         resize: (cols: number, rows: number) => invoke('terminal_resize', { id, cols, rows }),
+        // Closing the PTY kills the local `appliance-vm shell` client, which
+        // only *detaches* from tmux — the guest session lives on. Explicit
+        // destruction goes through `kill`.
         close: () => invoke('terminal_close', { id }),
       };
+    },
+    list(vmName?: string): Promise<TerminalSessionInfo[]> {
+      return invoke<TerminalSessionInfo[]>('terminal_sessions', { name: vmName ?? null });
+    },
+    async kill(vmName: string | undefined, id: string): Promise<void> {
+      await invoke('terminal_kill_session', { name: vmName ?? null, id });
     },
   },
 
