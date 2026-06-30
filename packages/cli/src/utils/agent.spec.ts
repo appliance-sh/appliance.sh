@@ -54,6 +54,9 @@ describe('claudeCodeAdapter', () => {
 
   it('launches a bare TTY interactively and `claude -p … json` autonomously', () => {
     expect(claudeCodeAdapter.launchArgv({ mode: 'interactive' })).toEqual(['claude']);
+    // Interactive WITH a task seeds the TTY with the prompt as the positional
+    // arg (`claude "<task>"`) — guard against regressing to a bare ['claude'].
+    expect(claudeCodeAdapter.launchArgv({ mode: 'interactive', task: 'fix it' })).toEqual(['claude', 'fix it']);
     expect(claudeCodeAdapter.launchArgv({ mode: 'autonomous', task: 'fix it' })).toEqual([
       'claude',
       '-p',
@@ -331,6 +334,18 @@ describe('extractOAuthToken', () => {
   it('tolerates surrounding whitespace and ANSI colour codes (TUI paste)', () => {
     expect(extractOAuthToken('  \n sk-ant-oat01-AbC_123 \n')).toBe('sk-ant-oat01-AbC_123');
     expect(extractOAuthToken('[38;2;215;119;87msk-ant-oat01-AbC_123[39m')).toBe('sk-ant-oat01-AbC_123');
+  });
+
+  it('strips a real ESC-prefixed CSI sequence wedged mid-token (no truncation)', () => {
+    // A raw ESC (\x1b) mid-token must be stripped WITH its CSI body. Stripping
+    // only the `[…m` body and leaving the ESC byte behind would truncate the
+    // capture at the ESC (it is not in the sk-ant-oat01- char class), yielding
+    // a short, invalid token — this guards the ESC introducer staying in the
+    // strip pattern.
+    expect(extractOAuthToken('sk-ant-oat01-AbC\x1b[0m_123')).toBe('sk-ant-oat01-AbC_123');
+    expect(extractOAuthToken('export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-AbC\x1b[39m_123')).toBe(
+      'sk-ant-oat01-AbC_123'
+    );
   });
 
   it('returns null when no oauth token is present', () => {

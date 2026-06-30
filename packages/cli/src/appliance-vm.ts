@@ -612,6 +612,14 @@ egress
   });
 
 egress
+  .command('remove <host>')
+  .description('remove a single operator allow/deny rule for an exact host (the per-rule counterpart of reset)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((host: string, opts: { name: string }) => {
+    process.exit(runVm(['egress', 'remove', host, '--name', opts.name]));
+  });
+
+egress
   .command('reset')
   .description('clear all rules and reset to the permissive default')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)

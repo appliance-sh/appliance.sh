@@ -266,6 +266,11 @@ program
     }
 
     if (useOauth) {
+      // `--key` is an API-key-mode flag; in OAuth mode the token comes from
+      // `claude setup-token`, so a stray `--key` is silently dropped. Say so.
+      if (opts.key) {
+        console.error(chalk.yellow('--key is ignored in OAuth mode (the token comes from `claude setup-token`).'));
+      }
       await oauthLogin();
       return;
     }
@@ -288,6 +293,10 @@ program
     console.log(
       `${chalk.green('✓')} Anthropic key stored host-side. It is brokered into agents and never enters the VM.`
     );
+    // The broker cred-rule is (re)written by `agent run`; switching modes
+    // (e.g. key→oauth) only takes effect on the next run, so an already-
+    // launched session keeps the old rule until then.
+    console.log(chalk.dim('  Re-run `appliance agent run` to apply this to an existing session.'));
   });
 
 program
@@ -417,6 +426,9 @@ async function oauthLogin(): Promise<void> {
   console.log(
     `${chalk.green('✓')} Signed in with Claude. The subscription token is stored host-side and never enters the VM.`
   );
+  // Switching modes only rewrites the broker cred-rule on the next `agent
+  // run`; an already-launched session keeps the old rule until then.
+  console.log(chalk.dim('  Re-run `appliance agent run` to apply this to an existing session.'));
 }
 
 function readStdin(): Promise<string> {

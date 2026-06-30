@@ -346,8 +346,13 @@ export function resolveAuthMode(adapter: AgentAdapter, kind: AgentAuthKind): Aut
  *  prints, with surrounding whitespace/colour codes. Returns null when no token
  *  is present (docs/agent-login.md §2, §7). Pure + unit-tested. */
 export function extractOAuthToken(raw: string): string | null {
+  // Strip ANSI/CSI escapes, INCLUDING the `\x1b` (ESC) introducer. The ESC
+  // is written explicitly (not as an invisible raw byte) and made optional so
+  // both a real `\x1b[…m` sequence AND a bare `[…m` strip cleanly. Leaving a
+  // raw ESC wedged mid-token would truncate the capture: the `sk-ant-oat01-…`
+  // char class stops at the ESC.
   // eslint-disable-next-line no-control-regex
-  const clean = raw.replace(/\[[0-9;?]*[ -/]*[@-~]/g, '');
+  const clean = raw.replace(/\x1b?\[[0-9;?]*[ -/]*[@-~]/g, '');
   const m = clean.match(/sk-ant-oat01-[A-Za-z0-9_-]+/);
   return m ? m[0] : null;
 }

@@ -435,8 +435,13 @@ fn forward_name(
     };
 
     // MITM only brokered hosts (reuse the egress.rs gate): every other
-    // allowed host stays a blind, streaming-preserving tunnel.
-    if tls && egress::should_intercept(name, true, policy.mitm, host) {
+    // allowed host stays a blind, streaming-preserving tunnel. The peer is
+    // this VM's own deterministic guest (the per-VM netstack link is
+    // L2-isolated — there is no cross-VM peer to re-attribute), so the
+    // exact-lease injection gate is satisfied by `super::GUEST_IP`.
+    if tls
+        && egress::should_intercept(name, std::net::IpAddr::V4(super::GUEST_IP), true, policy.mitm, host)
+    {
         match crate::mitm::configs(name) {
             Ok((server_cfg, client_cfg)) => {
                 // Replay the peeked ClientHello into rustls, which drives

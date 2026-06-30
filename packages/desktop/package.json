@@ -11,6 +11,8 @@
     "build": "pnpm run sidecar:build && pnpm run cli:bundle && pnpm run vm:build && pnpm run vm:bundle && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "clean": "rm -rf ./dist ./sidecar/dist ./src-tauri/binaries ./src-tauri/vm-bin",
     "sidecar:build": "tsc -p sidecar/tsconfig.json && mv sidecar/dist/main.js sidecar/dist/main.cjs && (mv sidecar/dist/main.js.map sidecar/dist/main.cjs.map 2>/dev/null || true)",
     "cli:bundle": "node scripts/copy-cli.mjs",
@@ -52,6 +54,7 @@
     "@types/react-dom": "^19.0.2",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.3",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "vitest": "^3.2.4"
   }
 }
