@@ -1,6 +1,8 @@
 # Fast agent spin-up — agent-only VM mode + a prebuilt agent image
 
-**Status:** S1 (Lever 1, agent-only VM mode) **shipped** — see [§1.6 Invariants](#16-invariants-enforced-as-built). Lever 2 (the prebuilt agent image) is still **decided, not built**. **Scope:** this doc decides _what_ S1/S2 build; S1's feature code now lives in `packages/vm` + `packages/cli`. **Owner-locked going in:** two levers only; **VM snapshots are ruled out** — see [§0](#0-why-not-snapshots).
+**Status:** S1 (Lever 1, agent-only VM mode) **shipped** — see [§1.6 Invariants](#16-invariants-enforced-as-built). S2 (Lever 2, the prebuilt agent image) **machinery shipped** — the build workflow, fetch + `download_and_verify`, RO squashfs attach (`vdc`), PATH-first, the npm prefix move + wipe-on-project-switch, and the claude-code pin all land in `packages/vm` + `packages/cli` + a CI workflow. **Owed-live (owner/CI):** the squashfs artifact must be built by `release-agent-image.yml` and its per-arch sha256 committed into `images.rs` (the all-zero sentinel until then — the attach is skipped and the guest self-heals via npm), then a live boot+launch on a VM. **Scope:** this doc decides _what_ S1/S2 build. **Owner-locked going in:** two levers only; **VM snapshots are ruled out** — see [§0](#0-why-not-snapshots).
+
+> **S2 as built — verify-before-use for ALL downloads (Sasha condition #3, elevated).** `download_and_verify(url, dest, sha256)` verifies the on-disk artifact's sha256 **before use, every boot — on a cache hit as well as a fresh download** (closing the `download_to` early-return-on-`exists()` hole — Quinn gap #3). It is applied not only to the new agent image but **retrofitted to the pre-existing unauthenticated root-code downloads** — k3s, `modloop-virt`, and the Alpine kernel/initramfs (`images.rs`/`guest.rs`) — whose digests are now committed in-source. The agent squashfs is additionally **re-verified at attach time** immediately before the device is attached. See §2.3.
 
 ## Context
 
@@ -175,7 +177,7 @@ npm installs are not bit-reproducible (timestamps, optional deps), so **the arti
 
 - **Hosted** as a GitHub release asset on the appliance repo — mirrors how k3s is fetched from `k3s-io` releases (`guest.rs:82-89`). The toolchain is built + hosted by the project, **not pulled live from npm at boot.**
 - **Fetched** by a new `ensure_agent_image()` mirroring `ensure_assets` (`guest.rs:67-92`), arch-split via `arch_tuple()` (`guest.rs:54`), into `images/agent-assets/agents-<ver>-<arch>.squashfs`. A new `AGENT_IMAGE` table mirrors the `IMAGES` table (`images.rs:24-34`): per-arch URL **and sha256**, keyed on a single `AGENT_IMAGE_VERSION` const.
-- **Verified** by sha256 **before the device is attached.** `images::download_to` has **no checksum today** (`images.rs:123-140`) — add a `download_and_verify(url, dest, sha256)` and use it for the agent image. (Follow-up worth flagging: k3s/modloop/alpine downloads are likewise unverified-by-hash; extending the same verification to them closes the same gap.)
+- **Verified** by sha256 **before the device is attached** — and **on every cache hit, not only after a fresh download** (Quinn gap #3). `download_to` early-returned on `dest.exists()` with no check; `download_and_verify(url, dest, sha256)` replaces it and verifies the on-disk bytes every boot, so a cached/tampered file can never bypass the hash. The agent image is additionally re-verified (`verify_agent_image`) right before the `VZDiskImageStorageDeviceAttachment` is built. **As built (Sasha condition #3, elevated):** `download_and_verify` is also applied to the **pre-existing** unauthenticated root-code downloads — k3s, `modloop-virt`, and the Alpine kernel/initramfs — whose committed sha256s now live in `images.rs`/`guest.rs`. The kernel is verified against its **raw** network bytes (a `kernel.raw` kept beside the normalized boot image) since normalization mutates the file. This closes a pre-existing hole: those run as root / become the guest kernel — higher privilege than the agent image.
 
 ### 2.4 Mounted on PATH at boot
 
@@ -198,6 +200,8 @@ export PATH="/opt/appliance/agents/bin:/persist/npm-global/bin:$PATH"
 > **Decision: `NPM_CONFIG_PREFIX` moves from `$HOME/.local` (= `/persist/workspace` = the mounted repo) to `/persist/npm-global` — on the ext4 data disk: VM-persistent, shared across all projects, never the VirtioFS mount.**
 
 Change both profile exports (`APP_USER_PROVISION`, `guest.rs:321-322`; `DEV_PROVISION`, `guest.rs:378`). This **ends the repo pollution** (no more `<repo>/.local`) and **ends the per-project reinstall** (the prefix is VM-global now, not per-mount). `/persist/npm-global` survives `vm stop`/`up` like the rest of `/persist`, so even the self-heal fallback installs once per VM, not once per project.
+
+> **As built — Sasha condition #2: wipe `/persist/npm-global` on a project switch.** Because the prefix is now VM-global and persistent, a CLI a self-heal installed for one project would otherwise linger on PATH into the next project's sandbox (the cross-project PATH-persistence vector). The host stamps the mounted project's identity (a 16-hex sha256 of its absolute path) into the boot media; the guest bootstrap compares it against `/persist/.npm-global-project` and `rm -rf`s the prefix when they differ — and the sandbox already reboots on a mount change, so the wipe rides that reboot. The read-only squashfs PATH-first already shields the three **baked** CLIs; this closes the **self-heal residue**. (No mount ⇒ empty identity ⇒ no wipe.)
 
 ### 2.6 Runtime `npm install` → presence-check no-op
 
@@ -259,5 +263,5 @@ The squashfs bakes three third-party CLIs + Node + their full transitive npm tre
 1. **Node source** — bake a pinned Node ≥ 22 into the squashfs (this doc's recommendation; apk `nodejs` on Alpine v3.21 may be < 22 and break copilot/codex). Confirm bake.
 2. **dockerd** — explicit `--docker` flag (recommended), or auto-imply from project detection (`Dockerfile`/compose present)? Lean explicit + honest error.
 3. **Hosting/attestation** — GitHub release on the appliance repo acceptable for v1, or does Sasha want cosign-signed + provenance-attested from day one?
-4. **Checksum gap** — extend `download_and_verify` to the existing k3s/modloop/alpine assets too (currently unverified-by-hash)? Recommend yes, as a follow-up.
+4. **Checksum gap** — ~~extend `download_and_verify` to the existing k3s/modloop/alpine assets too~~ **DONE (Sasha #3, S2):** the retrofit shipped — k3s/modloop/alpine kernel+initramfs now carry committed in-source sha256s and are verified before use every boot (cache-hit included). See §2.3.
 5. **claude-code pin** — pinning the adapter (§2.6) means choosing a claude-code version to bake; which release tracks the pin (and how often is it bumped vs the faster-moving copilot/codex)?

@@ -27,6 +27,21 @@ pub const K3S_VERSION: &str = "v1.31.4+k3s1";
 const ALPINE_BRANCH: &str = "v3.21";
 const ALPINE_NETBOOT: &str = "netboot-3.21.3";
 
+// Sasha condition #3: committed sha256 for the UNAUTHENTICATED root-code
+// downloads — `modloop-virt` is the guest's kernel-module squashfs and
+// `k3s` runs as root in the guest, both higher-privilege than the agent
+// image. k3s-io + Alpine publish these; verify before use, every boot
+// (cache-hit included). Bumping K3S_VERSION / the Alpine pin is a
+// deliberate change: new artifact + new digest, together.
+const MODLOOP_SHA256_AARCH64: &str =
+    "9ef26b38fa53be1310368150f947beead9011ce8b9890224a36f6be73dc14d49";
+const MODLOOP_SHA256_X86_64: &str =
+    "be613fc9d6f70c6b45dcee62787551c76e88ee3006867416bde6bc0cc2aa30f8";
+const K3S_SHA256_ARM64: &str =
+    "eff4cc82c8c057bd2dc432025b933616637dcf3df91e9e06720d9208743640d3";
+const K3S_SHA256_AMD64: &str =
+    "74897e4af26ea383ce50f445752f40ca63a0aef0d90994fb74073c43063eeeb2";
+
 /// Kubeconfig HTTP handoff port served by busybox httpd inside the
 /// guest (bound to the shared-network interface; the host fetches
 /// http://<guest-ip>:9991/k3s.yaml once k3s is up).
@@ -64,28 +79,37 @@ fn assets_dir() -> PathBuf {
     crate::store::vm_root().join("images").join("guest-assets")
 }
 
-/// Download (once) the module loop + k3s binary the boot media embeds.
+/// Download (once) + verify the module loop + k3s binary the boot media
+/// embeds. Sasha #3: both are hash-pinned and verified before use, every
+/// boot — a cached/tampered artifact is rejected, not silently embedded.
 fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
     let (alpine_arch, k3s_asset) = arch_tuple()?;
+    let (modloop_sha, k3s_sha) = match std::env::consts::ARCH {
+        "aarch64" => (MODLOOP_SHA256_AARCH64, K3S_SHA256_ARM64),
+        "x86_64" => (MODLOOP_SHA256_X86_64, K3S_SHA256_AMD64),
+        other => bail!("unsupported host architecture: {other}"),
+    };
     let dir = assets_dir();
     fs::create_dir_all(&dir)?;
 
     let modloop = dir.join("modloop-virt");
-    crate::images::download_to(
+    crate::images::download_and_verify(
         &format!(
             "https://dl-cdn.alpinelinux.org/alpine/{ALPINE_BRANCH}/releases/{alpine_arch}/{ALPINE_NETBOOT}/modloop-virt"
         ),
         &modloop,
+        modloop_sha,
     )?;
 
     let k3s = dir.join(format!("k3s-{K3S_VERSION}"));
-    crate::images::download_to(
+    crate::images::download_and_verify(
         &format!(
             "https://github.com/k3s-io/k3s/releases/download/{}/{}",
             K3S_VERSION.replace('+', "%2B"),
             k3s_asset
         ),
         &k3s,
+        k3s_sha,
     )?;
 
     Ok((modloop, k3s))
@@ -289,6 +313,38 @@ const AGENT_HANDOFF: &str = r#"# --- agent runtime handoff (agent-only VM) -----
 # vsock shell (already listening above) + the Node toolchain
 # DEV_PROVISION installs (agent_only implies dev).
 __AGENT_DOCKER_STUB__
+# --- prebuilt agent image (read-only squashfs on vdc) ---------------
+# Node ≥22 + the pinned agent CLIs, baked + hash-verified host-side and
+# attached read-only as the 3rd virtio-blk. Mount it read-only so the
+# baked toolchain is on PATH (the login profile prepends its bin) — an
+# agent can't shadow or tamper with its own toolchain at runtime
+# (docs/fast-spin-up.md §2.1/§2.4). Best-effort: when no verified image
+# was attached the device is absent, and the npm self-heal below installs
+# the CLIs into /persist/npm-global instead.
+mkdir -p /opt/appliance/agents
+if mount -t squashfs -o ro /dev/vdc /opt/appliance/agents 2>/dev/null; then
+  echo "appliance-agents: mounted prebuilt agent image (read-only) at /opt/appliance/agents"
+else
+  echo "appliance-agents: no prebuilt agent image on /dev/vdc — CLIs self-heal via npm into /persist/npm-global"
+fi
+# npm's global prefix lives on the ext4 data disk (/persist/npm-global),
+# OFF the VirtioFS workspace mount — this ends the repo pollution and the
+# per-project reinstall (docs/fast-spin-up.md §2.5).
+mkdir -p /persist/npm-global
+# Sasha condition #2: wipe /persist/npm-global on a PROJECT SWITCH so a CLI
+# a self-heal installed for one project can't persist on PATH into the
+# next (the cross-project PATH-persistence vector). The host stamps the
+# mounted project's identity (a hash of its path) into the media; compare
+# it against the one this disk was last provisioned for. The read-only
+# squashfs already shields the three baked CLIs — this closes the npm
+# self-heal residue. Empty identity (no mount) ⇒ no wipe.
+APPLIANCE_PROJECT='__PROJECT_ID__'
+if [ -n "$APPLIANCE_PROJECT" ] && [ "$(cat /persist/.npm-global-project 2>/dev/null)" != "$APPLIANCE_PROJECT" ]; then
+  echo "appliance-agents: project changed — wiping /persist/npm-global"
+  rm -rf /persist/npm-global
+  mkdir -p /persist/npm-global
+  printf '%s' "$APPLIANCE_PROJECT" > /persist/.npm-global-project
+fi
 mkdir -p /srv/handoff
 (
   # Wait for the dev toolchain (nodejs/npm) — the grippable .dev-ready
@@ -330,9 +386,13 @@ chmod +x /usr/local/bin/docker"#;
 ///
 /// The user lands in `wheel` (passwordless sudo via `/etc/sudoers.d`)
 /// here; `docker` group membership is added in `DOCKER_PROVISION` (the
-/// group only exists after `apk add docker`). HOME is
-/// `/persist/workspace`, with an npm global prefix under HOME so
-/// `appliance up`'s `npm i -g @devcontainers/cli` installs unprivileged.
+/// group only exists after `apk add docker`). HOME is `/persist/workspace`.
+/// The npm global prefix is `/persist/npm-global` — on the ext4 data disk,
+/// OFF the VirtioFS workspace mount (no repo pollution, no per-project
+/// reinstall — docs/fast-spin-up.md §2.5). PATH prepends the prebuilt agent
+/// image's `bin` (agent-only VMs, via `__AGENT_BIN_PATH__`) so the baked,
+/// read-only CLIs win and an agent can't shadow them, then the npm prefix
+/// `bin` for any self-healed installs.
 const APP_USER_PROVISION: &str = r#"
 echo "appliance-user: provisioning the non-root appliance user"
 # uid/gid are PINNED (host uid/gid on --mount VMs, 1000 otherwise) so
@@ -386,8 +446,8 @@ chmod 0440 /etc/sudoers.d/appliance
 # is sourced by the login shell the agent's `su -l` starts.
 mkdir -p /etc/profile.d
 cat > /etc/profile.d/appliance-user.sh <<'PROFILE'
-export NPM_CONFIG_PREFIX="$HOME/.local"
-export PATH="$HOME/.local/bin:$PATH"
+export NPM_CONFIG_PREFIX="/persist/npm-global"
+export PATH="__AGENT_BIN_PATH__/persist/npm-global/bin:$PATH"
 PROFILE
 "#;
 
@@ -443,7 +503,7 @@ __DEV_MOUNT__
 mkdir -p /etc/profile.d
 cat > /etc/profile.d/appliance-dev.sh <<'PROFILE'
 export APPLIANCE_DEV=1
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="__AGENT_BIN_PATH__/persist/npm-global/bin:$PATH"
 PROFILE
 # Install the toolchain in the background: first boot pulls from the
 # network (slow), later boots hit the persistent cache (fast/offline).
@@ -686,6 +746,10 @@ fn build_apkovl(
     docker: bool,
     egress_port: u16,
     agent_only: bool,
+    // Sasha #2: a stable identity (hash of the mounted project path) the
+    // guest compares to decide whether to wipe /persist/npm-global on a
+    // project switch. Empty ⇒ no mount ⇒ no wipe.
+    project_id: &str,
 ) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
@@ -775,6 +839,18 @@ fn build_apkovl(
             .replace("__DEV_MOUNT__", if dev && mount { DEV_MOUNT } else { "" })
             .replace("__DOCKER_PROVISION__", if docker { DOCKER_PROVISION } else { "" })
             .replace("__EGRESS_PORT__", &egress_port.to_string())
+            // PATH-first for the read-only squashfs `bin` (agent-only VMs):
+            // the baked CLIs win and can't be shadowed. Expanded AFTER the
+            // block injections above so the marker inside DEV_PROVISION /
+            // APP_USER_PROVISION resolves. Empty for non-agent VMs (no
+            // squashfs), where the nonexistent dir would just be skipped.
+            .replace(
+                "__AGENT_BIN_PATH__",
+                if agent_only { "/opt/appliance/agents/bin:" } else { "" },
+            )
+            // The mounted project's identity for the npm-global wipe (Sasha
+            // #2). Expanded after the agent handoff is injected.
+            .replace("__PROJECT_ID__", project_id)
             .as_bytes(),
     )?;
     // The vsock shell agent (socat EXEC target). Always present — every
@@ -829,7 +905,11 @@ pub fn build_boot_media(
     vm_dir: &Path,
     registry_host_port: u16,
     dev: bool,
-    mount: bool,
+    // The mounted host project (`spec.dev_mount`), or `None` when no folder
+    // is shared. Its presence drives the dev mount; a hash of its path is the
+    // project identity the guest uses to wipe npm-global on a switch (Sasha
+    // #2).
+    mount_path: Option<&str>,
     docker: bool,
     egress_port: u16,
     agent_only: bool,
@@ -843,14 +923,21 @@ pub fn build_boot_media(
         .and_then(|n| n.to_str())
         .filter(|name| crate::mitm::ensure_ca(name).is_ok())
         .and_then(|name| fs::read_to_string(crate::mitm::ca_cert_path(name)).ok());
+    // Project identity = a short hash of the mounted path. Hashing keeps the
+    // value shell-safe (no quoting concerns from arbitrary host paths) and
+    // still uniquely keys each project for the npm-global wipe.
+    let project_id = mount_path
+        .map(|p| crate::images::content_sha256_hex(p.as_bytes())[..16].to_string())
+        .unwrap_or_default();
     let apkovl = build_apkovl(
         registry_host_port,
         egress_ca_pem.as_deref(),
         dev,
-        mount,
+        mount_path.is_some(),
         docker,
         egress_port,
         agent_only,
+        &project_id,
     )?;
 
     let modloop_data = fs::read(&modloop)?;
@@ -1100,7 +1187,7 @@ mod tests {
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "").unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -1110,7 +1197,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -1118,7 +1205,7 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "").unwrap();
         assert_eq!(
             apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
             Some(pem)
@@ -1129,7 +1216,7 @@ mod tests {
     fn dev_provisioning_present_only_for_dev_vms() {
         // Non-dev: the marker is substituted to empty and no dev wiring
         // leaks into the bootstrap.
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         // The base user block references /persist/workspace on every VM,
@@ -1139,7 +1226,7 @@ mod tests {
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
-        let dev = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
+        let dev = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"));
         assert!(start.contains("mkdir -p /persist/workspace"));
@@ -1153,7 +1240,7 @@ mod tests {
     fn appliance_user_provisioned_on_every_vm() {
         // The non-root user is unconditional — present even on a plain
         // (non-dev, non-docker, non-mount) VM, just like the shell agent.
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
         // User + primary group, pinned uid/gid, on the persistent home.
@@ -1169,10 +1256,12 @@ mod tests {
         assert!(start.contains("addgroup \"$APP_USER\" wheel"));
         assert!(start.contains("/etc/sudoers.d/appliance"));
         assert!(start.contains("ALL=(ALL) NOPASSWD:ALL"));
-        // npm global prefix under HOME so `appliance up` installs the
-        // devcontainers CLI unprivileged.
+        // npm global prefix on the data disk (OFF the workspace mount) so
+        // global installs don't pollute the repo or reinstall per project
+        // (docs/fast-spin-up.md §2.5).
         assert!(start.contains("/etc/profile.d/appliance-user.sh"));
-        assert!(start.contains("NPM_CONFIG_PREFIX=\"$HOME/.local\""));
+        assert!(start.contains("NPM_CONFIG_PREFIX=\"/persist/npm-global\""));
+        assert!(!start.contains("NPM_CONFIG_PREFIX=\"$HOME/.local\""), "prefix moved off the mounted HOME");
         // sudo is in the base package set so it's installed before the
         // bootstrap provisions the user.
         let world = apkovl_file(&plain, "etc/apk/world").unwrap();
@@ -1192,7 +1281,7 @@ mod tests {
         assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
 
         // A non-mount VM pins the conventional 1000/1000.
-        let plain = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
+        let plain = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("APP_UID=1000"));
         assert!(start.contains("APP_GID=1000"));
@@ -1205,7 +1294,7 @@ mod tests {
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
         let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
-        let shared = build_apkovl(5052, None, true, true, false, 5053, false).unwrap();
+        let shared = build_apkovl(5052, None, true, true, false, 5053, false, "").unwrap();
         let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains(&format!("APP_UID={exp_uid}")), "mounted VM must pin the resolved uid");
         assert!(start.contains(&format!("APP_GID={exp_gid}")), "mounted VM must pin the resolved gid");
@@ -1228,7 +1317,7 @@ mod tests {
 
     #[test]
     fn vsock_shell_agent_is_baked_into_every_vm() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         // socat backs the agent and is in the base package set.
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "socat"));
@@ -1253,14 +1342,14 @@ mod tests {
     fn tmux_is_in_the_base_world_set() {
         // The reattachable-session multiplexer ships on EVERY VM (not just
         // dev VMs), next to socat/sudo — the feature is unconditional.
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "tmux"), "tmux must be in the base world set");
     }
 
     #[test]
     fn transparent_tmux_conf_is_baked_in() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let conf = apkovl_file(&ovl, "etc/appliance/tmux.conf").expect("tmux.conf present");
         // Invisible multiplexer: no status bar, short escape passthrough,
         // large scrollback, and sessions outlive a detach.
@@ -1274,7 +1363,7 @@ mod tests {
 
     #[test]
     fn shell_agent_routes_session_verbs_to_tmux() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
 
         // The four verbs are parsed off the size line.
@@ -1321,17 +1410,17 @@ mod tests {
         // Both markers must always be substituted away.
         for (dev, mount) in [(false, false), (true, false), (true, true)] {
             let start =
-                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
+                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
             assert!(!start.contains("__DEV_MOUNT__"), "marker must be substituted (dev={dev} mount={mount})");
         }
 
         // Dev without a share: no virtiofs mount.
-        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(!dev_only.contains("mount -t virtiofs"));
 
         // Dev + share: the bootstrap mounts the workspace tag, and the
         // tag literal matches the constant the VZ backend tags with.
-        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(shared.contains(&format!("mount -t virtiofs {WORKSPACE_VIRTIOFS_TAG} /persist/workspace")));
         assert!(DEV_MOUNT.contains(WORKSPACE_VIRTIOFS_TAG));
     }
@@ -1342,7 +1431,7 @@ mod tests {
         // provisioning leaks into the bootstrap. (The section-header
         // comment legitimately names dockerd even when off, so assert on
         // the provisioning strings that only the block emits.)
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("apk add --no-progress docker docker-cli-compose"));
@@ -1351,7 +1440,7 @@ mod tests {
 
         // Docker: the apk install, the separate dockerd engine, the
         // egress env injection, and the readiness marker are all present.
-        let docker = build_apkovl(5052, None, false, false, true, 5053, false).unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 5053, false, "").unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"));
         // Packaged from the Alpine community repo, cached on /persist.
@@ -1385,7 +1474,7 @@ mod tests {
         // The egress port is substituted into the proxy URL the guest
         // builds at boot from its default-route gateway — the marker must
         // be gone and the actual port present.
-        let docker = build_apkovl(5052, None, false, false, true, 8203, false).unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 8203, false, "").unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__EGRESS_PORT__"), "port marker must be substituted");
         assert!(start.contains(":8203"), "the per-VM egress port must be embedded");
@@ -1394,7 +1483,7 @@ mod tests {
     #[test]
     fn k3s_provisioned_only_for_non_agent_only_vms() {
         // Normal VM: the k3s block is present and the marker is gone.
-        let k3s = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
+        let k3s = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&k3s, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
         assert!(start.contains("k3s server"), "k3s launches on a normal VM");
@@ -1405,7 +1494,7 @@ mod tests {
         // Agent-only VM: the k3s block is GONE, replaced by the agent
         // handoff that waits on .dev-ready and serves the agent-ready
         // sentinel.
-        let agent = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("k3s server"), "agent-only provisions NO k3s");
@@ -1422,7 +1511,7 @@ mod tests {
         // the agent handoff's nested __KUBECONFIG_PORT__ must be expanded —
         // never survive as a literal. Assert no marker survives and the
         // real port is embedded on the handoff httpd.
-        let agent = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         for marker in [
             "__K3S_PROVISION__",
@@ -1441,21 +1530,76 @@ mod tests {
     fn agent_only_docker_stub_gated_on_the_docker_flag() {
         // No --docker: the honest-failure docker shim is dropped so an
         // unflagged `docker` call doesn't silently break.
-        let no_docker = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let no_docker = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
         let start = apkovl_file(&no_docker, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("/usr/local/bin/docker"), "no-docker agent VM gets the honest-error shim");
         assert!(start.contains("Relaunch the agent with: appliance agent start --docker"));
 
         // --docker: the shim is skipped so it never shadows the real engine
         // the docker provision installs.
-        let with_docker = build_apkovl(5052, None, true, false, true, 5053, true).unwrap();
+        let with_docker = build_apkovl(5052, None, true, false, true, 5053, true, "").unwrap();
         let start = apkovl_file(&with_docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("/usr/local/bin/docker"), "--docker agent VM must not shim docker");
         assert!(start.contains("apk add --no-progress docker docker-cli-compose"), "real docker is provisioned");
         // A normal (non-agent) VM never carries the shim either.
-        let normal = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let normal = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
         let start = apkovl_file(&normal, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("/usr/local/bin/docker"));
+    }
+
+    #[test]
+    fn agent_only_mounts_the_prebuilt_squashfs_and_puts_its_bin_first_on_path() {
+        // Agent-only: the read-only squashfs (vdc) is mounted at
+        // /opt/appliance/agents and its bin is PATH-FIRST so the baked CLIs
+        // win and an agent can't shadow them (docs/fast-spin-up.md §2.4).
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(
+            start.contains("mount -t squashfs -o ro /dev/vdc /opt/appliance/agents"),
+            "agent-only VM mounts the prebuilt image read-only on vdc"
+        );
+        assert!(
+            start.contains("export PATH=\"/opt/appliance/agents/bin:/persist/npm-global/bin:$PATH\""),
+            "the squashfs bin must be first on PATH for agent-only VMs"
+        );
+        assert!(!start.contains("__AGENT_BIN_PATH__"), "the PATH marker must be substituted");
+
+        // A normal (non-agent) VM has no squashfs: no mount, and its bin is
+        // NOT on PATH (the marker expands to empty).
+        let normal = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
+        let start = apkovl_file(&normal, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("/dev/vdc"), "non-agent VM attaches no agent image");
+        assert!(!start.contains("/opt/appliance/agents/bin"), "non-agent VM keeps the squashfs bin off PATH");
+        assert!(
+            start.contains("export PATH=\"/persist/npm-global/bin:$PATH\""),
+            "non-agent dev VM still moves the npm prefix off the mounted HOME"
+        );
+        assert!(!start.contains("__AGENT_BIN_PATH__"));
+    }
+
+    #[test]
+    fn npm_global_wipes_on_a_project_switch_only_with_a_project_identity() {
+        // Sasha #2: with a project identity (a mounted project), the
+        // bootstrap wipes /persist/npm-global when the recorded project
+        // differs — closing the cross-project PATH-persistence vector.
+        let with_project = build_apkovl(5052, None, true, true, false, 5053, true, "deadbeefcafe0001").unwrap();
+        let start = apkovl_file(&with_project, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains("APPLIANCE_PROJECT='deadbeefcafe0001'"), "the project identity is stamped in");
+        assert!(
+            start.contains("rm -rf /persist/npm-global"),
+            "a project switch wipes the npm prefix"
+        );
+        assert!(
+            start.contains("/persist/.npm-global-project"),
+            "the last-provisioned project is recorded for the next-boot comparison"
+        );
+        assert!(!start.contains("__PROJECT_ID__"), "the project marker must be substituted");
+
+        // No mount ⇒ empty identity ⇒ the guard is inert (the `-n` test is
+        // false), so npm-global is never wiped out from under a project.
+        let no_project = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let start = apkovl_file(&no_project, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains("APPLIANCE_PROJECT=''"), "no mount ⇒ empty project identity");
     }
 
     #[test]

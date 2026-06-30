@@ -542,20 +542,32 @@ describe('classifyAutonomousResult branches on captureMode', () => {
   });
 });
 
-// ---- installCommandFor: pinned (copilot/codex) vs unpinned (claude) ----
+// ---- installCommandFor: all three CLIs pinned to the baked image ----
 
 describe('installCommandFor (pinned install descriptor)', () => {
-  it('pins copilot + codex to their versions and leaves claude-code unpinned', () => {
+  it('pins all three CLIs to the versions baked into the prebuilt image', () => {
     expect(installCommandFor(copilotAdapter.install)).toBe(
       'command -v copilot >/dev/null 2>&1 || npm install -g @github/copilot@1.0.65 >/dev/null'
     );
     expect(installCommandFor(codexAdapter.install)).toBe(
       'command -v codex >/dev/null 2>&1 || npm install -g @openai/codex@0.142.0 >/dev/null'
     );
-    // claude-code stays byte-identical to its pre-multi-agent (unpinned) install.
+    // claude-code is now PINNED too (docs/fast-spin-up.md §2.6): the version
+    // must equal the squashfs-baked manifest, and the `command -v claude`
+    // guard makes the install a no-op when the squashfs put it on PATH.
     expect(installCommandFor(claudeCodeAdapter.install)).toBe(
-      'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null'
+      'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code@2.1.196 >/dev/null'
     );
+  });
+
+  it('guards every install with command -v so a PATH-resident CLI is a no-op', () => {
+    // The prebuilt image puts the CLIs on PATH; the `command -v <bin> ||`
+    // prefix is the no-op switch (the `|| npm install` self-heal never runs).
+    for (const adapter of [claudeCodeAdapter, copilotAdapter, codexAdapter]) {
+      expect(installCommandFor(adapter.install)).toMatch(
+        new RegExp(`^command -v ${adapter.install.bin} >/dev/null 2>&1 \\|\\| npm install -g `)
+      );
+    }
   });
 });
 

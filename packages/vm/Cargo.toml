@@ -17,6 +17,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 ureq = "2"
+# SHA-256 for download integrity verification (download_and_verify): the
+# unauthenticated k3s/modloop/alpine root-code downloads + the prebuilt
+# agent image are hash-pinned in-source and verified before use. ring is
+# already in the tree via rustls("ring"); naming it here is zero-cost.
+ring = "0.17"
 flate2 = "1"
 fatfs = "0.3"
 tar = "0.4"

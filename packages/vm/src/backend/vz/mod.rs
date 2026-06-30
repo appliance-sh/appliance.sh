@@ -82,11 +82,32 @@ impl VmBackend for VzBackend {
             &paths.dir,
             spec.registry_port,
             spec.dev,
-            spec.dev_mount.is_some(),
+            spec.dev_mount.as_deref(),
             spec.docker,
             spec.egress_port,
             spec.agent_only,
         )?;
+
+        // The prebuilt agent image (Node ≥22 + the pinned CLIs) attaches as a
+        // read-only 3rd virtio-blk, but ONLY for agent-only VMs. Fetch +
+        // verify it here (still the Media phase). Best-effort by contract:
+        // a missing-or-unverifiable image is skipped and the guest self-heals
+        // the CLIs via npm — but `ensure_agent_image` only returns a path it
+        // has hash-verified, so a tampered artifact is never attached
+        // (Quinn #3, defence in depth with the attach-time re-verify below).
+        let agent_image: Option<std::path::PathBuf> = if spec.agent_only {
+            match crate::images::ensure_agent_image() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!(
+                        "agent image unavailable ({e:#}); the guest will self-heal the CLIs via npm"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // The console log is the VM's primary observable output —
         // truncate per boot so `console` shows the current boot, not
@@ -98,8 +119,14 @@ impl VmBackend for VzBackend {
         let _ = std::fs::remove_file(paths.agent_ready());
         let _ = std::fs::remove_file(paths.guest_ip());
 
-        let built =
-            build_configuration(spec, &image.kernel, &image.initramfs, &boot_media.image, &paths)?;
+        let built = build_configuration(
+            spec,
+            &image.kernel,
+            &image.initramfs,
+            &boot_media.image,
+            agent_image.as_deref(),
+            &paths,
+        )?;
         let config = built.config;
         unsafe { config.validateWithError() }
             .map_err(|e| anyhow!("invalid VM configuration: {}", error_text(&e)))?;
@@ -199,6 +226,9 @@ fn build_configuration(
     kernel: &Path,
     initramfs: &Path,
     boot_media: &Path,
+    // The verified prebuilt agent image to attach read-only as `vdc`
+    // (agent-only VMs only). `None` ⇒ no third disk.
+    agent_image: Option<&Path>,
     paths: &VmPaths,
 ) -> Result<BuiltConfig> {
     // The host end of the netstack link, set only on the Netstack path.
@@ -281,6 +311,33 @@ fn build_configuration(
             &media_attachment,
         );
 
+        // Storage devices in vda, vdb[, vdc] order: data disk, boot media,
+        // and — only when an agent-only VM has a verified image — the
+        // prebuilt agent squashfs (vdc), read-only like the boot media.
+        let mut storage: Vec<Retained<VZStorageDeviceConfiguration>> = vec![
+            Retained::into_super(block_device),
+            Retained::into_super(media_device),
+        ];
+        if let Some(agent_path) = agent_image {
+            // Quinn gap #3 — verify-AT-ATTACH-TIME: re-check the on-disk bytes
+            // against the committed sha256 immediately before attaching, every
+            // boot (cache-hit included), so a tampered/stale cached squashfs
+            // can never reach the guest even if the fetch path was skipped.
+            crate::images::verify_agent_image(agent_path)
+                .map_err(|e| anyhow!("agent image failed verify before attach: {e:#}"))?;
+            let agent_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &file_url(agent_path),
+                true,
+            )
+            .map_err(|e| anyhow!("agent image attachment: {}", error_text(&e)))?;
+            let agent_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &agent_attachment,
+            );
+            storage.push(Retained::into_super(agent_device));
+        }
+
         let entropy = VZVirtioEntropyDeviceConfiguration::new();
 
         // virtio-vsock: the host↔guest control channel the shell agent
@@ -301,10 +358,7 @@ fn build_configuration(
         // provable path off-box.
         config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)
             as Retained<VZNetworkDeviceConfiguration>]));
-        config.setStorageDevices(&NSArray::from_retained_slice(&[
-            Retained::into_super(block_device) as Retained<VZStorageDeviceConfiguration>,
-            Retained::into_super(media_device) as Retained<VZStorageDeviceConfiguration>,
-        ]));
+        config.setStorageDevices(&NSArray::from_retained_slice(&storage));
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             entropy,
         )]));

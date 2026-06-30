@@ -164,11 +164,19 @@ export interface AgentAdapter {
 
 /** Derive the install-on-first-use command from a pinned install descriptor:
  *  `command -v <bin> >/dev/null 2>&1 || npm install -g <pkg>@<version> >/dev/null`.
+ *
+ *  With the prebuilt agent image (docs/fast-spin-up.md §2.6) the three CLIs
+ *  are on PATH from the read-only squashfs, so `command -v <bin>` succeeds and
+ *  the `|| npm install` NEVER runs — the runtime install is a no-op on the hot
+ *  path. The `|| npm install` is retained as a SELF-HEAL: if no image was
+ *  attached (e.g. the artifact isn't published yet), it still installs — now
+ *  into `/persist/npm-global` (the guest's `NPM_CONFIG_PREFIX`, off the
+ *  workspace mount), not the repo.
+ *
  *  Only stdout is suppressed (`>/dev/null`), so a failed `npm install` surfaces
  *  its stderr rather than silently producing a dead session — runAgent joins
  *  this with `&&` so a failure aborts before the tmux session is created. An
- *  empty `version` ⇒ unpinned (`@latest`), preserving claude-code's
- *  pre-multi-agent install byte-for-byte. */
+ *  empty `version` ⇒ unpinned (`@latest`); all three adapters are now pinned. */
 export function installCommandFor(install: AgentInstall): string {
   const spec = install.version ? `${install.pkg}@${install.version}` : install.pkg;
   return `command -v ${install.bin} >/dev/null 2>&1 || npm install -g ${spec} >/dev/null`;
@@ -235,10 +243,15 @@ const AGENT_NO_PROXY =
 export const claudeCodeAdapter: AgentAdapter = {
   type: 'claude-code',
   provider: 'anthropic',
-  // Unpinned (version: '') — keeps claude-code's pre-multi-agent install
-  // byte-for-byte (`npm install -g @anthropic-ai/claude-code`). Build-time
-  // pinning is a follow-up; Copilot + Codex ARE pinned (they move fast, §6).
-  install: { pkg: '@anthropic-ai/claude-code', version: '', bin: 'claude', node: '>=18' },
+  // PINNED to the version baked into the prebuilt agent image (squashfs).
+  // Was unpinned (`version: ''`) so the runtime install tracked `@latest`;
+  // the fast-spin-up prebuilt image (docs/fast-spin-up.md §2.6) bakes one
+  // reviewed version, so the adapter pin MUST equal the baked manifest — CI
+  // asserts `install.version == npm ls @anthropic-ai/claude-code` and fails
+  // on drift (§2.2/§2.7). Bumping the pin is one coordinated commit with
+  // AGENT_IMAGE_VERSION + the per-arch sha256 (images.rs). Node ≥22: the
+  // squashfs bakes Node ≥22, ahead of Alpine v3.21's apk `nodejs`.
+  install: { pkg: '@anthropic-ai/claude-code', version: '2.1.196', bin: 'claude', node: '>=22' },
   egressHosts: ['api.anthropic.com'],
   captureMode: 'json',
   launchArgv(opts: AgentLaunchOpts): string[] {
