@@ -561,3 +561,62 @@ concurrent-flow cap (1024) and the per-flow backpressure high-water
 (256 KiB) are sized well above interactive/dev workloads; the live pass
 should confirm a heavy `npm`/`docker`/multi-pod run completes without the
 SYN-flood refusal log firing or flows stalling.
+
+## 10. Desktop egress surface (F4 — `packages/app` + `packages/desktop`)
+
+The GUI counterpart to the CLI's `egress policy` / `egress denied` /
+`egress allow`. It lives in the **Local Runtime** page, per running VM, as
+the `EgressPanel` (`packages/app/src/pages/local-runtime/index.tsx`) — so an
+operator can see the boundary and unblock a host **without a terminal**. It
+is read + incremental-edit only; it never recreates a VM or flips
+`net_link` (that stays the engine's job).
+
+**Firewall status + effective policy (read-only).** The panel reads the
+**effective** policy through the existing `microvm_egress_get` Tauri
+command (`egress policy` → `egress::effective_policy`): for a
+`net_link=Netstack` VM that's the host-enforced **default-DENY + baked
+allowlist** merged over the operator's rules; for `net_link=Nat` it's the
+persisted cooperative policy. To label the boundary honestly the desktop
+also resolves the VM's link host-side — `microvm_egress_get` enriches the
+response with `enforced` / `netLink`, read from the engine's persisted spec
+(`~/.appliance/vm/<name>/vm.json` `netLink`, honoring the
+`APPLIANCE_NETSTACK=1` force-on override exactly as `VmSpec::net_link()`
+does). The panel renders an **Enforced boundary** banner (net_link=Netstack,
+default-DENY, the only path off-box) vs a **Cooperative proxy** banner
+(net_link=Nat, bypassable) and partitions the allowlist into the **baked**
+set (always-on, struck through when an operator deny overrides it — a mirror
+of `NETSTACK_ALLOWLIST` / `render_effective_policy`), **operator allow**, and
+**operator deny**. For a Netstack VM the default action is shown read-only
+(it is host-enforced; offering a toggle would persist `default=Deny` into the
+file).
+
+**Denied-attempts view.** A `DeniedAttempts` roll-up consumes the existing
+`egress log` JSON feed (`microvm_egress_log`, the `deny` records written by
+`netstack::guard::log_deny`) and aggregates them per `(host, port)` into
+**host : port · count · last-seen, most-recent-first** — a direct mirror of
+`traffic.rs::aggregate_denied` so the GUI matches the CLI's `egress denied`.
+
+**"Allow this host?" affordance + the incremental guarantee (Quinn's F3
+review).** Each denied row (and the live-traffic feed, and the manual add
+box) has a one-click **Allow** that calls `microvm_egress_rule(name,
+"allow", host)`, which drives the engine's typed `egress allow <host>`
+subcommand → `load_policy` → push the one rule → `save_policy` on the
+**persisted** `egress-policy.json`. It is **never** a
+get-effective→modify→`set` round-trip: `microvm_egress_get` returns the
+effective merge (default=Deny + baked hosts for Netstack), and writing that
+whole object back would persist `default=Deny` + the baked allowlist into
+the file and mis-enforce if the VM were later switched to NAT. All the other
+edit paths (`microvm_egress_default` / `_rule` / `_mitm` / `_reset`) are the
+same shape — thin wrappers over the engine's incremental subcommands, no
+effective-JSON write-back anywhere.
+
+**Graceful degradation.** The egress panel only mounts for a running,
+cluster-ready VM; the web/mock shell (`packages/desktop/src/mock-host.ts`)
+exercises both a Netstack (enforced) and a NAT (cooperative) VM with seeded
+deny records, so the surface is QA-able in a browser with no `microvm` host.
+
+**OWED-LIVE.** The real denied→allow loop in the GUI against a live
+`net_link=Netstack` VM under default-deny (block a host, watch it appear in
+Denied attempts, click Allow, confirm it now connects) is **owed-live** —
+the surface is implemented, typechecked, and build-verified, but the
+end-to-end GUI pass against a running Netstack VM has not been run.

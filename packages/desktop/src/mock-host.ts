@@ -527,7 +527,8 @@ export function createMockHost(): ConsoleHost {
           egress: {
             async get() {
               await sleep(100);
-              return { ...vm.egress };
+              const netLink = vm.egress.netLink ?? 'nat';
+              return { ...vm.egress, netLink, enforced: netLink === 'netstack' };
             },
             async setDefault(action: 'allow' | 'deny') {
               await sleep(150);
@@ -545,22 +546,54 @@ export function createMockHost(): ConsoleHost {
             },
             async reset() {
               await sleep(150);
-              vm.egress = { default: 'allow', allow: [], deny: [], mitm: false };
+              // Clears the operator's persisted rules; the net link (and so
+              // the enforced default-DENY boundary for a Netstack VM) is
+              // unchanged.
+              vm.egress = { default: 'allow', allow: [], deny: [], mitm: false, netLink: vm.egress.netLink };
             },
             async log(tail?: number) {
               await sleep(100);
-              const now = 1_700_000_000_000;
+              const now = Date.now();
               const events = [
                 {
-                  ts: now,
-                  host: 'api.openai.com',
+                  ts: now - 60_000,
+                  host: 'api.anthropic.com',
                   port: 443,
                   method: 'POST',
-                  path: '/v1/chat/completions',
+                  path: '/v1/messages',
                   decision: 'mitm' as const,
                 },
-                { ts: now + 1000, host: 'github.com', port: 443, method: 'CONNECT', decision: 'allow' as const },
-                { ts: now + 2000, host: 'evil.test', port: 443, method: 'CONNECT', decision: 'deny' as const },
+                { ts: now - 50_000, host: 'github.com', port: 443, method: 'CONNECT', decision: 'allow' as const },
+                // Repeated + multiple denied destinations so the
+                // denied-attempts roll-up shows counts + recency.
+                {
+                  ts: now - 40_000,
+                  host: 'telemetry.evil.test',
+                  port: 443,
+                  method: 'CONNECT',
+                  decision: 'deny' as const,
+                },
+                {
+                  ts: now - 30_000,
+                  host: 'telemetry.evil.test',
+                  port: 443,
+                  method: 'CONNECT',
+                  decision: 'deny' as const,
+                },
+                {
+                  ts: now - 20_000,
+                  host: 'telemetry.evil.test',
+                  port: 443,
+                  method: 'CONNECT',
+                  decision: 'deny' as const,
+                },
+                {
+                  ts: now - 10_000,
+                  host: 'pkgs.example.test',
+                  port: 443,
+                  method: 'CONNECT',
+                  decision: 'deny' as const,
+                },
               ];
               return events.slice(-(tail ?? 200));
             },
@@ -654,7 +687,15 @@ interface MockVm {
   apiPort: number;
   registryPort: number;
   egressPort: number;
-  egress: { default: 'allow' | 'deny'; allow: string[]; deny: string[]; mitm: boolean; caPath?: string };
+  egress: {
+    default: 'allow' | 'deny';
+    allow: string[];
+    deny: string[];
+    mitm: boolean;
+    caPath?: string;
+    /** Mirrors the VM's resolved net link; drives the enforced-boundary UI. */
+    netLink?: 'netstack' | 'nat';
+  };
   creds: {
     rules: Array<{ host: string; capture: boolean; inject: boolean; header: string; helper?: string }>;
     secrets: Array<{ host: string; header: string; masked: string }>;
@@ -690,11 +731,15 @@ const microVms: Record<string, MockVm> = {
     registryPort: 8102,
     egressPort: 8103,
     egress: {
+      // A Netstack VM: the host netstack is the enforced boundary
+      // (default-DENY + baked allowlist). `api.anthropic.com` + `github.com`
+      // are baked; the operator added `internal.example.test` and a deny.
       default: 'deny',
-      allow: ['api.openai.com', 'github.com'],
-      deny: [],
+      allow: ['api.anthropic.com', 'github.com', 'internal.example.test'],
+      deny: ['telemetry.evil.test'],
       mitm: true,
       caPath: '~/.appliance/vm/traffic/egress-ca.pem',
+      netLink: 'netstack',
     },
     creds: { rules: [], secrets: [] },
     agents: [],
