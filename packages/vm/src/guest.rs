@@ -153,7 +153,23 @@ __DEV_PROVISION__
 # otherwise. Backgrounded and fully decoupled from the bring-up phases:
 # k3s readiness below is what `vm up` waits on, never dockerd.
 __DOCKER_PROVISION__
-# --- k3s -------------------------------------------------------------
+# --- k3s / agent-runtime handoff -------------------------------------
+# Substituted with the k3s control-plane block (normal VM) or the
+# agent-runtime handoff (agent-only VM). Quinn gap #1: this block carries
+# nested port markers, so it is injected BEFORE the port substitutions.
+__K3S_PROVISION__
+"#;
+
+/// The k3s control-plane region of `APPLIANCE_START`, substituted for
+/// the `__K3S_PROVISION__` marker on a normal (non-agent-only) VM:
+/// byte-for-byte the original inline block — the k3s binary copy,
+/// `registries.yaml`, the in-VM registry manifest, `k3s server`, and the
+/// kubeconfig handoff. Agent-only VMs swap in `AGENT_HANDOFF` instead.
+///
+/// Carries nested `__REGISTRY_HOST_PORT__` / `__REGISTRY_NODEPORT__` /
+/// `__KUBECONFIG_PORT__` markers, so it MUST be injected before those
+/// port markers are substituted (Quinn gap #1; see `build_apkovl`).
+const K3S_PROVISION: &str = r#"# --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
 # runs without noexec/permission concerns.
 MEDIA=$(dirname "$(find /media -maxdepth 2 -name k3s 2>/dev/null | head -1)")
@@ -248,6 +264,58 @@ mkdir -p /srv/handoff
   httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
 ) &
 "#;
+
+/// The agent-runtime handoff, substituted for `__K3S_PROVISION__` when
+/// the spec is agent-only. This VM runs NO k3s: readiness is the agent
+/// runtime — the vsock shell agent (already launched above) plus the
+/// Node toolchain `DEV_PROVISION` installs.
+///
+/// Quinn gap #2: it gates on the toolchain's grippable
+/// `/persist/.dev-ready` marker (NOT the shell agent's "listening"
+/// console echo, which never lands in a file the host can grip), then
+/// serves a one-line `agent-ready` sentinel over the SAME busybox httpd
+/// the k3s kubeconfig handoff uses — bound to `__KUBECONFIG_PORT__`, free
+/// here since no k3s competes for it. `host_services` fetches it to gate
+/// `up`. Because `agent_only ⟹ dev`, `.dev-ready` is always written, so
+/// the gate always fires.
+///
+/// `__AGENT_DOCKER_STUB__` drops a no-op `docker` shim ONLY when this
+/// agent VM was provisioned without `--docker`, so an unflagged `docker`
+/// call gets an honest "relaunch with --docker" instead of a silent
+/// command-not-found. Empty (skipped) on a `--docker` agent VM, so it
+/// never shadows the real engine the docker provision installs.
+const AGENT_HANDOFF: &str = r#"# --- agent runtime handoff (agent-only VM) --------------------------
+# No k3s control plane here. Gate readiness on the agent runtime: the
+# vsock shell (already listening above) + the Node toolchain
+# DEV_PROVISION installs (agent_only implies dev).
+__AGENT_DOCKER_STUB__
+mkdir -p /srv/handoff
+(
+  # Wait for the dev toolchain (nodejs/npm) — the grippable .dev-ready
+  # marker, never the shell agent's console echo. Then serve the
+  # agent-ready sentinel the host gates `up` on.
+  while [ ! -f /persist/.dev-ready ]; do sleep 1; done
+  echo agent-ready > /srv/handoff/agent-ready
+  httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+) &
+"#;
+
+/// The honest-failure `docker` shim dropped on an agent VM provisioned
+/// WITHOUT `--docker` (substituted into `AGENT_HANDOFF`'s
+/// `__AGENT_DOCKER_STUB__`). Lives at `/usr/local/bin/docker` — ahead of
+/// the real `/usr/bin/docker` on PATH — but is only ever written on a
+/// no-docker agent boot (the marker is empty when `--docker` is set), so
+/// it never shadows a real engine.
+const AGENT_DOCKER_STUB: &str = r#"# docker not provisioned in this agent sandbox: fail honestly instead of
+# a silent command-not-found. Skipped (marker empty) on a --docker VM.
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/docker <<'DOCKERSTUB'
+#!/bin/sh
+echo "docker is not provisioned in this agent sandbox." >&2
+echo "Relaunch the agent with: appliance agent start --docker" >&2
+exit 127
+DOCKERSTUB
+chmod +x /usr/local/bin/docker"#;
 
 /// Non-root `appliance` user provisioning, substituted into
 /// `APPLIANCE_START` (the `__APP_USER_PROVISION__` marker) on EVERY VM.
@@ -617,6 +685,7 @@ fn build_apkovl(
     mount: bool,
     docker: bool,
     egress_port: u16,
+    agent_only: bool,
 ) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
@@ -681,6 +750,22 @@ fn build_apkovl(
         "etc/local.d/appliance.start",
         0o755,
         APPLIANCE_START
+            // Quinn gap #1: inject the k3s-or-agent branch FIRST. Both
+            // branches carry nested markers — k3s carries
+            // __KUBECONFIG_PORT__/__REGISTRY_NODEPORT__/__REGISTRY_HOST_PORT__,
+            // the agent handoff carries __KUBECONFIG_PORT__ +
+            // __AGENT_DOCKER_STUB__ — so the branch must land before the
+            // port/stub substitutions below expand those nested markers.
+            // Substituting it after the ports (the old order) would leave
+            // an injected __KUBECONFIG_PORT__ as a literal.
+            .replace(
+                "__K3S_PROVISION__",
+                if agent_only { AGENT_HANDOFF } else { K3S_PROVISION },
+            )
+            .replace(
+                "__AGENT_DOCKER_STUB__",
+                if agent_only && !docker { AGENT_DOCKER_STUB } else { "" },
+            )
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
@@ -747,6 +832,7 @@ pub fn build_boot_media(
     mount: bool,
     docker: bool,
     egress_port: u16,
+    agent_only: bool,
 ) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
     // Generate (once) and bake the per-VM egress CA into the overlay so
@@ -764,6 +850,7 @@ pub fn build_boot_media(
         mount,
         docker,
         egress_port,
+        agent_only,
     )?;
 
     let modloop_data = fs::read(&modloop)?;
@@ -817,6 +904,37 @@ pub fn guest_cmdline() -> String {
     )
 }
 
+/// What `host_services` should do for a spec, computed purely so the
+/// agent-only invariants are unit-testable without a live guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostServicePlan {
+    /// SASHA #1 (acceptance criterion): the guest-ip lease is persisted
+    /// for EVERY spec — the broker's exact-lease peer-pin and the netstack
+    /// boundary's lease attribution both depend on `guest-ip`. ALWAYS
+    /// true; agent-only never skips it. A regression that gated this on
+    /// `agent_only` would flip it false and fail `agent_only_*` below.
+    persist_guest_ip: bool,
+    /// Wire the k3s api/ingress/registry/NodePort host forwards. Skipped
+    /// for agent-only (the agent reaches the world via the egress proxy,
+    /// not these); the KUBECONFIG_PORT handoff forward is separate and
+    /// always retained.
+    wire_k3s_forwards: bool,
+    /// Gate readiness on the `agent-ready` sentinel (agent-only) instead
+    /// of the k3s kubeconfig handoff.
+    agent_readiness: bool,
+}
+
+/// Decide the host-services plan for a spec. Pure — the invariants
+/// (guest-ip always persisted; only the k3s forwards dropped for
+/// agent-only) are locked by unit tests, not a live boot.
+fn plan_host_services(spec: &crate::spec::VmSpec) -> HostServicePlan {
+    HostServicePlan {
+        persist_guest_ip: true,
+        wire_k3s_forwards: !spec.agent_only,
+        agent_readiness: spec.agent_only,
+    }
+}
+
 /// Guest-facing host services, run inside the resident VM host
 /// process for the lifetime of the VM:
 ///
@@ -836,6 +954,11 @@ pub fn host_services(
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
+    // The plan encodes the agent-only invariants (Sasha #1: guest-ip
+    // always persisted; only the k3s forwards dropped) in a unit-tested
+    // pure function rather than scattering `spec.agent_only` checks.
+    let plan = plan_host_services(spec);
+
     // Bind failures here are almost always another microVM already
     // holding the port — name the fix, don't let it surface as a
     // generic timeout.
@@ -851,42 +974,81 @@ pub fn host_services(
     // known a-priori) and dials the guest *through* the userspace stack.
     let (guest_ip, handoff_host, handoff_port) = match netstack {
         Some(ns) => {
+            // Sasha #1: the netstack assigns the deterministic lease
+            // regardless of agent-only — guest_ip is known a-priori. The
+            // broker's exact-lease peer-pin and the netstack boundary's
+            // lease attribution depend on it, so the lease is NEVER skipped;
+            // only the k3s-specific forwards are.
             let guest_ip = IpAddr::V4(ns.guest_ip());
-            crate::net::spawn_proxy_netstack(spec.api_port, 6443, ns.clone())
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
-            crate::net::spawn_proxy_netstack(spec.host_port, 80, ns.clone())
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
-            crate::net::spawn_proxy_netstack(spec.registry_port, REGISTRY_NODEPORT, ns.clone())
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
-            for port in 30000..=30050u16 {
-                let _ = crate::net::spawn_proxy_netstack(port, port, ns.clone());
+            if plan.wire_k3s_forwards {
+                crate::net::spawn_proxy_netstack(spec.api_port, 6443, ns.clone())
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
+                crate::net::spawn_proxy_netstack(spec.host_port, 80, ns.clone())
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
+                crate::net::spawn_proxy_netstack(spec.registry_port, REGISTRY_NODEPORT, ns.clone())
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                for port in 30000..=30050u16 {
+                    let _ = crate::net::spawn_proxy_netstack(port, port, ns.clone());
+                }
             }
-            // The kubeconfig handoff has no OS route under the netstack —
-            // forward it onto a loopback port and fetch from there.
+            // The kubeconfig/agent-ready handoff has no OS route under the
+            // netstack — forward it onto a loopback port and fetch from
+            // there. RETAINED in agent-only mode (Quinn gap #4b): the
+            // agent-ready sentinel is served over it too.
             let hport = crate::net::spawn_proxy_netstack_ephemeral(KUBECONFIG_PORT, ns.clone())?;
             (guest_ip, IpAddr::V4(Ipv4Addr::LOCALHOST), hport)
         }
         None => {
+            // Sasha #1: discover_guest_ip writes the NAT lease the broker's
+            // exact-lease peer-pin reads — preserved in agent-only mode;
+            // only the k3s forwards below are skipped.
             let guest_ip = crate::net::discover_guest_ip(&spec.mac, Duration::from_secs(120))?;
-            crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
-            crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
-            crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
-                .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
-            // The deterministic-NodePort window KubernetesDeploymentService
-            // assigns from — forwarded so the "direct" URLs in deploy
-            // results work exactly as they do on k3d.
-            for port in 30000..=30050u16 {
-                let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
+            if plan.wire_k3s_forwards {
+                crate::net::spawn_proxy(spec.api_port, SocketAddr::new(guest_ip, 6443))
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.api_port, "kubernetes api")))?;
+                crate::net::spawn_proxy(spec.host_port, SocketAddr::new(guest_ip, 80))
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
+                crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                // The deterministic-NodePort window KubernetesDeploymentService
+                // assigns from — forwarded so the "direct" URLs in deploy
+                // results work exactly as they do on k3d.
+                for port in 30000..=30050u16 {
+                    let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
+                }
             }
+            // Under NAT the handoff httpd is reachable directly at the guest
+            // IP (k3s.yaml or agent-ready) — no loopback forward needed.
             (guest_ip, guest_ip, KUBECONFIG_PORT)
         }
     };
 
+    // Sasha #1 (acceptance criterion): agent-only STILL writes guest-ip —
+    // NAT and the netstack lease attribution depend on it. The forwards are
+    // skipped above, never the discovery/lease. `persist_guest_ip` is
+    // always true (the plan locks it); guarding the write through it keeps
+    // the invariant a single tested decision.
     eprintln!("guest address: {guest_ip}");
-    fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
+    if plan.persist_guest_ip {
+        fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
+    }
     crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
+
+    if plan.agent_readiness {
+        // Agent-only: no k3s control plane. Gate on the agent runtime — the
+        // guest serves an `agent-ready` sentinel once the Node toolchain
+        // (.dev-ready) is up (Quinn gap #2). Then write the host-side
+        // readiness marker `up`/`status`/`list` poll on for this spec.
+        eprintln!("agent-only: gating on the agent runtime (node + vsock shell)");
+        crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
+        let handoff = format!("http://{handoff_host}:{handoff_port}/agent-ready");
+        crate::net::wait_http(&handoff, Duration::from_secs(600))?;
+        fs::write(vm_dir.join("agent-ready"), b"agent-ready\n")?;
+        eprintln!("agent runtime ready: {}", vm_dir.join("agent-ready").display());
+        crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
+        return Ok(());
+    }
+
     eprintln!(
         "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT
@@ -938,7 +1100,7 @@ mod tests {
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -948,7 +1110,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -956,7 +1118,7 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false).unwrap();
         assert_eq!(
             apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
             Some(pem)
@@ -967,7 +1129,7 @@ mod tests {
     fn dev_provisioning_present_only_for_dev_vms() {
         // Non-dev: the marker is substituted to empty and no dev wiring
         // leaks into the bootstrap.
-        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         // The base user block references /persist/workspace on every VM,
@@ -977,7 +1139,7 @@ mod tests {
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
-        let dev = build_apkovl(5052, None, true, false, false, 5053).unwrap();
+        let dev = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
         let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"));
         assert!(start.contains("mkdir -p /persist/workspace"));
@@ -991,7 +1153,7 @@ mod tests {
     fn appliance_user_provisioned_on_every_vm() {
         // The non-root user is unconditional — present even on a plain
         // (non-dev, non-docker, non-mount) VM, just like the shell agent.
-        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
         // User + primary group, pinned uid/gid, on the persistent home.
@@ -1030,7 +1192,7 @@ mod tests {
         assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
 
         // A non-mount VM pins the conventional 1000/1000.
-        let plain = build_apkovl(5052, None, true, false, false, 5053).unwrap();
+        let plain = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("APP_UID=1000"));
         assert!(start.contains("APP_GID=1000"));
@@ -1043,7 +1205,7 @@ mod tests {
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
         let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
-        let shared = build_apkovl(5052, None, true, true, false, 5053).unwrap();
+        let shared = build_apkovl(5052, None, true, true, false, 5053, false).unwrap();
         let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains(&format!("APP_UID={exp_uid}")), "mounted VM must pin the resolved uid");
         assert!(start.contains(&format!("APP_GID={exp_gid}")), "mounted VM must pin the resolved gid");
@@ -1066,7 +1228,7 @@ mod tests {
 
     #[test]
     fn vsock_shell_agent_is_baked_into_every_vm() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         // socat backs the agent and is in the base package set.
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "socat"));
@@ -1091,14 +1253,14 @@ mod tests {
     fn tmux_is_in_the_base_world_set() {
         // The reattachable-session multiplexer ships on EVERY VM (not just
         // dev VMs), next to socat/sudo — the feature is unconditional.
-        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "tmux"), "tmux must be in the base world set");
     }
 
     #[test]
     fn transparent_tmux_conf_is_baked_in() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let conf = apkovl_file(&ovl, "etc/appliance/tmux.conf").expect("tmux.conf present");
         // Invisible multiplexer: no status bar, short escape passthrough,
         // large scrollback, and sessions outlive a detach.
@@ -1112,7 +1274,7 @@ mod tests {
 
     #[test]
     fn shell_agent_routes_session_verbs_to_tmux() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
 
         // The four verbs are parsed off the size line.
@@ -1159,17 +1321,17 @@ mod tests {
         // Both markers must always be substituted away.
         for (dev, mount) in [(false, false), (true, false), (true, true)] {
             let start =
-                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
+                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
             assert!(!start.contains("__DEV_MOUNT__"), "marker must be substituted (dev={dev} mount={mount})");
         }
 
         // Dev without a share: no virtiofs mount.
-        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(!dev_only.contains("mount -t virtiofs"));
 
         // Dev + share: the bootstrap mounts the workspace tag, and the
         // tag literal matches the constant the VZ backend tags with.
-        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053).unwrap(), "etc/local.d/appliance.start").unwrap();
+        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053, false).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(shared.contains(&format!("mount -t virtiofs {WORKSPACE_VIRTIOFS_TAG} /persist/workspace")));
         assert!(DEV_MOUNT.contains(WORKSPACE_VIRTIOFS_TAG));
     }
@@ -1180,7 +1342,7 @@ mod tests {
         // provisioning leaks into the bootstrap. (The section-header
         // comment legitimately names dockerd even when off, so assert on
         // the provisioning strings that only the block emits.)
-        let plain = build_apkovl(5052, None, false, false, false, 5053).unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("apk add --no-progress docker docker-cli-compose"));
@@ -1189,7 +1351,7 @@ mod tests {
 
         // Docker: the apk install, the separate dockerd engine, the
         // egress env injection, and the readiness marker are all present.
-        let docker = build_apkovl(5052, None, false, false, true, 5053).unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 5053, false).unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"));
         // Packaged from the Alpine community repo, cached on /persist.
@@ -1223,9 +1385,98 @@ mod tests {
         // The egress port is substituted into the proxy URL the guest
         // builds at boot from its default-route gateway — the marker must
         // be gone and the actual port present.
-        let docker = build_apkovl(5052, None, false, false, true, 8203).unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 8203, false).unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__EGRESS_PORT__"), "port marker must be substituted");
         assert!(start.contains(":8203"), "the per-VM egress port must be embedded");
+    }
+
+    #[test]
+    fn k3s_provisioned_only_for_non_agent_only_vms() {
+        // Normal VM: the k3s block is present and the marker is gone.
+        let k3s = build_apkovl(5052, None, true, false, false, 5053, false).unwrap();
+        let start = apkovl_file(&k3s, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
+        assert!(start.contains("k3s server"), "k3s launches on a normal VM");
+        assert!(start.contains("/srv/handoff/k3s.yaml"), "the kubeconfig handoff is served");
+        // No agent-runtime handoff on a normal VM.
+        assert!(!start.contains("agent-ready"));
+
+        // Agent-only VM: the k3s block is GONE, replaced by the agent
+        // handoff that waits on .dev-ready and serves the agent-ready
+        // sentinel.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("k3s server"), "agent-only provisions NO k3s");
+        assert!(!start.contains("registries.yaml"), "no in-VM registry on an agent VM");
+        // Gates on the grippable .dev-ready marker (Quinn gap #2), NOT the
+        // shell agent's console echo.
+        assert!(start.contains("while [ ! -f /persist/.dev-ready ]"));
+        assert!(start.contains("echo agent-ready > /srv/handoff/agent-ready"));
+    }
+
+    #[test]
+    fn agent_only_substitution_leaks_no_literal_port_markers() {
+        // Quinn gap #1: the branch is injected before the port markers, so
+        // the agent handoff's nested __KUBECONFIG_PORT__ must be expanded —
+        // never survive as a literal. Assert no marker survives and the
+        // real port is embedded on the handoff httpd.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        for marker in [
+            "__K3S_PROVISION__",
+            "__KUBECONFIG_PORT__",
+            "__REGISTRY_NODEPORT__",
+            "__REGISTRY_HOST_PORT__",
+            "__AGENT_DOCKER_STUB__",
+        ] {
+            assert!(!start.contains(marker), "literal marker {marker} leaked into agent-only bootstrap");
+        }
+        // The sentinel httpd binds the real KUBECONFIG_PORT, not a literal.
+        assert!(start.contains(&format!("httpd -f -p {KUBECONFIG_PORT} -h /srv/handoff")));
+    }
+
+    #[test]
+    fn agent_only_docker_stub_gated_on_the_docker_flag() {
+        // No --docker: the honest-failure docker shim is dropped so an
+        // unflagged `docker` call doesn't silently break.
+        let no_docker = build_apkovl(5052, None, true, false, false, 5053, true).unwrap();
+        let start = apkovl_file(&no_docker, "etc/local.d/appliance.start").unwrap();
+        assert!(start.contains("/usr/local/bin/docker"), "no-docker agent VM gets the honest-error shim");
+        assert!(start.contains("Relaunch the agent with: appliance agent start --docker"));
+
+        // --docker: the shim is skipped so it never shadows the real engine
+        // the docker provision installs.
+        let with_docker = build_apkovl(5052, None, true, false, true, 5053, true).unwrap();
+        let start = apkovl_file(&with_docker, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("/usr/local/bin/docker"), "--docker agent VM must not shim docker");
+        assert!(start.contains("apk add --no-progress docker docker-cli-compose"), "real docker is provisioned");
+        // A normal (non-agent) VM never carries the shim either.
+        let normal = build_apkovl(5052, None, false, false, false, 5053, false).unwrap();
+        let start = apkovl_file(&normal, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("/usr/local/bin/docker"));
+    }
+
+    #[test]
+    fn agent_only_still_persists_guest_ip_but_skips_k3s_forwards() {
+        // SASHA #1 (acceptance criterion): the host-services plan persists
+        // guest-ip for an agent-only VM exactly as for a k3s VM — the
+        // broker peer-pin + the netstack lease attribution depend on it.
+        // Only the k3s forwards are dropped.
+        let mut agent = crate::spec::VmSpec::defaults("sbx");
+        agent.agent_only = true;
+        let plan = plan_host_services(&agent);
+        assert!(plan.persist_guest_ip, "agent-only MUST still write guest-ip (Sasha #1)");
+        assert!(!plan.wire_k3s_forwards, "agent-only skips the k3s host forwards");
+        assert!(plan.agent_readiness, "agent-only gates on the agent-ready sentinel");
+
+        // A normal (k3s) VM persists guest-ip AND wires the k3s forwards,
+        // and gates on the kubeconfig handoff.
+        let k3s = crate::spec::VmSpec::defaults("appliance");
+        let plan = plan_host_services(&k3s);
+        assert!(plan.persist_guest_ip, "k3s VMs write guest-ip too");
+        assert!(plan.wire_k3s_forwards, "k3s VMs wire the api/ingress/registry forwards");
+        assert!(!plan.agent_readiness, "k3s VMs gate on kubeconfig, not agent-ready");
     }
 }

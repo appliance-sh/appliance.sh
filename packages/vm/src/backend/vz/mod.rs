@@ -85,6 +85,7 @@ impl VmBackend for VzBackend {
             spec.dev_mount.is_some(),
             spec.docker,
             spec.egress_port,
+            spec.agent_only,
         )?;
 
         // The console log is the VM's primary observable output —
@@ -92,6 +93,9 @@ impl VmBackend for VzBackend {
         // an append-forever scroll of every boot since creation.
         std::fs::write(paths.console_log(), b"")?;
         let _ = std::fs::remove_file(paths.kubeconfig());
+        // Quinn gap #4c: clear a prior boot's agent-ready marker too, so an
+        // agent-only `up` never returns on a stale readiness file.
+        let _ = std::fs::remove_file(paths.agent_ready());
         let _ = std::fs::remove_file(paths.guest_ip());
 
         let built =

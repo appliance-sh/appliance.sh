@@ -58,6 +58,10 @@ enum Cmd {
         /// Provision an in-guest Docker engine (dockerd) alongside k3s.
         #[arg(long, default_value_t = false)]
         docker: bool,
+        /// Provision this VM as an agent-only sandbox (no k3s; gate on the
+        /// agent runtime). Implies --dev.
+        #[arg(long, default_value_t = false)]
+        agent_only: bool,
     },
     /// Start a VM in the background (creates it with defaults first if needed).
     Start {
@@ -100,6 +104,13 @@ enum Cmd {
         /// Persisted; applies on the next boot; never silently turned off.
         #[arg(long, default_value_t = false)]
         docker: bool,
+        /// Provision this VM as an agent-only sandbox: skip the k3s control
+        /// plane entirely and gate readiness on the agent runtime (the
+        /// vsock shell + Node) instead of kubeconfig. Implies --dev (the
+        /// handoff waits on the dev toolchain's .dev-ready). Persisted;
+        /// one-way, applies on the next boot; never silently turned off.
+        #[arg(long, default_value_t = false)]
+        agent_only: bool,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -382,14 +393,16 @@ fn run() -> Result<()> {
             dev,
             mount,
             docker,
+            agent_only,
         } => {
             // A shared host folder only makes sense in a dev environment,
-            // so --mount implies --dev.
+            // so --mount implies --dev. Agent-only implies --dev too: its
+            // readiness handoff waits on the dev toolchain's .dev-ready.
             let dev_mount = match mount.as_deref() {
                 Some(path) => Some(resolve_mount(path)?),
                 None => None,
             };
-            let dev = dev || dev_mount.is_some();
+            let dev = dev || dev_mount.is_some() || agent_only;
             // Allocate a non-colliding port block so this VM can run
             // alongside others (the default VM keeps the canonical
             // 8081/6443/5052/5053; an existing VM keeps its ports).
@@ -405,6 +418,7 @@ fn run() -> Result<()> {
                 dev,
                 dev_mount,
                 docker,
+                agent_only,
                 ..VmSpec::defaults(&name)
             };
             store::save_spec(&spec)?;
@@ -448,6 +462,7 @@ fn run() -> Result<()> {
             mount,
             no_mount,
             docker,
+            agent_only,
         } => {
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
@@ -470,6 +485,14 @@ fn run() -> Result<()> {
             if docker {
                 spec.docker = true;
             }
+            // `--agent-only` is a one-way toggle as well, and it carries the
+            // invariant `agent_only ⟹ dev`: the agent-handoff readiness gate
+            // waits on the dev toolchain's .dev-ready, so force dev on too.
+            let was_agent_only = spec.agent_only;
+            if agent_only {
+                spec.agent_only = true;
+                spec.dev = true;
+            }
             // Mount override: --no-mount stops sharing; --mount sets or
             // replaces the shared host folder (and implies a dev env).
             let mount_changed = if no_mount {
@@ -485,7 +508,8 @@ fn run() -> Result<()> {
             };
             let dev_enabled = spec.dev && !was_dev;
             let docker_enabled = spec.docker && !was_docker;
-            if resized || dev_enabled || mount_changed || docker_enabled {
+            let agent_only_enabled = spec.agent_only && !was_agent_only;
+            if resized || dev_enabled || mount_changed || docker_enabled || agent_only_enabled {
                 store::save_spec(&spec)?;
                 if store::read_live_pid(&name).is_some() {
                     if resized {
@@ -504,6 +528,11 @@ fn run() -> Result<()> {
                             "note: VM '{name}' is already running — docker provisioning applies on its next boot"
                         );
                     }
+                    if agent_only_enabled {
+                        println!(
+                            "note: VM '{name}' is already running — agent-only mode applies on its next boot"
+                        );
+                    }
                     if mount_changed {
                         println!(
                             "note: VM '{name}' is already running — the shared folder applies on its next boot"
@@ -512,11 +541,22 @@ fn run() -> Result<()> {
                 }
             }
             let paths = VmPaths::for_name(&name);
+            // The readiness marker `up` polls on is spec-keyed: an
+            // agent-only VM has no k3s kubeconfig — it answers with the
+            // agent-ready sentinel marker instead.
+            let ready_marker = if spec.agent_only {
+                paths.agent_ready()
+            } else {
+                paths.kubeconfig()
+            };
             if store::read_live_pid(&name).is_none() {
                 // Clear stale readiness markers from a previous boot
                 // *before* spawning — the poll below must only ever
-                // observe files written by this boot.
+                // observe files written by this boot. Remove BOTH markers
+                // (Quinn gap #4c): a prior boot under the other mode, or a
+                // mode flip, must not leave a marker that fakes readiness.
                 let _ = std::fs::remove_file(paths.kubeconfig());
+                let _ = std::fs::remove_file(paths.agent_ready());
                 let _ = std::fs::remove_file(paths.guest_ip());
                 bringup::clear(&paths.dir);
                 let child = spawn_host_process(&name)?;
@@ -536,7 +576,7 @@ fn run() -> Result<()> {
             let liveness_grace = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut shown: Option<bringup::Phase> = None;
             loop {
-                if paths.kubeconfig().exists() {
+                if ready_marker.exists() {
                     break;
                 }
                 // Reflect the current phase: a new stage starts a fresh
@@ -583,6 +623,15 @@ fn run() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             println!();
+            if spec.agent_only {
+                // No k3s API to confirm — readiness is the agent runtime,
+                // already proven by the agent-ready marker above. Reach the
+                // guest over the k3s-independent vsock shell.
+                println!("VM '{name}' is up (agent-only)");
+                println!("  agent runtime: node + vsock shell ready");
+                println!("  shell: appliance-vm shell {name}");
+                return Ok(());
+            }
             net::wait_tcp(
                 std::net::SocketAddr::from(([127, 0, 0, 1], spec.api_port)),
                 std::time::Duration::from_secs(60),
@@ -638,9 +687,15 @@ fn run() -> Result<()> {
             let pid = store::read_live_pid(&name);
             let paths = VmPaths::for_name(&name);
             // Cluster readiness is gated on the host process being alive:
-            // the kubeconfig file lingers on disk after a stop, so the
-            // file alone would falsely report a stopped VM as "ready".
-            let cluster_ready = pid.is_some() && paths.kubeconfig().exists();
+            // the marker file lingers on disk after a stop, so the file
+            // alone would falsely report a stopped VM as "ready". The marker
+            // is spec-keyed — an agent-only VM answers with agent-ready, not
+            // kubeconfig.
+            let ready_marker = match spec.as_ref() {
+                Some(s) if s.agent_only => paths.agent_ready(),
+                _ => paths.kubeconfig(),
+            };
+            let cluster_ready = pid.is_some() && ready_marker.exists();
             let phase = if pid.is_some() {
                 bringup::read(&paths.dir).map(|b| b.phase)
             } else {
@@ -689,7 +744,14 @@ fn run() -> Result<()> {
                 .map(|spec| {
                     let pid = store::read_live_pid(&spec.name);
                     let paths = VmPaths::for_name(&spec.name);
-                    let cluster_ready = pid.is_some() && paths.kubeconfig().exists();
+                    // Spec-keyed readiness marker: agent-only answers with
+                    // agent-ready, k3s VMs with kubeconfig.
+                    let ready_marker = if spec.agent_only {
+                        paths.agent_ready()
+                    } else {
+                        paths.kubeconfig()
+                    };
+                    let cluster_ready = pid.is_some() && ready_marker.exists();
                     let phase = if pid.is_some() {
                         bringup::read(&paths.dir).map(|b| b.phase)
                     } else {

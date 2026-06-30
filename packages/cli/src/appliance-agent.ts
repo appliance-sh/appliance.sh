@@ -66,6 +66,11 @@ program
   )
   .option('--session <id>', 'use this session id instead of minting one (normalized to the agent- prefix)')
   .option('--no-attach', 'launch + record without attaching the interactive session afterwards')
+  .option(
+    '--docker',
+    'provision the in-guest Docker engine for this task (lazy re-up, one reboot); off by default',
+    false
+  )
   .action(
     async (
       project: string | undefined,
@@ -78,6 +83,7 @@ program
         wait: boolean;
         session?: string;
         attach: boolean;
+        docker: boolean;
       }
     ) => {
       if (opts.autonomous && !opts.task) {
@@ -122,7 +128,16 @@ program
       // captured result. A clean message (not a stack) on any failure.
       let run: RunAgentResult;
       try {
-        run = await runAgent({ vm, projectDir, adapter, mode, task: opts.task, sessionId: opts.session, wait });
+        run = await runAgent({
+          vm,
+          projectDir,
+          adapter,
+          mode,
+          task: opts.task,
+          sessionId: opts.session,
+          wait,
+          docker: opts.docker,
+        });
       } catch (err) {
         console.error(chalk.red(`agent launch failed: ${err instanceof Error ? err.message : String(err)}`));
         process.exit(1);

@@ -1,6 +1,6 @@
 # Fast agent spin-up — agent-only VM mode + a prebuilt agent image
 
-**Status:** Decided (design spike, S0). **Scope:** this doc decides _what_ S1/S2 build; it ships **no feature code**. **Owner-locked going in:** two levers only; **VM snapshots are ruled out** — see [§0](#0-why-not-snapshots).
+**Status:** S1 (Lever 1, agent-only VM mode) **shipped** — see [§1.6 Invariants](#16-invariants-enforced-as-built). Lever 2 (the prebuilt agent image) is still **decided, not built**. **Scope:** this doc decides _what_ S1/S2 build; S1's feature code now lives in `packages/vm` + `packages/cli`. **Owner-locked going in:** two levers only; **VM snapshots are ruled out** — see [§0](#0-why-not-snapshots).
 
 ## Context
 
@@ -51,7 +51,7 @@ Serializes as `agentOnly` in `vm.json`. Legacy specs lack it and parse to `false
 Wrap the k3s region of `APPLIANCE_START` (`guest.rs:156-249` — the `k3s` binary copy, `registries.yaml`, the registry manifest, `k3s server`, and the kubeconfig handoff) behind a new substitution marker `__K3S_PROVISION__`, exactly like `__DEV_PROVISION__`/`__DOCKER_PROVISION__` already work (`guest.rs:689-691`):
 
 - `agent_only = false` → marker is the existing k3s block (byte-for-byte unchanged).
-- `agent_only = true` → marker is replaced with an **agent-handoff** block: wait for the Node toolchain (`/persist/.dev-ready`, written by `DEV_PROVISION`, `guest.rs:392`) and for the shell agent's "listening" log line (`guest.rs:141`), then serve a one-line `agent-ready` sentinel over `httpd` on `KUBECONFIG_PORT` (free in agent-only mode — no k3s competes for it) at `/srv/handoff/agent-ready`. This **reuses the existing handoff httpd machinery** (`guest.rs:244-249`) and the host's `wait_http` + fetch path verbatim — minimal new code.
+- `agent_only = true` → marker is replaced with an **agent-handoff** block: wait for the Node toolchain (`/persist/.dev-ready`, written by `DEV_PROVISION`, `guest.rs:392`) — the **grippable** marker, **not** the shell agent's "listening" console echo (Quinn #2: it goes to console/serial, not a file the host can grip) — then serve a one-line `agent-ready` sentinel over `httpd` on `KUBECONFIG_PORT` (free in agent-only mode — no k3s competes for it) at `/srv/handoff/agent-ready`. This **reuses the existing handoff httpd machinery** (`guest.rs:244-249`) and the host's `wait_http` + fetch path verbatim — minimal new code. The host-side belt-and-suspenders probe is the vsock `command -v node` (`waitForAgentRuntime`, `sandbox.ts`).
 
 `build_apkovl`/`build_boot_media` take an `agent_only: bool` and thread it through the substitution (mirrors the existing `dev`/`docker` plumbing at `guest.rs:613-694, 743-767` and `backend/vz/mod.rs:81-88`).
 
@@ -86,6 +86,56 @@ Rationale (the open Q, resolved):
 - **Always-provision is wrong for the common case** — most agent runs never touch Docker, yet today every sandbox pays the `docker docker-cli-compose` apk install + dockerd start and `up` blocks on it (`waitForDocker`, up to a 300 s ceiling, `sandbox.ts:492`). It also enlarges the attack surface (a root daemon + its socket) for runs that don't want it.
 - **Flag-gated lazy threads the needle.** Default = fastest + smallest surface. `--docker` (persisted on the sandbox spec via the existing one-way `docker` toggle, `main.rs:469-472`) provisions dockerd exactly as today (`DOCKER_PROVISION`, backgrounded, `guest.rs:441-505`), and only a `--docker` launch waits on `.docker-ready`. The dockerd block is **already fully decoupled from the bring-up phases** (`guest.rs:151-155`, `sandbox.md §2`), so it composes with agent-only with zero new coupling.
 - **Honest failure when unflagged:** if an agent invokes `docker` without `--docker`, it gets a clear "docker not provisioned in this sandbox — relaunch with `appliance agent start --docker`" rather than a silent break. (Auto-implying `--docker` from project detection — a `Dockerfile`/compose present, `sandbox.ts:152-157` — is a reasonable follow-up nicety but not required for S1.)
+
+### 1.6 Invariants (enforced, as built)
+
+These are load-bearing and enforced in code + locked by unit tests, not
+just documented:
+
+1. **`agent_only ⟹ dev`.** The agent-handoff readiness gate waits on
+   `/persist/.dev-ready` (the dev toolchain's Node/npm marker, `guest.rs`),
+   so an agent-only VM **must** be a dev VM. The CLI forces `dev = true`
+   whenever it sets `agent_only` (`main.rs` `Up`/`Create`, `VmSpec`
+   doc-comment), and the sandbox is dev anyway via `--mount`. If this were
+   violated `.dev-ready` would never be written and the gate would hang —
+   so it is an invariant, not a convenience.
+
+2. **The `KUBECONFIG_PORT` handoff forward is RETAINED in agent-only
+   mode** (Quinn #4b). Agent-only drops the k3s api/ingress/registry/
+   NodePort forwards but keeps the handoff: the guest serves the
+   `agent-ready` sentinel over the **same** busybox `httpd` on
+   `KUBECONFIG_PORT` (free with no k3s competing), and under the netstack
+   `host_services` still stands up the ephemeral loopback forward to reach
+   it (`guest.rs::host_services`). Without this the host could never fetch
+   the readiness sentinel.
+
+3. **Network discovery is PRESERVED** (Sasha #1, acceptance criterion).
+   Agent-only **still** runs `discover_guest_ip` / the netstack lease and
+   **still writes `guest-ip`** — only the k3s _forwards_ are skipped, never
+   the discovery/lease. The broker's exact-lease peer-pin
+   (`peer_is_lease`/`should_intercept`) and the netstack boundary's lease
+   attribution both depend on `guest-ip`. This is encoded in a pure,
+   unit-tested `plan_host_services` (`persist_guest_ip` is unconditionally
+   true; only `wire_k3s_forwards` follows `!agent_only`), so a regression
+   that gated `guest-ip` on agent-only fails the test.
+
+4. **Marker ordering** (Quinn #1). The `__K3S_PROVISION__` branch (k3s
+   block _or_ the agent handoff) is substituted **before** the nested
+   `__KUBECONFIG_PORT__`/`__REGISTRY_*__`/`__AGENT_DOCKER_STUB__` port/stub
+   markers, so an injected `__KUBECONFIG_PORT__` is expanded rather than
+   surviving as a literal (`build_apkovl`). A unit test asserts no literal
+   marker leaks into the agent-only bootstrap.
+
+5. **Readiness is a grippable proof, never the console echo** (Quinn #2).
+   The gate is the host-side vsock probe (`command -v node` over
+   `vmShellCapture`) plus the `.dev-ready`-gated `agent-ready` sentinel —
+   **not** the shell-agent "listening" echo, which goes to console/serial
+   and lands in no file the host can grip.
+
+6. **Stale-marker removal** (Quinn #4c). A prior boot's `agent-ready`
+   marker is removed before spawn (`main.rs` `Up`, mirroring the stale
+   `kubeconfig` removal; also in the foreground host process,
+   `backend/vz/mod.rs`) so `up` can never return on a stale readiness file.
 
 ---
 

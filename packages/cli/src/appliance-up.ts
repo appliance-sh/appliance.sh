@@ -98,7 +98,7 @@ async function runUp(opts: { vm: string; port?: number; hostPort?: number; detac
 
   // 1. Boot/ensure the sandbox VM with docker + this workspace mounted,
   //    and wait for the in-guest engine.
-  await ensureSandboxVm(vm, cwd);
+  await ensureSandboxVm(vm, cwd, { docker: true });
 
   // 2. Build in-guest from the shared workspace.
   console.log(chalk.cyan(`» building image ${project} from ${GUEST_WORKSPACE}`));
@@ -166,7 +166,7 @@ async function runComposeUp(opts: { vm: string }, cwd: string): Promise<void> {
   console.log(chalk.bold(`Detected: docker-compose (${composeFile} → ${project})`));
 
   // 1. Boot/ensure the sandbox VM with docker + this workspace mounted.
-  await ensureSandboxVm(vm, cwd);
+  await ensureSandboxVm(vm, cwd, { docker: true });
 
   // 2. Build + start the whole project in-guest, streaming output.
   console.log(chalk.cyan(`» docker compose up -d --build (${project})`));
@@ -261,7 +261,7 @@ async function runDevcontainerUp(opts: { vm: string }, cwd: string): Promise<voi
   console.log(chalk.bold(`Detected: devcontainer (${project})`));
 
   // 1. Boot/ensure the sandbox VM with docker + this workspace mounted.
-  await ensureSandboxVm(vm, cwd);
+  await ensureSandboxVm(vm, cwd, { docker: true });
 
   // 2. Ensure the devcontainers CLI is present, then bring the
   //    devcontainer up — in ONE in-guest invocation, output captured.

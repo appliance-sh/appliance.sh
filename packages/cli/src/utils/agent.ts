@@ -993,6 +993,11 @@ export interface RunAgentOpts {
   /** Autonomous: block until the run completes, capturing the result
    *  in-band over the one-shot sentinel path, instead of detaching. */
   wait?: boolean;
+  /** Provision the in-guest Docker engine for this sandbox (lazy re-up,
+   *  one reboot). Off by default — the agent sandbox boots with no
+   *  dockerd; opt in via `appliance agent start --docker` for a task that
+   *  needs `docker build`/compose (docs/fast-spin-up.md §1.5). */
+  docker?: boolean;
 }
 
 /** What a launch produced. `result` is set only for a blocking (`--wait`)
@@ -1042,7 +1047,8 @@ export async function runAgent(opts: RunAgentOpts = {}): Promise<RunAgentResult>
   const authMode = resolveAuthMode(adapter, cred.kind);
 
   console.log(chalk.cyan(`» ensuring sandbox VM '${vm}' with the workspace mounted`));
-  await ensureSandboxVm(vm, projectDir);
+  // Agent-only by construction; docker is opt-in (--docker → lazy re-up).
+  await ensureSandboxVm(vm, projectDir, { docker: opts.docker ?? false });
 
   console.log(
     chalk.cyan(`» configuring the host credential broker (${cred.kind} injected at the proxy on ${authMode.header})`)

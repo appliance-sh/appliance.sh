@@ -480,37 +480,93 @@ export function deterministicHostPort(project: string): number {
 
 // ---- VM bring-up + docker readiness ------------------------------------
 
+/** Options for {@link ensureSandboxVm}. */
+export interface EnsureSandboxOpts {
+  /** Provision the in-guest Docker engine (and wait on it). `appliance
+   *  up` always needs it to build/run the project container; `appliance
+   *  agent start` only with `--docker`. Default: no docker — the fastest,
+   *  smallest agent sandbox (docs/fast-spin-up.md §1.5). */
+  docker?: boolean;
+  /** Readiness timeout (ms). */
+  timeoutMs?: number;
+}
+
 /**
- * Ensure the shared sandbox VM is up with docker provisioned and the
- * project workspace mounted, then wait for the in-guest dockerd. The
- * mount applies on next boot, so if the VM is already running with a
- * different mount we stop it and re-up to remount (docs/up.md §3 and the
- * verified runtime recipe).
+ * Ensure the shared sandbox VM is up with the project workspace mounted,
+ * then wait for the in-guest agent runtime (vsock shell + Node). The
+ * sandbox is ALWAYS agent-only — it never runs k3s — so `up` returns as
+ * soon as the runtime is ready instead of blocking on a k3s election the
+ * sandbox never uses (docs/fast-spin-up.md §1).
  *
- * Returns once `docker version` works in the guest.
+ * The mount (and docker provisioning) apply on the next boot, so if the
+ * VM is already running with a different mount — or `--docker` is newly
+ * requested — we stop it and re-up (one reboot, like a mount change).
+ *
+ * Returns once the agent runtime answers (plus dockerd when `docker`).
  */
-export async function ensureSandboxVm(vm: string, projectDir: string, timeoutMs = 300_000): Promise<void> {
+export async function ensureSandboxVm(vm: string, projectDir: string, opts: EnsureSandboxOpts = {}): Promise<void> {
+  const { docker = false, timeoutMs = 300_000 } = opts;
   const desiredMount = path.resolve(projectDir);
   const status = vmStatus(vm);
   const spec = readVmSpec(vm);
   const running = status?.running ?? false;
   const currentMount = spec?.devMount ? path.resolve(spec.devMount) : null;
+  const currentDocker = spec?.docker ?? false;
 
-  // A running VM only picks up a new mount on its next boot — restart it
-  // when the share points elsewhere so the build sees this project.
-  if (running && currentMount !== desiredMount) {
-    console.log(
-      chalk.yellow(`» sandbox VM '${vm}' is mounted elsewhere (${currentMount ?? 'none'}); restarting to remount`)
-    );
+  // A running VM only picks up a new mount — or newly-requested docker —
+  // on its next boot. Restart it when the share points elsewhere, or when
+  // --docker is newly requested (the lazy re-up), so the change takes
+  // effect this run.
+  const needsRemount = running && currentMount !== desiredMount;
+  const needsDocker = running && docker && !currentDocker;
+  if (needsRemount || needsDocker) {
+    const why = needsRemount ? `mounted elsewhere (${currentMount ?? 'none'})` : 'docker newly requested (--docker)';
+    console.log(chalk.yellow(`» sandbox VM '${vm}' ${why}; restarting to apply`));
     const stop = runVm(['stop', vm]);
-    if (stop !== 0) throw new Error(`failed to stop sandbox VM '${vm}' to remount the workspace`);
+    if (stop !== 0) throw new Error(`failed to stop sandbox VM '${vm}' to apply the change`);
   }
 
-  console.log(chalk.cyan(`» bringing up sandbox VM '${vm}' with docker + ${desiredMount} → ${GUEST_WORKSPACE}`));
-  const code = runVm(['up', vm, '--docker', '--mount', desiredMount]);
+  const upArgs = ['up', vm, '--agent-only', '--mount', desiredMount];
+  if (docker) upArgs.push('--docker');
+  console.log(
+    chalk.cyan(
+      `» bringing up agent sandbox VM '${vm}' (${desiredMount} → ${GUEST_WORKSPACE}${docker ? ' + docker' : ''})`
+    )
+  );
+  const code = runVm(upArgs);
   if (code !== 0) throw new Error(`appliance-vm up '${vm}' failed (exit ${code})`);
 
-  await waitForDocker(vm, timeoutMs);
+  // Readiness is the agent runtime — `up`'s agent-only gate already waits
+  // on it, so this vsock probe returns near-instantly. Only a --docker
+  // sandbox additionally waits on the backgrounded dockerd.
+  await waitForAgentRuntime(vm, timeoutMs);
+  if (docker) await waitForDocker(vm, timeoutMs);
+}
+
+/** Poll until the in-guest agent runtime is ready: the vsock shell
+ *  answers and `node` is on PATH (the Node toolchain the agent rides).
+ *  `up`'s agent-only gate already waits on `.dev-ready`, so this is a
+ *  belt-and-suspenders probe that returns near-instantly. The agent CLI
+ *  itself is installed on first use by the runner, so we probe only the
+ *  runtime, not the agent binary. */
+export async function waitForAgentRuntime(vm: string, timeoutMs: number): Promise<void> {
+  console.log(chalk.cyan('» waiting for the in-guest agent runtime (node + shell)'));
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const probe = vmShellCapture(vm, ['command', '-v', 'node']);
+    if (probe.status === 0 && probe.stdout.trim()) {
+      console.log(`${chalk.green('✓')} agent runtime ready`);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `the in-guest agent runtime never became ready in '${vm}' (waited ${Math.round(timeoutMs / 1000)}s).\n` +
+          'The Node toolchain installs in the background on first boot and pulls from the network — ' +
+          `inspect it with \`appliance vm console ${vm}\` or retry once the cache is warm.`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
 }
 
 /** Poll until the in-guest dockerd is provisioned (`.docker-ready`
