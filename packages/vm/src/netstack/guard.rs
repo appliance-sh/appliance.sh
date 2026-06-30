@@ -17,10 +17,15 @@
 //! Sasha's four invariants live here:
 //!   * **#1** — [`is_forbidden_target`] rejects any private/internal/
 //!     host-LAN address. It gates the DNS answer filter (`dns.rs`), the
-//!     DNS→IP back-reference set, the raw-IP/CIDR hatch, and the
-//!     host-side re-resolution ([`resolve_public`]). The netstack never
-//!     originates an upstream connection — nor admits a back-ref allow —
-//!     to a non-public address.
+//!     DNS→IP back-reference set, the raw-IP/CIDR hatch, the host-side
+//!     re-resolution ([`resolve_public`]), AND the MITM upstream dial:
+//!     [`crate::mitm::intercept`] receives that pre-validated
+//!     `resolve_public` address and connects only to it (re-checking the
+//!     filter), instead of independently re-resolving `host` — so a
+//!     DNS-rebind / multi-A private record cannot relocate the brokered
+//!     dial. The netstack never originates an upstream connection — nor
+//!     admits a back-ref allow, nor injects a brokered credential — to a
+//!     non-public address.
 //!   * **#2** — only allowlisted TCP (+ local DNS) is ever forwarded;
 //!     every other L3/L4 is already dropped by `frame::classify` and we
 //!     open none of it back up here.
@@ -136,12 +141,25 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_public_v4(v4);
     }
-    let s = ip.segments()[0];
+    let seg = ip.segments();
+    let s = seg[0];
     if (s & 0xffc0) == 0xfe80 {
         return false; // fe80::/10 link-local
     }
     if (s & 0xfe00) == 0xfc00 {
         return false; // fc00::/7 ULA
+    }
+    // 6to4 (2002::/16) embeds an IPv4 in segs[1..3]; judge by it so a
+    // private v4 can't tunnel out wrapped in a 6to4 address.
+    if s == 0x2002 {
+        let v4 = Ipv4Addr::from((u32::from(seg[1]) << 16) | u32::from(seg[2]));
+        return is_public_v4(v4);
+    }
+    // NAT64 well-known prefix (64:ff9b::/96) embeds an IPv4 in the low 32
+    // bits; judge by it for the same reason.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        let v4 = Ipv4Addr::from((u32::from(seg[6]) << 16) | u32::from(seg[7]));
+        return is_public_v4(v4);
     }
     true
 }
@@ -175,6 +193,15 @@ impl Net {
 /// it is publicly addressed. Over-broad / zero masks are skipped so a
 /// point-to-point or default-route interface can't accidentally forbid
 /// the whole internet.
+///
+/// Cache-at-start limitation: the set is discovered on first use and
+/// cached in this `OnceLock` for the process lifetime — never refreshed.
+/// A LAN attached *after* netstack start (e.g. plugging in a new
+/// interface / joining a new network) is therefore NOT treated as
+/// host-LAN until the process restarts. This only narrows the
+/// publicly-addressed-LAN reject; the RFC1918 / loopback / link-local /
+/// CGNAT / ULA ranges are always rejected by `is_public_ip` regardless
+/// of this cache, so invariant #1's core never depends on it.
 fn host_lan() -> &'static Vec<Net> {
     static LAN: OnceLock<Vec<Net>> = OnceLock::new();
     LAN.get_or_init(discover_host_lan)
@@ -415,7 +442,13 @@ fn forward_name(
                 // Replay the peeked ClientHello into rustls, which drives
                 // the handshake from the first byte.
                 let client = Prefixed::new(head, ext.clone());
-                let _ = crate::mitm::intercept(name, client, host, port, server_cfg, client_cfg, false);
+                // Thread the **pre-validated public addr** (from
+                // `resolve_public` above) into the interceptor so its
+                // upstream dial lands on the filtered target, NOT an
+                // independent re-resolution of `host` that a DNS rebind /
+                // multi-A private record could relocate (#1, brokered path).
+                let _ =
+                    crate::mitm::intercept(name, client, host, port, Some(addr), server_cfg, client_cfg, false);
                 ext.mark_ext_fin();
                 return;
             }
@@ -818,10 +851,22 @@ mod tests {
         ] {
             assert!(!is_public_ip(s.parse().unwrap()), "{s} must be non-public");
         }
-        for s in ["::1", "fe80::1", "fc00::1", "fd12:3456::1", "::ffff:10.0.0.1"] {
+        for s in [
+            "::1", "fe80::1", "fc00::1", "fd12:3456::1", "::ffff:10.0.0.1",
+            // 6to4 embedding a private v4: 2002:0a00:0001:: == 10.0.0.1.
+            "2002:0a00:0001::1",
+            // NAT64 well-known prefix embedding a private v4:
+            // 64:ff9b::c0a8:0101 == 192.168.1.1.
+            "64:ff9b::c0a8:0101",
+        ] {
             assert!(!is_public_ip(s.parse().unwrap()), "{s} must be non-public");
         }
         for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "140.82.121.3"] {
+            assert!(is_public_ip(s.parse().unwrap()), "{s} must be public");
+        }
+        // 6to4 / NAT64 embedding a PUBLIC v4 stays public (no over-block):
+        // 2002:0808:0808:: == 8.8.8.8; 64:ff9b::0808:0808 == 8.8.8.8.
+        for s in ["2002:0808:0808::1", "64:ff9b::0808:0808"] {
             assert!(is_public_ip(s.parse().unwrap()), "{s} must be public");
         }
         // is_forbidden_target subsumes is_public for non-public addrs.

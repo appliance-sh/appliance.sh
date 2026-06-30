@@ -319,11 +319,16 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
             // The client expects the tunnel up before its TLS hello.
             // intercept() records the decrypted request line itself.
             client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+            // No pre-validated addr on the legacy front door: `intercept`
+            // resolves `host:port` itself, but now rejects any forbidden
+            // (private/internal/host-LAN) result before dialing — a legit
+            // public CONNECT host resolves public, so it still works.
             return mitm::intercept(
                 &ctx.name,
                 client,
                 &host,
                 port,
+                None,
                 ctx.server_cfg.clone(),
                 ctx.client_cfg.clone(),
                 log,

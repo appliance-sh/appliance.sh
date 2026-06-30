@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -25,6 +25,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 
+use crate::netstack::guard::is_forbidden_target;
 use crate::spec::VmPaths;
 
 pub fn ca_cert_path(name: &str) -> PathBuf {
@@ -205,11 +206,24 @@ pub fn client_config() -> Result<Arc<ClientConfig>> {
 /// both the legacy CONNECT proxy (a `TcpStream`) and the netstack
 /// accept-path (a netstack flow whose peeked ClientHello is replayed in
 /// front of it) — one allow/deny + capture/inject core, no duplication.
+///
+/// `upstream` is the **pre-validated public `SocketAddr`** the netstack
+/// already filtered through [`is_forbidden_target`] (its `resolve_public`
+/// result). When `Some`, we dial **exactly that addr** — never re-resolve
+/// `host` — so a DNS rebind / multi-A private record can't relocate the
+/// dial after the credential decision (§8.1 #1 on the brokered path).
+/// When `None` (the legacy CONNECT front door) we resolve `host:port`
+/// here, but still reject any forbidden (private/internal/host-LAN)
+/// result. Either way the dial is gated by the private-range filter and
+/// `intercept` never originates — nor injects a brokered credential into
+/// a request — to a forbidden target.
+#[allow(clippy::too_many_arguments)]
 pub fn intercept<S: Read + Write>(
     name: &str,
     client_tcp: S,
     host: &str,
     port: u16,
+    upstream: Option<SocketAddr>,
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
     log: bool,
@@ -269,7 +283,11 @@ pub fn intercept<S: Read + Write>(
     };
 
     // Only now dial upstream — no wasted connection on a dead client.
-    let upstream_tcp = TcpStream::connect((host, port)).with_context(|| format!("connect {host}:{port}"))?;
+    // Dial the pre-validated public addr (netstack) or a freshly resolved
+    // public one (legacy CONNECT); never a forbidden target. The dial is
+    // reached only AFTER the injection decision above, so a refusal here
+    // returns before any credential is written upstream.
+    let upstream_tcp = dial_upstream(host, port, upstream)?;
     let sni = ServerName::try_from(host.to_string()).context("server name")?;
     let client_conn = ClientConnection::new(client_cfg, sni).context("client tls conn")?;
     let mut up_tls = StreamOwned::new(client_conn, upstream_tcp);
@@ -289,6 +307,48 @@ pub fn intercept<S: Read + Write>(
     std::io::copy(&mut up_tls, &mut client_tls).ok();
     client_tls.flush().ok();
     Ok(())
+}
+
+/// Pick the upstream `SocketAddr` to dial for an intercepted flow,
+/// gated by the §8.1 #1 private-range filter ([`is_forbidden_target`]).
+///
+/// A `validated` addr (the netstack's pre-filtered `resolve_public`
+/// result, threaded in) wins and is re-checked as defense-in-depth;
+/// otherwise we take the first **public, non-host-LAN** entry among
+/// `resolved` (the legacy CONNECT host-side resolution). Returns `None`
+/// — meaning "refuse the dial" — when nothing public is available, so a
+/// DNS rebind to a private addr, a multi-A record carrying a private
+/// entry, or a brokered name that resolves internal never becomes an
+/// upstream connection (and never receives the injected credential).
+fn pick_upstream(validated: Option<SocketAddr>, resolved: &[SocketAddr]) -> Option<SocketAddr> {
+    let addr = validated
+        .or_else(|| resolved.iter().copied().find(|a| !is_forbidden_target(a.ip())))?;
+    // Belt-and-suspenders: re-reject here so `intercept` never originates
+    // to a forbidden target on ANY path — including the legacy CONNECT
+    // front door. A legit public host resolves public ⇒ passes.
+    if is_forbidden_target(addr.ip()) {
+        return None;
+    }
+    Some(addr)
+}
+
+/// Dial the upstream for an intercepted flow. When the netstack threaded
+/// a pre-validated public addr, connect to exactly that (no re-resolve);
+/// otherwise resolve `host:port` host-side. Either way [`pick_upstream`]
+/// filters the candidate(s) through the private-range gate and we refuse
+/// rather than dial a forbidden target.
+fn dial_upstream(host: &str, port: u16, validated: Option<SocketAddr>) -> Result<TcpStream> {
+    let resolved: Vec<SocketAddr> = if validated.is_some() {
+        Vec::new()
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolve {host}:{port}"))?
+            .collect()
+    };
+    let addr = pick_upstream(validated, &resolved)
+        .with_context(|| format!("refusing intercept dial: {host}:{port} has no public upstream"))?;
+    TcpStream::connect(addr).with_context(|| format!("connect {addr}"))
 }
 
 /// Read an HTTP message head (through the blank line) from a stream.
@@ -513,5 +573,58 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         copy_chunked(&mut reader, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), body);
+    }
+
+    #[test]
+    fn pick_upstream_refuses_validated_private_addr() {
+        // The netstack belt-and-suspenders reject: even a "pre-validated"
+        // addr that turns out private/internal is refused, so `intercept`
+        // never originates to a forbidden target — and the dial fails
+        // BEFORE the credential injection write, so no cred is disclosed.
+        for s in ["10.0.0.5:443", "127.0.0.1:443", "192.168.1.9:443", "169.254.1.1:443"] {
+            let addr: SocketAddr = s.parse().unwrap();
+            assert_eq!(pick_upstream(Some(addr), &[]), None, "{s} must be refused");
+        }
+    }
+
+    #[test]
+    fn pick_upstream_legacy_refuses_private_resolution() {
+        // The legacy CONNECT front door: a brokered host that resolves
+        // host-side only to a private IP yields no public upstream ⇒
+        // refuse (no connect, no cred injection).
+        let resolved: [SocketAddr; 1] = ["10.0.0.9:443".parse().unwrap()];
+        assert_eq!(pick_upstream(None, &resolved), None);
+    }
+
+    #[test]
+    fn pick_upstream_multi_a_never_dials_private() {
+        // A multi-A name carrying one private and one public record: the
+        // private record is NEVER selected; the dial lands on the public
+        // one (order-independent).
+        let private: SocketAddr = "192.168.1.50:443".parse().unwrap();
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let picked = pick_upstream(None, &[private, public]).expect("a public upstream");
+        assert_eq!(picked, public);
+        assert_ne!(picked, private);
+        // Even if the private record sorts first.
+        assert_eq!(pick_upstream(None, &[private, public]), Some(public));
+    }
+
+    #[test]
+    fn pick_upstream_allows_legit_public_hosts() {
+        // No regression to A1/A2: a legit public host passes both the
+        // netstack (pre-validated) and the legacy (resolved) path.
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        assert_eq!(pick_upstream(Some(public), &[]), Some(public)); // netstack
+        assert_eq!(pick_upstream(None, &[public]), Some(public)); // legacy CONNECT
+    }
+
+    #[test]
+    fn dial_upstream_refuses_forbidden_host_without_connecting() {
+        // End-to-end on the legacy path: "localhost" resolves only to
+        // loopback (forbidden), so the dial is refused with no TcpStream
+        // ever opened — `intercept` would return before injecting a cred.
+        let err = dial_upstream("localhost", 443, None).unwrap_err();
+        assert!(err.to_string().contains("no public upstream"), "got: {err}");
     }
 }
