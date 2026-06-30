@@ -412,7 +412,7 @@ export function LocalRuntimeDeployPage() {
           error={runError}
           resultUrl={resultUrl}
           onRetry={runDeploy}
-          onDone={() => navigate('/local-runtime')}
+          onDone={() => navigate('/clusters')}
         />
       ) : null}
     </div>

@@ -11,6 +11,8 @@ import { DeploymentsPage } from '@/pages/deployments/list';
 import { DeploymentDetailPage } from '@/pages/deployments/detail';
 import { SettingsPage } from '@/pages/settings';
 import { LocalRuntimePage } from '@/pages/local-runtime';
+import { ClustersPage } from '@/pages/clusters';
+import { ClusterDetailPage } from '@/pages/clusters/detail';
 import { LocalRuntimeDeployPage } from '@/pages/local-runtime/deploy';
 import { BootstrapWizardPage } from '@/pages/bootstrap/wizard';
 import { BootstrapProgressPage } from '@/pages/bootstrap/progress';
@@ -50,12 +52,14 @@ export const routes: RouteObject[] = [
       { path: 'setup/bootstrap/run', element: <BootstrapProgressPage /> },
       { path: 'setup/doctor', element: <LocalRuntimePage /> },
 
-      // ② Clusters — list + adaptive `/clusters/:id` detail (dispatch on
-      // cluster kind lands in I2). For I1 both render the existing runtime
-      // page; its desktop-only bits are host.vm-gated inside the page, so
-      // this is safe on the web shell too.
-      { path: 'clusters', element: <LocalRuntimePage /> },
-      { path: 'clusters/:id', element: <LocalRuntimePage /> },
+      // ② Clusters — the live owner of cluster/runtime management (I2). The
+      // list (cloud clusters + local runtimes) and the single ADAPTIVE
+      // `/clusters/:id` detail that dispatches on cluster kind: cloud →
+      // lifecycle ops; local runtime → tabbed VM management (lifecycle /
+      // egress / credentials / facts). Desktop-only bits are host.vm-gated
+      // inside the pages, so this is safe on the web shell too.
+      { path: 'clusters', element: <ClustersPage /> },
+      { path: 'clusters/:id', element: <ClusterDetailPage /> },
 
       // ③ Projects — the Overview grid home, deploy wizard, project detail,
       // and Environments/Deployments folded UNDER the area as nested routes
@@ -66,8 +70,9 @@ export const routes: RouteObject[] = [
       { path: 'projects/:id', element: <ProjectDetailPage /> },
       { path: 'projects/:projectId/environments/:id', element: <EnvironmentDetailPage /> },
 
-      // ④ Agents — deferred to I4 (no backing page yet). The launcher lives
-      // on the runtime page today, so the stub redirects there.
+      // ④ Agents — deferred to I4 (no backing page yet). The launcher rides
+      // along in the ② runtime detail for now, so the stub redirects to the
+      // cluster list.
       { path: 'agents', element: <Navigate to="/clusters" replace /> },
 
       // ⑤ Settings
@@ -82,7 +87,11 @@ export const routes: RouteObject[] = [
       // drop the query / `location.state` the wizard + progress pages read.
       { path: 'bootstrap', element: <BootstrapWizardPage /> },
       { path: 'bootstrap/run', element: <BootstrapProgressPage /> },
-      { path: 'local-runtime', element: <LocalRuntimePage /> },
+      // ② now owns runtime management — the old runtimes page redirects to
+      // the cluster list (I2). The doctor preflight it used to host now
+      // stands alone at /setup/doctor (still rendered by LocalRuntimePage,
+      // slimmed to the Doctor host until I5 extracts a standalone page).
+      { path: 'local-runtime', element: <Navigate to="/clusters" replace /> },
       { path: 'local-runtime/deploy', element: <LocalRuntimeDeployPage /> },
       // Environments/Deployments lose their nav entries but keep their flat
       // routes so existing in-app links resolve (§2 / §8 Q2).

@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { NavLink, Outlet } from 'react-router';
-import { Wand, Server, Folder, Cog } from 'lucide-react';
+import { Wand, Server, Boxes, Folder, Cog } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
@@ -31,9 +31,11 @@ export function AppShell() {
   // only: Setup / Clusters / Projects / Settings (no Dashboard/Overview/
   // Runtimes drift). Clusters stays always-visible — its desktop-only
   // bits are host-gated inside the page, not hidden from the rail.
+  // Clusters uses `Boxes` (a distinct icon, not the brand mark's `Server`)
+  // so the nav item doesn't read as a second logo (Devon).
   const nav: NavItem[] = [
     ...(!isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
-    { to: '/clusters', label: 'Clusters', icon: Server },
+    { to: '/clusters', label: 'Clusters', icon: Boxes },
     { to: '/projects', label: 'Projects', icon: Folder },
     { to: '/settings', label: 'Settings', icon: Cog },
   ];
