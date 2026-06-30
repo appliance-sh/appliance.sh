@@ -1,5 +1,5 @@
 import type { RouteObject } from 'react-router';
-import { Navigate } from 'react-router';
+import { Navigate, useLocation } from 'react-router';
 import { AppShell } from '@/components/layout/app-shell';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { DashboardPage } from '@/pages/dashboard';
@@ -26,6 +26,16 @@ function LandingRedirect() {
   const { cluster, isLoading } = useSelectedCluster();
   if (isLoading) return null;
   return <Navigate to={cluster ? '/projects' : '/setup'} replace />;
+}
+
+// The deploy wizard's canonical home is ③ `/projects/deploy` (I3); the old
+// `/local-runtime/deploy` is an alias that redirects. It carries the deploy
+// intent in the query string (`?project=&environment=`), so we redirect
+// PRESERVING `location.search` — a bare `<Navigate>` would drop it and
+// dead-end the "Set up first deploy" links.
+function DeployAliasRedirect() {
+  const { search } = useLocation();
+  return <Navigate to={`/projects/deploy${search}`} replace />;
 }
 
 // Five-area IA route skeleton (I1). The shell + nav + routes are the new
@@ -92,7 +102,9 @@ export const routes: RouteObject[] = [
       // stands alone at /setup/doctor (still rendered by LocalRuntimePage,
       // slimmed to the Doctor host until I5 extracts a standalone page).
       { path: 'local-runtime', element: <Navigate to="/clusters" replace /> },
-      { path: 'local-runtime/deploy', element: <LocalRuntimeDeployPage /> },
+      // Deploy wizard moved to ③ /projects/deploy (I3); alias preserves the
+      // `?project=&environment=` intent on the redirect.
+      { path: 'local-runtime/deploy', element: <DeployAliasRedirect /> },
       // Environments/Deployments lose their nav entries but keep their flat
       // routes so existing in-app links resolve (§2 / §8 Q2).
       { path: 'environments', element: <EnvironmentsPage /> },

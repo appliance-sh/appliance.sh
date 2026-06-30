@@ -9,11 +9,14 @@ import { StatusDot } from '@/components/ui/status-dot';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useEnvironmentHealth } from '@/hooks/use-environment-health';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useHost } from '@/providers/host-provider';
 import { relativeTime } from '@/lib/time';
 import { urlForEnvironment } from '@/lib/deployment';
+import { microVmNameFromClusterId } from '@/lib/host';
 import { formatCpu, formatMemory, healthDotStatus, healthLabel } from '@/lib/health';
 import { EnvironmentHealthStatus, type Environment, type EnvironmentHealth } from '@appliance.sh/sdk/models';
+import { WorkloadsPanel } from './workloads-panel';
 
 // "pending" looks like in-flight but is also the initial status a
 // freshly-created environment has before any deployment runs, so we
@@ -31,6 +34,12 @@ export function EnvironmentDetailPage() {
   const host = useHost();
   const confirm = useConfirm();
   const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
+  // ③ env-detail absorbs the runtime Workloads surface (move-map 4a). It
+  // reads through the selected cluster's in-VM api-server, so it's only
+  // meaningful when the env's cluster is a local microVM runtime this shell
+  // can see (host.vm). Cloud / web env-detail keeps the Health section below.
+  const { cluster: selectedCluster } = useSelectedCluster();
+  const workloadsVmName = host.vm && selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
 
   const envQuery = useQuery({
     queryKey: ['environment', projectId, id],
@@ -110,7 +119,7 @@ export function EnvironmentDetailPage() {
     onError: (err) => setActionError(err instanceof Error ? err.message : String(err)),
   });
 
-  if (!projectId || !id) return <Navigate to="/environments" replace />;
+  if (!projectId || !id) return <Navigate to="/projects" replace />;
 
   const inFlight = env ? ENV_IN_FLIGHT.has(env.status) : false;
   const busy = deployMutation.isPending || destroyMutation.isPending || inFlight;
@@ -129,9 +138,11 @@ export function EnvironmentDetailPage() {
   return (
     <div className="space-y-6">
       <div>
+        {/* Nested under ③ Projects — back goes to the parent project, not the
+            flat /environments list, so the area reads coherently. */}
         <Button asChild variant="ghost" size="sm" className="-ml-2">
-          <Link to="/environments">
-            <ChevronLeft className="h-4 w-4" /> Environments
+          <Link to={`/projects/${projectId}`}>
+            <ChevronLeft className="h-4 w-4" /> {projectQuery.data?.name ?? 'Project'}
           </Link>
         </Button>
       </div>
@@ -170,7 +181,7 @@ export function EnvironmentDetailPage() {
                 // ever fail.
                 const hasImage = Boolean(env.lastDeployedAt);
                 if (!hasImage && canRunDeployWizard) {
-                  const target = `/local-runtime/deploy?project=${encodeURIComponent(
+                  const target = `/projects/deploy?project=${encodeURIComponent(
                     projectQuery.data?.name ?? env.projectId
                   )}&environment=${encodeURIComponent(env.name)}`;
                   return (
@@ -250,6 +261,14 @@ export function EnvironmentDetailPage() {
           </section>
 
           {env.lastDeployedAt ? <HealthSection health={healthQuery.data} loading={healthQuery.isLoading} /> : null}
+
+          {/* Runtime workloads (deployments / pods / services + live logs +
+              pod-shell), moved here from the runtimes page — it belongs with
+              the env that was deployed. Local microVM runtimes only; cloud /
+              web env-detail relies on the Health section above. */}
+          {workloadsVmName && selectedCluster ? (
+            <WorkloadsPanel clusterId={selectedCluster.id} vmName={workloadsVmName} />
+          ) : null}
 
           <section className="rounded-md border border-[var(--color-border)]">
             <div className="border-b border-[var(--color-border)] px-4 py-3">

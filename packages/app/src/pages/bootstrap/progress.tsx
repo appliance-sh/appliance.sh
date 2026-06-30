@@ -360,7 +360,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 // fails fast — the in-flight rung turns red and the error is surfaced
 // with a Retry. Lands on a clean "ready" state whose primary CTA leads
 // straight into the first deploy ("Deploy your first app" →
-// /local-runtime/deploy), with "Open dashboard" as the secondary action.
+// /projects/deploy), with "Open dashboard" as the secondary action.
 // ============================================================
 
 // The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
@@ -633,11 +633,11 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
             needed.
           </p>
           <div className="flex gap-2">
-            <Button onClick={() => navigate('/local-runtime/deploy')}>Deploy your first app</Button>
+            <Button onClick={() => navigate('/projects/deploy')}>Deploy your first app</Button>
             <Button variant="outline" onClick={() => navigate('/')}>
               Open dashboard
             </Button>
-            <Button variant="outline" onClick={() => navigate('/local-runtime')}>
+            <Button variant="outline" onClick={() => navigate('/clusters')}>
               Manage runtimes
             </Button>
           </div>

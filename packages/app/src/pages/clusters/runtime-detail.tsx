@@ -19,7 +19,12 @@ import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
 import { cn } from '@/lib/utils';
 import type { MicroVmStatus, MicroVmSummary } from '@/lib/host';
-import { DoctorPanel, LaunchAgentButton, WorkloadsPanel } from '@/pages/local-runtime';
+import { DoctorPanel, LaunchAgentButton } from '@/pages/local-runtime';
+// PARKER CONTINUITY: workloads moved to ③ env-detail in I3, but the
+// runtime-scoped "what's running on THIS engine, across all projects" view
+// stays reachable here as the ② cluster-detail Workloads tab — it imports the
+// same panel from its new home rather than being stranded or duplicated.
+import { WorkloadsPanel } from '@/pages/environments/workloads-panel';
 import { EgressPanel } from './egress-panel';
 import { CredentialsPanel } from './credentials-panel';
 
@@ -29,8 +34,9 @@ type RuntimeTab = 'lifecycle' | 'egress' | 'credentials' | 'facts' | 'workloads'
 // used to be the monolithic `MicroVmPanel` card on `/local-runtime`, now a
 // proper detail page rendered as TABS (Parker) — Lifecycle · Egress ·
 // Credentials · Facts — so the decomposition isn't undone in one long
-// scroll at the leaf. Workloads rides along as a 5th tab until I3 moves it
-// to ③ env-detail; the agent launcher rides along in Lifecycle until I4.
+// scroll at the leaf. Workloads is the runtime-scoped 5th tab (its panel now
+// lives in ③ env-detail; this is the deep-link to "what's running on THIS
+// engine"); the agent launcher rides along in Lifecycle until I4.
 //
 // THE EGRESS DOUBLE-FETCH FIX (docs/desktop-ia.md §5.5): the single
 // `['microvm', name, 'egress']` policy poll lives HERE and is passed down —
@@ -460,7 +466,8 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
         <MicroVmFacts apiServerUrl={status.apiServerUrl} clusterId={clusterId} summary={summary} />
       ) : null}
 
-      {/* Workloads rides along until I3 moves it to ③ env-detail. */}
+      {/* Runtime-scoped Workloads — the same panel ③ env-detail renders,
+          here filtered to this engine (Parker continuity). */}
       {activeTab === 'workloads' ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
     </div>
   );

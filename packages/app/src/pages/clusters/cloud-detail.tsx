@@ -763,6 +763,10 @@ function DestroyClusterPanel({ cluster }: { cluster: Cluster }) {
   const [logs, setLogs] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [awsProfile, setAwsProfile] = React.useState('');
+  // Type-the-cluster-name gate: destroying real AWS infra is irreversible, so
+  // arm the button only once the operator re-types the exact cluster name.
+  const [confirmName, setConfirmName] = React.useState('');
+  const nameConfirmed = confirmName.trim() === cluster.name;
 
   const profilesQuery = useQuery({
     queryKey: ['aws-profiles'],
@@ -828,10 +832,12 @@ function DestroyClusterPanel({ cluster }: { cluster: Cluster }) {
       <div>
         <div className="text-sm font-medium text-red-400">Destroy cluster</div>
         <div className="text-xs text-[var(--color-muted-foreground)]">
-          Tear down this cluster&apos;s base AWS infrastructure (the inverse of bootstrap) using the installer state on
-          this device. Destroy any deployed appliances first — they live in a separate Pulumi project and would
-          otherwise be orphaned. The local Pulumi state is archived, so the operation is reversible if something was
-          torn down by mistake.
+          Run <code className="font-mono">pulumi destroy</code> against this cluster&apos;s installer stack using the
+          state on this device — it tears down the <span className="font-medium">real AWS infrastructure</span> it
+          created (Route53 zone, CloudFront, ACM cert, edge router Lambda, S3 state + data buckets, ECR, IAM roles).
+          Destroy any deployed appliances first — they live in a separate Pulumi project and would otherwise be
+          orphaned. <span className="font-medium text-red-300">This cannot be undone</span> — archived Pulumi state
+          can&apos;t restore deleted AWS resources.
         </div>
       </div>
 
@@ -864,8 +870,24 @@ function DestroyClusterPanel({ cluster }: { cluster: Cluster }) {
         )}
       </label>
 
+      <label className="block space-y-1 text-xs">
+        <span className="text-[var(--color-muted-foreground)]">
+          Type <code className="font-mono text-[var(--color-foreground)]">{cluster.name}</code> to confirm
+        </span>
+        <input
+          type="text"
+          value={confirmName}
+          onChange={(e) => setConfirmName(e.target.value)}
+          placeholder={cluster.name}
+          autoComplete="off"
+          spellCheck={false}
+          disabled={status === 'running'}
+          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-sm disabled:opacity-50"
+        />
+      </label>
+
       <div className="flex items-center gap-2">
-        <Button variant="destructive" size="sm" onClick={onRun} disabled={status === 'running'}>
+        <Button variant="destructive" size="sm" onClick={onRun} disabled={status === 'running' || !nameConfirmed}>
           <Trash2 className="h-4 w-4" />
           {status === 'running' ? 'Destroying…' : 'Destroy cluster'}
         </Button>

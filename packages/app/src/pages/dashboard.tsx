@@ -1,13 +1,15 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
-import { useQuery, useQueries } from '@tanstack/react-query';
-import { Plug, Wand, Laptop, Plus, Search } from 'lucide-react';
+import { useMutation, useQuery, useQueries, useQueryClient } from '@tanstack/react-query';
+import { Plug, Wand, Laptop, Plus, Search, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { LiveUrl } from '@/components/ui/live-url';
 import { Skeleton } from '@/components/ui/skeleton';
 import { StatusDot } from '@/components/ui/status-dot';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -56,10 +58,27 @@ export function DashboardPage() {
 }
 
 // ---- the project grid (Vercel-style home) -------------------------------
+//
+// ③ Projects-area home (docs/desktop-ia.md §3, move-map 4c). The Vercel-style
+// card grid + health rollup + recent activity, now the canonical Projects
+// home — so it also owns the project CRUD the old `pages/projects.tsx`
+// (`ConnectedProjects`) carried: inline create + per-card delete + the live
+// URLs (the cards surface the primary live deployment; the project detail
+// lists every env's URL).
 
 function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: string }) {
   const client = useApplianceClient();
+  const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
   const [filter, setFilter] = React.useState('');
+
+  // Inline "New Project" create (folded in from ConnectedProjects) — the
+  // grid's New Project CTA used to dead-link back to /projects.
+  const [creating, setCreating] = React.useState(false);
+  const [newName, setNewName] = React.useState('');
+  const [newDescription, setNewDescription] = React.useState('');
+  const [mutationError, setMutationError] = React.useState<string | null>(null);
 
   const projectsQuery = useQuery({
     queryKey: ['projects'],
@@ -71,6 +90,53 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
     },
     refetchInterval: 10_000,
   });
+
+  const createMutation = useMutation({
+    mutationFn: async (input: { name: string; description?: string }) => {
+      const r = await client!.createProject(input);
+      if (!r.success) throw r.error;
+      return r.data;
+    },
+    onSuccess: (project) => {
+      setCreating(false);
+      setNewName('');
+      setNewDescription('');
+      setMutationError(null);
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      toast(`Project "${project.name}" created`);
+    },
+    onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (p: Project) => {
+      const r = await client!.deleteProject(p.id);
+      if (!r.success) throw r.error;
+      return p;
+    },
+    onSuccess: (p) => {
+      setMutationError(null);
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      toast(`Project "${p.name}" deleted`);
+    },
+    onError: (err) => setMutationError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const onCreate = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newName) return;
+    createMutation.mutate({ name: newName, description: newDescription || undefined });
+  };
+
+  const onDeleteProject = async (p: Project) => {
+    const ok = await confirm({
+      title: `Delete project "${p.name}"?`,
+      description: 'Its environments must already be destroyed.',
+      confirmLabel: 'Delete',
+    });
+    if (!ok) return;
+    deleteMutation.mutate(p);
+  };
 
   const environmentQueries = useQueries({
     queries: (projectsQuery.data ?? []).map((p) => ({
@@ -127,17 +193,62 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
               className="h-9 w-56 rounded-md border border-[var(--color-border)] bg-transparent pl-8 pr-3 text-sm placeholder:text-[var(--color-muted-foreground)] focus:border-[var(--color-border-strong)] focus:outline-none"
             />
           </div>
-          <Button asChild>
-            <Link to="/projects">
+          {!creating ? (
+            <Button onClick={() => setCreating(true)}>
               <Plus className="h-4 w-4" /> New Project
-            </Link>
-          </Button>
+            </Button>
+          ) : null}
         </div>
       </div>
 
-      {error ? (
+      {creating ? (
+        <form onSubmit={onCreate} className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+          <h2 className="text-sm font-semibold">New project</h2>
+          <label className="block space-y-1 text-sm">
+            <span className="text-[var(--color-muted-foreground)]">Name</span>
+            <input
+              type="text"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              pattern="[a-z][a-z0-9\-]*"
+              required
+              autoFocus
+              placeholder="my-project"
+              className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]"
+            />
+          </label>
+          <label className="block space-y-1 text-sm">
+            <span className="text-[var(--color-muted-foreground)]">Description (optional)</span>
+            <input
+              type="text"
+              value={newDescription}
+              onChange={(e) => setNewDescription(e.target.value)}
+              className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]"
+            />
+          </label>
+          <div className="flex gap-2">
+            <Button type="submit" disabled={createMutation.isPending}>
+              {createMutation.isPending ? 'Creating…' : 'Create'}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setCreating(false);
+                setNewName('');
+                setNewDescription('');
+                setMutationError(null);
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </form>
+      ) : null}
+
+      {mutationError || error ? (
         <div className="rounded-md border border-red-500/50 bg-red-500/5 p-3 text-xs text-red-400">
-          {error instanceof Error ? error.message : String(error)}
+          {mutationError ?? (error instanceof Error ? error.message : String(error))}
         </div>
       ) : null}
 
@@ -156,7 +267,13 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {visible.map((project) => (
-            <ProjectCard key={project.id} project={project} environments={envsByProject.get(project.id) ?? []} />
+            <ProjectCard
+              key={project.id}
+              project={project}
+              environments={envsByProject.get(project.id) ?? []}
+              onDelete={onDeleteProject}
+              deleting={deleteMutation.isPending}
+            />
           ))}
           {visible.length === 0 ? (
             <p className="col-span-full py-12 text-center text-sm text-[var(--color-muted-foreground)]">
@@ -173,7 +290,17 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
   );
 }
 
-function ProjectCard({ project, environments }: { project: Project; environments: Environment[] }) {
+function ProjectCard({
+  project,
+  environments,
+  onDelete,
+  deleting,
+}: {
+  project: Project;
+  environments: Environment[];
+  onDelete: (p: Project) => void;
+  deleting: boolean;
+}) {
   const client = useApplianceClient();
   // Card status mirrors the "worst interesting" environment state:
   // anything failed wins, else in-flight, else deployed.
@@ -211,39 +338,50 @@ function ProjectCard({ project, environments }: { project: Project; environments
   const summary = summarizeHealth(healthQueries.map((q) => q.data));
 
   return (
-    <Link
-      to={`/projects/${project.id}`}
-      className="group flex flex-col gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-5 transition-colors hover:border-[var(--color-border-strong)]"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate font-medium">{project.name}</span>
-        <StatusDot status={status} />
-      </div>
-      <div className="min-h-5 text-sm">
-        {live?.url ? (
-          <LiveUrl url={live.url} />
-        ) : (
-          <span className="text-[var(--color-muted-foreground)]">No live deployment</span>
-        )}
-      </div>
-      {summary ? (
-        <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
-          <StatusDot status={healthDotStatus(summary.status)} />
-          <span>{healthLabel(summary.status)}</span>
-          {summary.usage ? (
-            <span className="font-mono">
-              · {formatCpu(summary.usage.cpuMillicores)} · {formatMemory(summary.usage.memoryBytes)}
-            </span>
-          ) : null}
+    <div className="group relative flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] transition-colors hover:border-[var(--color-border-strong)]">
+      {/* Per-card delete (folded from ConnectedProjects) — a sibling of the
+          navigation Link, not nested inside it, so the markup stays valid.
+          Revealed on hover / keyboard focus. */}
+      <button
+        type="button"
+        aria-label={`Delete ${project.name}`}
+        disabled={deleting}
+        onClick={() => onDelete(project)}
+        className="absolute right-2 top-2 z-10 rounded p-1 text-[var(--color-muted-foreground)] opacity-0 transition-opacity hover:bg-[var(--color-muted)] hover:text-[var(--color-foreground)] focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-50"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
+      <Link to={`/projects/${project.id}`} className="flex flex-1 flex-col gap-3 p-5">
+        <div className="flex items-center justify-between gap-2 pr-6">
+          <span className="truncate font-medium">{project.name}</span>
+          <StatusDot status={status} />
         </div>
-      ) : null}
-      <div className="mt-auto flex items-center justify-between text-xs text-[var(--color-muted-foreground)]">
-        <span>
-          {environments.length} environment{environments.length === 1 ? '' : 's'}
-        </span>
-        <span>{lastDeployed ? `Updated ${relativeTime(lastDeployed)}` : 'Never deployed'}</span>
-      </div>
-    </Link>
+        <div className="min-h-5 text-sm">
+          {live?.url ? (
+            <LiveUrl url={live.url} />
+          ) : (
+            <span className="text-[var(--color-muted-foreground)]">No live deployment</span>
+          )}
+        </div>
+        {summary ? (
+          <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+            <StatusDot status={healthDotStatus(summary.status)} />
+            <span>{healthLabel(summary.status)}</span>
+            {summary.usage ? (
+              <span className="font-mono">
+                · {formatCpu(summary.usage.cpuMillicores)} · {formatMemory(summary.usage.memoryBytes)}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="mt-auto flex items-center justify-between text-xs text-[var(--color-muted-foreground)]">
+          <span>
+            {environments.length} environment{environments.length === 1 ? '' : 's'}
+          </span>
+          <span>{lastDeployed ? `Updated ${relativeTime(lastDeployed)}` : 'Never deployed'}</span>
+        </div>
+      </Link>
+    </div>
   );
 }
 
@@ -285,7 +423,7 @@ function summarizeHealth(
 function EmptyProjects() {
   const navigate = useNavigate();
   // A freshly-onboarded user with no projects gets a button, not just a
-  // command to copy. The deploy wizard (/local-runtime/deploy) find-or-creates
+  // command to copy. The deploy wizard (/projects/deploy) find-or-creates
   // the project + environment and writes the link itself, so there's no
   // separate "project setup" step — the CLI snippet stays as a secondary hint
   // for terminal-first users.
@@ -296,7 +434,7 @@ function EmptyProjects() {
         Pick an application folder with an <code className="font-mono">appliance.json</code> — the wizard creates the
         project, builds, and deploys in one step.
       </p>
-      <Button size="lg" onClick={() => navigate('/local-runtime/deploy')}>
+      <Button size="lg" onClick={() => navigate('/projects/deploy')}>
         Deploy your first app
       </Button>
       <p className="text-xs text-[var(--color-muted-foreground)]">
