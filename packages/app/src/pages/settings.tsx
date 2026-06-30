@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Check, RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
-import { AgentLoginPanel } from '@/components/agent-login';
+import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
 import { AGENT_ADAPTERS, DEFAULT_AGENT_TYPE } from '@/lib/agents';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
@@ -1176,6 +1176,10 @@ function UpdatesSection() {
 // so the panel's own layout isn't nested inside a `<dl>`.
 function AgentAuthSection() {
   const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
+  // Bumped on a successful login so the per-agent "signed in" dots refresh
+  // without a remount (Devon nit).
+  const [authBump, setAuthBump] = React.useState(0);
+  const signedIn = useAgentSignedIn(true, authBump);
   return (
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
       <div>
@@ -1185,7 +1189,7 @@ function AgentAuthSection() {
           brokered into the sandbox at request time; it never enters the VM.
         </p>
       </div>
-      <div role="group" aria-label="Agent" className="flex flex-wrap gap-1">
+      <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
         {AGENT_ADAPTERS.map((a) => {
           const active = a.type === agentType;
           return (
@@ -1193,7 +1197,7 @@ function AgentAuthSection() {
               key={a.type}
               type="button"
               aria-pressed={active}
-              title={a.blurb}
+              title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
               onClick={() => setAgentType(a.type)}
               className={cn(
                 'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors',
@@ -1203,11 +1207,17 @@ function AgentAuthSection() {
               )}
             >
               <a.Icon className="h-3.5 w-3.5" /> {a.label}
+              {/* Green dot = a credential is already stored for this agent
+                  (decorative; the "— signed in" title suffix is the a11y
+                  signal). */}
+              {signedIn[a.type] ? (
+                <span aria-hidden className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-green-400" />
+              ) : null}
             </button>
           );
         })}
       </div>
-      <AgentLoginPanel agentType={agentType} />
+      <AgentLoginPanel agentType={agentType} onAuthenticated={() => setAuthBump((n) => n + 1)} />
     </section>
   );
 }

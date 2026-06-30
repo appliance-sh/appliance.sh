@@ -380,7 +380,12 @@ export const codexAdapter: AgentAdapter = {
         opts.task ?? '',
       ];
     }
-    return ['codex']; // interactive TTY
+    // Interactive: `codex "<prompt>"` starts the TUI seeded with the user's
+    // task as the first prompt (per the recon — the positional arg with no
+    // `exec` subcommand stays interactive), mirroring `claude "<task>"`. The
+    // token is shQuoted by composeLaunchLine, so a multi-word task is safe.
+    // Without a task it's a bare interactive session.
+    return opts.task ? ['codex', opts.task] : ['codex'];
   },
   authModes: [
     // SAME kind as Claude api-key, DIFFERENT wire shape (Bearer, not bare) —

@@ -22,7 +22,7 @@ import {
 import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
-import { AgentLoginPanel } from '@/components/agent-login';
+import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
 import { AGENT_ADAPTERS, agentAdapter, agentLabel, DEFAULT_AGENT_TYPE } from '@/lib/agents';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions, mintAgentSessionId, agentSessionKey } from '@/providers/terminal-sessions-provider';
@@ -741,6 +741,11 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
   // before any await, so the second Enter is dropped.
   const launchingRef = React.useRef(false);
 
+  // Per-agent "signed in" dots on the picker (Devon nit): probe every agent's
+  // host store while the launcher is open, re-running after a login (keyed on
+  // the selected agent's `authStatus`) so a freshly-signed-in agent lights up.
+  const signedIn = useAgentSignedIn(open && Boolean(agentAuth), authStatus);
+
   // Refresh the SELECTED agent's credential status when the launcher opens,
   // when the agent type changes (each type has its own provider store), and
   // after a login or a keyless failure — so the gate reflects the live host
@@ -864,7 +869,7 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
             key={a.type}
             type="button"
             aria-pressed={active}
-            title={a.blurb}
+            title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
             disabled={busy}
             onClick={() => setAgentType(a.type)}
             className={cn(
@@ -875,6 +880,12 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
             )}
           >
             <a.Icon className="h-3.5 w-3.5" /> {a.label}
+            {/* A green dot marks an agent that already has a stored credential
+                (decorative; the "— signed in" suffix on the button title is
+                the accessible signal). */}
+            {signedIn[a.type] ? (
+              <span aria-hidden className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-green-400" />
+            ) : null}
           </button>
         );
       })}
@@ -948,6 +959,15 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
           Cancel
         </Button>
       </div>
+      {/* Task-box honesty (Parker): claude + codex seed the typed task as the
+          interactive TUI's first prompt; Copilot's interactive seeding is
+          unverified, so its task box only LABELS the tab — say so rather than
+          imply it runs. */}
+      {agentType === 'copilot' ? (
+        <p className="text-[10px] text-[var(--color-muted-foreground)]">
+          Copilot opens a fresh interactive session — a task here only labels the tab; it isn&rsquo;t run automatically.
+        </p>
+      ) : null}
       {/* A keyless failure flips the launcher to the login affordance above;
           any other error shows here as an alert. */}
       {err ? (

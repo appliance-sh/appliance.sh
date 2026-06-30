@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import type { AgentAuthKind, AgentAuthStatus } from '@/lib/host';
 import {
+  AGENT_ADAPTERS,
   agentAdapter,
   DEFAULT_AGENT_TYPE,
   GITHUB_FINE_GRAINED_PAT_SETTINGS_URL,
@@ -33,6 +34,43 @@ import { cn } from '@/lib/utils';
 // the VM — the egress broker injects it host-side at request time.
 
 const SETUP_TOKEN_CMD = 'claude setup-token';
+
+/**
+ * Best-effort `{ agentType → has a stored credential }` map, for the per-agent
+ * "signed in" dot on the agent-type pickers (launcher + Settings — Devon nit).
+ * Polls each registered agent's host store status when `enabled`; resolves
+ * empty (no dots) where the host has no `agentAuth` capability (web shell). The
+ * `refreshToken` re-runs the probe after a login so a freshly-signed-in agent
+ * lights up without a remount. NEVER reads the secret — `status()` is
+ * prompt-free.
+ */
+export function useAgentSignedIn(enabled: boolean, refreshToken?: unknown): Record<string, boolean> {
+  const auth = useHost().agentAuth;
+  const [map, setMap] = React.useState<Record<string, boolean>>({});
+  React.useEffect(() => {
+    if (!enabled || !auth) {
+      setMap({});
+      return;
+    }
+    let cancelled = false;
+    void Promise.all(
+      AGENT_ADAPTERS.map(async (a) => {
+        try {
+          const s = await auth.status(a.type);
+          return [a.type, s.configured] as const;
+        } catch {
+          return [a.type, false] as const;
+        }
+      })
+    ).then((entries) => {
+      if (!cancelled) setMap(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, auth, refreshToken]);
+  return map;
+}
 
 /** Pull the first `sk-ant-oat01-…` token out of a paste — mirrors the CLI's
  *  `extractOAuthToken` so a paste of the bare token OR the whole
@@ -519,6 +557,12 @@ function OpenAiKeyLogin({
         Paste an OpenAI API key (<code className="font-mono">sk-…</code>). It&rsquo;s brokered onto Codex&rsquo;s{' '}
         <code className="font-mono">api.openai.com</code> calls and never enters the VM. Get one from the OpenAI
         platform dashboard.
+      </p>
+      {/* Acknowledge the deferred ChatGPT-subscription path (docs §7): it
+          writes a durable refresh_token into the guest, so it isn't brokered
+          here yet — set the expectation rather than leaving a silent gap. */}
+      <p className="text-[10px] text-[var(--color-muted-foreground)]">
+        ChatGPT subscription login isn&rsquo;t supported here yet — use an API key.
       </p>
       <label className="block space-y-1">
         <span className="text-[var(--color-muted-foreground)]">API key</span>

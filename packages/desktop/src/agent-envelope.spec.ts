@@ -84,6 +84,46 @@ function parseStoredCredMirror(raw: string): StoredCred | null {
 const here = dirname(fileURLToPath(import.meta.url));
 const RUST_SRC = readFileSync(resolve(here, '../src-tauri/src/lib.rs'), 'utf-8');
 const CLI_SRC = readFileSync(resolve(here, '../../cli/src/utils/agent.ts'), 'utf-8');
+// The desktop UI's adapter registry is a THIRD producer of the type→provider
+// map (+ the github_pat_/ghp_ prefixes + the mirrored validateCopilotPat /
+// looksLikeOpenAiKey). It can't import the CLI module (node built-ins) so it
+// hand-mirrors those fields — guard the mirror against drifting from the CLI.
+const APP_SRC = readFileSync(resolve(here, '../../app/src/lib/agents.ts'), 'utf-8');
+
+/** The cross-source agent contract the CLI + App-UI registries share, per
+ *  agent type: the host cred-store `provider`, the App-UI `login` style, and
+ *  the CLI auth-mode `kind`(s) the login style maps onto. */
+const AGENTS = {
+  'claude-code': { provider: 'anthropic', appLogin: 'claude', cliKinds: ['api-key', 'oauth'] },
+  copilot: { provider: 'github-copilot', appLogin: 'github-pat', cliKinds: ['pat'] },
+  codex: { provider: 'openai', appLogin: 'openai-key', cliKinds: ['api-key'] },
+} as const;
+
+/** Slice one App-UI registry entry (`type: '<type>'` → its closing `},`) — the
+ *  entries have no nested braces, so the first `},` after the type IS the end.
+ *  Used to assert per-entry fields (provider/login) without a brittle whole-file
+ *  `toContain`. */
+function appAdapterBlock(type: string): string {
+  const start = APP_SRC.indexOf(`type: '${type}'`);
+  expect(start, `app adapter '${type}' not found`).toBeGreaterThanOrEqual(0);
+  const end = APP_SRC.indexOf('},', start);
+  return APP_SRC.slice(start, end < 0 ? undefined : end);
+}
+
+/** Slice a whole CLI adapter object (`export const <name>Adapter` → the next
+ *  top-level `export const`). The CLI adapters nest braces (install, authModes),
+ *  so we bound on the export markers rather than the first `},`. */
+const CLI_ADAPTER_CONST: Record<string, string> = {
+  'claude-code': 'claudeCodeAdapter',
+  copilot: 'copilotAdapter',
+  codex: 'codexAdapter',
+};
+function cliAdapterBlock(type: string): string {
+  const start = CLI_SRC.indexOf(`export const ${CLI_ADAPTER_CONST[type]}: AgentAdapter = {`);
+  expect(start, `CLI adapter for '${type}' not found`).toBeGreaterThanOrEqual(0);
+  const next = CLI_SRC.indexOf('\nexport const ', start + 1);
+  return CLI_SRC.slice(start, next < 0 ? undefined : next);
+}
 
 describe('agent-credential envelope round-trip', () => {
   it('round-trips every kind through the producer envelope', () => {
@@ -164,6 +204,41 @@ describe('TS producer/parser parity (packages/cli/src/utils/agent.ts)', () => {
   it('maps every agent type to its provider store key', () => {
     for (const provider of Object.values(CONTRACT.providers)) {
       expect(CLI_SRC).toContain(`provider: '${provider}'`);
+    }
+  });
+});
+
+describe('App-UI registry parity (packages/app/src/lib/agents.ts)', () => {
+  it('maps every agent type to the SAME provider store key as the CLI', () => {
+    for (const [type, { provider }] of Object.entries(AGENTS)) {
+      // Both the CONTRACT (already cross-checked vs Rust) and the CLI source
+      // agree on this provider…
+      expect(CONTRACT.providers[type]).toBe(provider);
+      expect(cliAdapterBlock(type)).toContain(`provider: '${provider}'`);
+      // …and the App-UI registry entry for THIS type maps to it too.
+      expect(appAdapterBlock(type)).toContain(`provider: '${provider}'`);
+    }
+  });
+
+  it('pairs each App-UI login style with the CLI auth-mode kind(s)', () => {
+    for (const [type, { appLogin, cliKinds }] of Object.entries(AGENTS)) {
+      expect(appAdapterBlock(type)).toContain(`login: '${appLogin}'`);
+      const cli = cliAdapterBlock(type);
+      for (const kind of cliKinds) expect(cli).toContain(`kind: '${kind}'`);
+    }
+  });
+
+  it('mirrors the github_pat_/ghp_ PAT prefixes byte-for-byte with the CLI', () => {
+    for (const src of [APP_SRC, CLI_SRC]) {
+      expect(src).toContain(`GITHUB_FINE_GRAINED_PAT_PREFIX = 'github_pat_'`);
+      expect(src).toContain(`GITHUB_CLASSIC_PAT_PREFIX = 'ghp_'`);
+    }
+  });
+
+  it('mirrors the OpenAI `sk-` key shape guard with the CLI', () => {
+    for (const src of [APP_SRC, CLI_SRC]) {
+      expect(src).toContain('export function looksLikeOpenAiKey');
+      expect(src).toContain(`.startsWith('sk-')`);
     }
   });
 });

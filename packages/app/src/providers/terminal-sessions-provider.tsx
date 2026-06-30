@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { useHost } from '@/providers/host-provider';
+import { agentLabel } from '@/lib/agents';
 import type { TerminalSession } from '@/lib/host';
 
 // App-root store for live terminal sessions (E3.2).
@@ -187,8 +188,10 @@ const TerminalSessionsContext = React.createContext<TerminalSessionsContextValue
 
 function deriveTitle(opts: OpenTerminalOptions): string {
   if (opts.title) return opts.title;
-  // An agent tab reads as the agent, not the host shell it rides on.
-  if (opts.agent) return `Agent · ${opts.agent.type}`;
+  // An agent tab reads as the agent, not the host shell it rides on — use the
+  // human label ("Claude Code"), not the raw `--type` key, for parity with the
+  // launcher + the tab tooltip.
+  if (opts.agent) return `Agent · ${agentLabel(opts.agent.type)}`;
   const base = opts.engine === 'microvm' ? 'Terminal · microVM' : 'Terminal';
   if (opts.mode === 'dev') return `${base} · dev workspace`;
   if (opts.mode === 'host') return `${base} · host`;
@@ -606,7 +609,9 @@ export function TerminalSessionsProvider({ children }: { children: React.ReactNo
               sessionKey: agentSessionKey(s.id),
               sessionId: s.id,
               agent: { type, status, mode: info?.mode },
-              title: info?.task ? `Agent · ${info.task}` : `Agent · ${type} (reattached)`,
+              // Use the human label ("GitHub Copilot"), not the raw `--type`
+              // key, for parity with the launcher's `Agent · <label>`.
+              title: info?.task ? `Agent · ${info.task}` : `Agent · ${agentLabel(type)} (reattached)`,
               background: true,
             });
             continue;

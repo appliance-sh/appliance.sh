@@ -454,6 +454,10 @@ describe('codexAdapter (G2 — api-key Bearer, json capture)', () => {
 
   it('launches `codex exec --json … --dangerously-bypass-approvals-and-sandbox` autonomously', () => {
     expect(codexAdapter.launchArgv({ mode: 'interactive' })).toEqual(['codex']);
+    // Interactive WITH a task seeds the TUI's first prompt (`codex "<task>"`),
+    // mirroring `claude "<task>"` — the task box runs rather than silently
+    // labelling the tab only.
+    expect(codexAdapter.launchArgv({ mode: 'interactive', task: 'fix it' })).toEqual(['codex', 'fix it']);
     expect(codexAdapter.launchArgv({ mode: 'autonomous', task: 'fix it' })).toEqual([
       'codex',
       'exec',

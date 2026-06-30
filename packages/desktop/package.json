@@ -31,6 +31,14 @@
           "{projectRoot}/dist",
           "{projectRoot}/sidecar/dist"
         ]
+      },
+      "test": {
+        "inputs": [
+          "default",
+          "{workspaceRoot}/packages/cli/src/utils/agent.ts",
+          "{workspaceRoot}/packages/app/src/lib/agents.ts",
+          "{workspaceRoot}/packages/desktop/src-tauri/src/lib.rs"
+        ]
       }
     }
   },
