@@ -32,6 +32,11 @@ pub enum Phase {
     /// k3s is coming up — on first boot this installs packages and pulls
     /// the registry/traefik images, which is the slow part.
     Cluster,
+    /// Agent-only VMs: preparing the agent runtime (the Node toolchain +
+    /// the vsock shell). Replaces `Cluster` when the spec is agent-only —
+    /// there is no k3s control plane to wait on, just the runtime an agent
+    /// actually rides.
+    Agent,
     /// kubeconfig fetched and the cluster answers. Terminal success.
     Ready,
     /// Bring-up failed; `detail` carries the reason. Terminal.
@@ -46,6 +51,7 @@ impl Phase {
             Phase::Booting => "booting guest",
             Phase::Network => "guest network up",
             Phase::Cluster => "starting k3s (first boot pulls images — can take a few minutes)",
+            Phase::Agent => "preparing agent runtime (node + shell)",
             Phase::Ready => "cluster ready",
             Phase::Failed => "bring-up failed",
         }
@@ -131,6 +137,7 @@ mod tests {
     fn phase_serializes_kebab_case_for_the_ui() {
         // The desktop reads these strings off `status` — pin the wire form.
         assert_eq!(serde_json::to_string(&Phase::Cluster).unwrap(), "\"cluster\"");
+        assert_eq!(serde_json::to_string(&Phase::Agent).unwrap(), "\"agent\"");
         assert_eq!(serde_json::to_string(&Phase::Ready).unwrap(), "\"ready\"");
         assert_eq!(serde_json::to_string(&Phase::Failed).unwrap(), "\"failed\"");
     }
@@ -142,6 +149,7 @@ mod tests {
             Phase::Booting,
             Phase::Network,
             Phase::Cluster,
+            Phase::Agent,
             Phase::Ready,
             Phase::Failed,
         ] {

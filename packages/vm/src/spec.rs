@@ -76,6 +76,21 @@ pub struct VmSpec {
     /// turned back off.
     #[serde(default)]
     pub docker: bool,
+    /// When set, this VM provisions NO k3s control plane: the guest
+    /// bootstrap skips the `k3s server` / registry / kubeconfig-handoff
+    /// block, and `up` gates on the agent runtime (the vsock shell + the
+    /// Node toolchain) instead of `kubeconfig.yaml`. The vsock shell
+    /// agent, egress proxy, clock-sync and dev toolchain are unaffected
+    /// (they are k3s-independent). The sandbox VM (`appliance-sbx`) is
+    /// always agent-only; the deploy VM `appliance` never is.
+    ///
+    /// Invariant: `agent_only ⟹ dev`. The agent-handoff readiness gate
+    /// waits on `/persist/.dev-ready` (written by the dev toolchain
+    /// install), so an agent-only VM must also be a dev VM — the CLI
+    /// forces `dev = true` whenever it sets this. A plain `vm up` leaves
+    /// it false; one-way, like `dev`/`docker`.
+    #[serde(default)]
+    pub agent_only: bool,
     /// Container ports published from the in-guest Docker engine, each
     /// mapped to a host loopback port drawn from this VM's allocated
     /// block (see `allocate_published_port`). `host_services` reads this
@@ -168,6 +183,7 @@ impl VmSpec {
             dev: false,
             dev_mount: None,
             docker: false,
+            agent_only: false,
             published: Vec::new(),
             net_link: NetLink::Nat,
         }
@@ -319,6 +335,13 @@ impl VmPaths {
     }
     pub fn kubeconfig(&self) -> PathBuf {
         self.dir.join("kubeconfig.yaml")
+    }
+    /// The readiness marker an agent-only VM writes once its agent
+    /// runtime (vsock shell + Node) answers — the sibling of
+    /// `kubeconfig()` that `up`/`status`/`list` poll on for an agent-only
+    /// spec (there is no k3s kubeconfig to wait for).
+    pub fn agent_ready(&self) -> PathBuf {
+        self.dir.join("agent-ready")
     }
     pub fn guest_ip(&self) -> PathBuf {
         self.dir.join("guest-ip")
@@ -538,5 +561,33 @@ mod tests {
         let default_json = serde_json::to_string(&VmSpec::defaults("x")).unwrap();
         let back: VmSpec = serde_json::from_str(&default_json).unwrap();
         assert!(!back.docker);
+    }
+
+    #[test]
+    fn agent_only_flag_defaults_off_and_round_trips() {
+        // A legacy spec predates the agent_only flag — it must parse to
+        // false (the unchanged k3s path), not fail.
+        let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
+        let spec: VmSpec = serde_json::from_str(legacy).unwrap();
+        assert!(!spec.agent_only, "legacy specs are not agent-only");
+        // A fresh default spec is not agent-only either.
+        assert!(!VmSpec::defaults("x").agent_only);
+
+        // The flag serializes as camelCase `agentOnly` and round-trips.
+        let mut spec = VmSpec::defaults("x");
+        spec.agent_only = true;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"agentOnly\":true"), "wire form is camelCase agentOnly");
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.agent_only, "agent_only must survive a JSON round-trip");
+    }
+
+    #[test]
+    fn agent_ready_marker_is_a_sibling_of_kubeconfig() {
+        // The agent-only readiness marker lives next to kubeconfig.yaml in
+        // the same VM dir — `up` polls one or the other per spec.
+        let paths = VmPaths::for_name("x");
+        assert_eq!(paths.agent_ready().parent(), paths.kubeconfig().parent());
+        assert_eq!(paths.agent_ready().file_name().unwrap(), "agent-ready");
     }
 }

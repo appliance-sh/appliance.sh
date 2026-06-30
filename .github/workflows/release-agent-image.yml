@@ -1,0 +1,186 @@
+name: Release prebuilt agent image
+
+# Builds the prebuilt agent image (docs/fast-spin-up.md §2): Node ≥22 + the
+# three pinned agent CLIs baked, per arch, into a read-only squashfs, hosted
+# as a GitHub release asset and fetched + hash-verified by the VM manager at
+# boot. The artifact is PINNED, not the build: exact versions in, the
+# resulting sha256 committed in-source (packages/vm/src/images.rs) as the
+# contract. CI asserts the adapter pins (agent.ts) equal what it bakes, so
+# they can never drift silently, and attests build provenance on each asset.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create/attach the GitHub release (agent-image-v<ver>). Off → build + digest only.'
+        type: boolean
+        required: false
+        default: false
+  # A deliberate version bump pushes the tag; that publishes the artifacts.
+  push:
+    tags:
+      - 'agent-image-v*'
+
+permissions:
+  contents: write # upload release assets
+  id-token: write # build provenance (OIDC)
+  attestations: write # actions/attest-build-provenance
+
+concurrency:
+  group: release-agent-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build agent squashfs (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    # Build inside the official Node ≥22 Alpine image: the baked `node` is
+    # then MUSL-linked, matching the Alpine guest (a glibc node from
+    # nodejs.org would not run in the microVM). node:22-alpine is multi-arch,
+    # so each runner pulls its own arch.
+    container:
+      image: node:22-alpine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: apk add --no-cache squashfs-tools coreutils git bash grep
+
+      - name: Resolve the pinned versions (adapter + image)
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          AGENT_TS=packages/cli/src/utils/agent.ts
+          IMAGES_RS=packages/vm/src/images.rs
+          # The single source of truth for the CLI pins is the adapter table;
+          # extract each install.version so CI bakes EXACTLY the reviewed pins.
+          claude=$(grep -oP "@anthropic-ai/claude-code', version: '\K[^']+" "$AGENT_TS")
+          copilot=$(grep -oP "@github/copilot', version: '\K[^']+" "$AGENT_TS")
+          codex=$(grep -oP "@openai/codex', version: '\K[^']+" "$AGENT_TS")
+          ver=$(grep -oP 'AGENT_IMAGE_VERSION: &str = "\K[^"]+' "$IMAGES_RS")
+          for v in "$claude" "$copilot" "$codex" "$ver"; do
+            [ -n "$v" ] || { echo "::error::failed to resolve a pin from source"; exit 1; }
+          done
+          {
+            echo "claude=$claude"
+            echo "copilot=$copilot"
+            echo "codex=$codex"
+            echo "image_version=$ver"
+          } >> "$GITHUB_OUTPUT"
+          echo "claude-code=$claude  copilot=$copilot  codex=$codex  image=$ver"
+
+      - name: Install the pinned CLIs + Node into the stage prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE=/build/agents
+          mkdir -p "$STAGE/bin"
+          npm install -g --prefix "$STAGE" \
+            "@anthropic-ai/claude-code@${{ steps.pins.outputs.claude }}" \
+            "@github/copilot@${{ steps.pins.outputs.copilot }}" \
+            "@openai/codex@${{ steps.pins.outputs.codex }}"
+          # Bake the build container's Node ≥22 (musl) so the guest never
+          # depends on apk `nodejs` (Alpine v3.21 may ship < 22, breaking
+          # copilot/codex). The CLI shebangs are `#!/usr/bin/env node`; with
+          # this on PATH-first in the guest they resolve to the baked node.
+          cp "$(command -v node)" "$STAGE/bin/node"
+          node --version
+
+      - name: Emit the SBOM / npm ls manifest and assert pins == baked
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE=/build/agents
+          MAN="appliance-agents-${{ matrix.arch }}-${{ steps.pins.outputs.image_version }}.manifest.json"
+          # The audit manifest: exact installed versions of the whole global
+          # tree + the baked node.
+          npm ls --global --prefix "$STAGE" --json --all > "$MAN" || true
+          node -e '
+            const fs = require("fs");
+            const man = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const deps = man.dependencies || {};
+            const want = {
+              "@anthropic-ai/claude-code": process.env.CLAUDE,
+              "@github/copilot": process.env.COPILOT,
+              "@openai/codex": process.env.CODEX,
+            };
+            let bad = false;
+            for (const [pkg, pin] of Object.entries(want)) {
+              const got = deps[pkg] && deps[pkg].version;
+              if (got !== pin) {
+                console.error(`::error::baked ${pkg}@${got} != adapter pin @${pin}`);
+                bad = true;
+              } else {
+                console.log(`ok  ${pkg}@${got} == adapter pin`);
+              }
+            }
+            if (bad) process.exit(1);
+          ' "$MAN"
+        env:
+          CLAUDE: ${{ steps.pins.outputs.claude }}
+          COPILOT: ${{ steps.pins.outputs.copilot }}
+          CODEX: ${{ steps.pins.outputs.codex }}
+
+      - name: Pack the read-only squashfs + compute the digest
+        id: squashfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="appliance-agents-${{ matrix.arch }}-${{ steps.pins.outputs.image_version }}.squashfs"
+          # zstd for size, -no-xattrs for reproducibility across hosts, all-root
+          # ownership so the guest mount is uniform.
+          mksquashfs /build/agents "$OUT" -comp zstd -no-xattrs -all-root -noappend
+          DIGEST=$(sha256sum "$OUT" | cut -d' ' -f1)
+          echo "$DIGEST  $OUT" | tee "$OUT.sha256"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Agent image \`${{ matrix.arch }}\`"
+            echo ""
+            echo "- artifact: \`$OUT\`"
+            echo "- sha256: \`$DIGEST\`"
+            echo ""
+            echo "Commit this digest into \`packages/vm/src/images.rs\` as"
+            echo "\`AGENT_IMAGE_SHA256_$(echo ${{ matrix.arch }} | tr a-z A-Z)\` (the version-bump commit, §2.7)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance (Sasha #4)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.squashfs.outputs.out }}
+
+      - name: Upload workflow artifacts (always — digest + manifest for review)
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-image-${{ matrix.arch }}
+          path: |
+            appliance-agents-${{ matrix.arch }}-*.squashfs
+            appliance-agents-${{ matrix.arch }}-*.squashfs.sha256
+            appliance-agents-${{ matrix.arch }}-*.manifest.json
+
+      - name: Publish to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/agent-image-v') || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="agent-image-v${{ steps.pins.outputs.image_version }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" \
+              --notes "Prebuilt agent image: Node ≥22 + pinned claude-code/copilot/codex (read-only squashfs, per arch). Digests are committed in packages/vm/src/images.rs."
+          fi
+          gh release upload "$TAG" --clobber \
+            "${{ steps.squashfs.outputs.out }}" \
+            "${{ steps.squashfs.outputs.out }}.sha256" \
+            appliance-agents-${{ matrix.arch }}-*.manifest.json
