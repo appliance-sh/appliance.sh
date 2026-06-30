@@ -146,6 +146,13 @@ struct Bridge {
 /// memory when the guest is slow.
 const EXT_TO_GUEST_HIGH_WATER: usize = 256 * 1024;
 
+/// Symmetric cap on the bytes buffered *from* the guest (what the guest
+/// sent, awaiting the ext side). The engine stops draining smoltcp's recv
+/// buffer once `guest_to_ext` reaches this, so smoltcp's receive window
+/// closes and the guest is backpressured — a guest blasting a slow/stalled
+/// upstream can't balloon host memory unbounded (memory-DoS guard, F5).
+pub(super) const GUEST_TO_EXT_HIGH_WATER: usize = 256 * 1024;
+
 /// The external (non-guest) end of a [`Bridge`], exposed as a blocking
 /// `Read + Write` stream so the existing proxy/pump code can treat a
 /// netstack flow exactly like a `TcpStream`. Cloneable so a reader and a

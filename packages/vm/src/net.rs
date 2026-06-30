@@ -71,31 +71,6 @@ fn parse_leases(raw: &str, mac: &str) -> Result<Option<IpAddr>> {
     Ok(None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LEASES: &str = "{\n\tname=appliance\n\tip_address=192.168.64.7\n\thw_address=1,5e:94:ef:e4:c:ee\n\tlease=0x12345\n}\n{\n\tname=other\n\tip_address=192.168.64.2\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
-
-    #[test]
-    fn finds_lease_with_zero_stripped_octets() {
-        // The lease file writes `c` where the spec MAC says `0c`.
-        let ip = parse_leases(LEASES, "5e:94:ef:e4:0c:ee").unwrap();
-        assert_eq!(ip, Some("192.168.64.7".parse().unwrap()));
-    }
-
-    #[test]
-    fn misses_unknown_mac() {
-        let ip = parse_leases(LEASES, "02:00:00:00:00:01").unwrap();
-        assert_eq!(ip, None);
-    }
-
-    #[test]
-    fn rejects_invalid_mac() {
-        assert!(parse_leases(LEASES, "not-a-mac").is_err());
-    }
-}
-
 /// Poll the lease table until the VM's MAC shows up (the guest DHCPs
 /// early in initramfs, so this resolves within a few seconds of boot).
 pub fn discover_guest_ip(mac: &str, timeout: Duration) -> Result<IpAddr> {
@@ -253,3 +228,28 @@ pub fn wait_http(url: &str, timeout: Duration) -> Result<()> {
 fn _unused(_: fn(&mut dyn Read, &mut dyn Write)) {}
 #[allow(dead_code)]
 fn _unused_path(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEASES: &str = "{\n\tname=appliance\n\tip_address=192.168.64.7\n\thw_address=1,5e:94:ef:e4:c:ee\n\tlease=0x12345\n}\n{\n\tname=other\n\tip_address=192.168.64.2\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
+
+    #[test]
+    fn finds_lease_with_zero_stripped_octets() {
+        // The lease file writes `c` where the spec MAC says `0c`.
+        let ip = parse_leases(LEASES, "5e:94:ef:e4:0c:ee").unwrap();
+        assert_eq!(ip, Some("192.168.64.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn misses_unknown_mac() {
+        let ip = parse_leases(LEASES, "02:00:00:00:00:01").unwrap();
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn rejects_invalid_mac() {
+        assert!(parse_leases(LEASES, "not-a-mac").is_err());
+    }
+}

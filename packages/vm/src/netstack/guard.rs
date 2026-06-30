@@ -447,8 +447,8 @@ fn forward_name(
                 // upstream dial lands on the filtered target, NOT an
                 // independent re-resolution of `host` that a DNS rebind /
                 // multi-A private record could relocate (#1, brokered path).
-                let _ =
-                    crate::mitm::intercept(name, client, host, port, Some(addr), server_cfg, client_cfg, false);
+                let target = crate::mitm::MitmTarget { host, port, upstream: Some(addr) };
+                let _ = crate::mitm::intercept(name, client, target, server_cfg, client_cfg, false);
                 ext.mark_ext_fin();
                 return;
             }
@@ -509,21 +509,71 @@ fn log_deny(name: &str, label: &str, port: u16, reason: &str) {
     eprintln!("egress: DENY {label}:{port} ({reason})");
 }
 
-/// Bounded, host-side re-resolution of a validated name. Resolves on a
-/// helper thread so a slow resolver can neither stall the flow nor act as
-/// an internal-host timing oracle (#1). Returns the first **public,
-/// non-host-LAN** address; `None` if it resolves only to forbidden
-/// targets, fails, or times out (all ⇒ deny).
+/// Size of the shared resolver worker pool. A hung host `getaddrinfo`
+/// wedges at most this many threads process-wide — never one-per-flow.
+const RESOLVER_WORKERS: usize = 8;
+
+/// One host-resolution job submitted to the [`resolver_pool`]: resolve
+/// `host:port` and post the addresses back on `reply` (whose receiver may
+/// have already timed out — the worker tolerates a dropped receiver).
+struct ResolveJob {
+    host: String,
+    port: u16,
+    reply: mpsc::Sender<Vec<SocketAddr>>,
+}
+
+/// A small, process-wide **bounded** pool of resolver worker threads.
+///
+/// The host `getaddrinfo` (`to_socket_addrs`) can hang indefinitely on a
+/// slow/hostile resolver. Running it on a detached thread-per-flow leaks
+/// one thread per allowed flow whenever it hangs (the bug this replaces).
+/// Instead, resolutions are submitted to a fixed set of workers and the
+/// caller bounds its wait with a timeout: a hung resolver can wedge at most
+/// `RESOLVER_WORKERS` threads, reused across every flow, never growing
+/// without bound. The pool is created once and lives for the process.
+fn resolver_pool() -> &'static mpsc::Sender<ResolveJob> {
+    static POOL: OnceLock<mpsc::Sender<ResolveJob>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ResolveJob>();
+        // Workers share one queue via a Mutex<Receiver>; each locks only to
+        // dequeue, then releases the lock BEFORE the (possibly slow)
+        // getaddrinfo, so a hung resolution never blocks the others.
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..RESOLVER_WORKERS {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name("egress-resolver".into())
+                .spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
+                        match guard.recv() {
+                            Ok(job) => job,
+                            Err(_) => return, // channel closed — pool gone
+                        }
+                    };
+                    let addrs = (job.host.as_str(), job.port)
+                        .to_socket_addrs()
+                        .map(|it| it.collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    // The caller may have timed out and dropped its
+                    // receiver; that's fine — drop the result and loop.
+                    let _ = job.reply.send(addrs);
+                });
+        }
+        tx
+    })
+}
+
+/// Bounded, host-side re-resolution of a validated name. Resolves on the
+/// shared, **bounded** resolver pool (above) — never a per-flow detached
+/// thread — so a slow resolver can neither stall the flow, leak a thread,
+/// nor act as an internal-host timing oracle (#1). Returns the first
+/// **public, non-host-LAN** address; `None` if it resolves only to
+/// forbidden targets, fails, or times out (all ⇒ deny).
 fn resolve_public(host: &str, port: u16, timeout: Duration) -> Option<SocketAddr> {
-    let h = host.to_string();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let addrs = (h.as_str(), port)
-            .to_socket_addrs()
-            .map(|it| it.collect::<Vec<_>>())
-            .unwrap_or_default();
-        let _ = tx.send(addrs);
-    });
+    let job = ResolveJob { host: host.to_string(), port, reply: tx };
+    resolver_pool().send(job).ok()?;
     let addrs = rx.recv_timeout(timeout).ok()?;
     addrs.into_iter().find(|a| !is_forbidden_target(a.ip()))
 }
@@ -918,6 +968,35 @@ mod tests {
         assert!(resolve_public("localhost", 443, Duration::from_secs(3)).is_none());
         // A name that cannot resolve ⇒ None, bounded by the timeout.
         assert!(resolve_public("nonexistent.invalid.", 443, Duration::from_secs(3)).is_none());
+    }
+
+    #[test]
+    fn resolver_pool_is_bounded_and_reaped() {
+        // Submit many more jobs than there are workers: every one must be
+        // serviced, which proves the fixed worker set is REUSED (reaped
+        // back to the queue) rather than leaking a thread per job. A reply
+        // receiver dropped mid-flight (the caller timed out) must not wedge
+        // a worker — the next job still gets through.
+        let jobs = RESOLVER_WORKERS * 4;
+        let mut rxs = Vec::with_capacity(jobs);
+        for i in 0..jobs {
+            let (tx, rx) = mpsc::channel();
+            resolver_pool()
+                .send(ResolveJob { host: "localhost".into(), port: 80, reply: tx })
+                .unwrap();
+            // Drop a few receivers immediately to model a timed-out caller.
+            if i % 5 == 0 {
+                drop(rx);
+            } else {
+                rxs.push(rx);
+            }
+        }
+        for rx in rxs {
+            assert!(
+                rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "every queued resolution is serviced by the bounded pool"
+            );
+        }
     }
 
     #[test]

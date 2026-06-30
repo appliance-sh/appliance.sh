@@ -16,14 +16,14 @@ use super::{Bridge, BridgeStream, ConnectRequest, LinkConfig, Netstack};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// SO_SNDBUF on the link ends. Apple wants SO_RCVBUF ≥ 2× (ideally 4×)
 /// SO_SNDBUF for the file-handle attachment (§2.3).
@@ -36,6 +36,27 @@ const RX_BATCH: usize = 256;
 /// Loop wait cap (ms): bounds added latency for bridge data that
 /// smoltcp's own `poll_delay` can't see. Throughput tuning is F5.
 const WAIT_CAP_MS: i32 = 5;
+
+/// Cap on concurrent terminated guest flows (SYN-flood guard, F5). Each
+/// guest SYN eagerly allocates a 2×`TCP_BUF` (128 KiB) socket; a SYN-flood
+/// across distinct 4-tuples would balloon socket memory before smoltcp's
+/// retransmit/timeout reaps the half-open sockets. Past this many live
+/// flows we refuse new SYNs (drop the frame — no socket is allocated; the
+/// guest's stack retransmits then aborts), bounding worst-case smoltcp
+/// socket memory to `MAX_CONCURRENT_FLOWS × 2×TCP_BUF`.
+const MAX_CONCURRENT_FLOWS: usize = 1024;
+/// Per-flow idle timeout. A flow with no packets for this long is reset —
+/// including a half-open SYN-flood socket stuck in `SYN_RECEIVED` — so the
+/// eagerly-allocated sockets a flood leaves behind don't linger. Generous
+/// enough that a live, keep-alive'd peer never trips it.
+const FLOW_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
+/// Keep-alive probe interval on established flows. Probes elicit ACKs that
+/// reset the idle timeout for a *live* peer (so `FLOW_IDLE_TIMEOUT` reaps
+/// only dead/half-open sockets) and surface a dead upstream.
+const FLOW_KEEPALIVE: SmolDuration = SmolDuration::from_secs(30);
+/// Rate-limit on the SYN-flood-refusal log so a flood can't also flood the
+/// host log.
+const FLOW_CAP_LOG_EVERY: Duration = Duration::from_secs(5);
 
 /// Create the `socketpair(AF_UNIX, SOCK_DGRAM)` link. Returns
 /// `(host_fd, vz_fd)`: the host end (owned by the netstack, made
@@ -182,10 +203,69 @@ struct Flow {
 }
 
 fn tcp_socket() -> tcp::Socket<'static> {
-    tcp::Socket::new(
+    let mut sock = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
         tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
-    )
+    );
+    // Reap half-open / dead flows (SYN-flood guard + dead-upstream
+    // detection): an idle timeout plus keep-alive probes that keep a live
+    // peer's flow from tripping it. Applied to every socket the engine
+    // creates — guest-terminated SYNs and host-originated connects alike.
+    sock.set_timeout(Some(FLOW_IDLE_TIMEOUT));
+    sock.set_keep_alive(Some(FLOW_KEEPALIVE));
+    sock
+}
+
+/// Fate of an incoming guest SYN under the SYN-flood guard.
+#[derive(Debug, PartialEq, Eq)]
+enum SynAdmit {
+    /// A new 4-tuple under the cap — allocate a terminated flow.
+    New,
+    /// A retransmitted SYN for a flow we already track — let smoltcp
+    /// handle it; don't allocate a second socket.
+    Duplicate,
+    /// At/over [`MAX_CONCURRENT_FLOWS`] — refuse (drop the SYN, no socket).
+    RefusedAtCap,
+}
+
+/// Decide whether a guest SYN should allocate a new terminated flow.
+/// Dedups retransmitted SYNs by 4-tuple and enforces the concurrent-flow
+/// cap so a SYN-flood across distinct tuples can't balloon socket memory.
+fn admit_syn(tuple_live: bool, live_flows: usize) -> SynAdmit {
+    if tuple_live {
+        SynAdmit::Duplicate
+    } else if live_flows >= MAX_CONCURRENT_FLOWS {
+        SynAdmit::RefusedAtCap
+    } else {
+        SynAdmit::New
+    }
+}
+
+/// Log a SYN-flood refusal, rate-limited so the flood can't also flood the
+/// host log. `last` is the engine-local timestamp of the previous warning.
+fn warn_flow_cap(vm_name: &str, last: &mut Option<Instant>) {
+    let now = Instant::now();
+    if last.is_none_or(|t| now.duration_since(t) >= FLOW_CAP_LOG_EVERY) {
+        *last = Some(now);
+        eprintln!(
+            "netstack[{vm_name}]: concurrent-flow cap ({MAX_CONCURRENT_FLOWS}) reached — refusing new guest SYNs (SYN-flood guard)"
+        );
+    }
+}
+
+/// Drain the bytes the guest sent from its smoltcp socket into `buf`,
+/// stopping once `buf` reaches [`GUEST_TO_EXT_HIGH_WATER`](super::GUEST_TO_EXT_HIGH_WATER).
+/// Leaving bytes unread closes smoltcp's receive window, which backpressures
+/// the guest — so a guest blasting a slow/stalled upstream can't balloon
+/// host memory unbounded (memory-DoS guard, symmetric to the ext→guest cap).
+fn drain_guest_to_ext(sock: &mut tcp::Socket, buf: &mut VecDeque<u8>) {
+    while sock.can_recv() && buf.len() < super::GUEST_TO_EXT_HIGH_WATER {
+        let mut tmp = [0u8; 8192];
+        match sock.recv_slice(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend(tmp[..n].iter().copied()),
+        }
+    }
 }
 
 fn smol_now(start: Instant) -> SmolInstant {
@@ -227,6 +307,9 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
     // engine thread writes the fd.
     let (outframe_tx, outframe_rx) = channel::<Vec<u8>>();
 
+    // Last time we logged a SYN-flood refusal (rate-limited).
+    let mut flood_log_at: Option<Instant> = None;
+
     loop {
         // 1. Inbound connect requests (published ports) → originate sockets.
         while let Ok(req) = connect_rx.try_recv() {
@@ -265,32 +348,43 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
                     if seg.is_syn {
                         // Pre-create the LISTEN socket on the exact dst so
                         // the interface delivers the SYN instead of RSTing
-                        // it. Dedupe by 4-tuple so a retransmitted SYN
-                        // doesn't spawn a second socket.
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            by_tuple.entry(seg.tuple())
-                        {
-                            let mut sock = tcp_socket();
-                            let _ = sock.listen(IpListenEndpoint {
-                                addr: Some(IpAddress::Ipv4(seg.dst_ip)),
-                                port: seg.dst_port,
-                            });
-                            let handle = sockets.add(sock);
-                            flows.insert(
-                                handle,
-                                Flow {
-                                    bridge: Arc::new(Mutex::new(Bridge::default())),
-                                    kind: FlowKind::Terminated {
-                                        dst: SocketAddr::new(seg.dst_ip.into(), seg.dst_port),
-                                        upstream_spawned: false,
+                        // it. Dedupe by 4-tuple (retransmitted SYN) and cap
+                        // concurrent flows (SYN-flood guard).
+                        let tuple = seg.tuple();
+                        match admit_syn(by_tuple.contains_key(&tuple), flows.len()) {
+                            SynAdmit::New => {
+                                let mut sock = tcp_socket();
+                                let _ = sock.listen(IpListenEndpoint {
+                                    addr: Some(IpAddress::Ipv4(seg.dst_ip)),
+                                    port: seg.dst_port,
+                                });
+                                let handle = sockets.add(sock);
+                                flows.insert(
+                                    handle,
+                                    Flow {
+                                        bridge: Arc::new(Mutex::new(Bridge::default())),
+                                        kind: FlowKind::Terminated {
+                                            dst: SocketAddr::new(seg.dst_ip.into(), seg.dst_port),
+                                            upstream_spawned: false,
+                                        },
+                                        tuple: Some(tuple),
                                     },
-                                    tuple: Some(seg.tuple()),
-                                },
-                            );
-                            e.insert(handle);
+                                );
+                                by_tuple.insert(tuple, handle);
+                                device.rx.push_back(f);
+                            }
+                            // A retransmitted SYN: hand it to smoltcp (its
+                            // existing socket completes the handshake), but
+                            // allocate nothing new.
+                            SynAdmit::Duplicate => device.rx.push_back(f),
+                            // Past the cap: drop the SYN. No socket is
+                            // allocated; the guest's stack retransmits then
+                            // aborts. Live flows are untouched.
+                            SynAdmit::RefusedAtCap => warn_flow_cap(&cfg.vm_name, &mut flood_log_at),
                         }
+                    } else {
+                        device.rx.push_back(f);
                     }
-                    device.rx.push_back(f);
                 }
                 Class::Passthrough => device.rx.push_back(f),
                 Class::Drop => {}
@@ -389,14 +483,11 @@ fn service_flow(
         }
     }
 
-    // guest → ext
-    while sock.can_recv() {
-        let mut tmp = [0u8; 8192];
-        match sock.recv_slice(&mut tmp) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => bridge.guest_to_ext.extend(tmp[..n].iter().copied()),
-        }
-    }
+    // guest → ext (bounded: stop draining smoltcp's recv buffer once
+    // guest_to_ext hits the high-water, closing the TCP window so a slow/
+    // stalled upstream backpressures the guest instead of ballooning host
+    // memory — symmetric to the ext→guest cap).
+    drain_guest_to_ext(sock, &mut bridge.guest_to_ext);
     if !sock.may_recv() {
         bridge.guest_fin = true;
     }
@@ -593,5 +684,80 @@ mod tests {
 
         unsafe { libc::close(vz_fd) };
         let _ = Duration::from_millis(0);
+    }
+
+    #[test]
+    fn admit_syn_caps_concurrent_flows_and_dedups_retransmits() {
+        // A fresh 4-tuple under the cap allocates a flow...
+        assert_eq!(admit_syn(false, 0), SynAdmit::New);
+        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS - 1), SynAdmit::New);
+        // ...a retransmitted SYN for a live tuple never allocates a second
+        // socket, regardless of the flow count...
+        assert_eq!(admit_syn(true, 0), SynAdmit::Duplicate);
+        assert_eq!(admit_syn(true, MAX_CONCURRENT_FLOWS + 9), SynAdmit::Duplicate);
+        // ...and a new tuple AT/OVER the cap is refused (SYN-flood guard).
+        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS), SynAdmit::RefusedAtCap);
+        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS + 100), SynAdmit::RefusedAtCap);
+    }
+
+    #[test]
+    fn guest_to_ext_backpressure_stops_draining_at_high_water() {
+        use smoltcp::phy::Loopback;
+
+        // Stand up a real smoltcp loopback with a server + client socket on
+        // one interface, so the test drives the actual recv path the engine
+        // drains (can_recv / recv_slice) rather than a stand-in.
+        let mut device = Loopback::new(Medium::Ethernet);
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 1])));
+        config.random_seed = 1;
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
+        let ip = Ipv4Addr::new(192, 168, 69, 1);
+        iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::Ipv4(ip), 24));
+        });
+
+        let mut sockets = SocketSet::new(Vec::new());
+        let server = sockets.add(tcp_socket());
+        let client = sockets.add(tcp_socket());
+        sockets
+            .get_mut::<tcp::Socket>(server)
+            .listen(IpListenEndpoint { addr: Some(IpAddress::Ipv4(ip)), port: 7777 })
+            .unwrap();
+        sockets
+            .get_mut::<tcp::Socket>(client)
+            .connect(iface.context(), IpEndpoint::new(IpAddress::Ipv4(ip), 7777), 49000)
+            .unwrap();
+
+        let mut t = 1i64;
+        for _ in 0..40 {
+            iface.poll(SmolInstant::from_millis(t), &mut device, &mut sockets);
+            t += 1;
+        }
+        assert!(sockets.get::<tcp::Socket>(client).may_send(), "handshake completed");
+
+        // Client sends a blob; pump so the server has it buffered to read.
+        let blob = vec![7u8; 8 * 1024];
+        sockets.get_mut::<tcp::Socket>(client).send_slice(&blob).unwrap();
+        for _ in 0..40 {
+            iface.poll(SmolInstant::from_millis(t), &mut device, &mut sockets);
+            t += 1;
+        }
+        assert!(sockets.get::<tcp::Socket>(server).can_recv(), "server has data buffered");
+
+        // Buffer already AT the high-water: draining must pull NOTHING, and
+        // the bytes stay in smoltcp (receive window closed ⇒ the guest is
+        // backpressured rather than ballooning host memory).
+        let mut buf: VecDeque<u8> = vec![0u8; crate::netstack::GUEST_TO_EXT_HIGH_WATER].into();
+        drain_guest_to_ext(sockets.get_mut::<tcp::Socket>(server), &mut buf);
+        assert_eq!(buf.len(), crate::netstack::GUEST_TO_EXT_HIGH_WATER, "nothing drained past the cap");
+        assert!(
+            sockets.get::<tcp::Socket>(server).can_recv(),
+            "data held in smoltcp == window closed == backpressure"
+        );
+
+        // Below the high-water the same socket drains normally (no false cap).
+        let mut buf2: VecDeque<u8> = VecDeque::new();
+        drain_guest_to_ext(sockets.get_mut::<tcp::Socket>(server), &mut buf2);
+        assert!(!buf2.is_empty(), "below the cap, draining proceeds");
     }
 }

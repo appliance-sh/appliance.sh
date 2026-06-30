@@ -468,3 +468,96 @@ Remaining residual risks (after the six invariants above):
 3. **Netstack in the data path.** A logic bug is a confinement bug even
    with #5 robustness; smoltcp's track record plus F5 fuzzing mitigate,
    but the parser ingests hostile input from a rooted guest.
+
+## 9. F5 netstack hardening (pre-default-flip)
+
+These are the gating hardening items that MUST land before the F4
+default-flip makes `Netstack` the default link (§7). They harden the
+netstack against a **hostile guest** (resource-exhaustion DoS) and restore
+a behavior parity the F2 brokered-dial refactor regressed — all on
+`packages/vm`, none of it changing the confinement contract above.
+
+### 9.1 Resource-exhaustion (DoS) caps
+
+A rooted guest drives the netstack directly; without caps it can exhaust
+host memory or threads while staying inside the boundary. The caps make
+each resource the guest can provoke **bounded**:
+
+- **`guest → ext` backpressure (memory).** The engine now stops draining
+  smoltcp's recv buffer once the per-flow `guest_to_ext` buffer reaches
+  `GUEST_TO_EXT_HIGH_WATER` (256 KiB) — closing the TCP receive window so a
+  guest blasting a slow/stalled upstream is backpressured instead of
+  ballooning host memory. **Symmetric** to the existing
+  `EXT_TO_GUEST_HIGH_WATER` cap on the other direction
+  (`netstack/engine.rs::drain_guest_to_ext`).
+- **Concurrent-flow cap + per-socket reaping (memory, SYN-flood).** Each
+  guest SYN eagerly allocates a 2×`TCP_BUF` (128 KiB) socket. The engine
+  now refuses new SYNs past `MAX_CONCURRENT_FLOWS` (1024) — dropping the
+  SYN so no socket is allocated, the guest's stack retransmits then aborts,
+  and the refusal is logged rate-limited — bounding worst-case smoltcp
+  socket memory to `MAX_CONCURRENT_FLOWS × 2×TCP_BUF`. Every socket also
+  carries `set_timeout` (60 s idle) + `set_keep_alive` (30 s), so a
+  half-open SYN-flood socket stuck in `SYN_RECEIVED` is reaped while a
+  live, keep-alive'd peer never trips the idle timeout
+  (`admit_syn`, `tcp_socket`).
+- **Bounded resolver pool (threads).** Host-side name re-resolution
+  (`getaddrinfo`) ran on a **detached thread per allowed flow** — a hung
+  resolver leaked one thread per flow. It now runs on a fixed,
+  process-wide pool of `RESOLVER_WORKERS` (8) workers; the caller still
+  bounds its wait with `RESOLVE_TIMEOUT`. A hung resolver wedges at most 8
+  threads, reused across every flow, never growing without bound
+  (`guard.rs::resolver_pool`). (`dns::forward` is UDP with a read timeout,
+  so its per-query worker already self-reaps — the unbounded leak was only
+  the `getaddrinfo` path.)
+
+### 9.2 Brokered-dial parity fix
+
+- **Legacy multi-addr connect fallback restored.** On the legacy (`None`
+  upstream) CONNECT path, `mitm::dial_upstream` again iterates **all**
+  public resolved candidates in order until one connects, rather than
+  trying only the first — while preserving the §8.1 #1 private-range reject
+  on each candidate (`public_upstreams` + `dial_first`). The netstack
+  accept-path is unchanged: it still dials **exactly** the one pre-validated
+  public addr, never re-resolving.
+
+### 9.3 Blast-radius / live-test matrix (OWED-LIVE)
+
+The DoS caps and the fallback fix are **unit-verified** (backpressure stops
+at the high-water; the flow cap refuses past N and dedups retransmits;
+`dial_first` iterates public candidates until one connects and still
+rejects private ones; the resolver pool is bounded/reaped). The **compat
+matrix below is owed-live** — it must be confirmed on a real
+`net_link=Netstack` VM under **default-deny** before the F4 flip, because a
+silent regression here (e.g. a cap throttling a legitimate heavy workload,
+or k3s intra-cluster traffic mistakenly crossing the boundary) breaks the
+appliance quietly. Owner runs this pass on a `Netstack` VM.
+
+**Must still WORK under default-deny + the §5 baked allowlist:**
+
+| #   | Scenario                                                                                                                       | Confirms                                                                                                                                  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | The **broker**: an agent/curl call to `api.anthropic.com` (brokered MITM + cred injection)                                     | the allowlisted brokered path round-trips through the accept-path interceptor                                                             |
+| 2   | **apk** add (`dl-cdn.alpinelinux.org`)                                                                                         | Alpine package install over the allowlist                                                                                                 |
+| 3   | **npm** install (`registry.npmjs.org`)                                                                                         | npm registry fetch                                                                                                                        |
+| 4   | **pip** install (`pypi.org`, `files.pythonhosted.org`)                                                                         | PyPI + the CDN host                                                                                                                       |
+| 5   | **cargo** fetch (`crates.io`, `static.crates.io`)                                                                              | crate index + downloads                                                                                                                   |
+| 6   | **git** clone/fetch (`github.com`, `codeload.github.com`, `*.githubusercontent.com`) over HTTPS                                | git smart-HTTP, incl. the codeload + raw CDNs                                                                                             |
+| 7   | **dockerd image pulls** (`registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com`, `ghcr.io`)              | the in-guest docker daemon pulling through the boundary                                                                                   |
+| 8   | **k3s multi-pod intra-cluster**: a 2+ pod workload talking pod→pod (`10.42/16`) and pod→service (`10.43/16`)                   | intra-guest traffic is switched in-kernel and **never crosses `host_fd`** — default-deny structurally cannot touch it (§5, §7 risk 2)     |
+| 9   | **cluster-internal names**: `*.svc` / `*.svc.cluster.local`, `localhost`                                                       | excluded names resolve/route without being policed                                                                                        |
+| 10  | **published-port round-trips**: ingress `:80`, api `:6443`, registry NodePort, the `30000–30050` window, dev `published` ports | the re-homed `netstack.connect` inbound leg under filtering (§6) — and that the flow cap / backpressure don't throttle legitimate inbound |
+| 11  | **BYO-k8s + cloud paths**                                                                                                      | **untouched** — never start the vz link, never get default-deny, don't depend on the netstack (§7 "Untouched")                            |
+
+**Must be DENIED (adversarial):**
+
+| #   | Attack                                                                                                                                                  | Expected                                                                                                                                                                            |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A   | A **rooted guest** dials a **raw public IP** (no allowlisted name, no fresh back-ref) to exfiltrate                                                     | dropped at default-deny (§4 raw-IP path); no upstream originated                                                                                                                    |
+| B   | A **brokered host** whose DNS **rebinds to a private/host-LAN addr** (allowlisted name → internal answer, or a multi-A record carrying a private entry) | refused — the resolver drops the private-resolving answer and `resolve_public`/`public_upstreams` reject the forbidden target (§8.1 #1); the brokered credential is never disclosed |
+| C   | A process that **drops the proxy env** (`--network host`, no `HTTPS_PROXY`) and egresses directly                                                       | still confined — every frame still arrives in the netstack and hits default-deny; the cooperative proxy env was never the boundary (§8)                                             |
+
+**Caps must not throttle legitimate use** (watch during 1–10): the
+concurrent-flow cap (1024) and the per-flow backpressure high-water
+(256 KiB) are sized well above interactive/dev workloads; the live pass
+should confirm a heavy `npm`/`docker`/multi-pod run completes without the
+SYN-flood refusal log firing or flows stalling.

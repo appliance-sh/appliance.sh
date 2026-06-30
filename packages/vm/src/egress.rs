@@ -435,12 +435,11 @@ fn handle_conn(mut client: TcpStream, ctx: &ProxyCtx) -> Result<()> {
             // resolves `host:port` itself, but now rejects any forbidden
             // (private/internal/host-LAN) result before dialing — a legit
             // public CONNECT host resolves public, so it still works.
+            let target = mitm::MitmTarget { host: &host, port, upstream: None };
             return mitm::intercept(
                 &ctx.name,
                 client,
-                &host,
-                port,
-                None,
+                target,
                 ctx.server_cfg.clone(),
                 ctx.client_cfg.clone(),
                 log,
