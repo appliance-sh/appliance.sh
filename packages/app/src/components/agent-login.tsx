@@ -56,6 +56,10 @@ export function AgentLoginPanel({
   const [paste, setPaste] = React.useState('');
   const [hasClaude, setHasClaude] = React.useState<boolean | null>(null);
   const [terminalLaunched, setTerminalLaunched] = React.useState(false);
+  // True when the last "Open terminal" click could NOT auto-launch a terminal
+  // (non-macOS, where runSetupToken() resolves false, or a launch error). Drives
+  // an inline "copy the command below" note so the click is never a dead no-op.
+  const [terminalAutoOpenFailed, setTerminalAutoOpenFailed] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   // The kind we just stored — Settings can label "Signed in (…)" immediately
@@ -93,6 +97,15 @@ export function AgentLoginPanel({
       cancelled = true;
     };
   }, [mode, auth, hasClaude]);
+
+  // The "Terminal opened" confirmation is transient: re-clicking re-launches,
+  // so revert the label after a few seconds rather than leaving a stale sticky
+  // "Terminal opened" that hides that the button is still actionable.
+  React.useEffect(() => {
+    if (!terminalLaunched) return;
+    const id = setTimeout(() => setTerminalLaunched(false), 4000);
+    return () => clearTimeout(id);
+  }, [terminalLaunched]);
 
   if (!auth) return null; // desktop-only capability
 
@@ -141,10 +154,17 @@ export function AgentLoginPanel({
 
   const openTerminal = async () => {
     setErr(null);
+    setTerminalAutoOpenFailed(false);
     try {
-      setTerminalLaunched(await auth.runSetupToken());
+      const launched = await auth.runSetupToken();
+      setTerminalLaunched(launched);
+      // Off-macOS (or any host without an auto-launch) resolves false — surface
+      // the manual fallback instead of a silent no-op.
+      setTerminalAutoOpenFailed(!launched);
     } catch (e) {
       // Best-effort: the manual command below is always available.
+      setTerminalLaunched(false);
+      setTerminalAutoOpenFailed(true);
       setErr(e instanceof Error ? e.message : String(e));
     }
   };
@@ -165,6 +185,12 @@ export function AgentLoginPanel({
 
   const displayKind = status?.kind ?? lastKind;
 
+  // Soft, NON-blocking shape check: Anthropic keys are `sk-ant-…`. A mis-paste
+  // would store "successfully" then 401 at launch, so warn early — but let the
+  // user proceed (we don't gate Save on it; the prefix isn't a hard contract).
+  const apiKeyTrimmed = apiKey.trim();
+  const apiKeyShapeWarn = apiKeyTrimmed.length > 0 && !apiKeyTrimmed.startsWith('sk-ant-');
+
   return (
     <div className={cn('w-full max-w-md space-y-3 text-xs', className)}>
       {status?.configured ? (
@@ -184,7 +210,11 @@ export function AgentLoginPanel({
 
       {/* Mode toggle: lead with the subscription path, API key as the
           alternative. */}
-      <div className="inline-flex rounded-md border border-[var(--color-border)] p-0.5">
+      <div
+        role="group"
+        aria-label="Authentication method"
+        className="inline-flex rounded-md border border-[var(--color-border)] p-0.5"
+      >
         <ModeTab active={mode === 'oauth'} onClick={() => setMode('oauth')}>
           <Sparkles className="h-3.5 w-3.5" /> Sign in with Claude
         </ModeTab>
@@ -221,14 +251,21 @@ export function AgentLoginPanel({
                 disabled={busy || hasClaude === null}
               >
                 <TerminalSquare className="h-3.5 w-3.5" />
-                {terminalLaunched ? 'Terminal opened' : 'Open terminal & run it'}
+                {terminalLaunched ? 'Terminal opened — run again?' : 'Open terminal & run it'}
               </Button>
               {hasClaude === null ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--color-muted-foreground)]" />
               ) : null}
             </div>
+            {terminalAutoOpenFailed ? (
+              <p className="text-[var(--color-muted-foreground)]">
+                Couldn&rsquo;t open a terminal automatically — copy the command below and run it yourself.
+              </p>
+            ) : null}
             <div className="space-y-1">
-              <span className="text-[var(--color-muted-foreground)]">…or run it yourself:</span>
+              <span className="text-[var(--color-muted-foreground)]">
+                {terminalAutoOpenFailed ? 'Run this in any terminal:' : '…or run it yourself:'}
+              </span>
               <CommandSnippet command={SETUP_TOKEN_CMD} />
             </div>
             <label className="block space-y-1">
@@ -274,6 +311,12 @@ export function AgentLoginPanel({
               className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono disabled:opacity-50"
             />
           </label>
+          {apiKeyShapeWarn ? (
+            <p className="text-amber-300/90">
+              That doesn&rsquo;t look like an Anthropic key — they start with <code className="font-mono">sk-ant-</code>
+              . You can still save it.
+            </p>
+          ) : null}
           <Button size="sm" onClick={() => void saveApiKey()} disabled={busy || !apiKey.trim()}>
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Save key
           </Button>

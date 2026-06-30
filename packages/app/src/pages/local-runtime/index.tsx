@@ -9,6 +9,7 @@ import {
   Download,
   FileText,
   FolderOpen,
+  Loader2,
   Play,
   Plus,
   RefreshCw,
@@ -675,6 +676,33 @@ function MicroVmPanel({ name, summary }: { name: string; summary?: MicroVmSummar
   );
 }
 
+/** Heuristic: does an agent-launch error look like an UPSTREAM auth rejection
+ *  (a stale one-year OAuth token or a bad API key)? The one-year token has no
+ *  expiry surfacing — the broker injects the stored credential host-side, so an
+ *  EXPIRED token does NOT trip the keyless gate; it surfaces as an opaque 401 /
+ *  authentication_error from the agent. Rather than thread a mint timestamp
+ *  through the `{kind,value}` Keychain envelope (a risky dual Rust+TS writer
+ *  change), we detect the failure SHAPE here and offer a re-login.
+ *
+ *  NOTE: this catches auth failures that surface through `agent.start()` (and
+ *  any error routed to the launcher). A 401 that only appears mid-run inside
+ *  the observe tab's output is not auto-detected — that would need the
+ *  broker/egress to thread upstream response status back to the desktop. */
+export function looksLikeAuthFailure(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes('401') ||
+    m.includes('unauthorized') ||
+    m.includes('authentication_error') ||
+    m.includes('invalid x-api-key') ||
+    m.includes('invalid api key') ||
+    m.includes('oauth token') ||
+    m.includes('token has expired') ||
+    m.includes('token expired') ||
+    (m.includes('token') && m.includes('invalid'))
+  );
+}
+
 // "Launch agent" (Phase 5, A5): spawn a Claude Code agent into the VM's
 // shared workspace and attach it as an agent-typed dock tab to observe +
 // steer it. The Anthropic key is brokered host-side and never enters the
@@ -696,6 +724,11 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
   // task input — so a desktop-only user can authenticate without a terminal
   // rather than hitting the keyless 502.
   const [authStatus, setAuthStatus] = React.useState<AgentAuthStatus | null>(null);
+  // A stored credential that upstream now REJECTS (most often a stale one-year
+  // OAuth token) keeps `configured: true`, so the keyless gate won't trip — set
+  // this when a launch fails with an auth-shaped error, to swap in a re-login
+  // nudge instead of a dead 401. See `looksLikeAuthFailure`.
+  const [reauthNudge, setReauthNudge] = React.useState(false);
   // Synchronous re-entrancy latch: the `busy` state in the keydown closure
   // is stale within the same tick, so a rapid double-Enter could fire two
   // launches before the first re-render disables the input. The ref flips
@@ -712,10 +745,16 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       .catch(() => setAuthStatus(null));
   }, [agentAuth]);
   React.useEffect(() => {
-    if (open) refreshAuth();
+    if (open) {
+      setReauthNudge(false);
+      refreshAuth();
+    }
   }, [open, refreshAuth]);
 
   const needsLogin = Boolean(agentAuth) && authStatus !== null && !authStatus.configured;
+  // Brief loading gate (avoids a one-frame flash of the task input before the
+  // login panel): the host has the capability but the status hasn't resolved.
+  const authLoading = Boolean(agentAuth) && authStatus === null;
 
   const launch = async () => {
     if (launchingRef.current) return;
@@ -750,8 +789,13 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       // Surfaces the CLI's stderr verbatim — most often "No Anthropic key
       // configured". Re-check the host store so a keyless failure flips the
       // launcher to the in-app login affordance.
-      setErr(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setErr(msg);
       refreshAuth();
+      // A stored-but-rejected credential (expired one-year OAuth token / bad
+      // key) leaves `configured: true`, so `needsLogin` stays false — detect
+      // the auth shape and offer a re-login rather than a dead error.
+      if (looksLikeAuthFailure(msg)) setReauthNudge(true);
     } finally {
       setBusy(false);
       launchingRef.current = false;
@@ -791,18 +835,38 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       </Button>
     );
   }
+  // Brief loading state while the host credential status resolves, so the task
+  // input doesn't render for one frame and then swap to the login panel.
+  if (authLoading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking sign-in…
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+    );
+  }
   // Keyless gate (L3): the desktop reports no stored credential, so offer the
   // in-app login (API key OR Sign in with Claude) right here instead of
   // letting the launch fail at the broker. The credential is brokered in and
-  // never enters the VM.
-  if (needsLogin) {
+  // never enters the VM. The `reauthNudge` branch reuses the same panel when a
+  // stored credential was rejected upstream (likely an expired token).
+  if (needsLogin || reauthNudge) {
     return (
       <div className="flex max-w-md flex-col items-start gap-2">
-        <p className="text-xs text-[var(--color-muted-foreground)]">
-          Sign in to run agents — your Anthropic credential is stored on this machine and brokered in; it never enters
-          the VM.
+        <p className={cn('text-xs', reauthNudge ? 'text-amber-300' : 'text-[var(--color-muted-foreground)]')}>
+          {reauthNudge
+            ? 'Your Claude token may be expired — sign in again. Your credential is stored on this machine and brokered in; it never enters the VM.'
+            : 'Sign in to run agents — your Anthropic credential is stored on this machine and brokered in; it never enters the VM.'}
         </p>
-        <AgentLoginPanel onAuthenticated={setAuthStatus} />
+        <AgentLoginPanel
+          onAuthenticated={(s) => {
+            setReauthNudge(false);
+            setErr(null);
+            setAuthStatus(s);
+          }}
+        />
         <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
           Cancel
         </Button>
@@ -917,6 +981,7 @@ function microVmClusterLabel(name: string): string {
 // writes the whole effective policy back (see the host bridge's addRule).
 function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
   const egress = vm.egress;
   const [host_, setHost] = React.useState('');
   const [busy, setBusy] = React.useState(false);
@@ -973,14 +1038,19 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
   // drops an EXACT-match operator deny (deny.retain) — so confirm first
   // and name the deny removal when one will actually be deleted. The
   // cooperative/NAT proxy is already bypassable, so it stays one-click.
-  const allowHost = (host: string) => {
+  const allowHost = async (host: string) => {
     if (policy && enforced) {
       const removesDeny = policy.deny.includes(host);
-      const msg =
-        `Allow egress to ${host}? This widens the enforced boundary` +
-        (removesDeny ? `, and removes your deny rule for ${host}` : '') +
-        '.';
-      if (!window.confirm(msg)) return;
+      const ok = await confirm({
+        title: `Allow egress to ${host}?`,
+        description:
+          `This widens the enforced boundary` + (removesDeny ? `, and removes your deny rule for ${host}` : '') + '.',
+        confirmLabel: 'Allow',
+        // Widening egress is a deliberate-but-not-destructive action — render
+        // the primary (non-red) confirm style rather than the delete style.
+        destructive: false,
+      });
+      if (!ok) return;
     }
     void act(() => egress.addRule('allow', host));
   };
