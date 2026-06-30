@@ -366,10 +366,29 @@ still reconciles against the tmux session list.
   `kind:'api-key'` / `kind:'oauth'`.
 - **copilot** (`login:'pat'`): paste/pipe a **fine-grained GitHub PAT** (a
   personal-account token with the **`Copilot Requests`** permission, ~1-year
-  expiry; **classic PATs are silently ignored by the CLI** — guide the user to a
-  fine-grained one). Stored `kind:'pat'`. Same hidden-prompt / stdin handling as
-  the api-key path (never on argv). No host-side `loginCmd` — the user mints the
-  PAT in GitHub settings and pastes it.
+  expiry). Stored `kind:'pat'`. Same hidden-prompt / stdin handling as the
+  api-key path (never on argv). No host-side `loginCmd` — the user mints the PAT
+  in GitHub settings and pastes it.
+
+  **SECURITY BOUND on host-keyed injection (Sasha's pre-ship guard).** The
+  fine-grained-only requirement is **not** a CLI-functionality nicety — it is
+  the security bound. The broker injects this PAT on **every**
+  `api.github.com` request from the guest (host-keyed, not path-keyed —
+  `creds.rs` matches by host, §7), so the PAT's scope **is** the blast radius of
+  a jailbroken guest abusing that rule. A fine-grained PAT scoped to **only**
+  `Copilot Requests` cannot push code, read repos, or act beyond Copilot
+  requests; a **classic `ghp_` PAT carries the user's full account scope** and
+  would hand a compromised guest that scope on the brokered host. Therefore:
+
+  - **The login layer accepts ONLY `github_pat_`-prefixed tokens and REJECTS
+    classic `ghp_` PATs** with a clear error (it does not rely on the CLI's own
+    "classic PATs are ignored" behaviour — it is a hard guard at the point the
+    durable credential is stored host-side). The `github_pat_` prefix also
+    matches the in-guest placeholder shape (`github_pat_appliance_proxy`).
+  - **Login prominently instructs the user to grant ONLY the `Copilot
+Requests` permission** before the prompt — that single scope is what makes
+    host-keyed injection on the broad `api.github.com` host acceptable.
+
 - **codex** (`login:'api-key'`): paste/pipe an **OpenAI API key**. Stored
   `kind:'api-key'`.
 

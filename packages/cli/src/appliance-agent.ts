@@ -5,16 +5,22 @@ import { password, select } from '@inquirer/prompts';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 
 import {
+  type AgentAdapter,
   type AutonomousResult,
   type RunAgentResult,
+  GITHUB_FINE_GRAINED_PAT_PREFIX,
   adapterForType,
   extractOAuthToken,
   forgetAgentKey,
   hostHasClaude,
+  looksLikeOpenAiKey,
   readAgentKey,
+  resolveAuthMode,
   runAgent,
   runSetupTokenInteractive,
+  supportedAgentTypes,
   targetVm,
+  validateCopilotPat,
   wireValueForCred,
   writeAgentKey,
 } from './utils/agent.js';
@@ -83,16 +89,19 @@ program
       }
       const adapter = adapterForType(opts.type);
       if (!adapter) {
-        console.error(chalk.red(`unsupported agent type '${opts.type}' (supported: claude-code).`));
+        console.error(
+          chalk.red(`unsupported agent type '${opts.type}' (supported: ${supportedAgentTypes().join(', ')}).`)
+        );
         process.exit(1);
       }
-      // Keyless guard: warn + point to `appliance agent login` rather than
-      // silently launching a keyless agent — the proxy fails closed, so it
-      // would only hit a 502 (docs/agent-sandbox.md §3 step 5).
-      if (!readAgentKey()) {
+      // Keyless guard: warn + point to `appliance agent login --type <agent>`
+      // rather than silently launching a keyless agent — the proxy fails
+      // closed, so it would only hit a 502 (docs/agent-sandbox.md §3 step 5).
+      // Read from the agent's OWN provider store (docs/multi-agent §4).
+      if (!readAgentKey(adapter.provider)) {
         console.error(
-          chalk.yellow('No Anthropic key configured. ') +
-            `Run ${chalk.bold('appliance agent login')} to store it host-side ` +
+          chalk.yellow(`No ${adapter.provider} credential configured. `) +
+            `Run ${chalk.bold(`appliance agent login --type ${adapter.type}`)} to store it host-side ` +
             '(it is brokered into the agent and never enters the VM).'
         );
         process.exit(1);
@@ -244,76 +253,65 @@ program
 program
   .command('login')
   .description(
-    'store an Anthropic credential host-side (Keychain on macOS; 0600 file elsewhere). ' +
-      'API key OR "Sign in with Claude" (subscription OAuth). Never enters the VM.'
+    'store an agent credential host-side, per provider (Keychain on macOS; 0600 file elsewhere). ' +
+      'claude-code: API key OR "Sign in with Claude" (OAuth); copilot: fine-grained GitHub PAT; ' +
+      'codex: OpenAI API key. Never enters the VM.'
   )
-  .option('--key <value>', 'API-key mode: the key (argv-visible; prefer the interactive prompt or stdin)')
-  .option('--oauth', 'OAuth mode: sign in with your Claude subscription via `claude setup-token` on this host', false)
-  .action(async (opts: { key?: string; oauth: boolean }) => {
-    // Mode selection: an explicit flag wins; a piped/`--key` invocation is
-    // api-key; otherwise an interactive TTY gets the picker.
-    let useOauth = opts.oauth;
-    const stdinPiped = !process.stdin.isTTY;
-    if (!useOauth && !opts.key && !stdinPiped) {
-      useOauth =
-        (await select({
-          message: 'How should the agent authenticate to Anthropic?',
-          choices: [
-            { name: 'API key (paste an Anthropic API key)', value: 'api-key' },
-            { name: 'Sign in with Claude (subscription OAuth via `claude setup-token`)', value: 'oauth' },
-          ],
-        })) === 'oauth';
-    }
-
-    if (useOauth) {
-      // `--key` is an API-key-mode flag; in OAuth mode the token comes from
-      // `claude setup-token`, so a stray `--key` is silently dropped. Say so.
-      if (opts.key) {
-        console.error(chalk.yellow('--key is ignored in OAuth mode (the token comes from `claude setup-token`).'));
-      }
-      await oauthLogin();
-      return;
-    }
-
-    // API-key path (unchanged except the explicit `'api-key'` kind tag).
-    let key = opts.key;
-    if (!key) {
-      // Read from a pipe when stdin isn't a TTY (`… | appliance agent
-      // login`), else prompt with a hidden input — neither puts the key
-      // on argv.
-      key = stdinPiped ? await readStdin() : await password({ message: 'Paste your Anthropic API key:', mask: '*' });
-    }
-    key = (key ?? '').trim();
-    if (!key) {
-      console.error(chalk.red('no key provided.'));
+  .option('--type <type>', 'agent adapter type', 'claude-code')
+  .option('--key <value>', 'paste the secret non-interactively (argv-visible; prefer the prompt or stdin)')
+  .option('--oauth', 'claude-code only: sign in with your Claude subscription via `claude setup-token`', false)
+  .action(async (opts: { type: string; key?: string; oauth: boolean }) => {
+    const adapter = adapterForType(opts.type);
+    if (!adapter) {
+      console.error(
+        chalk.red(`unsupported agent type '${opts.type}' (supported: ${supportedAgentTypes().join(', ')}).`)
+      );
       process.exit(1);
     }
-    writeAgentKey(key, 'api-key');
-    // NEVER echo the key.
-    console.log(
-      `${chalk.green('✓')} Anthropic key stored host-side. It is brokered into agents and never enters the VM.`
-    );
-    // The broker cred-rule is (re)written by `agent run`; switching modes
-    // (e.g. key→oauth) only takes effect on the next run, so an already-
-    // launched session keeps the old rule until then.
-    console.log(chalk.dim('  Re-run `appliance agent run` to apply this to an existing session.'));
+    const stdinPiped = !process.stdin.isTTY;
+    // Dispatch by the adapter's login UX. claude-code keeps its api-key/OAuth
+    // picker; copilot pastes a fine-grained PAT (Sasha's guard); codex pastes
+    // an OpenAI key (docs/multi-agent-adapters.md §4).
+    switch (adapter.type) {
+      case 'copilot':
+        await copilotLogin(adapter, opts.key, stdinPiped);
+        return;
+      case 'codex':
+        await codexLogin(adapter, opts.key, stdinPiped);
+        return;
+      default:
+        await claudeLogin(adapter, opts, stdinPiped);
+        return;
+    }
   });
 
 program
   .command('logout')
-  .description('forget the stored host-side Anthropic key')
-  .action(() => {
-    forgetAgentKey();
-    console.log(`${chalk.green('✓')} forgot the stored Anthropic key.`);
+  .description("forget a provider's stored host-side credential (--type selects the agent)")
+  .option('--type <type>', 'agent adapter type', 'claude-code')
+  .action((opts: { type: string }) => {
+    const adapter = adapterForType(opts.type);
+    if (!adapter) {
+      console.error(
+        chalk.red(`unsupported agent type '${opts.type}' (supported: ${supportedAgentTypes().join(', ')}).`)
+      );
+      process.exit(1);
+    }
+    forgetAgentKey(adapter.provider);
+    console.log(`${chalk.green('✓')} forgot the stored ${adapter.provider} credential.`);
   });
 
 program
   .command('print-key')
-  .description(
-    'HOST helper: print the resolved Anthropic credential to stdout for the egress proxy (do not call directly)'
-  )
-  .action(() => {
-    const cred = readAgentKey();
+  .description('HOST helper: print the resolved credential to stdout for the egress proxy (do not call directly)')
+  .option('--type <type>', 'agent adapter type', 'claude-code')
+  .action((opts: { type: string }) => {
+    const adapter = adapterForType(opts.type);
+    if (!adapter) {
+      // Unknown type → no stdout, exit non-zero so the proxy fails CLOSED.
+      process.exit(1);
+    }
+    const cred = readAgentKey(adapter.provider);
     if (!cred) {
       // Exit non-zero with NO stdout so the proxy helper resolves to
       // nothing and fails CLOSED (it never forwards the placeholder). This
@@ -321,10 +319,17 @@ program
       // null), so a corrupt store fails closed rather than leaking bytes.
       process.exit(1);
     }
-    // The wire-ready header value per stored kind: api-key → the bare key;
-    // oauth → `Bearer <token>`. Nothing else; the proxy trims it. NEVER
-    // logged.
-    process.stdout.write(wireValueForCred(cred));
+    // The wire-ready header value: `<scheme> <secret>` from the resolved mode
+    // (claude api-key → bare; claude oauth/codex → `Bearer …`; copilot →
+    // `token …`). An unsupported stored kind throws → non-zero exit → fails
+    // CLOSED. Nothing else on stdout; the proxy trims it. NEVER logged.
+    let scheme;
+    try {
+      scheme = resolveAuthMode(adapter, cred.kind).scheme;
+    } catch {
+      process.exit(1);
+    }
+    process.stdout.write(wireValueForCred(cred, scheme));
   });
 
 /** Colorize a (pre-padded) status cell by status + reconciled liveness:
@@ -366,6 +371,151 @@ function printAutonomousSummary(id: string, result: AutonomousResult, workspaceD
 }
 
 /**
+ * claude-code login (unchanged UX): an API-key/"Sign in with Claude" picker.
+ * Stored under the `anthropic` provider. An explicit flag wins; a piped/`--key`
+ * invocation is api-key; an interactive TTY gets the picker.
+ */
+async function claudeLogin(
+  adapter: AgentAdapter,
+  opts: { key?: string; oauth: boolean },
+  stdinPiped: boolean
+): Promise<void> {
+  let useOauth = opts.oauth;
+  if (!useOauth && !opts.key && !stdinPiped) {
+    useOauth =
+      (await select({
+        message: 'How should the agent authenticate to Anthropic?',
+        choices: [
+          { name: 'API key (paste an Anthropic API key)', value: 'api-key' },
+          { name: 'Sign in with Claude (subscription OAuth via `claude setup-token`)', value: 'oauth' },
+        ],
+      })) === 'oauth';
+  }
+
+  if (useOauth) {
+    // `--key` is an API-key-mode flag; in OAuth mode the token comes from
+    // `claude setup-token`, so a stray `--key` is silently dropped. Say so.
+    if (opts.key) {
+      console.error(chalk.yellow('--key is ignored in OAuth mode (the token comes from `claude setup-token`).'));
+    }
+    await oauthLogin(adapter);
+    return;
+  }
+
+  // API-key path.
+  let key = opts.key;
+  if (!key) {
+    // Read from a pipe when stdin isn't a TTY (`… | appliance agent login`),
+    // else prompt with a hidden input — neither puts the key on argv.
+    key = stdinPiped ? await readStdin() : await password({ message: 'Paste your Anthropic API key:', mask: '*' });
+  }
+  key = (key ?? '').trim();
+  if (!key) {
+    console.error(chalk.red('no key provided.'));
+    process.exit(1);
+  }
+  writeAgentKey(adapter.provider, key, 'api-key');
+  // NEVER echo the key.
+  console.log(
+    `${chalk.green('✓')} Anthropic key stored host-side. It is brokered into agents and never enters the VM.`
+  );
+  console.log(chalk.dim('  Re-run `appliance agent run` to apply this to an existing session.'));
+}
+
+/**
+ * copilot login — paste a fine-grained GitHub PAT (Sasha's HARD pre-ship
+ * guard, docs/multi-agent-adapters.md §4/§7). The login layer REJECTS classic
+ * `ghp_` PATs and accepts ONLY `github_pat_` fine-grained tokens, and
+ * prominently instructs the user to grant ONLY the `Copilot Requests`
+ * permission — that narrow scope is the entire security bound on host-keyed
+ * injection. Stored under the `github-copilot` provider, tagged `pat`. Same
+ * hidden-prompt / stdin handling as the api-key path (never on argv).
+ */
+async function copilotLogin(
+  adapter: AgentAdapter,
+  providedKey: string | undefined,
+  stdinPiped: boolean
+): Promise<void> {
+  // Prominent scope instruction — shown BEFORE the prompt so the user mints the
+  // right token. The fine-grained PAT's `Copilot Requests`-only scope is the
+  // security bound: the broker injects this PAT on ALL guest→api.github.com
+  // traffic (host-keyed, not path-keyed), so a broader scope would let a
+  // jailbroken guest act beyond Copilot requests (§7).
+  console.log(chalk.cyan('» GitHub Copilot login — paste a fine-grained GitHub PAT.'));
+  console.log(
+    chalk.yellow.bold('  Grant ONLY the "Copilot Requests" permission on the token.') +
+      chalk.dim(
+        '\n  Create it at GitHub → Settings → Developer settings → Fine-grained tokens.\n' +
+          '  That single scope is the security bound on host-keyed injection: the PAT is\n' +
+          "  brokered onto the official copilot CLI's api.github.com leg and never enters\n" +
+          '  the VM, but it is injected on ALL guest→api.github.com traffic — a broader\n' +
+          '  scope would let the sandbox act beyond Copilot requests (docs/multi-agent §7).\n' +
+          '  Classic ghp_ tokens are REJECTED — they carry your full account scope.'
+      )
+  );
+
+  let raw = providedKey;
+  if (!raw) {
+    raw = stdinPiped
+      ? await readStdin()
+      : await password({ message: 'Paste your fine-grained GitHub PAT (github_pat_…):', mask: '*' });
+  }
+  const v = validateCopilotPat(raw ?? '');
+  if (!v.ok) {
+    if (v.reason === 'classic') {
+      console.error(
+        chalk.red('Classic ghp_ PAT rejected. ') +
+          `Copilot requires a fine-grained token (${chalk.bold(GITHUB_FINE_GRAINED_PAT_PREFIX)}…) scoped to ` +
+          chalk.bold('Copilot Requests') +
+          ' only. A classic PAT carries your full account scope, which a host-keyed inject must not.'
+      );
+    } else if (v.reason === 'empty') {
+      console.error(chalk.red('no token provided.'));
+    } else {
+      console.error(
+        chalk.red(`expected a fine-grained GitHub PAT starting with ${chalk.bold(GITHUB_FINE_GRAINED_PAT_PREFIX)}. `) +
+          'Mint one scoped to `Copilot Requests` and paste it.'
+      );
+    }
+    process.exit(1);
+  }
+  writeAgentKey(adapter.provider, v.value, 'pat');
+  // NEVER echo the PAT.
+  console.log(
+    `${chalk.green('✓')} GitHub PAT stored host-side. It is brokered onto Copilot's api.github.com leg and never enters the VM.`
+  );
+  console.log(chalk.dim('  Re-run `appliance agent run --type copilot` to apply this to an existing session.'));
+}
+
+/**
+ * codex login — paste an OpenAI API key (docs/multi-agent-adapters.md §4).
+ * Soft `sk-` shape warning (no hard guard, mirroring Claude's api-key path).
+ * Stored under the `openai` provider, tagged `api-key`. ChatGPT-subscription
+ * login is DEFERRED (it writes a durable refresh_token into the guest — §7).
+ */
+async function codexLogin(adapter: AgentAdapter, providedKey: string | undefined, stdinPiped: boolean): Promise<void> {
+  let raw = providedKey;
+  if (!raw) {
+    raw = stdinPiped ? await readStdin() : await password({ message: 'Paste your OpenAI API key (sk-…):', mask: '*' });
+  }
+  const key = (raw ?? '').trim();
+  if (!key) {
+    console.error(chalk.red('no key provided.'));
+    process.exit(1);
+  }
+  if (!looksLikeOpenAiKey(key)) {
+    // Soft warning only — store anyway (no local format pre-validation).
+    console.error(chalk.yellow('warning: that does not look like an `sk-` OpenAI key; storing it anyway.'));
+  }
+  writeAgentKey(adapter.provider, key, 'api-key');
+  // NEVER echo the key.
+  console.log(
+    `${chalk.green('✓')} OpenAI key stored host-side. It is brokered onto Codex's api.openai.com calls and never enters the VM.`
+  );
+  console.log(chalk.dim('  Re-run `appliance agent run --type codex` to apply this to an existing session.'));
+}
+
+/**
  * "Sign in with Claude" — the host-side subscription OAuth login (L1).
  *
  * Runs `claude setup-token` on the HOST with the TTY inherited (browser opens,
@@ -380,7 +530,7 @@ function printAutonomousSummary(id: string, result: AutonomousResult, workspaceD
  * written to a temp file — it goes straight from the paste prompt to the
  * Keychain.
  */
-async function oauthLogin(): Promise<void> {
+async function oauthLogin(adapter: AgentAdapter): Promise<void> {
   // Host `claude` is a hard precondition for `setup-token`; detect + guide
   // rather than crash (docs §2, §7).
   if (!hostHasClaude()) {
@@ -421,7 +571,7 @@ async function oauthLogin(): Promise<void> {
     );
     process.exit(1);
   }
-  writeAgentKey(token, 'oauth');
+  writeAgentKey(adapter.provider, token, 'oauth');
   // NEVER echo the token.
   console.log(
     `${chalk.green('✓')} Signed in with Claude. The subscription token is stored host-side and never enters the VM.`

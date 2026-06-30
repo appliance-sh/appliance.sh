@@ -7,17 +7,26 @@ import {
   ANTHROPIC_OAUTH_PLACEHOLDER,
   ANTHROPIC_PLACEHOLDER_KEY,
   type AuthMode,
+  COPILOT_PLACEHOLDER_PAT,
+  OPENAI_PLACEHOLDER_KEY,
   adapterForType,
   agentResultPaths,
   classifyAutonomousResult,
   claudeCodeAdapter,
+  codexAdapter,
   composeAutonomousCaptureLine,
   composeLaunchLine,
+  copilotAdapter,
   extractOAuthToken,
+  installCommandFor,
+  looksLikeOpenAiKey,
   parseStoredCred,
   printKeyHelperCommand,
   readAutonomousResultFromFiles,
   resolveAuthMode,
+  supportedAgentTypes,
+  tailLines,
+  validateCopilotPat,
   wireValueForCred,
 } from './agent.js';
 
@@ -35,6 +44,7 @@ describe('claudeCodeAdapter', () => {
       kind: 'api-key',
       header: 'x-api-key',
       env: 'ANTHROPIC_API_KEY',
+      login: 'api-key',
       placeholder: ANTHROPIC_PLACEHOLDER_KEY,
     });
     // oauth mode: authorization + Bearer scheme, CLAUDE_CODE_OAUTH_TOKEN
@@ -44,9 +54,13 @@ describe('claudeCodeAdapter', () => {
       header: 'authorization',
       scheme: 'Bearer',
       env: 'CLAUDE_CODE_OAUTH_TOKEN',
+      login: 'setup-token',
       loginCmd: 'claude setup-token',
       placeholder: ANTHROPIC_OAUTH_PLACEHOLDER,
     });
+    // claude-code stays json-capture with the anthropic provider store.
+    expect(claudeCodeAdapter.provider).toBe('anthropic');
+    expect(claudeCodeAdapter.captureMode).toBe('json');
     // The oauth placeholder is oauth-shaped and the api-key placeholder is not.
     expect(ANTHROPIC_OAUTH_PLACEHOLDER.startsWith('sk-ant-oat01-')).toBe(true);
     expect(ANTHROPIC_PLACEHOLDER_KEY.startsWith('sk-ant-oat01-')).toBe(false);
@@ -126,9 +140,12 @@ describe('composeLaunchLine', () => {
 });
 
 describe('adapterForType', () => {
-  it('resolves the claude-code adapter and rejects unknown types', () => {
+  it('resolves claude-code / copilot / codex and rejects unknown types', () => {
     expect(adapterForType('claude-code')).toBe(claudeCodeAdapter);
+    expect(adapterForType('copilot')).toBe(copilotAdapter);
+    expect(adapterForType('codex')).toBe(codexAdapter);
     expect(adapterForType('aider')).toBeNull();
+    expect(supportedAgentTypes()).toEqual(['claude-code', 'copilot', 'codex']);
   });
 });
 
@@ -229,15 +246,19 @@ describe('readAutonomousResultFromFiles (A6)', () => {
 });
 
 describe('printKeyHelperCommand', () => {
-  it('pins the absolute interpreter + a stable agent entry, ending in print-key', () => {
-    const cmd = printKeyHelperCommand();
-    expect(cmd.endsWith('print-key')).toBe(true);
+  it('pins the absolute interpreter + a stable agent entry, ending in print-key --type <agent>', () => {
+    const cmd = printKeyHelperCommand('claude-code');
+    // The pinned helper carries the agent type so it reads that provider's store.
+    expect(cmd.endsWith("print-key --type 'claude-code'")).toBe(true);
     // First quoted token is the absolute interpreter (execPath).
     const firstQuoted = cmd.match(/^'([^']+)'/)?.[1];
     expect(firstQuoted).toBe(process.execPath);
     expect(firstQuoted?.startsWith('/')).toBe(true);
     // The node/interpreter path targets the runnable agent entry directly.
     expect(cmd).toContain('appliance-agent.js');
+    // The type rides through per agent.
+    expect(printKeyHelperCommand('copilot').endsWith("print-key --type 'copilot'")).toBe(true);
+    expect(printKeyHelperCommand('codex').endsWith("print-key --type 'codex'")).toBe(true);
   });
 
   it('ignores a dispatcher-clobbered process.argv[1]', () => {
@@ -248,12 +269,12 @@ describe('printKeyHelperCommand', () => {
     const saved = process.argv;
     try {
       process.argv = [process.execPath, 'appliance-agent', 'print-key'];
-      const cmd = printKeyHelperCommand();
+      const cmd = printKeyHelperCommand('claude-code');
       // Not the bogus cwd-resolved literal.
       expect(cmd).not.toContain(`'${path.resolve('appliance-agent')}'`);
       // The stable, runnable entry instead.
       expect(cmd).toContain('appliance-agent.js');
-      expect(cmd.endsWith('print-key')).toBe(true);
+      expect(cmd.endsWith("print-key --type 'claude-code'")).toBe(true);
     } finally {
       process.argv = saved;
     }
@@ -313,10 +334,26 @@ describe('parseStoredCred (envelope back-compat + fail-closed)', () => {
   });
 });
 
-describe('wireValueForCred (print-key wire value per kind)', () => {
-  it('emits the bare key for api-key and a Bearer-prefixed token for oauth', () => {
+describe('wireValueForCred (print-key wire value per scheme)', () => {
+  it('emits the bare secret with no scheme, and `<scheme> <secret>` with one', () => {
+    // No scheme (claude api-key) → bare.
     expect(wireValueForCred({ kind: 'api-key', value: 'sk-ant-api03-xyz' })).toBe('sk-ant-api03-xyz');
-    expect(wireValueForCred({ kind: 'oauth', value: 'sk-ant-oat01-abc' })).toBe('Bearer sk-ant-oat01-abc');
+    // Bearer (claude oauth, codex api-key) → `Bearer <secret>`.
+    expect(wireValueForCred({ kind: 'oauth', value: 'sk-ant-oat01-abc' }, 'Bearer')).toBe('Bearer sk-ant-oat01-abc');
+    expect(wireValueForCred({ kind: 'api-key', value: 'sk-openai-xyz' }, 'Bearer')).toBe('Bearer sk-openai-xyz');
+    // token (copilot pat) → `token <secret>`.
+    expect(wireValueForCred({ kind: 'pat', value: 'github_pat_abc' }, 'token')).toBe('token github_pat_abc');
+  });
+
+  it('drives the wire value off the RESOLVED mode scheme per agent (not the kind)', () => {
+    // The print-key flow resolves the scheme from the adapter+mode, so the same
+    // api-key kind yields bare for claude but Bearer for codex.
+    const claudeApiKey = resolveAuthMode(claudeCodeAdapter, 'api-key');
+    const codexApiKey = resolveAuthMode(codexAdapter, 'api-key');
+    const copilotPat = resolveAuthMode(copilotAdapter, 'pat');
+    expect(wireValueForCred({ kind: 'api-key', value: 'k' }, claudeApiKey.scheme)).toBe('k');
+    expect(wireValueForCred({ kind: 'api-key', value: 'k' }, codexApiKey.scheme)).toBe('Bearer k');
+    expect(wireValueForCred({ kind: 'pat', value: 'p' }, copilotPat.scheme)).toBe('token p');
   });
 });
 
@@ -351,5 +388,206 @@ describe('extractOAuthToken', () => {
   it('returns null when no oauth token is present', () => {
     expect(extractOAuthToken('')).toBeNull();
     expect(extractOAuthToken('sk-ant-api03-not-an-oauth-token')).toBeNull();
+  });
+});
+
+// ---- G1 Copilot adapter (PAT-broker, TEXT capture) ---------------------
+
+describe('copilotAdapter (G1 — PAT-broker, text capture)', () => {
+  it('brokers on the api.github.com token-exchange host with a `token` pat mode', () => {
+    expect(copilotAdapter.type).toBe('copilot');
+    expect(copilotAdapter.provider).toBe('github-copilot');
+    // BROKER host is the token-EXCHANGE leg (api.github.com), NOT the model host.
+    expect(copilotAdapter.apiHost).toBe('api.github.com');
+    const pat = resolveAuthMode(copilotAdapter, 'pat');
+    expect(pat).toEqual({
+      kind: 'pat',
+      header: 'authorization',
+      scheme: 'token',
+      env: 'COPILOT_GITHUB_TOKEN',
+      login: 'pat',
+      placeholder: COPILOT_PLACEHOLDER_PAT,
+    });
+    // The placeholder is fine-grained-PAT-shaped.
+    expect(COPILOT_PLACEHOLDER_PAT.startsWith('github_pat_')).toBe(true);
+  });
+
+  it('captures TEXT (no JSON parse) and bakes the model leg into egressHosts', () => {
+    expect(copilotAdapter.captureMode).toBe('text');
+    // Text-mode adapters have no parseResult (classify tails stdout).
+    expect(copilotAdapter.parseResult).toBeUndefined();
+    expect(copilotAdapter.egressHosts).toContain('githubcopilot.com');
+  });
+
+  it('launches a bare TTY interactively and the headless autonomous argv', () => {
+    expect(copilotAdapter.launchArgv({ mode: 'interactive' })).toEqual(['copilot']);
+    expect(copilotAdapter.launchArgv({ mode: 'autonomous', task: 'fix it' })).toEqual([
+      'copilot',
+      '-p',
+      'fix it',
+      '-s',
+      '--allow-all-tools',
+      '--no-ask-user',
+    ]);
+  });
+});
+
+// ---- G2 Codex adapter (API-key path, JSON capture) ---------------------
+
+describe('codexAdapter (G2 — api-key Bearer, json capture)', () => {
+  it('brokers OPENAI_API_KEY as Bearer on api.openai.com (mirrors Claude api-key, diff scheme)', () => {
+    expect(codexAdapter.type).toBe('codex');
+    expect(codexAdapter.provider).toBe('openai');
+    expect(codexAdapter.apiHost).toBe('api.openai.com');
+    expect(codexAdapter.captureMode).toBe('json');
+    const mode = resolveAuthMode(codexAdapter, 'api-key');
+    expect(mode).toEqual({
+      kind: 'api-key',
+      header: 'authorization',
+      scheme: 'Bearer', // SAME kind as Claude api-key, DIFFERENT scheme
+      env: 'OPENAI_API_KEY',
+      login: 'api-key',
+      placeholder: OPENAI_PLACEHOLDER_KEY,
+    });
+    expect(codexAdapter.egressHosts).toContain('api.openai.com');
+  });
+
+  it('launches `codex exec --json … --dangerously-bypass-approvals-and-sandbox` autonomously', () => {
+    expect(codexAdapter.launchArgv({ mode: 'interactive' })).toEqual(['codex']);
+    expect(codexAdapter.launchArgv({ mode: 'autonomous', task: 'fix it' })).toEqual([
+      'codex',
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox',
+      'fix it',
+    ]);
+  });
+
+  it('parseResult: turn.completed ⇒ ok, lifts the last assistant message as the summary', () => {
+    // Newer item.completed event shape.
+    const jsonl = [
+      '{"type":"thread.started","thread_id":"t1"}',
+      '{"type":"item.completed","item":{"type":"assistant_message","text":"all green"}}',
+      '{"type":"turn.completed","usage":{"input_tokens":10}}',
+    ].join('\n');
+    expect(codexAdapter.parseResult?.(jsonl)).toEqual({ ok: true, summary: 'all green' });
+
+    // Older msg/agent_message shape is also tolerated.
+    const older = ['{"msg":{"type":"agent_message","message":"done it"}}', '{"type":"turn.completed"}'].join('\n');
+    expect(codexAdapter.parseResult?.(older)).toEqual({ ok: true, summary: 'done it' });
+  });
+
+  it('parseResult: no turn.completed, or a fatal error event, ⇒ not ok', () => {
+    expect(
+      codexAdapter.parseResult?.('{"type":"item.completed","item":{"type":"assistant_message","text":"hi"}}')
+    ).toEqual({ ok: false, summary: 'hi' });
+    const errored = [
+      '{"type":"item.completed","item":{"type":"assistant_message","text":"partial"}}',
+      '{"type":"error","message":"upstream 500"}',
+      '{"type":"turn.completed"}',
+    ].join('\n');
+    expect(codexAdapter.parseResult?.(errored)).toEqual({ ok: false, summary: 'partial' });
+    // Non-JSON noise is ignored.
+    expect(codexAdapter.parseResult?.('not json at all')).toEqual({ ok: false, summary: undefined });
+  });
+});
+
+// ---- captureMode branch: json (parse) vs text (exit-code + stdout tail) -
+
+describe('classifyAutonomousResult branches on captureMode', () => {
+  it('text-mode (copilot): done iff exit 0; summary is the stdout tail, no parse', () => {
+    const out = 'thinking...\nedited foo.ts\nDone — the test passes now.';
+    const done = classifyAutonomousResult(0, out, copilotAdapter);
+    expect(done.status).toBe('done');
+    expect(done.exitCode).toBe(0);
+    expect(done.summary).toContain('Done — the test passes now.');
+
+    // Non-zero exit → error even with output; still no JSON parse.
+    const err = classifyAutonomousResult(3, 'boom', copilotAdapter);
+    expect(err.status).toBe('error');
+    expect(err.exitCode).toBe(3);
+    expect(err.summary).toBe('boom');
+
+    // Empty stdout on a clean exit still classifies done with a fallback summary.
+    expect(classifyAutonomousResult(0, '', copilotAdapter)).toEqual({
+      status: 'done',
+      exitCode: 0,
+      summary: 'completed',
+    });
+  });
+
+  it('json-mode (codex): parses the JSONL stream — done only on exit 0 + turn.completed', () => {
+    const jsonl = [
+      '{"type":"item.completed","item":{"type":"assistant_message","text":"shipped"}}',
+      '{"type":"turn.completed"}',
+    ].join('\n');
+    expect(classifyAutonomousResult(0, jsonl, codexAdapter)).toEqual({
+      status: 'done',
+      exitCode: 0,
+      summary: 'shipped',
+    });
+    // No turn.completed → error even on exit 0.
+    expect(classifyAutonomousResult(0, '{"type":"thread.started"}', codexAdapter).status).toBe('error');
+  });
+
+  it('tailLines keeps the last N non-empty-trailing lines', () => {
+    expect(tailLines('a\nb\nc\n\n', 2)).toBe('b\nc');
+    expect(tailLines('only', 5)).toBe('only');
+    expect(tailLines('', 5)).toBe('');
+  });
+});
+
+// ---- installCommandFor: pinned (copilot/codex) vs unpinned (claude) ----
+
+describe('installCommandFor (pinned install descriptor)', () => {
+  it('pins copilot + codex to their versions and leaves claude-code unpinned', () => {
+    expect(installCommandFor(copilotAdapter.install)).toBe(
+      'command -v copilot >/dev/null 2>&1 || npm install -g @github/copilot@1.0.65 >/dev/null'
+    );
+    expect(installCommandFor(codexAdapter.install)).toBe(
+      'command -v codex >/dev/null 2>&1 || npm install -g @openai/codex@0.142.0 >/dev/null'
+    );
+    // claude-code stays byte-identical to its pre-multi-agent (unpinned) install.
+    expect(installCommandFor(claudeCodeAdapter.install)).toBe(
+      'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null'
+    );
+  });
+});
+
+// ---- G1 Sasha's HARD pre-ship guard: github_pat_-only PAT validation ---
+
+describe('validateCopilotPat (Sasha: reject classic ghp_, require github_pat_)', () => {
+  it('accepts a fine-grained github_pat_ token', () => {
+    expect(validateCopilotPat('github_pat_11ABCDEF_xyz')).toEqual({ ok: true, value: 'github_pat_11ABCDEF_xyz' });
+    // Surrounding whitespace is trimmed.
+    expect(validateCopilotPat('  github_pat_abc\n')).toEqual({ ok: true, value: 'github_pat_abc' });
+  });
+
+  it('REJECTS a classic ghp_ PAT with the `classic` reason', () => {
+    expect(validateCopilotPat('ghp_1234567890abcdef')).toEqual({ ok: false, reason: 'classic' });
+  });
+
+  it('rejects anything that is not a github_pat_ token (shape) and empty input', () => {
+    expect(validateCopilotPat('sk-not-a-pat')).toEqual({ ok: false, reason: 'shape' });
+    expect(validateCopilotPat('github_personal_access_token')).toEqual({ ok: false, reason: 'shape' });
+    expect(validateCopilotPat('   ')).toEqual({ ok: false, reason: 'empty' });
+  });
+});
+
+describe('looksLikeOpenAiKey (codex soft sk- warning)', () => {
+  it('is true for sk- keys, false otherwise', () => {
+    expect(looksLikeOpenAiKey('sk-proj-abc')).toBe(true);
+    expect(looksLikeOpenAiKey('  sk-abc ')).toBe(true);
+    expect(looksLikeOpenAiKey('nope')).toBe(false);
+  });
+});
+
+describe('parseStoredCred accepts the pat kind (Copilot)', () => {
+  it('reads a pat envelope as { kind: pat, value }', () => {
+    expect(parseStoredCred('{"kind":"pat","value":"github_pat_abc"}')).toEqual({
+      kind: 'pat',
+      value: 'github_pat_abc',
+    });
   });
 });
