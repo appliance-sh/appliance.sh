@@ -37,23 +37,60 @@ const RX_BATCH: usize = 256;
 /// smoltcp's own `poll_delay` can't see. Throughput tuning is F5.
 const WAIT_CAP_MS: i32 = 5;
 
-/// Cap on concurrent terminated guest flows (SYN-flood guard, F5). Each
-/// guest SYN eagerly allocates a 2×`TCP_BUF` (128 KiB) socket; a SYN-flood
-/// across distinct 4-tuples would balloon socket memory before smoltcp's
-/// retransmit/timeout reaps the half-open sockets. Past this many live
-/// flows we refuse new SYNs (drop the frame — no socket is allocated; the
-/// guest's stack retransmits then aborts), bounding worst-case smoltcp
-/// socket memory to `MAX_CONCURRENT_FLOWS × 2×TCP_BUF`.
-const MAX_CONCURRENT_FLOWS: usize = 1024;
-/// Per-flow idle timeout. A flow with no packets for this long is reset —
-/// including a half-open SYN-flood socket stuck in `SYN_RECEIVED` — so the
-/// eagerly-allocated sockets a flood leaves behind don't linger. Generous
-/// enough that a live, keep-alive'd peer never trips it.
-const FLOW_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
+/// Default cap on concurrent terminated guest flows (SYN-flood guard, F5).
+/// Each guest SYN eagerly allocates a 2×`TCP_BUF` (128 KiB) socket; a
+/// SYN-flood across distinct 4-tuples would balloon socket memory before
+/// smoltcp's retransmit/timeout reaps the half-open sockets. Past this many
+/// live flows we refuse new SYNs (drop the frame — no socket is allocated;
+/// the guest's stack retransmits then aborts), bounding worst-case smoltcp
+/// socket memory to `max_flows × 2×TCP_BUF`. Override with
+/// [`ENV_MAX_FLOWS`] when a legitimate heavy-fan-out workload needs more
+/// (Quinn's F5 nit).
+const DEFAULT_MAX_CONCURRENT_FLOWS: usize = 1024;
+/// Default per-flow idle timeout (secs). A flow with no packets for this
+/// long is reset — including a half-open SYN-flood socket stuck in
+/// `SYN_RECEIVED` — so the eagerly-allocated sockets a flood leaves behind
+/// don't linger. Generous enough that a live, keep-alive'd peer never trips
+/// it. Override with [`ENV_IDLE_SECS`].
+const DEFAULT_FLOW_IDLE_SECS: u64 = 60;
 /// Keep-alive probe interval on established flows. Probes elicit ACKs that
-/// reset the idle timeout for a *live* peer (so `FLOW_IDLE_TIMEOUT` reaps
-/// only dead/half-open sockets) and surface a dead upstream.
+/// reset the idle timeout for a *live* peer (so the idle timeout reaps only
+/// dead/half-open sockets) and surface a dead upstream.
 const FLOW_KEEPALIVE: SmolDuration = SmolDuration::from_secs(30);
+
+/// Env override for the concurrent-flow cap (a positive integer).
+const ENV_MAX_FLOWS: &str = "APPLIANCE_NETSTACK_MAX_FLOWS";
+/// Env override for the per-flow idle timeout, in seconds (a positive
+/// integer).
+const ENV_IDLE_SECS: &str = "APPLIANCE_NETSTACK_IDLE_SECS";
+
+/// Parse a positive-integer override, falling back to `default` when the
+/// value is absent, empty, unparseable, or zero. Zero is treated as invalid
+/// because a zero cap would refuse every SYN and a zero idle timeout would
+/// reap flows instantly — either would wedge the stack. Pure (operates on
+/// the raw string) so the precedence is unit-tested without touching the
+/// process environment.
+fn parse_positive<T>(raw: Option<&str>, default: T) -> T
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
+    raw.and_then(|v| v.trim().parse::<T>().ok())
+        .filter(|n| *n != T::from(0u8))
+        .unwrap_or(default)
+}
+
+/// The effective concurrent-flow cap: [`ENV_MAX_FLOWS`] or the default.
+fn max_concurrent_flows() -> usize {
+    parse_positive(std::env::var(ENV_MAX_FLOWS).ok().as_deref(), DEFAULT_MAX_CONCURRENT_FLOWS)
+}
+
+/// The effective per-flow idle timeout: [`ENV_IDLE_SECS`] secs or the default.
+fn flow_idle_timeout() -> SmolDuration {
+    SmolDuration::from_secs(parse_positive(
+        std::env::var(ENV_IDLE_SECS).ok().as_deref(),
+        DEFAULT_FLOW_IDLE_SECS,
+    ))
+}
 /// Rate-limit on the SYN-flood-refusal log so a flood can't also flood the
 /// host log.
 const FLOW_CAP_LOG_EVERY: Duration = Duration::from_secs(5);
@@ -202,7 +239,7 @@ struct Flow {
     tuple: Option<Tuple>,
 }
 
-fn tcp_socket() -> tcp::Socket<'static> {
+fn tcp_socket(idle_timeout: SmolDuration) -> tcp::Socket<'static> {
     let mut sock = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
         tcp::SocketBuffer::new(vec![0u8; TCP_BUF]),
@@ -211,7 +248,7 @@ fn tcp_socket() -> tcp::Socket<'static> {
     // detection): an idle timeout plus keep-alive probes that keep a live
     // peer's flow from tripping it. Applied to every socket the engine
     // creates — guest-terminated SYNs and host-originated connects alike.
-    sock.set_timeout(Some(FLOW_IDLE_TIMEOUT));
+    sock.set_timeout(Some(idle_timeout));
     sock.set_keep_alive(Some(FLOW_KEEPALIVE));
     sock
 }
@@ -224,17 +261,19 @@ enum SynAdmit {
     /// A retransmitted SYN for a flow we already track — let smoltcp
     /// handle it; don't allocate a second socket.
     Duplicate,
-    /// At/over [`MAX_CONCURRENT_FLOWS`] — refuse (drop the SYN, no socket).
+    /// At/over the (configurable) concurrent-flow cap — refuse (drop the
+    /// SYN, no socket).
     RefusedAtCap,
 }
 
 /// Decide whether a guest SYN should allocate a new terminated flow.
 /// Dedups retransmitted SYNs by 4-tuple and enforces the concurrent-flow
-/// cap so a SYN-flood across distinct tuples can't balloon socket memory.
-fn admit_syn(tuple_live: bool, live_flows: usize) -> SynAdmit {
+/// cap (`max_flows`) so a SYN-flood across distinct tuples can't balloon
+/// socket memory.
+fn admit_syn(tuple_live: bool, live_flows: usize, max_flows: usize) -> SynAdmit {
     if tuple_live {
         SynAdmit::Duplicate
-    } else if live_flows >= MAX_CONCURRENT_FLOWS {
+    } else if live_flows >= max_flows {
         SynAdmit::RefusedAtCap
     } else {
         SynAdmit::New
@@ -243,12 +282,12 @@ fn admit_syn(tuple_live: bool, live_flows: usize) -> SynAdmit {
 
 /// Log a SYN-flood refusal, rate-limited so the flood can't also flood the
 /// host log. `last` is the engine-local timestamp of the previous warning.
-fn warn_flow_cap(vm_name: &str, last: &mut Option<Instant>) {
+fn warn_flow_cap(vm_name: &str, max_flows: usize, last: &mut Option<Instant>) {
     let now = Instant::now();
     if last.is_none_or(|t| now.duration_since(t) >= FLOW_CAP_LOG_EVERY) {
         *last = Some(now);
         eprintln!(
-            "netstack[{vm_name}]: concurrent-flow cap ({MAX_CONCURRENT_FLOWS}) reached — refusing new guest SYNs (SYN-flood guard)"
+            "netstack[{vm_name}]: concurrent-flow cap ({max_flows}) reached — refusing new guest SYNs (SYN-flood guard; raise with {ENV_MAX_FLOWS})"
         );
     }
 }
@@ -274,6 +313,11 @@ fn smol_now(start: Instant) -> SmolInstant {
 
 fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequest>) {
     let start = Instant::now();
+    // Resolve the configurable caps once per VM (env is fixed for the
+    // process lifetime): the concurrent-flow cap and the per-flow idle
+    // timeout applied to every socket the engine creates.
+    let max_flows = max_concurrent_flows();
+    let idle_timeout = flow_idle_timeout();
     let mut device = FdDevice {
         fd: host_fd,
         rx: VecDeque::new(),
@@ -313,7 +357,7 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
     loop {
         // 1. Inbound connect requests (published ports) → originate sockets.
         while let Ok(req) = connect_rx.try_recv() {
-            let mut sock = tcp_socket();
+            let mut sock = tcp_socket(idle_timeout);
             let local = next_local_port;
             next_local_port = next_local_port.checked_add(1).filter(|p| *p != 0).unwrap_or(49152);
             let remote = IpEndpoint::new(IpAddress::Ipv4(cfg.guest_ip), req.port);
@@ -351,9 +395,9 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
                         // it. Dedupe by 4-tuple (retransmitted SYN) and cap
                         // concurrent flows (SYN-flood guard).
                         let tuple = seg.tuple();
-                        match admit_syn(by_tuple.contains_key(&tuple), flows.len()) {
+                        match admit_syn(by_tuple.contains_key(&tuple), flows.len(), max_flows) {
                             SynAdmit::New => {
-                                let mut sock = tcp_socket();
+                                let mut sock = tcp_socket(idle_timeout);
                                 let _ = sock.listen(IpListenEndpoint {
                                     addr: Some(IpAddress::Ipv4(seg.dst_ip)),
                                     port: seg.dst_port,
@@ -380,7 +424,9 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
                             // Past the cap: drop the SYN. No socket is
                             // allocated; the guest's stack retransmits then
                             // aborts. Live flows are untouched.
-                            SynAdmit::RefusedAtCap => warn_flow_cap(&cfg.vm_name, &mut flood_log_at),
+                            SynAdmit::RefusedAtCap => {
+                                warn_flow_cap(&cfg.vm_name, max_flows, &mut flood_log_at)
+                            }
                         }
                     } else {
                         device.rx.push_back(f);
@@ -688,16 +734,40 @@ mod tests {
 
     #[test]
     fn admit_syn_caps_concurrent_flows_and_dedups_retransmits() {
+        let cap = DEFAULT_MAX_CONCURRENT_FLOWS;
         // A fresh 4-tuple under the cap allocates a flow...
-        assert_eq!(admit_syn(false, 0), SynAdmit::New);
-        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS - 1), SynAdmit::New);
+        assert_eq!(admit_syn(false, 0, cap), SynAdmit::New);
+        assert_eq!(admit_syn(false, cap - 1, cap), SynAdmit::New);
         // ...a retransmitted SYN for a live tuple never allocates a second
         // socket, regardless of the flow count...
-        assert_eq!(admit_syn(true, 0), SynAdmit::Duplicate);
-        assert_eq!(admit_syn(true, MAX_CONCURRENT_FLOWS + 9), SynAdmit::Duplicate);
+        assert_eq!(admit_syn(true, 0, cap), SynAdmit::Duplicate);
+        assert_eq!(admit_syn(true, cap + 9, cap), SynAdmit::Duplicate);
         // ...and a new tuple AT/OVER the cap is refused (SYN-flood guard).
-        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS), SynAdmit::RefusedAtCap);
-        assert_eq!(admit_syn(false, MAX_CONCURRENT_FLOWS + 100), SynAdmit::RefusedAtCap);
+        assert_eq!(admit_syn(false, cap, cap), SynAdmit::RefusedAtCap);
+        assert_eq!(admit_syn(false, cap + 100, cap), SynAdmit::RefusedAtCap);
+        // The cap is the configurable knob: a raised cap admits where the
+        // default would refuse; a lowered cap refuses where it would admit.
+        assert_eq!(admit_syn(false, cap, cap * 2), SynAdmit::New);
+        assert_eq!(admit_syn(false, 8, 8), SynAdmit::RefusedAtCap);
+    }
+
+    #[test]
+    fn parse_positive_takes_override_else_default_and_rejects_invalid() {
+        // Unset → default.
+        assert_eq!(parse_positive(None, DEFAULT_MAX_CONCURRENT_FLOWS), 1024);
+        // A valid positive override wins (whitespace tolerated).
+        assert_eq!(parse_positive(Some("4096"), DEFAULT_MAX_CONCURRENT_FLOWS), 4096);
+        assert_eq!(parse_positive(Some("  256 "), DEFAULT_MAX_CONCURRENT_FLOWS), 256);
+        // Invalid → default: non-numeric, empty, negative, and zero (zero
+        // would wedge the stack, so it's rejected like garbage).
+        assert_eq!(parse_positive(Some("lots"), DEFAULT_MAX_CONCURRENT_FLOWS), 1024);
+        assert_eq!(parse_positive(Some(""), DEFAULT_MAX_CONCURRENT_FLOWS), 1024);
+        assert_eq!(parse_positive(Some("-5"), DEFAULT_MAX_CONCURRENT_FLOWS), 1024);
+        assert_eq!(parse_positive(Some("0"), DEFAULT_MAX_CONCURRENT_FLOWS), 1024);
+        // Same precedence holds for the u64 idle-secs knob.
+        assert_eq!(parse_positive(Some("120"), DEFAULT_FLOW_IDLE_SECS), 120u64);
+        assert_eq!(parse_positive(Some("0"), DEFAULT_FLOW_IDLE_SECS), 60u64);
+        assert_eq!(parse_positive(None, DEFAULT_FLOW_IDLE_SECS), 60u64);
     }
 
     #[test]
@@ -717,8 +787,8 @@ mod tests {
         });
 
         let mut sockets = SocketSet::new(Vec::new());
-        let server = sockets.add(tcp_socket());
-        let client = sockets.add(tcp_socket());
+        let server = sockets.add(tcp_socket(flow_idle_timeout()));
+        let client = sockets.add(tcp_socket(flow_idle_timeout()));
         sockets
             .get_mut::<tcp::Socket>(server)
             .listen(IpListenEndpoint { addr: Some(IpAddress::Ipv4(ip)), port: 7777 })
