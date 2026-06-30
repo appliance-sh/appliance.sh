@@ -573,10 +573,18 @@ egress
 
 egress
   .command('policy')
-  .description("print the VM's current egress policy as JSON")
+  .description("print the VM's effective egress policy as JSON (the boundary actually enforced)")
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .action((opts: { name: string }) => {
     process.exit(runVm(['egress', 'policy', opts.name]));
+  });
+
+egress
+  .command('list')
+  .description('show the effective egress policy (Netstack VMs: default-deny + baked allowlist + your rules)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .action((opts: { name: string }) => {
+    process.exit(runVm(['egress', 'list', opts.name]));
   });
 
 egress
@@ -653,6 +661,15 @@ egress
     const args = ['egress', 'log', opts.name, '--tail', opts.tail];
     if (opts.clear) args.push('--clear');
     process.exit(runVm(args));
+  });
+
+egress
+  .command('denied')
+  .description('show blocked egress attempts and the `allow` command to permit each (the blocked→allow loop)')
+  .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
+  .option('--tail <n>', 'most-recent traffic events to scan for denials', '1000')
+  .action((opts: { name: string; tail: string }) => {
+    process.exit(runVm(['egress', 'denied', opts.name, '--tail', opts.tail]));
   });
 
 // ---- creds (per-host credential capture / injection) -------------------

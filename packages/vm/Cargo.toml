@@ -26,6 +26,12 @@ fscommon = "0.1"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# Host-side userspace TCP/IP terminator for the egress-firewall netstack
+# (net_link=Netstack): smoltcp consumes the guest's raw Ethernet frames
+# off the host socketpair end and terminates guest TCP in-process. Only
+# the TCP terminator + L2/IPv4 wire parsing is used — DHCP/DNS are
+# answered at the raw-frame layer, so no smoltcp udp/dhcp/dns sockets.
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -44,6 +50,10 @@ objc2-virtualization = { version = "0.3", features = [
   "VZNetworkDeviceConfiguration",
   "VZNetworkDeviceAttachment",
   "VZNATNetworkDeviceAttachment",
+  # Host-mediated network link (net_link=Netstack): the guest NIC is
+  # backed by a socketpair whose host end the smoltcp netstack owns.
+  # Pulls in objc2-foundation/NSFileHandle transitively.
+  "VZFileHandleNetworkDeviceAttachment",
   "VZMACAddress",
   "VZVirtioNetworkDeviceConfiguration",
   "VZStorageDeviceConfiguration",

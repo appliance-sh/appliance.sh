@@ -71,31 +71,6 @@ fn parse_leases(raw: &str, mac: &str) -> Result<Option<IpAddr>> {
     Ok(None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LEASES: &str = "{\n\tname=appliance\n\tip_address=192.168.64.7\n\thw_address=1,5e:94:ef:e4:c:ee\n\tlease=0x12345\n}\n{\n\tname=other\n\tip_address=192.168.64.2\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
-
-    #[test]
-    fn finds_lease_with_zero_stripped_octets() {
-        // The lease file writes `c` where the spec MAC says `0c`.
-        let ip = parse_leases(LEASES, "5e:94:ef:e4:0c:ee").unwrap();
-        assert_eq!(ip, Some("192.168.64.7".parse().unwrap()));
-    }
-
-    #[test]
-    fn misses_unknown_mac() {
-        let ip = parse_leases(LEASES, "02:00:00:00:00:01").unwrap();
-        assert_eq!(ip, None);
-    }
-
-    #[test]
-    fn rejects_invalid_mac() {
-        assert!(parse_leases(LEASES, "not-a-mac").is_err());
-    }
-}
-
 /// Poll the lease table until the VM's MAC shows up (the guest DHCPs
 /// early in initramfs, so this resolves within a few seconds of boot).
 pub fn discover_guest_ip(mac: &str, timeout: Duration) -> Result<IpAddr> {
@@ -180,6 +155,55 @@ pub fn spawn_proxy(listen_port: u16, target: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// Under `net_link = Netstack` there is **no OS route to the guest** —
+/// it lives entirely inside our userspace stack — so an inbound forward
+/// can't `TcpStream::connect((guest_ip, port))` the way the NAT path
+/// does. Instead each accepted host connection is dialed *through* the
+/// netstack (`Netstack::connect`, which originates a SYN to the guest),
+/// and the two streams are spliced by the same bidirectional pump. The
+/// listener side (`127.0.0.1:<port>`) is identical to the NAT forward —
+/// only the "connect to guest" leg swaps (docs/egress-firewall.md §6).
+pub fn spawn_proxy_netstack(
+    listen_port: u16,
+    guest_port: u16,
+    netstack: crate::netstack::Netstack,
+) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", listen_port))
+        .with_context(|| format!("bind 127.0.0.1:{listen_port}"))?;
+    spawn_netstack_accept_loop(listener, guest_port, netstack);
+    Ok(())
+}
+
+/// Like [`spawn_proxy_netstack`] but on an OS-chosen loopback port,
+/// returned to the caller. Used for the one-shot kubeconfig handoff,
+/// which under the netstack must also be reached through the stack
+/// rather than at `guest_ip:9991` directly.
+pub fn spawn_proxy_netstack_ephemeral(
+    guest_port: u16,
+    netstack: crate::netstack::Netstack,
+) -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind 127.0.0.1:0")?;
+    let port = listener.local_addr().context("ephemeral local addr")?.port();
+    spawn_netstack_accept_loop(listener, guest_port, netstack);
+    Ok(port)
+}
+
+fn spawn_netstack_accept_loop(
+    listener: TcpListener,
+    guest_port: u16,
+    netstack: crate::netstack::Netstack,
+) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let netstack = netstack.clone();
+            std::thread::spawn(move || match netstack.connect(guest_port) {
+                Ok(bridge) => crate::netstack::bridge_pump(bridge, stream),
+                Err(_) => drop(stream),
+            });
+        }
+    });
+}
+
 /// Probe an HTTP endpoint until it answers anything at all.
 pub fn wait_http(url: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
@@ -204,3 +228,28 @@ pub fn wait_http(url: &str, timeout: Duration) -> Result<()> {
 fn _unused(_: fn(&mut dyn Read, &mut dyn Write)) {}
 #[allow(dead_code)]
 fn _unused_path(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEASES: &str = "{\n\tname=appliance\n\tip_address=192.168.64.7\n\thw_address=1,5e:94:ef:e4:c:ee\n\tlease=0x12345\n}\n{\n\tname=other\n\tip_address=192.168.64.2\n\thw_address=1,aa:bb:cc:dd:ee:ff\n}\n";
+
+    #[test]
+    fn finds_lease_with_zero_stripped_octets() {
+        // The lease file writes `c` where the spec MAC says `0c`.
+        let ip = parse_leases(LEASES, "5e:94:ef:e4:0c:ee").unwrap();
+        assert_eq!(ip, Some("192.168.64.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn misses_unknown_mac() {
+        let ip = parse_leases(LEASES, "02:00:00:00:00:01").unwrap();
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn rejects_invalid_mac() {
+        assert!(parse_leases(LEASES, "not-a-mac").is_err());
+    }
+}

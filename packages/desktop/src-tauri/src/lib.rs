@@ -3106,6 +3106,46 @@ struct EgressPolicy {
     /// the interceptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ca_path: Option<String>,
+    /// True when this VM's host netstack is the ENFORCED egress boundary
+    /// (`net_link=Netstack`): default-DENY plus the baked allowlist, and
+    /// `microvm_egress_get` returns the *effective* merged policy. False
+    /// for the cooperative NAT proxy (`net_link=Nat`, default-Allow).
+    /// Host-populated from the VM's persisted spec (the engine's JSON does
+    /// not carry it), like `ca_path` above — never round-tripped back.
+    #[serde(default)]
+    enforced: bool,
+    /// `"netstack"` | `"nat"` — the VM's resolved network link, so the
+    /// desktop can label the boundary without re-deriving it from the
+    /// effective default.
+    #[serde(default)]
+    net_link: String,
+}
+
+/// Resolve a VM's effective network link by reading the engine's
+/// persisted spec (`~/.appliance/vm/<name>/vm.json`, `netLink` field) and
+/// applying the same `APPLIANCE_NETSTACK=1` force-on override the engine's
+/// `VmSpec::net_link()` uses (packages/vm/src/spec.rs). Returns true when
+/// the host netstack is the enforced egress boundary (`net_link=Netstack`),
+/// false for the cooperative NAT proxy. A missing / unreadable spec ⇒ Nat
+/// unless the override is set, mirroring the engine. Read-only: this never
+/// writes the spec.
+fn microvm_netstack_enforced(name: &str) -> bool {
+    if std::env::var("APPLIANCE_NETSTACK").map(|v| v == "1").unwrap_or(false) {
+        return true;
+    }
+    let Some(path) =
+        home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("vm").join(name).join("vm.json"))
+    else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|spec| spec.get("netLink").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase()))
+        .map(|link| link == "netstack")
+        .unwrap_or(false)
 }
 
 fn microvm_ca_path(name: &str) -> Option<PathBuf> {
@@ -3126,8 +3166,15 @@ async fn microvm_egress_get(name: Option<String>) -> Result<EgressPolicy, String
     if !ok {
         return Err(format!("read egress policy failed: {}", stderr.trim()));
     }
+    // The engine prints the EFFECTIVE policy for a Netstack VM (default-Deny
+    // + the baked allowlist merged over the operator's rules) — see
+    // `egress::effective_policy`. We display that as-is, and tag it with the
+    // VM's resolved link so the UI can label the boundary as enforced vs
+    // cooperative. Read-only: nothing here is ever written back.
     let mut policy: EgressPolicy = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
     policy.ca_path = microvm_ca_path(&name).map(|p| p.to_string_lossy().into_owned());
+    policy.enforced = microvm_netstack_enforced(&name);
+    policy.net_link = if policy.enforced { "netstack".into() } else { "nat".into() };
     Ok(policy)
 }
 
@@ -3144,6 +3191,21 @@ async fn microvm_egress_default(name: Option<String>, action: String) -> Result<
     Ok(())
 }
 
+/// Incrementally allow/deny a single host on the VM's PERSISTED policy.
+///
+/// CRITICAL (Quinn's F3 review): this drives the engine's typed
+/// `egress allow|deny <host>` subcommand, which does `load_policy` → add
+/// the one rule → `save_policy` against the persisted `egress-policy.json`.
+/// It is the host-side counterpart of the "allow this blocked host"
+/// affordance. It must NEVER be implemented as a `get-effective → modify →
+/// set` round-trip: `microvm_egress_get` returns the *effective merged*
+/// policy (default=Deny + the baked allowlist for a Netstack VM), so
+/// writing that whole object back would persist `default=Deny` + the baked
+/// hosts into the file and mis-enforce if the VM were later switched to
+/// NAT. Adding exactly one rule keeps the persisted file minimal and
+/// link-agnostic. (`microvm_egress_default`/`_mitm`/`_reset` are likewise
+/// thin typed subcommands — none of the desktop edit paths round-trip the
+/// effective JSON.)
 #[tauri::command]
 async fn microvm_egress_rule(name: Option<String>, action: String, host: String) -> Result<(), String> {
     // action: "allow" | "deny"
@@ -3157,6 +3219,25 @@ async fn microvm_egress_rule(name: Option<String>, action: String, host: String)
         run_status_command(&[&bin, "egress", &action, &host, "--name", &name]).await?;
     if !ok {
         return Err(format!("add {action} rule failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Incrementally remove ONE operator allow/deny rule for an exact host —
+/// the per-rule counterpart of `microvm_egress_reset` (which nukes every
+/// rule). Drives the engine's typed `egress remove <host>` (load → drop
+/// the host from both lists → save). Like `microvm_egress_rule` it must
+/// stay incremental: never a `get-effective → modify → set` round-trip,
+/// which would bake `default=Deny` + the baked allowlist into the file.
+#[tauri::command]
+async fn microvm_egress_remove(name: Option<String>, host: String) -> Result<(), String> {
+    let name = vm_name(name);
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", "remove", &host, "--name", &name]).await?;
+    if !ok {
+        return Err(format!("remove rule failed: {}", stderr.trim()));
     }
     Ok(())
 }
@@ -4796,6 +4877,7 @@ pub fn run() {
             microvm_egress_get,
             microvm_egress_default,
             microvm_egress_rule,
+            microvm_egress_remove,
             microvm_egress_mitm,
             microvm_egress_reset,
             microvm_egress_log,

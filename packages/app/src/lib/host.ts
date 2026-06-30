@@ -442,10 +442,19 @@ export interface MicroVmStatus {
 }
 
 /** Outbound-traffic policy for the microVM's egress proxy. Mirrors
- *  EgressPolicy in packages/vm/src/egress.rs. */
+ *  EgressPolicy in packages/vm/src/egress.rs.
+ *
+ *  For a `net_link=Netstack` VM (`enforced: true`) the host returns the
+ *  EFFECTIVE policy enforced at the boundary — default-DENY plus the baked
+ *  allowlist merged over the operator's rules (egress::effective_policy).
+ *  For a `net_link=Nat` VM (`enforced: false`) it's the persisted,
+ *  cooperative policy. The fields below are display-only — never write the
+ *  whole object back; edits go through the incremental `addRule`/`setDefault`
+ *  bridge calls. */
 export interface EgressPolicy {
   default: 'allow' | 'deny';
-  /** Host suffixes always allowed. */
+  /** Host suffixes always allowed. For a Netstack VM this includes the
+   *  baked allowlist (NETSTACK_BAKED_ALLOWLIST) merged with operator rules. */
   allow: string[];
   /** Host suffixes always denied (deny wins over allow). */
   deny: string[];
@@ -453,7 +462,37 @@ export interface EgressPolicy {
   mitm: boolean;
   /** Path to the VM's egress CA cert, when interception is on. */
   caPath?: string;
+  /** True when the host netstack is the ENFORCED egress boundary
+   *  (`net_link=Netstack`): default-DENY + the baked allowlist, the only
+   *  path off-box. False for the cooperative NAT proxy. Host-populated from
+   *  the VM's persisted spec. */
+  enforced?: boolean;
+  /** The VM's resolved network link. */
+  netLink?: 'netstack' | 'nat';
 }
+
+/** The baked, always-on allowlist for `net_link=Netstack` VMs — a mirror
+ *  of NETSTACK_ALLOWLIST in packages/vm/src/egress.rs (§5 of
+ *  docs/egress-firewall.md). The engine merges these into the effective
+ *  policy's `allow`; the desktop partitions them back out to distinguish
+ *  the always-on baked set from the operator's own allow rules. Keep in
+ *  sync with the engine constant. */
+export const NETSTACK_BAKED_ALLOWLIST: readonly string[] = [
+  'api.anthropic.com',
+  'dl-cdn.alpinelinux.org',
+  'registry.npmjs.org',
+  'pypi.org',
+  'files.pythonhosted.org',
+  'crates.io',
+  'static.crates.io',
+  'github.com',
+  'codeload.github.com',
+  'githubusercontent.com',
+  'registry-1.docker.io',
+  'auth.docker.io',
+  'production.cloudflare.docker.com',
+  'ghcr.io',
+];
 
 /** One recorded egress request — mirrors TrafficEvent in
  *  packages/vm/src/traffic.rs. */
@@ -473,6 +512,11 @@ export interface MicroVmEgressHost {
   get(): Promise<EgressPolicy>;
   setDefault(action: 'allow' | 'deny'): Promise<void>;
   addRule(action: 'allow' | 'deny', host: string): Promise<void>;
+  /** Remove a single operator allow/deny rule for an exact host — the
+   *  per-rule counterpart of `reset` (which clears every rule).
+   *  Incremental, like `addRule`: never a whole effective-policy
+   *  write-back. */
+  removeRule(host: string): Promise<void>;
   setMitm(enabled: boolean): Promise<void>;
   reset(): Promise<void>;
   /** Recent recorded traffic, oldest-first. */

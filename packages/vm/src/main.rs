@@ -6,6 +6,7 @@ mod guest;
 mod images;
 mod mitm;
 mod net;
+mod netstack;
 mod shell;
 mod spec;
 mod store;
@@ -251,10 +252,31 @@ enum EgressCmd {
         #[arg(long, default_value_t = false)]
         log: bool,
     },
-    /// Print the VM's current egress policy as JSON.
+    /// Print the VM's current egress policy as JSON. For a Netstack VM
+    /// this is the EFFECTIVE policy enforced at the boundary (default-Deny
+    /// plus the baked allowlist plus your rules), not the permissive
+    /// persisted default. A NAT VM prints its persisted policy unchanged.
     Policy {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
+    },
+    /// Show the EFFECTIVE egress policy as a readable report —
+    /// distinguishing the baked allowlist, your allow rules, and your
+    /// deny rules. For a Netstack VM the default is Deny (host-enforced)
+    /// even though the persisted file keeps the serde-default allow.
+    List {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Show blocked egress attempts (host + count + last-seen) and the
+    /// exact `egress allow` command to permit each — the blocked→allow
+    /// loop that turns an opaque "it hung" into a one-line fix.
+    Denied {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+        /// Most-recent traffic events to scan for denials.
+        #[arg(long, default_value_t = 1000)]
+        tail: usize,
     },
     /// Set the default action when no rule matches (allow | deny).
     Default {
@@ -270,6 +292,14 @@ enum EgressCmd {
     },
     /// Add a deny rule (host suffix). Deny wins over allow.
     Deny {
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Remove a single operator allow/deny rule for an exact host — the
+    /// per-rule counterpart of `reset` (which nukes every rule).
+    /// Incremental: load → drop this exact host from both lists → save.
+    Remove {
         host: String,
         #[arg(long, default_value = DEFAULT_VM)]
         name: String,
@@ -816,8 +846,29 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             egress::run_proxy(&name, addr, log)
         }
         EgressCmd::Policy { name } => {
-            let policy = egress::load_policy(&name);
+            // The EFFECTIVE policy enforced at the boundary — for a
+            // Netstack VM that's default-Deny + the baked allowlist (not
+            // the persisted serde-default Allow), so the JSON the desktop
+            // and CLI read matches what's actually enforced. NAT is
+            // unchanged (its persisted, cooperative policy).
+            let policy = egress::effective_policy(&name);
             println!("{}", serde_json::to_string_pretty(&policy)?);
+            Ok(())
+        }
+        EgressCmd::List { name } => {
+            // Human-readable effective view: distinguishes baked-allow vs
+            // operator-allow vs operator-deny and reconciles the persisted
+            // default with the netstack-enforced one.
+            let persisted = egress::load_policy(&name);
+            let netstack = egress::is_netstack(&name);
+            print!("{}", egress::render_effective_policy(&name, &persisted, netstack));
+            Ok(())
+        }
+        EgressCmd::Denied { name, tail } => {
+            let denied = traffic::denied(&name, tail);
+            let report =
+                traffic::render_denied_report(&name, name == DEFAULT_VM, &denied, traffic::now_millis());
+            print!("{report}");
             Ok(())
         }
         EgressCmd::Default { action, name } => {
@@ -853,6 +904,19 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             egress::save_policy(&name, &policy)?;
             let _ = egress::publish_configmap(&name);
             println!("egress: deny {host}");
+            Ok(())
+        }
+        EgressCmd::Remove { host, name } => {
+            // Per-rule remove: drop this exact host from both lists,
+            // mirroring the load→edit→save contract of allow/deny so the
+            // persisted file stays minimal (never write the effective
+            // merged policy back).
+            let mut policy = egress::load_policy(&name);
+            policy.allow.retain(|h| h != &host);
+            policy.deny.retain(|h| h != &host);
+            egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
+            println!("egress: remove {host}");
             Ok(())
         }
         EgressCmd::Reset { name } => {
