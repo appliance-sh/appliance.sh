@@ -306,14 +306,29 @@ behind a redirect.**
 
 ### I1 — New shell + 5-area nav + route skeleton
 
-- Rewrite `app-shell.tsx` nav to the five items, host-gated (Agents hidden when
-  `!host.vm`, mirroring today's Runtimes gate). Keep `<TerminalDock/>`/`<TerminalLayer/>`.
-- Add the new route paths in `routes.tsx`. Initially each new path renders the
-  **existing** page component (or a thin redirect to it) — e.g. `/clusters` →
-  `LocalRuntimePage` + a clusters stub, `/projects` → `DashboardPage`, `/setup` →
-  the onboarding branch. Old paths (`/`, `/local-runtime`, `/environments`,
-  `/deployments`, `/bootstrap`, `/connect`, `/settings`) stay live.
-- Add the `/` redirect resolver (Setup-if-unconfigured-else-Projects).
+- Rewrite `app-shell.tsx` nav. The live items are **Setup (adaptive), Clusters,
+  Projects, Settings**; Setup shows only while unconfigured and demotes out of the
+  primary nav once a cluster is selected (Q3). The **Agents nav item lands in I4** —
+  it has no backing page yet, so I1 doesn't add a dead item (when it lands it's
+  `host.vm`-gated, mirroring today's Runtimes gate). Keep `<TerminalDock/>` /
+  `<TerminalLayer/>` as grid rows OUTSIDE `<Outlet/>`.
+- Add the new route paths in `routes.tsx`, **inside `AppShell`** (Setup / Connect /
+  Bootstrap move in, so the dock + cluster switcher stay mounted during onboarding).
+  Initially each new path renders the **existing** page component (or a thin
+  redirect) — `/setup` → the onboarding hub (`DashboardPage`'s first-run branch; on
+  web the **Setup CTA is Connect-led**, since the microVM-express path is
+  desktop-only), `/clusters` + `/clusters/:id` → `LocalRuntimePage`, `/projects` →
+  `DashboardPage` (the Overview grid), `/setup/doctor` → the page that hosts the
+  `PreflightPanel`, `/agents` → redirect to `/clusters`. Old paths (`/dashboard`,
+  `/local-runtime`, `/environments`, `/deployments`, `/bootstrap`, `/connect`) stay
+  reachable — a redirect when stateless (`/connect`, `/dashboard`), an alias (same
+  element at both paths) when they carry `?mode` / router state (`/bootstrap`,
+  `/bootstrap/run`).
+- Add the `/` redirect resolver (Setup-if-unconfigured-else-Projects), replacing
+  `DashboardPage`'s own index-route branch.
+- The **workloads** browser + **agent launcher** keep rendering inside ②
+  (`LocalRuntimePage`) until I3 / I4 extract them — I1 stands up the shell + routes,
+  it does **not** move surfaces.
 - **Green because:** every old page still mounts; nothing is moved yet, only
   re-pointed and re-labelled. Pure routing/nav change.
 
@@ -363,25 +378,32 @@ behind a redirect.**
 
 ---
 
-## 8. Open questions
+## 8. Resolved decisions (owner + Devon + Parker)
 
-- **Q1 (owner): ② sub-routing for local runtimes.** I propose **one** `/clusters/:id`
-  detail that dispatches on cluster kind (cloud vs microVM). Acceptable, or do you
-  want a distinct `/clusters/runtimes/:name` namespace for microVMs (clearer URLs, but
-  two detail components)?
-- **Q2 (owner): Environments/Deployments as routes-only.** Dropping their **nav**
-  entries (folding them under ③) is what keeps the nav at five. Confirm you're happy
-  losing the top-level shortcuts, or do you want a secondary in-area tab strip?
-- **Q3 (Devon): does Setup belong in the sidebar permanently,** or should ① collapse
-  to a header affordance once a cluster exists (so configured users see a 4-item nav)?
-  The locked decision is five areas; this is only about whether ① is always visible.
-- **Q4 (Parker): the Doctor's home.** I placed prerequisite preflight under
-  ① `/setup/doctor`. It's also a recurring troubleshooting surface (a daemon can stop
-  any time). Keep it in Setup, or also surface a "Re-run checks" entry from ② Clusters?
-- **Q5 (Devon/Parker): deploy CTA target when no runtime is up.** Today several CTAs
-  deep-link to the wizard while the VM is down (the wizard then nags). With ② owning
-  runtime start, should those CTAs route to ② `/clusters/:id` first when nothing is
-  running, instead of into a wizard that can't finish?
+The planning-pass open questions are now locked — the build phases implement these,
+they don't relitigate them:
+
+- **Q1 — one adaptive `/clusters/:id`.** A single cluster-detail route dispatches on
+  cluster kind (`isMicroVmClusterId`): a cloud cluster → lifecycle ops, a local
+  runtime → VM lifecycle + egress + credentials + facts. No separate
+  `/clusters/runtimes/:name` namespace. [build in I2]
+- **Q2 — Environments/Deployments are routes-only, nested under ③ Projects.** They
+  lose their top-level nav entries (this is what keeps the nav at five) but keep live
+  routes so existing links resolve; they're reachable from the grid, project detail,
+  and env detail. No secondary in-area tab strip. [nav drops in I1, re-home in I3]
+- **Q3 — Setup is ADAPTIVE.** ① is a prominent nav item (and the default landing)
+  while the shell is unconfigured, and is **demoted out of the primary nav once a
+  cluster is selected**. `/setup` stays routable; its recurring children (add-cluster,
+  doctor) surface from ② Clusters. Configured users see the four-item nav Clusters /
+  Projects / Agents / Settings. [build in I1]
+- **Q4 — Doctor: canonical in Setup, plus a re-run entry from the runtime.** The
+  prerequisite preflight lives at ① `/setup/doctor`, and a "Re-run checks" entry
+  surfaces from the ② cluster/runtime detail — **one `PreflightPanel`, two entry
+  points**, not two implementations. [build in I2/I5]
+- **Q5 — the deploy wizard is target-aware.** When no runtime is up, the wizard gains
+  an inline "start a runtime" step and **preserves the deploy intent** (project /
+  environment) across the runtime bring-up, rather than dead-ending in a wizard that
+  can't finish or bouncing the operator out to ②. [build in I3]
 
 ```
 
