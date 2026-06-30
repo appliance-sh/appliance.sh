@@ -1,7 +1,8 @@
 import * as React from 'react';
 import { NavLink, Outlet } from 'react-router';
-import { Wand, Server, Boxes, Folder, Cog } from 'lucide-react';
+import { Wand, Server, Boxes, Folder, Bot, Cog } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
@@ -25,18 +26,24 @@ export function AppShell() {
   const { cluster, isLoading } = useSelectedCluster();
   const configured = Boolean(cluster);
 
-  // Five-area IA (§2). ④ Agents is deferred to I4 — it has no backing
-  // page yet, so we don't add a dead nav item now; when it lands it is
-  // `host.vm`-gated, mirroring today's Runtimes gate. Canonical labels
-  // only: Setup / Clusters / Projects / Settings (no Dashboard/Overview/
-  // Runtimes drift). Clusters stays always-visible — its desktop-only
-  // bits are host-gated inside the page, not hidden from the rail.
-  // Clusters uses `Boxes` (a distinct icon, not the brand mark's `Server`)
-  // so the nav item doesn't read as a second logo (Devon).
+  // ④ Agents is desktop-only — it launches coding agents into a local
+  // runtime (host.vm). The web shell hides it, mirroring today's Runtimes
+  // gate; the `/agents` route itself renders a "desktop app only" message.
+  const host = useHost();
+  const showAgents = Boolean(host.vm);
+
+  // Five-area IA (§2): Setup (adaptive) / Clusters / Projects / Agents /
+  // Settings — canonical labels only (no Dashboard/Overview/Runtimes drift).
+  // Clusters stays always-visible — its desktop-only bits are host-gated
+  // inside the page, not hidden from the rail; Agents is gated OFF the rail on
+  // web since the whole area is desktop-only. Clusters uses `Boxes` (a
+  // distinct icon, not the brand mark's `Server`) so the nav item doesn't read
+  // as a second logo (Devon); Agents uses `Bot`.
   const nav: NavItem[] = [
     ...(!isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
     { to: '/clusters', label: 'Clusters', icon: Boxes },
     { to: '/projects', label: 'Projects', icon: Folder },
+    ...(showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
     { to: '/settings', label: 'Settings', icon: Cog },
   ];
 

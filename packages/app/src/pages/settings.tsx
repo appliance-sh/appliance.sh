@@ -1,8 +1,6 @@
 import * as React from 'react';
 import { RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
-import { AGENT_ADAPTERS, DEFAULT_AGENT_TYPE } from '@/lib/agents';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import type { AvailableUpdate, UpdateProgress } from '@/lib/host';
@@ -10,14 +8,12 @@ import { cn } from '@/lib/utils';
 
 // ⑤ Settings — slimmed (docs/desktop-ia.md §3 / move-map 4b). Cluster CRUD
 // and the cloud-lifecycle panels moved to ② Clusters (`/clusters` +
-// `/clusters/:id`); agent sign-in moves to ④ Agents in I4 (it still lives
-// here until then). What stays: Agent authentication (transitional), Updates,
-// and About.
+// `/clusters/:id`); agent sign-in moved to ④ Agents (I4). What stays: Updates
+// and About (I5 finalizes the area to Updates / About / Preferences).
 export function SettingsPage() {
   const host = useHost();
   const canBootstrap = Boolean(host.bootstrap);
   const canSelfUpdate = Boolean(host.updater);
-  const canAgentAuth = Boolean(host.agentAuth);
 
   return (
     <div className="max-w-2xl space-y-8">
@@ -25,11 +21,10 @@ export function SettingsPage() {
         <h1 className="text-xl font-semibold">Settings</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
           Shell info and updates. Manage clusters under{' '}
-          <span className="font-medium text-[var(--color-foreground)]">Clusters</span>.
+          <span className="font-medium text-[var(--color-foreground)]">Clusters</span>, and sign in to coding agents
+          under <span className="font-medium text-[var(--color-foreground)]">Agents</span>.
         </p>
       </div>
-
-      {canAgentAuth ? <AgentAuthSection /> : null}
 
       {canSelfUpdate ? <UpdatesSection /> : null}
 
@@ -202,61 +197,6 @@ function UpdatesSection() {
         ) : null}
       </div>
     </Section>
-  );
-}
-
-// Agent authentication (Phase 5, L3 / multi-agent G3 — docs/agent-login.md §4,
-// docs/multi-agent-adapters.md §4). Desktop-only: store each coding agent's
-// credential host-side so it can reach its provider — Claude Code (API key or
-// "Sign in with Claude"), GitHub Copilot (fine-grained PAT), OpenAI Codex (API
-// key). Each agent has its OWN provider store, so a type picker switches which
-// agent you're signing in. The credential is brokered into the sandbox at
-// request time and NEVER enters the VM. Moves to ④ Agents in I4.
-function AgentAuthSection() {
-  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
-  // Bumped on a successful login so the per-agent "signed in" dots refresh
-  // without a remount (Devon nit).
-  const [authBump, setAuthBump] = React.useState(0);
-  const signedIn = useAgentSignedIn(true, authBump);
-  return (
-    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-      <div>
-        <h2 className="text-sm font-semibold">Agent authentication</h2>
-        <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-          Sign in so coding agents can reach their providers. Each agent stores its own credential on this machine,
-          brokered into the sandbox at request time; it never enters the VM.
-        </p>
-      </div>
-      <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
-        {AGENT_ADAPTERS.map((a) => {
-          const active = a.type === agentType;
-          return (
-            <button
-              key={a.type}
-              type="button"
-              aria-pressed={active}
-              title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
-              onClick={() => setAgentType(a.type)}
-              className={cn(
-                'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors',
-                active
-                  ? 'border-cyan-500/50 bg-cyan-500/10 text-[var(--color-foreground)]'
-                  : 'border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
-              )}
-            >
-              <a.Icon className="h-3.5 w-3.5" /> {a.label}
-              {/* Green dot = a credential is already stored for this agent
-                  (decorative; the "— signed in" title suffix is the a11y
-                  signal). */}
-              {signedIn[a.type] ? (
-                <span aria-hidden className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-green-400" />
-              ) : null}
-            </button>
-          );
-        })}
-      </div>
-      <AgentLoginPanel agentType={agentType} onAuthenticated={() => setAuthBump((n) => n + 1)} />
-    </section>
   );
 }
 

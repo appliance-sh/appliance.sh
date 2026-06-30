@@ -1,7 +1,8 @@
 import * as React from 'react';
-import { useNavigate } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  Bot,
   Download,
   FolderOpen,
   Play,
@@ -19,7 +20,7 @@ import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
 import { cn } from '@/lib/utils';
 import type { MicroVmStatus, MicroVmSummary } from '@/lib/host';
-import { DoctorPanel, LaunchAgentButton } from '@/pages/local-runtime';
+import { DoctorPanel } from '@/pages/local-runtime';
 // PARKER CONTINUITY: workloads moved to ③ env-detail in I3, but the
 // runtime-scoped "what's running on THIS engine, across all projects" view
 // stays reachable here as the ② cluster-detail Workloads tab — it imports the
@@ -36,7 +37,8 @@ type RuntimeTab = 'lifecycle' | 'egress' | 'credentials' | 'facts' | 'workloads'
 // Credentials · Facts — so the decomposition isn't undone in one long
 // scroll at the leaf. Workloads is the runtime-scoped 5th tab (its panel now
 // lives in ③ env-detail; this is the deep-link to "what's running on THIS
-// engine"); the agent launcher rides along in Lifecycle until I4.
+// engine"). The agent launcher moved to ④ Agents in I4 — Lifecycle now keeps
+// only a thin "Run agent →" deep-link (preselecting this runtime).
 //
 // THE EGRESS DOUBLE-FETCH FIX (docs/desktop-ia.md §5.5): the single
 // `['microvm', name, 'egress']` policy poll lives HERE and is passed down —
@@ -429,17 +431,15 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
                     <TerminalIcon className="h-4 w-4" /> {status.dev ? 'Open dev shell' : 'Open shell'}
                   </Button>
                 ) : null}
-                {/* Agent launcher rides along here until I4 stands up ④ Agents,
-                    where the detail keeps only a thin "Run agent →" deep-link. */}
+                {/* The launcher itself lives in ④ Agents (I4). Keep a thin
+                    deep-link here, preselecting this runtime via `?runtime=`,
+                    so "run an agent on this VM" stays one click from detail. */}
                 {host.terminal && host.vm ? (
-                  <LaunchAgentButton
-                    name={name}
-                    disabledReason={
-                      status.devMount
-                        ? null
-                        : 'VM has no shared workspace — start it as a dev environment to run agents'
-                    }
-                  />
+                  <Button asChild variant="outline" size="sm">
+                    <Link to={`/agents?runtime=${encodeURIComponent(name)}`} title="Launch a coding agent in ④ Agents">
+                      <Bot className="h-4 w-4" /> Run agent →
+                    </Link>
+                  </Button>
                 ) : null}
                 <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
                   <Rocket className="h-4 w-4" /> Deploy application

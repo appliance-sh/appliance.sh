@@ -1,0 +1,420 @@
+import * as React from 'react';
+import { Link, useSearchParams } from 'react-router';
+import { useQuery } from '@tanstack/react-query';
+import { Bot, Server, Terminal as TerminalIcon } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { EmptyState } from '@/components/ui/empty-state';
+import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
+import { AGENT_ADAPTERS, DEFAULT_AGENT_TYPE, agentAdapter, agentLabel } from '@/lib/agents';
+import { useHost } from '@/providers/host-provider';
+import { useTerminalSessions, agentSessionKey, agentBadgeStatus } from '@/providers/terminal-sessions-provider';
+import { cn } from '@/lib/utils';
+import type { AgentInfo, MicroVmStatus, MicroVmSummary } from '@/lib/host';
+import { LaunchAgentButton } from './launch-agent-button';
+
+// ④ Agents — the first-class area (docs/desktop-ia.md §3). Three surfaces,
+// assembled here: per-agent SIGN-IN (moved out of ⑤ Settings), the LAUNCHER
+// (moved out of ② cluster detail — pick a runtime + agent type + task), and a
+// RUNS list (each runtime's `agent.list`, the durable index behind the dock's
+// agent tabs). The observe terminals stay in the GLOBAL dock
+// (`TerminalSessionsProvider`); this area links to them, it does not own a
+// second terminal stack. Desktop-only (`host.vm`) — the nav item is hidden on
+// the web shell, and the route renders a "desktop app only" message there.
+export function AgentsPage() {
+  const host = useHost();
+  const supported = Boolean(host.vm);
+  const canAgentAuth = Boolean(host.agentAuth);
+
+  // The per-agent "signed in" map drives BOTH the sign-in picker dots and the
+  // page-level cold-start banner, so it is lifted here (one probe) and shared.
+  // Bumped after a login so a freshly-signed-in agent lights up and the
+  // cold-start banner dismisses without a remount.
+  const [authBump, setAuthBump] = React.useState(0);
+  const signedIn = useAgentSignedIn(canAgentAuth, authBump);
+
+  if (!supported) {
+    return (
+      <div className="max-w-2xl space-y-4">
+        <h1 className="text-xl font-semibold">Agents</h1>
+        <p className="text-sm text-[var(--color-muted-foreground)]">
+          Coding agents run inside a local runtime — only available in the desktop app.
+        </p>
+      </div>
+    );
+  }
+
+  // Cold-start (Parker I0): the host can store credentials but NONE of the
+  // three agents is signed in yet. Only treat it as the no-signed-in state once
+  // the probe has RESOLVED (every adapter present in the map), so the banner
+  // doesn't flash before the first status read.
+  const authResolved = AGENT_ADAPTERS.every((a) => a.type in signedIn);
+  const anySignedIn = AGENT_ADAPTERS.some((a) => signedIn[a.type]);
+  const noAgentSignedIn = canAgentAuth && authResolved && !anySignedIn;
+
+  return (
+    <div className="max-w-3xl space-y-8">
+      <header>
+        <h1 className="text-xl font-semibold">Agents</h1>
+        <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+          Sign in to a coding agent, launch it into a local runtime&rsquo;s shared workspace, and observe it in the
+          terminal dock. Credentials are brokered host-side and never enter the VM.
+        </p>
+      </header>
+
+      {/* Cold-start, "no signed-in agent" state (named): lead with a clear
+          "sign in, then launch" call rather than dropping the user straight
+          onto a launcher whose first action would 502 on a missing key. */}
+      {noAgentSignedIn ? <NoSignedInAgentBanner /> : null}
+
+      {canAgentAuth ? <AgentSignIn signedIn={signedIn} onAuthenticated={() => setAuthBump((n) => n + 1)} /> : null}
+
+      <LauncherSection />
+
+      <RunsList />
+    </div>
+  );
+}
+
+// The "no signed-in agent" cold-start banner (Parker I0). Distinct from the
+// "no runs" empty state below: this one is about CREDENTIALS, and points at the
+// sign-in section that immediately follows.
+function NoSignedInAgentBanner() {
+  return (
+    <div className="rounded-md border border-cyan-500/40 bg-cyan-500/5 px-4 py-3">
+      <h2 className="text-sm font-semibold text-cyan-200">Sign in to get started</h2>
+      <p className="mt-1 text-xs text-cyan-100/80">
+        No coding agent is signed in yet. Pick an agent below and store its credential, then launch it into a running
+        local runtime. The credential stays on this machine — it never enters the VM.
+      </p>
+    </div>
+  );
+}
+
+// Per-agent sign-in (moved out of ⑤ Settings — docs/desktop-ia.md move-map 4b).
+// The agent-type picker + per-type "signed in" dots + the shared
+// `AgentLoginPanel`. Presentational: the signed-in map + login refresh are
+// owned by the page so the cold-start banner stays in lock-step.
+function AgentSignIn({
+  signedIn,
+  onAuthenticated,
+}: {
+  signedIn: Record<string, boolean>;
+  onAuthenticated: () => void;
+}) {
+  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
+  return (
+    <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+      <div>
+        <h2 className="text-sm font-semibold">Agent sign-in</h2>
+        <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
+          Sign in so coding agents can reach their providers. Each agent stores its own credential on this machine,
+          brokered into the sandbox at request time; it never enters the VM.
+        </p>
+      </div>
+      <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
+        {AGENT_ADAPTERS.map((a) => {
+          const active = a.type === agentType;
+          return (
+            <button
+              key={a.type}
+              type="button"
+              aria-pressed={active}
+              title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
+              onClick={() => setAgentType(a.type)}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors',
+                active
+                  ? 'border-cyan-500/50 bg-cyan-500/10 text-[var(--color-foreground)]'
+                  : 'border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
+              )}
+            >
+              <a.Icon className="h-3.5 w-3.5" /> {a.label}
+              {/* Green dot = a credential is already stored for this agent
+                  (decorative; the "— signed in" title suffix is the a11y
+                  signal). */}
+              {signedIn[a.type] ? (
+                <span aria-hidden className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-green-400" />
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+      <AgentLoginPanel agentType={agentType} onAuthenticated={onAuthenticated} />
+    </section>
+  );
+}
+
+// The launcher — pick a RUNTIME, then the agent type + task (the latter two are
+// the moved `LaunchAgentButton`). Agents need a running local runtime with a
+// shared workspace; we list the running VMs and gate the launch on the selected
+// one's `devMount`, mirroring the gating ② cluster detail used to apply.
+function LauncherSection() {
+  const host = useHost();
+  const [searchParams] = useSearchParams();
+  // ② "Run agent →" deep-links with `?runtime=<name>` so the picker preselects
+  // the runtime the user came from.
+  const preferred = searchParams.get('runtime');
+
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
+    queryFn: () => host.vm!.list(),
+    refetchInterval: 8_000,
+  });
+  const runningVms = (vmListQuery.data ?? []).filter((v) => v.running);
+
+  // Which runtime to launch into. Default to the deep-link hint when it is
+  // running, else the first running VM; re-resolve when the selection stops
+  // running so we never strand the launcher on a dead VM.
+  const [selected, setSelected] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    if (runningVms.length === 0) {
+      if (selected !== null) setSelected(null);
+      return;
+    }
+    const stillRunning = selected !== null && runningVms.some((v) => v.name === selected);
+    if (!stillRunning) {
+      const hint = preferred && runningVms.some((v) => v.name === preferred) ? preferred : runningVms[0].name;
+      setSelected(hint);
+    }
+  }, [runningVms, selected, preferred]);
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Launch</h2>
+      {vmListQuery.isLoading && runningVms.length === 0 ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">Loading runtimes…</p>
+      ) : runningVms.length === 0 ? (
+        <EmptyState
+          icon={Server}
+          title="No running runtime"
+          description="Start a local runtime as a dev environment to launch coding agents into its shared workspace."
+          action={
+            <Button asChild>
+              <Link to="/clusters">
+                <Server className="h-4 w-4" /> Go to Clusters
+              </Link>
+            </Button>
+          }
+        />
+      ) : (
+        <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
+          {runningVms.length > 1 ? <RuntimePicker vms={runningVms} selected={selected} onSelect={setSelected} /> : null}
+          {selected ? <RuntimeLauncher name={selected} /> : null}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Pick which running runtime to launch into, when more than one is up.
+function RuntimePicker({
+  vms,
+  selected,
+  onSelect,
+}: {
+  vms: MicroVmSummary[];
+  selected: string | null;
+  onSelect: (name: string) => void;
+}) {
+  return (
+    <div role="group" aria-label="Runtime" className="flex flex-wrap gap-1">
+      {vms.map((v) => {
+        const active = v.name === selected;
+        return (
+          <button
+            key={v.name}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onSelect(v.name)}
+            className={cn(
+              'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[11px] transition-colors',
+              active
+                ? 'border-cyan-500/50 bg-cyan-500/10 text-[var(--color-foreground)]'
+                : 'border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
+            )}
+          >
+            <Server className="h-3.5 w-3.5" /> {v.name}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// The launch affordance for one runtime: resolve its status to gate on a shared
+// workspace (the launcher needs `devMount`), then render the moved
+// `LaunchAgentButton`. Shares the `['microvm', name, 'status']` query key with
+// ② cluster detail, so TanStack dedupes the poll.
+function RuntimeLauncher({ name }: { name: string }) {
+  const host = useHost();
+  const statusQuery = useQuery({
+    queryKey: ['microvm', name, 'status'],
+    queryFn: () => host.vm!.instance(name).status(),
+    refetchInterval: (q) => {
+      const data = q.state.data as MicroVmStatus | undefined;
+      if (!data?.available) return 30_000;
+      return data.running ? 8_000 : 4_000;
+    },
+  });
+  const status = statusQuery.data;
+
+  const disabledReason = !status
+    ? 'Checking the runtime…'
+    : !status.running
+      ? 'Start this runtime to run agents'
+      : status.devMount
+        ? null
+        : 'VM has no shared workspace — start it as a dev environment to run agents';
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Launch into <code className="font-mono">{name}</code>
+        {status?.devMount ? (
+          <>
+            {' '}
+            — shared workspace <code className="font-mono">{status.devMount}</code>
+          </>
+        ) : null}
+      </p>
+      <LaunchAgentButton name={name} disabledReason={disabledReason} />
+    </div>
+  );
+}
+
+// The runs list — each running runtime's reconciled agent registry
+// (`agent.list`), the durable index behind the dock's agent tabs. "Observe"
+// focuses-or-opens the agent's tab through the SAME provider the launcher uses.
+function RunsList() {
+  const host = useHost();
+  const terminals = useTerminalSessions();
+
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
+    queryFn: () => host.vm!.list(),
+    refetchInterval: 8_000,
+  });
+  const runningVms = (vmListQuery.data ?? []).filter((v) => v.running);
+  const vmNames = runningVms.map((v) => v.name).sort();
+
+  // Fan `agent.list` out across every running VM and flatten — keyed on the
+  // running-VM set so the poll re-subscribes only when a VM starts/stops.
+  const runsQuery = useQuery({
+    queryKey: ['agents', 'runs', vmNames.join(',')],
+    enabled: vmNames.length > 0,
+    queryFn: async () => {
+      const perVm = await Promise.all(
+        vmNames.map(async (vmName) => {
+          const list = await host
+            .vm!.instance(vmName)
+            .agent.list()
+            .catch(() => [] as AgentInfo[]);
+          return list.map((a) => ({ ...a, vmName }));
+        })
+      );
+      return perVm.flat();
+    },
+    refetchInterval: 5_000,
+  });
+  const runs = runsQuery.data ?? [];
+
+  const observe = (run: AgentInfo & { vmName: string }) => {
+    // Reuse the SAME provider wiring the launcher + rehydrate use: opening a
+    // session with this agent's guest id focuses an existing observe tab or
+    // attaches a new one. The dock owns the terminal — this only links to it.
+    terminals.openSession({
+      target: run.vmName,
+      engine: 'microvm',
+      clusterName: run.vmName,
+      mode: 'host',
+      sessionKey: agentSessionKey(run.sessionId),
+      sessionId: run.sessionId,
+      agent: { type: run.type, status: agentBadgeStatus(run.status), mode: run.mode },
+      title: run.task ? `Agent · ${run.task}` : `Agent · ${agentLabel(run.type)}`,
+    });
+  };
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Runs</h2>
+      {runsQuery.isLoading && runs.length === 0 ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">Loading runs…</p>
+      ) : runs.length === 0 ? (
+        <NoRunsState hasRuntime={runningVms.length > 0} />
+      ) : (
+        <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
+          {runs.map((run) => (
+            <RunRow key={`${run.vmName}:${run.sessionId}`} run={run} onObserve={() => observe(run)} />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// The "no runs" empty state (named, distinct from the no-signed-in banner): an
+// agent is signed in (or a runtime is up) but nothing has been launched yet —
+// point at the launcher, don't render a bare empty table.
+function NoRunsState({ hasRuntime }: { hasRuntime: boolean }) {
+  return (
+    <EmptyState
+      icon={Bot}
+      title="No agents running"
+      description={
+        hasRuntime
+          ? 'Launch a coding agent above and it appears here with its live status; its observe tab opens in the terminal dock.'
+          : 'Start a local runtime, then launch a coding agent — runs show up here with their live status.'
+      }
+    />
+  );
+}
+
+function RunRow({ run, onObserve }: { run: AgentInfo & { vmName: string }; onObserve: () => void }) {
+  const adapter = agentAdapter(run.type);
+  // An agent is observable while it is the live, attached TTY. A reconciled
+  // `live: false` means the tmux session is gone, so reattaching would just
+  // surface a dead shell — hide Observe then.
+  const observable = run.status === 'running' && run.live !== false;
+  return (
+    <li className="flex items-center gap-3 px-3 py-2.5">
+      <adapter.Icon className="h-4 w-4 shrink-0 text-[var(--color-muted-foreground)]" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium">{run.task ? run.task : agentLabel(run.type)}</span>
+          <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+            {agentLabel(run.type)}
+          </span>
+        </div>
+        <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
+          {run.vmName} · {run.mode ?? 'interactive'}
+        </div>
+      </div>
+      <RunStatusBadge status={run.status} />
+      {observable ? (
+        <Button variant="outline" size="sm" onClick={onObserve}>
+          <TerminalIcon className="h-3.5 w-3.5" /> Observe
+        </Button>
+      ) : null}
+    </li>
+  );
+}
+
+// Registry status badge — the four-way `agent.list` status (running / done /
+// error / exited), shown verbatim. `exited`/`done` read as muted (terminal),
+// `error` red, `running` green.
+function RunStatusBadge({ status }: { status: AgentInfo['status'] }) {
+  return (
+    <span
+      className={cn(
+        'shrink-0 rounded-md px-2 py-1 text-xs font-medium',
+        status === 'running'
+          ? 'border border-green-500/40 bg-green-500/15 text-green-300'
+          : status === 'error'
+            ? 'border border-red-500/40 bg-red-500/15 text-red-300'
+            : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+      )}
+    >
+      {status}
+    </span>
+  );
+}

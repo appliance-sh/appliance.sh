@@ -11,6 +11,7 @@ import { DeploymentsPage } from '@/pages/deployments/list';
 import { DeploymentDetailPage } from '@/pages/deployments/detail';
 import { SettingsPage } from '@/pages/settings';
 import { LocalRuntimePage } from '@/pages/local-runtime';
+import { AgentsPage } from '@/pages/agents';
 import { ClustersPage } from '@/pages/clusters';
 import { ClusterDetailPage } from '@/pages/clusters/detail';
 import { LocalRuntimeDeployPage } from '@/pages/local-runtime/deploy';
@@ -80,10 +81,12 @@ export const routes: RouteObject[] = [
       { path: 'projects/:id', element: <ProjectDetailPage /> },
       { path: 'projects/:projectId/environments/:id', element: <EnvironmentDetailPage /> },
 
-      // ④ Agents — deferred to I4 (no backing page yet). The launcher rides
-      // along in the ② runtime detail for now, so the stub redirects to the
-      // cluster list.
-      { path: 'agents', element: <Navigate to="/clusters" replace /> },
+      // ④ Agents — the first-class area (I4): per-agent sign-in (moved from
+      // ⑤ Settings) + the launcher (moved from ② cluster detail) + a runs list
+      // across runtimes. Desktop-only (`host.vm`); the nav item is hidden on
+      // web and the page renders a "desktop app only" message there. Observe
+      // terminals stay in the global dock.
+      { path: 'agents', element: <AgentsPage /> },
 
       // ⑤ Settings
       { path: 'settings', element: <SettingsPage /> },
