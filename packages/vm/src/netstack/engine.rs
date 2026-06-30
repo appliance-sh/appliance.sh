@@ -23,7 +23,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// SO_SNDBUF on the link ends. Apple wants SO_RCVBUF ≥ 2× (ideally 4×)
 /// SO_SNDBUF for the file-handle attachment (§2.3).
@@ -217,6 +217,12 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
     let mut by_tuple: HashMap<Tuple, SocketHandle> = HashMap::new();
     let mut next_local_port: u16 = 49152;
 
+    // The DNS→IP back-reference set (§4a): public A/AAAA answers the
+    // resolver hands out, so a later raw-IP connect can be tied back to
+    // the allowlisted name it came from. Shared between the DNS workers
+    // (writers) and the per-flow guard (reader).
+    let resolved = super::guard::Resolved::new();
+
     // DNS replies built off-thread are posted back here so only the
     // engine thread writes the fd.
     let (outframe_tx, outframe_rx) = channel::<Vec<u8>>();
@@ -253,7 +259,7 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
             match frame::classify(&f, cfg.gateway_ip) {
                 Class::Dhcp => answer_dhcp(&f, &cfg, host_fd),
                 Class::Dns { src_ip, src_port } => {
-                    spawn_dns(&f, src_ip, src_port, &cfg, outframe_tx.clone())
+                    spawn_dns(&f, src_ip, src_port, &cfg, outframe_tx.clone(), resolved.clone())
                 }
                 Class::Tcp(seg) => {
                     if seg.is_syn {
@@ -299,7 +305,7 @@ fn engine_loop(host_fd: RawFd, cfg: LinkConfig, connect_rx: Receiver<ConnectRequ
         let handles: Vec<SocketHandle> = flows.keys().copied().collect();
         let mut dead: Vec<SocketHandle> = Vec::new();
         for handle in handles {
-            if service_flow(handle, &mut flows, &mut sockets) {
+            if service_flow(handle, &mut flows, &mut sockets, &cfg.vm_name, &resolved) {
                 dead.push(handle);
             }
         }
@@ -346,6 +352,8 @@ fn service_flow(
     handle: SocketHandle,
     flows: &mut HashMap<SocketHandle, Flow>,
     sockets: &mut SocketSet<'static>,
+    vm_name: &str,
+    resolved: &super::guard::Resolved,
 ) -> bool {
     let flow = match flows.get_mut(&handle) {
         Some(f) => f,
@@ -362,15 +370,21 @@ fn service_flow(
         bridge.established = true;
     }
 
-    // Start the upstream once a terminated (outbound) flow is up.
+    // Hand a newly-established terminated (outbound) flow to the F2
+    // boundary: classify (SNI/Host/IP), apply default-deny + allowlist,
+    // and forward (to the re-resolved name, §8.1 #3) or drop+log. Runs on
+    // its own thread so the bounded peek + re-resolution never blocks the
+    // netstack loop. **This is the choke point** — every guest flow that
+    // reaches upstream passes through here.
     if let FlowKind::Terminated { dst, upstream_spawned } = &mut flow.kind {
         if bridge.established && !*upstream_spawned {
             *upstream_spawned = true;
             let dst = *dst;
             let ext = BridgeStream::new(bridge_arc.clone());
-            std::thread::spawn(move || match std::net::TcpStream::connect_timeout(&dst, Duration::from_secs(10)) {
-                Ok(stream) => super::bridge_pump(ext, stream),
-                Err(_) => ext.abort(),
+            let name = vm_name.to_string();
+            let resolved = resolved.clone();
+            std::thread::spawn(move || {
+                super::guard::serve_outbound(&name, dst, ext, &resolved);
             });
         }
     }
@@ -437,20 +451,34 @@ fn answer_dhcp(frame: &[u8], cfg: &LinkConfig, fd: RawFd) {
     send_frame(fd, &out);
 }
 
-fn spawn_dns(frame: &[u8], src_ip: Ipv4Addr, src_port: u16, cfg: &LinkConfig, out_tx: Sender<Vec<u8>>) {
+fn spawn_dns(
+    frame: &[u8],
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    cfg: &LinkConfig,
+    out_tx: Sender<Vec<u8>>,
+    resolved: super::guard::Resolved,
+) {
     let Some(query) = frame::udp_payload(frame) else {
         return;
     };
     let query = query.to_vec();
     let cfg = cfg.clone();
     std::thread::spawn(move || {
-        let name = super::dns::query_name(&query);
-        // F1: always allowed. F2 adds the allowlist + private-range
-        // answer reject here (the §8.1 #1 pre-F2 blocker).
-        if !super::dns::allowed(&name) {
+        let qname = super::dns::query_name(&query);
+        // F2 (§8.1 #1): the resolver applies the VM's default-deny policy
+        // to the name (denied/absent ⇒ no answer, fail-closed)...
+        let policy = crate::egress::netstack_policy(&cfg.vm_name);
+        if !super::dns::name_allowed(&qname, &policy) {
             return;
         }
         if let Some(resp) = super::dns::forward(&query, &cfg.dns_upstreams, super::dns::UPSTREAM_TIMEOUT) {
+            // ...and drops any answer that resolves into a private/
+            // internal/host-LAN range (anti-rebind SSRF), recording the
+            // public answers for the raw-IP back-reference hatch.
+            if !super::dns::answer_ok_and_record(&resp, &resolved) {
+                return;
+            }
             let out = frame::build_udp_ipv4(
                 cfg.guest_mac,
                 cfg.gateway_mac,
@@ -529,7 +557,7 @@ mod tests {
         }
 
         let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
-        let cfg = LinkConfig::for_guest_mac("52:54:00:aa:bb:cc");
+        let cfg = LinkConfig::for_guest_mac("engine-dhcp-test", "52:54:00:aa:bb:cc");
         let _ns = start(host_fd, cfg);
 
         // Build a DHCP DISCOVER BOOTP payload.

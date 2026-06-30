@@ -26,6 +26,7 @@
 pub mod dhcp;
 pub mod dns;
 pub mod frame;
+pub mod guard;
 
 #[cfg(unix)]
 mod engine;
@@ -64,6 +65,10 @@ pub const LINK_MTU: usize = 1500;
 /// Per-VM link parameters.
 #[derive(Debug, Clone)]
 pub struct LinkConfig {
+    /// The VM's name — the key into its egress policy, credential rules,
+    /// MITM CA, and traffic log. The F2 boundary needs it to apply policy
+    /// per VM.
+    pub vm_name: String,
     pub guest_mac: [u8; 6],
     pub guest_ip: Ipv4Addr,
     pub gateway_ip: Ipv4Addr,
@@ -74,11 +79,12 @@ pub struct LinkConfig {
 }
 
 impl LinkConfig {
-    /// Build the standard config for a VM with the given guest MAC. The
-    /// guest IP, gateway, and subnet are fixed (single-client subnet);
+    /// Build the standard config for a VM with the given name + guest MAC.
+    /// The guest IP, gateway, and subnet are fixed (single-client subnet);
     /// the upstream resolvers are the host's.
-    pub fn for_guest_mac(mac: &str) -> Self {
+    pub fn for_guest_mac(vm_name: &str, mac: &str) -> Self {
         LinkConfig {
+            vm_name: vm_name.to_string(),
             guest_mac: parse_mac(mac).unwrap_or([0x02, 0, 0, 0, 0, 0x02]),
             guest_ip: GUEST_IP,
             gateway_ip: GATEWAY_IP,
@@ -156,15 +162,52 @@ impl BridgeStream {
 
     /// Signal that the ext side has sent everything it will toward the
     /// guest (EOF in the ext→guest direction).
-    fn mark_ext_fin(&self) {
+    pub(crate) fn mark_ext_fin(&self) {
         if let Ok(mut b) = self.inner.lock() {
             b.ext_fin = true;
         }
     }
 
-    fn abort(&self) {
+    pub(crate) fn abort(&self) {
         if let Ok(mut b) = self.inner.lock() {
             b.aborted = true;
+        }
+    }
+
+    /// Drain up to `max` bytes the guest has sent, returning as soon as
+    /// `done(&buf)` is satisfied, the guest half-closes/aborts, `max` is
+    /// reached, or `timeout` elapses — whichever first. The F2 boundary's
+    /// fail-closed peek (§8.1 #4): a bounded read with a deadline so a
+    /// silent guest can never hang classification, and the consumed bytes
+    /// are returned so the caller can replay them upstream. The `bool`
+    /// reports whether `done` was satisfied (a complete head).
+    pub(crate) fn peek_until(
+        &self,
+        max: usize,
+        timeout: Duration,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> (Vec<u8>, bool) {
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        loop {
+            let mut closed = false;
+            if let Ok(mut b) = self.inner.lock() {
+                while out.len() < max && !b.guest_to_ext.is_empty() {
+                    out.push(b.guest_to_ext.pop_front().unwrap());
+                }
+                if b.guest_fin || b.aborted {
+                    closed = true;
+                }
+            } else {
+                return (out, false);
+            }
+            if done(&out) {
+                return (out, true);
+            }
+            if out.len() >= max || closed || Instant::now() >= deadline {
+                return (out, false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -314,6 +357,39 @@ pub fn run_isolated<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> bool {
     std::panic::catch_unwind(f).is_ok()
 }
 
+/// Test-only plumbing so the F2 boundary (`guard`) can drive the executor
+/// over a synthetic terminated flow without a VM: build a [`BridgeStream`]
+/// pre-loaded with the guest's bytes, and inspect the shared state the
+/// executor mutates.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::*;
+
+    /// An opaque handle to a synthetic flow's shared state — keeps the
+    /// private `Bridge` from leaking through the test helper's signature.
+    pub struct FlowProbe(Arc<Mutex<Bridge>>);
+
+    impl FlowProbe {
+        pub fn aborted(&self) -> bool {
+            self.0.lock().map(|b| b.aborted).unwrap_or(false)
+        }
+    }
+
+    /// A `(probe, ext)` pair for an established terminated flow carrying
+    /// `guest_bytes` as the guest→ext payload. `fin` marks the guest's
+    /// half closed so the boundary's peek returns promptly.
+    pub fn bridge(guest_bytes: &[u8], fin: bool) -> (FlowProbe, BridgeStream) {
+        let inner = Arc::new(Mutex::new(Bridge::default()));
+        {
+            let mut b = inner.lock().unwrap();
+            b.guest_to_ext.extend(guest_bytes.iter().copied());
+            b.established = true;
+            b.guest_fin = fin;
+        }
+        (FlowProbe(inner.clone()), BridgeStream::new(inner))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +411,7 @@ mod tests {
 
     #[test]
     fn link_config_lease_is_deterministic() {
-        let cfg = LinkConfig::for_guest_mac("52:54:00:11:22:33");
+        let cfg = LinkConfig::for_guest_mac("link-config-test", "52:54:00:11:22:33");
         assert_eq!(cfg.guest_mac, [0x52, 0x54, 0, 0x11, 0x22, 0x33]);
         let lease = cfg.dhcp_lease();
         assert_eq!(lease.guest_ip, GUEST_IP);

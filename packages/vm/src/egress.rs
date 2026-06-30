@@ -115,6 +115,54 @@ fn policy_path(name: &str) -> PathBuf {
     VmPaths::for_name(name).dir.join("egress-policy.json")
 }
 
+/// The baked sane default allowlist for `net_link = Netstack` VMs
+/// (docs/egress-firewall.md §5): the package mirrors, registries, git
+/// hosts, and the model API a fresh agent/dev VM needs, suffix-matched by
+/// [`host_matches`]. `githubusercontent.com` is the suffix form of the
+/// doc's `*.githubusercontent.com` wildcard.
+pub const NETSTACK_ALLOWLIST: &[&str] = &[
+    // api / model
+    "api.anthropic.com",
+    // alpine packages
+    "dl-cdn.alpinelinux.org",
+    // language package registries
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "static.crates.io",
+    // git
+    "github.com",
+    "codeload.github.com",
+    "githubusercontent.com",
+    // container registries
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "ghcr.io",
+];
+
+/// The **effective** egress policy for a Netstack VM: a hard default-DENY
+/// boundary plus the baked allowlist, merged over the operator's persisted
+/// allow/deny rules (deny always wins, via [`EgressPolicy::allows`]).
+///
+/// This is opt-in and Netstack-only: the global [`EgressPolicy::default`]
+/// stays `Allow` so the legacy NAT proxy and its callers are untouched
+/// (the global default-flip is F4). For the host-mediated boundary the
+/// default is **Deny** regardless of the persisted file's serde-default
+/// `Allow`, so an operator can never accidentally leave the boundary wide
+/// open — they tighten with `deny` rules and widen with `allow` rules.
+pub fn netstack_policy(name: &str) -> EgressPolicy {
+    let mut p = load_policy(name);
+    p.default = Action::Deny;
+    for h in NETSTACK_ALLOWLIST {
+        if !p.allow.iter().any(|a| a.eq_ignore_ascii_case(h)) {
+            p.allow.push((*h).to_string());
+        }
+    }
+    p
+}
+
 /// Load the VM's policy, or a permissive default when none is set.
 pub fn load_policy(name: &str) -> EgressPolicy {
     let path = policy_path(name);
@@ -419,7 +467,7 @@ fn peer_allowed(peer: std::net::IpAddr, name: &str) -> bool {
 ///     escapes). Refusing to intercept until the lease pins `peer_allowed`
 ///     to this VM's exact address closes that window: brokered hosts stay
 ///     blind tunnels (no inject) until the peer can be exactly attributed.
-fn should_intercept(name: &str, allowed: bool, mitm: bool, host: &str) -> bool {
+pub(crate) fn should_intercept(name: &str, allowed: bool, mitm: bool, host: &str) -> bool {
     allowed && mitm && guest_ip_v4(name).is_some() && crate::creds::has_cred_rule(name, host)
 }
 

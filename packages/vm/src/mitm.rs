@@ -160,6 +160,16 @@ pub fn server_config(ca: Arc<Ca>) -> Result<Arc<ServerConfig>> {
     Ok(Arc::new(cfg))
 }
 
+/// Build the TLS material for one intercepted flow: the per-VM CA's
+/// server config (mints a leaf per SNI) plus the shared upstream client
+/// config. The netstack accept-path has no long-lived `ProxyCtx` to hang
+/// these on, so it asks for them per brokered flow (cheap: the CA is
+/// cached on disk, the client config is a global `OnceLock`).
+pub fn configs(name: &str) -> Result<(Arc<ServerConfig>, Arc<ClientConfig>)> {
+    let ca = Arc::new(ensure_ca(name)?);
+    Ok((server_config(ca)?, client_config()?))
+}
+
 /// The client config used to re-originate TLS to the real upstream,
 /// validating against the webpki trust roots. Built once.
 pub fn client_config() -> Result<Arc<ClientConfig>> {
@@ -190,9 +200,14 @@ pub fn client_config() -> Result<Arc<ClientConfig>> {
 ///
 /// `client_tcp` has already received the proxy's `200` and is about
 /// to start its TLS handshake.
-pub fn intercept(
+///
+/// Generic over the client transport so the **same** interceptor serves
+/// both the legacy CONNECT proxy (a `TcpStream`) and the netstack
+/// accept-path (a netstack flow whose peeked ClientHello is replayed in
+/// front of it) — one allow/deny + capture/inject core, no duplication.
+pub fn intercept<S: Read + Write>(
     name: &str,
-    client_tcp: TcpStream,
+    client_tcp: S,
     host: &str,
     port: u16,
     server_cfg: Arc<ServerConfig>,

@@ -107,7 +107,10 @@ impl VmBackend for VzBackend {
         // Behaviour-neutral in F1: every flow is forwarded, no filtering.
         let netstack: Option<Netstack> = built.host_fd.map(|fd| {
             eprintln!("network: host-mediated smoltcp netstack (net_link=netstack)");
-            crate::netstack::start(fd, crate::netstack::LinkConfig::for_guest_mac(&spec.mac))
+            crate::netstack::start(
+                fd,
+                crate::netstack::LinkConfig::for_guest_mac(&spec.name, &spec.mac),
+            )
         });
 
         let queue = DispatchQueue::new(&format!("sh.appliance.vm.{}", spec.name), None);
