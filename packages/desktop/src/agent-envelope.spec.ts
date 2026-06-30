@@ -4,21 +4,24 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 // ============================================================
-// Agent-credential envelope parity (Sasha's L3 nit).
+// Agent-credential envelope + per-provider store parity (Sasha's L3 nit,
+// extended for multi-agent G3).
 //
-// The host Anthropic credential is written by TWO producers that MUST agree
-// byte-for-byte, because a third process (the egress broker's `print-key`)
-// reads it back and a drift fails the broker CLOSED:
+// Each agent's host credential is written by TWO producers that MUST agree
+// byte-for-byte, because a third process (the egress broker's
+// `print-key --type <agent>`) reads it back and a drift fails the broker CLOSED:
 //
 //   • Rust  — `microvm_agent_login` in packages/desktop/src-tauri/src/lib.rs
-//             (the desktop "Sign in with Claude" / API-key path).
-//   • TS    — `writeAgentKey` / `parseStoredCred` in
+//             (the desktop per-agent login path).
+//   • TS    — `writeAgentKey(provider, value, kind)` / `parseStoredCred` in
 //             packages/cli/src/utils/agent.ts (the `appliance agent login`
 //             path + the print-key reader).
 //
-// Both write the SAME Keychain item (`sh.appliance.agent` / `anthropic`) — or
-// the SAME 0600 file off-macOS — holding the SAME `{"kind","value"}` JSON
-// envelope, with the SAME kind strings (`api-key` / `oauth`).
+// Both write the SAME Keychain item (`sh.appliance.agent`, account = the
+// agent's PROVIDER) — or the SAME `<provider>-cred` 0600 file off-macOS —
+// holding the SAME `{"kind","value"}` JSON envelope, with the SAME kind strings
+// (`api-key` / `oauth` / `pat`). The per-provider store keys (claude-code →
+// anthropic, copilot → github-copilot, codex → openai) MUST also agree.
 //
 // This is a TS-only test: it (1) round-trips the envelope shape both producers
 // emit and (2) cross-checks the two SOURCE files so either side drifting fails
@@ -27,12 +30,19 @@ import { describe, expect, it } from 'vitest';
 // asserted against the Rust source text and documented above.
 // ============================================================
 
-/** The canonical envelope contract. Both producers + the parser MUST match. */
+/** The canonical envelope + per-provider store contract. Both producers + the
+ *  parser MUST match. */
 const CONTRACT = {
   keychainService: 'sh.appliance.agent',
-  keychainAccount: 'anthropic',
-  offMacFile: '.appliance/agent/anthropic-key',
-  kinds: ['api-key', 'oauth'] as const,
+  /** agent `--type` → host cred-store provider key. */
+  providers: {
+    'claude-code': 'anthropic',
+    copilot: 'github-copilot',
+    codex: 'openai',
+  } as Record<string, string>,
+  /** off-macOS 0600 file is `<provider>-cred`. */
+  offMacSuffix: '-cred',
+  kinds: ['api-key', 'oauth', 'pat'] as const,
   envelopeKeys: ['kind', 'value'] as const,
 };
 
@@ -62,7 +72,7 @@ function parseStoredCredMirror(raw: string): StoredCred | null {
       const o = JSON.parse(s) as { kind?: unknown; value?: unknown };
       const kind = o.kind;
       const value = typeof o.value === 'string' ? o.value.trim() : '';
-      if ((kind === 'api-key' || kind === 'oauth') && value) return { kind, value };
+      if ((kind === 'api-key' || kind === 'oauth' || kind === 'pat') && value) return { kind, value };
       return null;
     } catch {
       return null;
@@ -78,7 +88,12 @@ const CLI_SRC = readFileSync(resolve(here, '../../cli/src/utils/agent.ts'), 'utf
 describe('agent-credential envelope round-trip', () => {
   it('round-trips every kind through the producer envelope', () => {
     for (const kind of CONTRACT.kinds) {
-      const value = kind === 'oauth' ? 'sk-ant-oat01-roundtrip' : 'sk-ant-api03-roundtrip';
+      const value =
+        kind === 'oauth'
+          ? 'sk-ant-oat01-roundtrip'
+          : kind === 'pat'
+            ? 'github_pat_roundtrip'
+            : 'sk-ant-api03-roundtrip';
       const envelope = buildEnvelope(kind, value);
       // Exactly the two contract keys, in the documented order.
       expect(Object.keys(JSON.parse(envelope))).toEqual([...CONTRACT.envelopeKeys]);
@@ -102,28 +117,32 @@ describe('agent-credential envelope round-trip', () => {
 });
 
 describe('Rust producer parity (packages/desktop/src-tauri/src/lib.rs)', () => {
-  it('declares the canonical Keychain service + account', () => {
+  it('declares the canonical Keychain service', () => {
     expect(RUST_SRC).toContain(`const AGENT_KEYCHAIN_SERVICE: &str = "${CONTRACT.keychainService}";`);
-    expect(RUST_SRC).toContain(`const AGENT_KEYCHAIN_ACCOUNT: &str = "${CONTRACT.keychainAccount}";`);
   });
 
   it('emits the `{kind,value}` envelope', () => {
     expect(RUST_SRC).toContain('serde_json::json!({ "kind": kind, "value": value })');
   });
 
-  it('rejects any kind outside the contract', () => {
-    expect(RUST_SRC).toContain('kind != "api-key" && kind != "oauth"');
+  it('maps every agent type to its provider store key', () => {
+    expect(RUST_SRC).toContain('"claude-code" => Some("anthropic")');
+    expect(RUST_SRC).toContain('"copilot" => Some("github-copilot")');
+    expect(RUST_SRC).toContain('"codex" => Some("openai")');
   });
 
-  it('uses the same off-macOS store file', () => {
-    expect(RUST_SRC).toContain('.join(".appliance").join("agent").join("anthropic-key")');
+  it('uses the per-provider off-macOS store file', () => {
+    expect(RUST_SRC).toContain('.join(format!("{provider}-cred"))');
+  });
+
+  it('accepts all contract kinds when parsing', () => {
+    expect(RUST_SRC).toContain('kind == "api-key" || kind == "oauth" || kind == "pat"');
   });
 });
 
 describe('TS producer/parser parity (packages/cli/src/utils/agent.ts)', () => {
-  it('declares the canonical Keychain service + account', () => {
+  it('declares the canonical Keychain service', () => {
     expect(CLI_SRC).toContain(`const AGENT_KEYCHAIN_SERVICE = '${CONTRACT.keychainService}';`);
-    expect(CLI_SRC).toContain(`const AGENT_KEYCHAIN_ACCOUNT = '${CONTRACT.keychainAccount}';`);
   });
 
   it('writes the `{kind,value}` envelope', () => {
@@ -131,10 +150,20 @@ describe('TS producer/parser parity (packages/cli/src/utils/agent.ts)', () => {
   });
 
   it('declares exactly the contract kinds', () => {
-    expect(CLI_SRC).toContain(`export type AgentAuthKind = 'api-key' | 'oauth';`);
+    expect(CLI_SRC).toContain(`export type AgentAuthKind = 'api-key' | 'oauth' | 'pat';`);
   });
 
-  it('accepts only the contract kinds when parsing', () => {
-    expect(CLI_SRC).toContain(`(kind === 'api-key' || kind === 'oauth') && value`);
+  it('accepts all contract kinds when parsing', () => {
+    expect(CLI_SRC).toContain(`(kind === 'api-key' || kind === 'oauth' || kind === 'pat') && value`);
+  });
+
+  it('uses the per-provider off-macOS store file', () => {
+    expect(CLI_SRC).toContain('`${provider}-cred`');
+  });
+
+  it('maps every agent type to its provider store key', () => {
+    for (const provider of Object.values(CONTRACT.providers)) {
+      expect(CLI_SRC).toContain(`provider: '${provider}'`);
+    }
   });
 });

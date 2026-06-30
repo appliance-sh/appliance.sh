@@ -281,11 +281,13 @@ export interface ConsoleHost {
   agentAuth?: AgentAuthHost;
 }
 
-/** The kind of Anthropic credential stored host-side. Mirrors the CLI's
+/** The kind of agent credential stored host-side. Mirrors the CLI's
  *  `AgentAuthKind` (`packages/cli/src/utils/agent.ts`): `api-key` is brokered
- *  as `X-Api-Key`; `oauth` is the one-year `sk-ant-oat01-…` subscription
- *  token brokered as `Authorization: Bearer`. */
-export type AgentAuthKind = 'api-key' | 'oauth';
+ *  bare (`X-Api-Key`) or as `Authorization: Bearer` depending on the agent;
+ *  `oauth` is the one-year `sk-ant-oat01-…` Claude subscription token; `pat` is
+ *  Copilot's fine-grained GitHub PAT (`Authorization: token …`). The stored
+ *  kind selects the broker auth mode per agent (docs/multi-agent-adapters.md §1). */
+export type AgentAuthKind = 'api-key' | 'oauth' | 'pat';
 
 /** Whether a host credential is stored, and (best-effort) its kind, so the
  *  UI can show a "signed in as …" indicator. NEVER carries the secret value.
@@ -296,21 +298,25 @@ export interface AgentAuthStatus {
   kind: AgentAuthKind | null;
 }
 
-/** Store/inspect the host-side Anthropic credential for agents (L3). All
- *  operations are host-global (not per-VM) and the secret is written ONLY to
- *  the host store — it never enters any VM. */
+/** Store/inspect the host-side agent credential, PER AGENT TYPE (L3 +
+ *  multi-agent). Each agent type stores into its own provider store
+ *  (`anthropic` / `github-copilot` / `openai`) so three agents' credentials
+ *  never collide (docs/multi-agent-adapters.md §4). All operations are
+ *  host-global (not per-VM) and the secret is written ONLY to the host store —
+ *  it never enters any VM. `agentType` is the registry `--type` key. */
 export interface AgentAuthHost {
-  /** Is a credential stored, and (best-effort) what kind? Never returns the
-   *  secret. Cheap + prompt-free so the UI can poll it. */
-  status(): Promise<AgentAuthStatus>;
-  /** Store an Anthropic credential host-side, tagged by kind. `value` is the
-   *  bare API key, or the `sk-ant-oat01-…` OAuth token. Never logged, never
-   *  sent to the VM (mirrors the CLI's `writeAgentKey`). */
-  login(input: { kind: AgentAuthKind; value: string }): Promise<void>;
-  /** Forget the stored host credential. */
-  logout(): Promise<void>;
+  /** Is a credential stored for `agentType`, and (best-effort) what kind?
+   *  Never returns the secret. Cheap + prompt-free so the UI can poll it. */
+  status(agentType: string): Promise<AgentAuthStatus>;
+  /** Store an agent credential host-side under `agentType`'s provider store,
+   *  tagged by kind. `value` is the bare API key, the `sk-ant-oat01-…` OAuth
+   *  token, or a fine-grained `github_pat_…` PAT. Never logged, never sent to
+   *  the VM (mirrors the CLI's `writeAgentKey(provider, value, kind)`). */
+  login(input: { agentType: string; kind: AgentAuthKind; value: string }): Promise<void>;
+  /** Forget the stored host credential for `agentType`'s provider store. */
+  logout(agentType: string): Promise<void>;
   /** Is `claude` present + runnable on this HOST? "Sign in with Claude" runs
-   *  `claude setup-token` host-side, so this gates the OAuth path. */
+   *  `claude setup-token` host-side, so this gates claude-code's OAuth path. */
   hasHostClaude(): Promise<boolean>;
   /** Best-effort: launch `claude setup-token` in a VISIBLE host terminal so
    *  the user can complete the browser sign-in and copy the one-year token to

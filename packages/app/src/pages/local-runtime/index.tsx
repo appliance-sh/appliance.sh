@@ -23,6 +23,7 @@ import { createApplianceClient, type ApplianceClient } from '@appliance.sh/sdk/c
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { AgentLoginPanel } from '@/components/agent-login';
+import { AGENT_ADAPTERS, agentAdapter, agentLabel, DEFAULT_AGENT_TYPE } from '@/lib/agents';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions, mintAgentSessionId, agentSessionKey } from '@/providers/terminal-sessions-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
@@ -703,18 +704,23 @@ export function looksLikeAuthFailure(message: string): boolean {
   );
 }
 
-// "Launch agent" (Phase 5, A5): spawn a Claude Code agent into the VM's
-// shared workspace and attach it as an agent-typed dock tab to observe +
-// steer it. The Anthropic key is brokered host-side and never enters the
-// VM — run `appliance agent login` once to store it. The detached,
-// broker-wired `agent-<id>` tmux session is created first (so it exists),
-// then the observe tab attaches to it via the reattachable host-shell
-// transport. Only rendered for dev VMs with a shared workspace folder.
+// "Launch agent" (Phase 5, A5 / multi-agent G3): pick an agent type
+// (claude-code / copilot / codex — driven by the AGENT_ADAPTERS registry),
+// spawn it into the VM's shared workspace, and attach it as an agent-typed dock
+// tab to observe + steer it. The selected agent's credential is brokered
+// host-side per provider and never enters the VM — sign in here, or run
+// `appliance agent login --type <agent>` once. The detached, broker-wired
+// `agent-<id>` tmux session is created first (so it exists), then the observe
+// tab attaches via the reattachable host-shell transport. Only rendered for dev
+// VMs with a shared workspace folder.
 function LaunchAgentButton({ name, disabledReason }: { name: string; disabledReason?: string | null }) {
   const host = useHost();
   const terminals = useTerminalSessions();
   const agentAuth = host.agentAuth;
   const [open, setOpen] = React.useState(false);
+  // Which agent to launch + authenticate (the `--type` key). Drives the login
+  // panel, the per-agent sign-in status, and the launch/tab metadata.
+  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
   const [task, setTask] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
@@ -735,18 +741,23 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
   // before any await, so the second Enter is dropped.
   const launchingRef = React.useRef(false);
 
-  // Refresh the credential status when the launcher opens (and after a login
-  // or a keyless failure), so the gate reflects the live host store.
+  // Refresh the SELECTED agent's credential status when the launcher opens,
+  // when the agent type changes (each type has its own provider store), and
+  // after a login or a keyless failure — so the gate reflects the live host
+  // store for the agent the user is about to launch.
   const refreshAuth = React.useCallback(() => {
     if (!agentAuth) return;
     void agentAuth
-      .status()
+      .status(agentType)
       .then(setAuthStatus)
       .catch(() => setAuthStatus(null));
-  }, [agentAuth]);
+  }, [agentAuth, agentType]);
   React.useEffect(() => {
     if (open) {
       setReauthNudge(false);
+      // Clear the previous agent's status so switching types can't briefly
+      // show a stale "signed in" for the new agent before its status resolves.
+      setAuthStatus(null);
       refreshAuth();
     }
   }, [open, refreshAuth]);
@@ -766,8 +777,9 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       const t = task.trim() || undefined;
       // Spawn the agent FIRST so its tmux session exists, then attach the
       // observe tab — attaching first would create an empty shell session
-      // under the agent id instead of reattaching the agent.
-      await host.vm!.instance(name).agent.start({ type: 'claude-code', task: t, sessionId });
+      // under the agent id instead of reattaching the agent. `--type` is the
+      // selected adapter (claude-code / copilot / codex).
+      await host.vm!.instance(name).agent.start({ type: agentType, task: t, sessionId });
       terminals.openSession({
         target: name,
         engine: 'microvm',
@@ -779,9 +791,10 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
         sessionId,
         // The desktop launcher only spawns interactive agents — tag the mode
         // so the tab badge shows a steady "attached" glyph instead of the
-        // perpetual "working" spinner reserved for autonomous runs.
-        agent: { type: 'claude-code', status: 'running', mode: 'interactive' },
-        title: t ? `Agent · ${t}` : 'Agent · claude-code',
+        // perpetual "working" spinner reserved for autonomous runs. `type`
+        // labels the tab so a user can tell which agent it is.
+        agent: { type: agentType, status: 'running', mode: 'interactive' },
+        title: t ? `Agent · ${t}` : `Agent · ${agentLabel(agentType)}`,
       });
       setOpen(false);
       setTask('');
@@ -835,32 +848,70 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
       </Button>
     );
   }
+  const selectedLabel = agentLabel(agentType);
+  const selectedBin = agentAdapter(agentType).bin;
+
+  // The agent-type picker — claude-code / copilot / codex from the registry —
+  // shown above every open-state body so the user can switch which agent they
+  // launch + authenticate (each agent has its own host store, so switching
+  // re-resolves the sign-in status).
+  const picker = (
+    <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
+      {AGENT_ADAPTERS.map((a) => {
+        const active = a.type === agentType;
+        return (
+          <button
+            key={a.type}
+            type="button"
+            aria-pressed={active}
+            title={a.blurb}
+            disabled={busy}
+            onClick={() => setAgentType(a.type)}
+            className={cn(
+              'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors disabled:opacity-50',
+              active
+                ? 'border-cyan-500/50 bg-cyan-500/10 text-[var(--color-foreground)]'
+                : 'border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
+            )}
+          >
+            <a.Icon className="h-3.5 w-3.5" /> {a.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+
   // Brief loading state while the host credential status resolves, so the task
   // input doesn't render for one frame and then swap to the login panel.
   if (authLoading) {
     return (
-      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking sign-in…
-        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
-          Cancel
-        </Button>
+      <div className="flex flex-col items-start gap-2">
+        {picker}
+        <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking {selectedLabel} sign-in…
+          <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+            Cancel
+          </Button>
+        </div>
       </div>
     );
   }
-  // Keyless gate (L3): the desktop reports no stored credential, so offer the
-  // in-app login (API key OR Sign in with Claude) right here instead of
-  // letting the launch fail at the broker. The credential is brokered in and
-  // never enters the VM. The `reauthNudge` branch reuses the same panel when a
-  // stored credential was rejected upstream (likely an expired token).
+  // Keyless gate (L3): the desktop reports no stored credential for the SELECTED
+  // agent, so offer its in-app login right here instead of letting the launch
+  // fail at the broker. The credential is brokered in and never enters the VM.
+  // The `reauthNudge` branch reuses the same panel when a stored credential was
+  // rejected upstream (likely an expired token / bad key).
   if (needsLogin || reauthNudge) {
     return (
       <div className="flex max-w-md flex-col items-start gap-2">
+        {picker}
         <p className={cn('text-xs', reauthNudge ? 'text-amber-300' : 'text-[var(--color-muted-foreground)]')}>
           {reauthNudge
-            ? 'Your Claude token may be expired — sign in again. Your credential is stored on this machine and brokered in; it never enters the VM.'
-            : 'Sign in to run agents — your Anthropic credential is stored on this machine and brokered in; it never enters the VM.'}
+            ? `Your ${selectedLabel} credential may be rejected — sign in again. It's stored on this machine and brokered in; it never enters the VM.`
+            : `Sign in to run ${selectedLabel} — its credential is stored on this machine and brokered in; it never enters the VM.`}
         </p>
         <AgentLoginPanel
+          agentType={agentType}
           onAuthenticated={(s) => {
             setReauthNudge(false);
             setErr(null);
@@ -874,7 +925,8 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
     );
   }
   return (
-    <div className="flex flex-col items-start gap-1">
+    <div className="flex flex-col items-start gap-2">
+      {picker}
       <div className="flex items-center gap-2">
         <input
           autoFocus
@@ -904,19 +956,21 @@ function LaunchAgentButton({ name, disabledReason }: { name: string; disabledRea
         </p>
       ) : null}
       <p className="text-[10px] text-[var(--color-muted-foreground)]">
-        Runs <code className="font-mono">claude</code> in the shared workspace — your Anthropic credential is brokered
-        in and never enters the VM.{' '}
+        Runs <code className="font-mono">{selectedBin}</code> in the shared workspace — your {selectedLabel} credential
+        is brokered in and never enters the VM.{' '}
         {agentAuth ? (
           authStatus?.configured ? (
             <>
               Signed in
-              {authStatus.kind ? ` (${authStatus.kind === 'oauth' ? 'Claude subscription' : 'API key'})` : ''} — manage
-              in Settings.
+              {authStatus.kind
+                ? ` (${authStatus.kind === 'oauth' ? 'Claude subscription' : authStatus.kind === 'pat' ? 'GitHub PAT' : 'API key'})`
+                : ''}{' '}
+              — manage in Settings.
             </>
           ) : null
         ) : (
           <>
-            Store your key once with <code className="font-mono">appliance agent login</code>.
+            Store its credential once with <code className="font-mono">appliance agent login --type {agentType}</code>.
           </>
         )}
       </p>

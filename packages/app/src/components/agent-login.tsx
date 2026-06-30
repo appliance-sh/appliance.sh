@@ -1,22 +1,36 @@
 import * as React from 'react';
-import { Check, KeyRound, Loader2, Sparkles, TerminalSquare } from 'lucide-react';
+import { Check, ExternalLink, Github, KeyRound, Loader2, Sparkles, TerminalSquare } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import type { AgentAuthKind, AgentAuthStatus } from '@/lib/host';
+import {
+  agentAdapter,
+  DEFAULT_AGENT_TYPE,
+  GITHUB_FINE_GRAINED_PAT_SETTINGS_URL,
+  looksLikeOpenAiKey,
+  validateCopilotPat,
+} from '@/lib/agents';
 import { cn } from '@/lib/utils';
 
-// Desktop agent login (Phase 5, L3 — docs/agent-login.md §4). Lets a
-// desktop-only user authenticate the agent WITHOUT a terminal, in either
-// mode:
-//   • API key       — a masked paste field → `microvm_agent_login('api-key')`.
-//   • Sign in with   — runs `claude setup-token` in a visible host terminal
-//     Claude (OAuth)   (the full-screen TUI shows a one-year token on-screen
-//                       ONLY — there is no headless capture, docs §7), then a
-//                       masked paste field captures the token the user copies
-//                       → `microvm_agent_login('oauth')`.
-// The credential is stored host-side (Keychain) and NEVER sent to the VM —
-// the egress broker injects it host-side at request time.
+// Desktop agent login (Phase 5, L3 / multi-agent G3 — docs/agent-login.md §4,
+// docs/multi-agent-adapters.md §4). Lets a desktop-only user authenticate a
+// coding agent WITHOUT a terminal, PARAMETERIZED by agent type. Each agent's
+// credential UX (and its host store) differs:
+//   • claude-code — API key (masked paste → `agent login api-key`) OR
+//     "Sign in with Claude": runs `claude setup-token` in a visible host
+//     terminal (the full-screen TUI shows a one-year token on-screen ONLY —
+//     there is no headless capture, docs §7), then a masked field captures the
+//     token the user copies. Stored under the `anthropic` provider.
+//   • copilot — a masked fine-grained GitHub PAT field. We REQUIRE a
+//     `github_pat_` token scoped to ONLY `Copilot Requests` (mirrors the CLI's
+//     `validateCopilotPat`; the narrow scope is the security bound on host-keyed
+//     injection, docs §4/§7) and REJECT classic `ghp_` PATs. Stored under the
+//     `github-copilot` provider, tagged `pat`.
+//   • codex — a masked OpenAI API key field, soft `sk-` shape warning. Stored
+//     under the `openai` provider, tagged `api-key`.
+// The credential is stored host-side (Keychain) PER PROVIDER and NEVER sent to
+// the VM — the egress broker injects it host-side at request time.
 
 const SETUP_TOKEN_CMD = 'claude setup-token';
 
@@ -30,36 +44,34 @@ function extractOauthToken(raw: string): string | null {
   return m ? m[0] : null;
 }
 
+/** Label a stored credential kind in the agent's own vocabulary. */
 function kindLabel(kind: AgentAuthKind): string {
-  return kind === 'oauth' ? 'Claude subscription' : 'API key';
+  if (kind === 'oauth') return 'Claude subscription';
+  if (kind === 'pat') return 'GitHub PAT';
+  return 'API key';
 }
 
 /**
- * Self-contained agent-login control. Shows the current signed-in state and
- * lets the user store an Anthropic credential host-side via `host.agentAuth`.
- * Reused on the launcher's keyless path and in Settings. Renders nothing when
- * the host has no `agentAuth` capability (web shell).
+ * Self-contained agent-login control, parameterized by `agentType` (default
+ * `claude-code`). Shows the current signed-in state for THAT agent and lets the
+ * user store its credential host-side via `host.agentAuth` (each agent → its
+ * own provider store). Reused on the launcher's keyless path and in Settings.
+ * Renders nothing when the host has no `agentAuth` capability (web shell).
  */
 export function AgentLoginPanel({
+  agentType = DEFAULT_AGENT_TYPE,
   onAuthenticated,
   className,
 }: {
+  agentType?: string;
   onAuthenticated?: (status: AgentAuthStatus) => void;
   className?: string;
 }) {
   const host = useHost();
   const auth = host.agentAuth;
+  const adapter = agentAdapter(agentType);
 
   const [status, setStatus] = React.useState<AgentAuthStatus | null>(null);
-  const [mode, setMode] = React.useState<AgentAuthKind>('oauth');
-  const [apiKey, setApiKey] = React.useState('');
-  const [paste, setPaste] = React.useState('');
-  const [hasClaude, setHasClaude] = React.useState<boolean | null>(null);
-  const [terminalLaunched, setTerminalLaunched] = React.useState(false);
-  // True when the last "Open terminal" click could NOT auto-launch a terminal
-  // (non-macOS, where runSetupToken() resolves false, or a launch error). Drives
-  // an inline "copy the command below" note so the click is never a dead no-op.
-  const [terminalAutoOpenFailed, setTerminalAutoOpenFailed] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   // The kind we just stored — Settings can label "Signed in (…)" immediately
@@ -70,7 +82,7 @@ export function AgentLoginPanel({
   const refreshStatus = React.useCallback(async (): Promise<AgentAuthStatus | null> => {
     if (!auth) return null;
     try {
-      const s = await auth.status();
+      const s = await auth.status(adapter.type);
       setStatus(s);
       return s;
     } catch {
@@ -78,16 +90,124 @@ export function AgentLoginPanel({
       setStatus(s);
       return s;
     }
-  }, [auth]);
+  }, [auth, adapter.type]);
 
   React.useEffect(() => {
+    // Re-resolve when the agent type changes (the picker switches stores).
+    setStatus(null);
+    setLastKind(null);
+    setErr(null);
     void refreshStatus();
   }, [refreshStatus]);
+
+  if (!auth) return null; // desktop-only capability
+
+  const finish = (kind: AgentAuthKind, s: AgentAuthStatus | null) => {
+    setLastKind(kind);
+    onAuthenticated?.(s ?? { configured: true, kind });
+  };
+
+  // Store a resolved secret under this agent's provider store, tagged by kind.
+  // Shared by all three credential UXes — the only per-agent differences are
+  // the input + validation that produce `(kind, value)`.
+  const store = async (kind: AgentAuthKind, value: string, after?: () => void) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await auth.login({ agentType: adapter.type, kind, value });
+      after?.();
+      finish(kind, await refreshStatus());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await auth.logout(adapter.type);
+      setLastKind(null);
+      await refreshStatus();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const displayKind = status?.kind ?? lastKind;
+
+  return (
+    <div className={cn('w-full max-w-md space-y-3 text-xs', className)}>
+      {status?.configured ? (
+        <div className="flex items-center justify-between gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)] px-3 py-2">
+          <span className="flex items-center gap-2">
+            <Check className="h-3.5 w-3.5 text-green-400" />
+            Signed in to {adapter.label}
+            {displayKind ? (
+              <span className="text-[var(--color-muted-foreground)]"> · {kindLabel(displayKind)}</span>
+            ) : null}
+          </span>
+          <Button variant="ghost" size="sm" onClick={() => void signOut()} disabled={busy}>
+            Sign out
+          </Button>
+        </div>
+      ) : null}
+
+      {adapter.login === 'claude' ? (
+        <ClaudeLogin auth={auth} busy={busy} setErr={setErr} store={store} />
+      ) : adapter.login === 'github-pat' ? (
+        <CopilotPatLogin busy={busy} setErr={setErr} store={store} />
+      ) : (
+        <OpenAiKeyLogin busy={busy} setErr={setErr} store={store} />
+      )}
+
+      {err ? (
+        <p role="alert" className="font-mono text-[10px] text-red-300">
+          {err}
+        </p>
+      ) : null}
+
+      <p className="text-[10px] text-[var(--color-muted-foreground)]">
+        Stored in your login keychain on this machine, per agent. Brokered into agents at request time — it never enters
+        the VM.
+      </p>
+    </div>
+  );
+}
+
+// ---- claude-code: API key OR "Sign in with Claude" (unchanged UX) --------
+
+type StoreFn = (kind: AgentAuthKind, value: string, after?: () => void) => Promise<void>;
+
+function ClaudeLogin({
+  auth,
+  busy,
+  setErr,
+  store,
+}: {
+  auth: NonNullable<ReturnType<typeof useHost>['agentAuth']>;
+  busy: boolean;
+  setErr: (e: string | null) => void;
+  store: StoreFn;
+}) {
+  const [mode, setMode] = React.useState<'oauth' | 'api-key'>('oauth');
+  const [apiKey, setApiKey] = React.useState('');
+  const [paste, setPaste] = React.useState('');
+  const [hasClaude, setHasClaude] = React.useState<boolean | null>(null);
+  const [terminalLaunched, setTerminalLaunched] = React.useState(false);
+  // True when the last "Open terminal" click could NOT auto-launch a terminal
+  // (non-macOS, where runSetupToken() resolves false, or a launch error). Drives
+  // an inline "copy the command below" note so the click is never a dead no-op.
+  const [terminalAutoOpenFailed, setTerminalAutoOpenFailed] = React.useState(false);
 
   // Probe host `claude` lazily the first time the OAuth mode is shown — it
   // gates "Sign in with Claude" (setup-token needs a host `claude`).
   React.useEffect(() => {
-    if (mode !== 'oauth' || !auth || hasClaude !== null) return;
+    if (mode !== 'oauth' || hasClaude !== null) return;
     let cancelled = false;
     void auth
       .hasHostClaude()
@@ -107,49 +227,22 @@ export function AgentLoginPanel({
     return () => clearTimeout(id);
   }, [terminalLaunched]);
 
-  if (!auth) return null; // desktop-only capability
-
-  const finish = (kind: AgentAuthKind, s: AgentAuthStatus | null) => {
-    setLastKind(kind);
-    onAuthenticated?.(s ?? { configured: true, kind });
-  };
-
-  const saveApiKey = async () => {
+  const saveApiKey = () => {
     const value = apiKey.trim();
     if (!value) {
       setErr('Paste an Anthropic API key first.');
       return;
     }
-    setBusy(true);
-    setErr(null);
-    try {
-      await auth.login({ kind: 'api-key', value });
-      setApiKey('');
-      finish('api-key', await refreshStatus());
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    void store('api-key', value, () => setApiKey(''));
   };
 
-  const saveOauth = async () => {
+  const saveOauth = () => {
     const token = extractOauthToken(paste);
     if (!token) {
       setErr('Could not find an sk-ant-oat01- token in what you pasted. Copy the token shown by `claude setup-token`.');
       return;
     }
-    setBusy(true);
-    setErr(null);
-    try {
-      await auth.login({ kind: 'oauth', value: token });
-      setPaste('');
-      finish('oauth', await refreshStatus());
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    void store('oauth', token, () => setPaste(''));
   };
 
   const openTerminal = async () => {
@@ -169,22 +262,6 @@ export function AgentLoginPanel({
     }
   };
 
-  const signOut = async () => {
-    setBusy(true);
-    setErr(null);
-    try {
-      await auth.logout();
-      setLastKind(null);
-      await refreshStatus();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const displayKind = status?.kind ?? lastKind;
-
   // Soft, NON-blocking shape check: Anthropic keys are `sk-ant-…`. A mis-paste
   // would store "successfully" then 401 at launch, so warn early — but let the
   // user proceed (we don't gate Save on it; the prefix isn't a hard contract).
@@ -192,22 +269,7 @@ export function AgentLoginPanel({
   const apiKeyShapeWarn = apiKeyTrimmed.length > 0 && !apiKeyTrimmed.startsWith('sk-ant-');
 
   return (
-    <div className={cn('w-full max-w-md space-y-3 text-xs', className)}>
-      {status?.configured ? (
-        <div className="flex items-center justify-between gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)] px-3 py-2">
-          <span className="flex items-center gap-2">
-            <Check className="h-3.5 w-3.5 text-green-400" />
-            Signed in
-            {displayKind ? (
-              <span className="text-[var(--color-muted-foreground)]"> · {kindLabel(displayKind)}</span>
-            ) : null}
-          </span>
-          <Button variant="ghost" size="sm" onClick={() => void signOut()} disabled={busy}>
-            Sign out
-          </Button>
-        </div>
-      ) : null}
-
+    <>
       {/* Mode toggle: lead with the subscription path, API key as the
           alternative. */}
       <div
@@ -277,14 +339,14 @@ export function AgentLoginPanel({
                 value={paste}
                 onChange={(e) => setPaste(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') void saveOauth();
+                  if (e.key === 'Enter') saveOauth();
                 }}
                 placeholder="sk-ant-oat01-…"
                 disabled={busy}
                 className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono disabled:opacity-50"
               />
             </label>
-            <Button size="sm" onClick={() => void saveOauth()} disabled={busy || !paste.trim()}>
+            <Button size="sm" onClick={saveOauth} disabled={busy || !paste.trim()}>
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Save token
             </Button>
           </div>
@@ -304,7 +366,7 @@ export function AgentLoginPanel({
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void saveApiKey();
+                if (e.key === 'Enter') saveApiKey();
               }}
               placeholder="sk-ant-…"
               disabled={busy}
@@ -317,21 +379,172 @@ export function AgentLoginPanel({
               . You can still save it.
             </p>
           ) : null}
-          <Button size="sm" onClick={() => void saveApiKey()} disabled={busy || !apiKey.trim()}>
+          <Button size="sm" onClick={saveApiKey} disabled={busy || !apiKey.trim()}>
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Save key
           </Button>
         </div>
       )}
+    </>
+  );
+}
 
-      {err ? (
-        <p role="alert" className="font-mono text-[10px] text-red-300">
-          {err}
+// ---- copilot: fine-grained GitHub PAT (Copilot Requests only) ------------
+
+function CopilotPatLogin({
+  busy,
+  setErr,
+  store,
+}: {
+  busy: boolean;
+  setErr: (e: string | null) => void;
+  store: StoreFn;
+}) {
+  const [pat, setPat] = React.useState('');
+
+  const save = () => {
+    const v = validateCopilotPat(pat);
+    if (!v.ok) {
+      setErr(
+        v.reason === 'classic'
+          ? 'Classic ghp_ PAT rejected — it carries your full account scope. Create a fine-grained github_pat_ token scoped to Copilot Requests only.'
+          : v.reason === 'empty'
+            ? 'Paste a fine-grained GitHub PAT first.'
+            : 'Expected a fine-grained GitHub PAT starting with github_pat_. Mint one scoped to Copilot Requests and paste it.'
+      );
+      return;
+    }
+    void store('pat', v.value, () => setPat(''));
+  };
+
+  const trimmed = pat.trim();
+  // Live shape feedback BEFORE save: a classic ghp_ is a hard reject; anything
+  // non-empty that isn't github_pat_ gets a soft heads-up (Save still validates).
+  const isClassic = trimmed.startsWith('ghp_');
+  const wrongShape = trimmed.length > 0 && !isClassic && !trimmed.startsWith('github_pat_');
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[var(--color-muted-foreground)]">
+        GitHub Copilot signs in with a <span className="text-[var(--color-foreground)]">fine-grained GitHub PAT</span>.
+        The token is brokered onto Copilot&rsquo;s <code className="font-mono">api.github.com</code> leg and never
+        enters the VM.
+      </p>
+
+      {/* Security bound (Sasha's pre-ship guard): the fine-grained PAT's narrow
+          scope is the ENTIRE bound on host-keyed injection, so make the
+          single-scope requirement impossible to miss. */}
+      <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2.5 py-2 text-amber-200">
+        <p className="font-semibold">
+          Grant ONLY the <code className="font-mono">Copilot Requests</code> permission.
+        </p>
+        <p className="mt-1 text-[10px] leading-relaxed text-amber-200/80">
+          That single scope is the security bound: the PAT is injected on ALL guest&nbsp;&rarr;&nbsp;
+          <code className="font-mono">api.github.com</code> traffic, so a broader scope would let the sandbox act beyond
+          Copilot requests. Classic <code className="font-mono">ghp_</code> tokens are rejected — they carry your full
+          account scope.
+        </p>
+        <a
+          href={GITHUB_FINE_GRAINED_PAT_SETTINGS_URL}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-medium text-amber-100 underline hover:text-white"
+        >
+          <ExternalLink className="h-3 w-3" /> Create a fine-grained token on GitHub
+        </a>
+      </div>
+
+      <label className="block space-y-1">
+        <span className="text-[var(--color-muted-foreground)]">Fine-grained PAT</span>
+        <input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          value={pat}
+          onChange={(e) => setPat(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') save();
+          }}
+          placeholder="github_pat_…"
+          disabled={busy}
+          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono disabled:opacity-50"
+        />
+      </label>
+      {isClassic ? (
+        <p className="text-red-300">
+          That&rsquo;s a classic <code className="font-mono">ghp_</code> token — rejected. Use a fine-grained{' '}
+          <code className="font-mono">github_pat_</code> token scoped to Copilot Requests only.
+        </p>
+      ) : wrongShape ? (
+        <p className="text-amber-300/90">
+          A fine-grained PAT starts with <code className="font-mono">github_pat_</code>.
         </p>
       ) : null}
+      <Button size="sm" onClick={save} disabled={busy || !trimmed || isClassic}>
+        {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Github className="h-3.5 w-3.5" />} Save PAT
+      </Button>
+    </div>
+  );
+}
 
-      <p className="text-[10px] text-[var(--color-muted-foreground)]">
-        Stored in your login keychain on this machine. Brokered into agents at request time — it never enters the VM.
+// ---- codex: OpenAI API key -----------------------------------------------
+
+function OpenAiKeyLogin({
+  busy,
+  setErr,
+  store,
+}: {
+  busy: boolean;
+  setErr: (e: string | null) => void;
+  store: StoreFn;
+}) {
+  const [key, setKey] = React.useState('');
+
+  const save = () => {
+    const value = key.trim();
+    if (!value) {
+      setErr('Paste an OpenAI API key first.');
+      return;
+    }
+    void store('api-key', value, () => setKey(''));
+  };
+
+  // Soft, NON-blocking shape check (mirrors the CLI's `looksLikeOpenAiKey`):
+  // OpenAI keys are `sk-…`. Warn but never gate Save — there's no hard format.
+  const trimmed = key.trim();
+  const shapeWarn = trimmed.length > 0 && !looksLikeOpenAiKey(trimmed);
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[var(--color-muted-foreground)]">
+        Paste an OpenAI API key (<code className="font-mono">sk-…</code>). It&rsquo;s brokered onto Codex&rsquo;s{' '}
+        <code className="font-mono">api.openai.com</code> calls and never enters the VM. Get one from the OpenAI
+        platform dashboard.
       </p>
+      <label className="block space-y-1">
+        <span className="text-[var(--color-muted-foreground)]">API key</span>
+        <input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') save();
+          }}
+          placeholder="sk-…"
+          disabled={busy}
+          className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono disabled:opacity-50"
+        />
+      </label>
+      {shapeWarn ? (
+        <p className="text-amber-300/90">
+          That doesn&rsquo;t look like an OpenAI key — they start with <code className="font-mono">sk-</code>. You can
+          still save it.
+        </p>
+      ) : null}
+      <Button size="sm" onClick={save} disabled={busy || !trimmed}>
+        {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Save key
+      </Button>
     </div>
   );
 }
