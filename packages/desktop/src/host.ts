@@ -406,20 +406,22 @@ export const tauriHost: ConsoleHost = {
     },
   },
 
-  // Host-side agent credential login (Phase 5, L3). Stores the Anthropic
-  // credential (API key or subscription OAuth token) in the same host
-  // Keychain item / 0600 file the CLI's `writeAgentKey` uses — the value
-  // never enters the VM; the egress broker injects it host-side. The Rust
+  // Host-side agent credential login (Phase 5, L3 / multi-agent G3). Stores
+  // each agent's credential under ITS OWN provider store — the same per-provider
+  // Keychain item / 0600 file the CLI's `writeAgentKey(provider, value, kind)`
+  // uses — so three agents' credentials never collide. `agentType` selects the
+  // provider (claude-code→anthropic, copilot→github-copilot, codex→openai). The
+  // value never enters the VM; the egress broker injects it host-side. The Rust
   // side never logs the value.
   agentAuth: {
-    status(): Promise<AgentAuthStatus> {
-      return invoke<AgentAuthStatus>('microvm_agent_login_status');
+    status(agentType: string): Promise<AgentAuthStatus> {
+      return invoke<AgentAuthStatus>('microvm_agent_login_status', { agentType });
     },
-    async login(input: { kind: AgentAuthKind; value: string }): Promise<void> {
-      await invoke('microvm_agent_login', { kind: input.kind, value: input.value });
+    async login(input: { agentType: string; kind: AgentAuthKind; value: string }): Promise<void> {
+      await invoke('microvm_agent_login', { agentType: input.agentType, kind: input.kind, value: input.value });
     },
-    async logout(): Promise<void> {
-      await invoke('microvm_agent_logout');
+    async logout(agentType: string): Promise<void> {
+      await invoke('microvm_agent_logout', { agentType });
     },
     hasHostClaude(): Promise<boolean> {
       return invoke<boolean>('microvm_agent_has_host_claude');

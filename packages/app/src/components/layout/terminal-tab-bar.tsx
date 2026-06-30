@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Bot, Check, CircleX, Loader2, Plus, Radio, X } from 'lucide-react';
+import { Check, CircleX, Loader2, Plus, Radio, X } from 'lucide-react';
 import {
   useTerminalSessions,
   statusLabel,
@@ -8,6 +8,7 @@ import {
   type TerminalSessionMeta,
 } from '@/providers/terminal-sessions-provider';
 import { useConfirm } from '@/components/ui/confirm-dialog';
+import { agentAdapter, agentLabel } from '@/lib/agents';
 import { cn } from '@/lib/utils';
 
 // Terminal tab strip (E3.3) — one tab per live session in the
@@ -75,8 +76,14 @@ function TerminalTab({
   // read first, but keep it present (and closable) per Devon's nit.
   const dead = session.status === 'closed' || session.status === 'error';
   // A coding agent (Phase 5, A5) reads distinctly from a plain shell: a
-  // bot glyph + an agent-typed tooltip, and a cyan accent when active.
+  // PER-TYPE glyph (Sparkles / Github / SquareTerminal from the registry, so
+  // two differently-typed agents are distinguishable at a glance — not a
+  // generic bot — Devon) + a cyan accent when active. Its tooltip + accessible
+  // name carry BOTH the human agent label (agentLabel) and the task (via
+  // session.title), so two same-tasked tabs of different types stay
+  // distinguishable even when their visible label reads "Agent · <task>".
   const agent = session.agent;
+  const AgentIcon = agent ? agentAdapter(agent.type).Icon : null;
 
   React.useEffect(() => {
     if (editing) {
@@ -121,7 +128,7 @@ function TerminalTab({
       )}
       title={
         agent
-          ? `${session.title} — ${agent.type} agent on ${session.subtitle} · run ${agentStatusLabel(
+          ? `${session.title} — ${agentLabel(agent.type)} agent on ${session.subtitle} · run ${agentStatusLabel(
               agent.status,
               agent.mode
             )} (shell ${statusLabel(session.status)})`
@@ -129,8 +136,8 @@ function TerminalTab({
       }
     >
       <StatusDot status={session.status} />
-      {agent ? (
-        <Bot
+      {agent && AgentIcon ? (
+        <AgentIcon
           aria-hidden
           className={cn('h-3.5 w-3.5 shrink-0', dead ? 'text-[var(--color-muted-foreground)]' : 'text-cyan-300')}
         />
@@ -176,13 +183,13 @@ function TerminalTab({
           }}
           className="min-w-0 flex-1 truncate text-left"
           aria-pressed={active}
-          // Fold the status word (and agent type) into the accessible name
+          // Fold the status word (and agent label) into the accessible name
           // so a screen-reader / keyboard user can tell a live tab from a
-          // dead one, and an agent from a shell — the dot + bot glyph are
+          // dead one, and an agent from a shell — the dot + per-type glyph are
           // colour-only and aria-hidden.
           aria-label={
             agent
-              ? `${session.title}, ${agent.type} agent, run ${agentStatusLabel(
+              ? `${session.title}, ${agentLabel(agent.type)} agent, run ${agentStatusLabel(
                   agent.status,
                   agent.mode
                 )} (shell ${statusLabel(session.status)})`

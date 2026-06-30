@@ -4,7 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, Check, RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
-import { AgentLoginPanel } from '@/components/agent-login';
+import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
+import { AGENT_ADAPTERS, DEFAULT_AGENT_TYPE } from '@/lib/agents';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
@@ -1165,22 +1166,58 @@ function UpdatesSection() {
   );
 }
 
-// Agent authentication (Phase 5, L3 / docs/agent-login.md §4). Desktop-only:
-// store an Anthropic credential (API key OR "Sign in with Claude" OAuth)
-// host-side so coding agents can reach Anthropic. The credential is brokered
-// into the sandbox at request time and NEVER enters the VM. Bespoke section
-// shell (not `Section`) so the panel's own layout isn't nested inside a `<dl>`.
+// Agent authentication (Phase 5, L3 / multi-agent G3 — docs/agent-login.md §4,
+// docs/multi-agent-adapters.md §4). Desktop-only: store each coding agent's
+// credential host-side so it can reach its provider — Claude Code (API key or
+// "Sign in with Claude"), GitHub Copilot (fine-grained PAT), OpenAI Codex (API
+// key). Each agent has its OWN provider store, so a type picker switches which
+// agent you're signing in. The credential is brokered into the sandbox at
+// request time and NEVER enters the VM. Bespoke section shell (not `Section`)
+// so the panel's own layout isn't nested inside a `<dl>`.
 function AgentAuthSection() {
+  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
+  // Bumped on a successful login so the per-agent "signed in" dots refresh
+  // without a remount (Devon nit).
+  const [authBump, setAuthBump] = React.useState(0);
+  const signedIn = useAgentSignedIn(true, authBump);
   return (
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
       <div>
         <h2 className="text-sm font-semibold">Agent authentication</h2>
         <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-          Sign in so coding agents can reach Anthropic — API key or your Claude subscription. Stored on this machine and
-          brokered into the sandbox; it never enters the VM.
+          Sign in so coding agents can reach their providers. Each agent stores its own credential on this machine,
+          brokered into the sandbox at request time; it never enters the VM.
         </p>
       </div>
-      <AgentLoginPanel />
+      <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
+        {AGENT_ADAPTERS.map((a) => {
+          const active = a.type === agentType;
+          return (
+            <button
+              key={a.type}
+              type="button"
+              aria-pressed={active}
+              title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
+              onClick={() => setAgentType(a.type)}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors',
+                active
+                  ? 'border-cyan-500/50 bg-cyan-500/10 text-[var(--color-foreground)]'
+                  : 'border-[var(--color-border)] text-[var(--color-muted-foreground)] hover:bg-[var(--color-muted)]'
+              )}
+            >
+              <a.Icon className="h-3.5 w-3.5" /> {a.label}
+              {/* Green dot = a credential is already stored for this agent
+                  (decorative; the "— signed in" title suffix is the a11y
+                  signal). */}
+              {signedIn[a.type] ? (
+                <span aria-hidden className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-green-400" />
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+      <AgentLoginPanel agentType={agentType} onAuthenticated={() => setAuthBump((n) => n + 1)} />
     </section>
   );
 }

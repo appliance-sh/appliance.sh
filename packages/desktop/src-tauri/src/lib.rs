@@ -270,7 +270,8 @@ fn shared_secret_for_platform(secret: String, is_macos: bool) -> String {
 /// entries (managed != "desktop") are preserved untouched.
 fn mirror_to_shared_profiles(cfg: &PersistedConfig) -> Result<(), HostError> {
     let mut file = read_shared_profiles().unwrap_or_default();
-    file.profiles.retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
+    file.profiles
+        .retain(|_, entry| entry.managed.as_deref() != Some("desktop"));
     for cluster in &cfg.clusters {
         // An entry that survived the retain above is CLI-owned (e.g.
         // the microVM engine's profile, written by `appliance vm up`).
@@ -402,7 +403,9 @@ fn decide_seed(
             key_id: key.id.clone(),
             secret: key.secret.clone(),
             created_at: prev.created_at.or_else(|| Some(cluster.created_at.clone())),
-            state_backend_url: prev.state_backend_url.or_else(|| cluster.state_backend_url.clone()),
+            state_backend_url: prev
+                .state_backend_url
+                .or_else(|| cluster.state_backend_url.clone()),
             last_bootstrap_input: prev
                 .last_bootstrap_input
                 .or_else(|| cluster.last_bootstrap_input.clone()),
@@ -660,7 +663,10 @@ fn migrate_legacy_top_level_url(cfg: &mut PersistedConfig) -> Result<bool, HostE
 /// survives) and lets the freshly in-cluster api-server pick up the
 /// existing API key the moment it's reachable.
 fn migrate_legacy_local_runtime_urls(cfg: &mut PersistedConfig) -> bool {
-    let new_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, DEFAULT_LOCAL_HOST_PORT);
+    let new_url = format!(
+        "http://{}:{}",
+        IN_CLUSTER_API_SERVER_HOSTNAME, DEFAULT_LOCAL_HOST_PORT
+    );
     let mut migrated = false;
     for cluster in &mut cfg.clusters {
         if cluster.id != LOCAL_RUNTIME_CLUSTER_ID {
@@ -836,7 +842,8 @@ fn list_aws_profiles() -> Result<Vec<AwsProfile>, HostError> {
                 let profile_name = if name == "default" {
                     Some("default".to_string())
                 } else {
-                    name.strip_prefix("profile ").map(|rest| rest.trim().to_string())
+                    name.strip_prefix("profile ")
+                        .map(|rest| rest.trim().to_string())
                 };
                 if let Some(profile_name) = profile_name {
                     let is_sso = body.contains("sso_session") || body.contains("sso_start_url");
@@ -1062,17 +1069,30 @@ async fn local_helper_install(
     let payload = match input {
         serde_json::Value::Object(map) => map,
         serde_json::Value::Null => serde_json::Map::new(),
-        other => return Err(format!("local_helper_install expected an object input, got: {}", other)),
+        other => {
+            return Err(format!(
+                "local_helper_install expected an object input, got: {}",
+                other
+            ))
+        }
     };
 
-    let force = payload.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force = payload
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let tools: Vec<String> = match payload.get("tools") {
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect(),
         Some(serde_json::Value::Null) | None => Vec::new(),
-        Some(other) => return Err(format!("`tools` must be an array of strings, got: {}", other)),
+        Some(other) => {
+            return Err(format!(
+                "`tools` must be an array of strings, got: {}",
+                other
+            ))
+        }
     };
 
     let mut args: Vec<String> = vec!["local".into(), "install".into()];
@@ -1176,17 +1196,22 @@ fn handle_cli_line(
     let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match kind {
         "result" => {
-            *final_outcomes = parsed.get("result").and_then(|r| r.get("outcomes")).cloned();
+            *final_outcomes = parsed
+                .get("result")
+                .and_then(|r| r.get("outcomes"))
+                .cloned();
         }
         "error" => {
-            *error = parsed.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+            *error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
         _ => {
             let _ = on_event.send(parsed);
         }
     }
 }
-
 
 /// Drive a full bootstrap (phases 1–3) via the sidecar. The frontend
 /// passes `{bootstrapInput, options?}`; this command tags the payload
@@ -1517,7 +1542,10 @@ async fn local_preflight() -> Vec<PreflightCheck> {
 }
 
 async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
-    let probe = Command::new(tool.name).args(tool.version_args).output().await;
+    let probe = Command::new(tool.name)
+        .args(tool.version_args)
+        .output()
+        .await;
     match probe {
         Ok(output) if output.status.success() => {
             let line = String::from_utf8_lossy(&output.stdout)
@@ -1539,8 +1567,15 @@ async fn probe_tool(tool: &PrereqTool) -> PreflightCheck {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let (hint, error) =
-                resolve_missing_hint(tool.name, if stderr.is_empty() { None } else { Some(stderr) }).await;
+            let (hint, error) = resolve_missing_hint(
+                tool.name,
+                if stderr.is_empty() {
+                    None
+                } else {
+                    Some(stderr)
+                },
+            )
+            .await;
             PreflightCheck {
                 tool: tool.name.to_string(),
                 installed: false,
@@ -1693,7 +1728,11 @@ async fn colima_instance_exists() -> bool {
         Ok((true, out, _)) => out.lines().filter(|l| !l.trim().is_empty()).any(|l| {
             serde_json::from_str::<serde_json::Value>(l)
                 .ok()
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| !s.is_empty()))
+                .and_then(|v| {
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| !s.is_empty())
+                })
                 .unwrap_or(false)
         }),
         _ => false,
@@ -1742,7 +1781,10 @@ async fn colima_is_active_runtime() -> bool {
                 .collect(),
             _ => return false,
         };
-    if names.iter().any(|n| GUI_RUNTIME_CONTEXTS.contains(&n.as_str())) {
+    if names
+        .iter()
+        .any(|n| GUI_RUNTIME_CONTEXTS.contains(&n.as_str()))
+    {
         return false;
     }
     colima_instance_exists().await
@@ -1948,7 +1990,9 @@ fn default_local_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(preferred);
     }
 
-    legacy.ok_or_else(|| "could not resolve a local-runtime data dir (no $HOME, no app data dir)".to_string())
+    legacy.ok_or_else(|| {
+        "could not resolve a local-runtime data dir (no $HOME, no app data dir)".to_string()
+    })
 }
 
 /// Generate a short opaque token used as BOOTSTRAP_TOKEN for the
@@ -2057,7 +2101,10 @@ fn build_in_cluster_base_config(cfg: &ResolvedRuntimeConfig) -> String {
 /// the call sites is unconditional, so we don't need to handle the
 /// plain-scalar reserved characters here.
 fn yaml_double_quoted(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 /// Compose the multi-document YAML manifest deployed via kubectl apply.
@@ -2300,7 +2347,9 @@ async fn read_existing_bootstrap_token() -> Option<String> {
     // Secret values are base64-encoded on read. Decode and validate
     // it's a non-empty UTF-8 string before reusing.
     use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let token = String::from_utf8(decoded).ok()?;
     if token.is_empty() {
         None
@@ -2368,7 +2417,10 @@ async fn wait_for_api_server_url(url: &str, max_wait: Duration) -> Result<(), St
 /// the host-side `mint_api_key` but takes the full URL instead of a
 /// loopback port — same `/bootstrap/create-key` route, same payload.
 async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, String> {
-    let url = format!("{}/bootstrap/create-key", api_server_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/bootstrap/create-key",
+        api_server_url.trim_end_matches('/')
+    );
     let body = serde_json::json!({"name": "Local Runtime"}).to_string();
     let (ok, stdout, stderr) = run_status_command(&[
         "curl",
@@ -2416,7 +2468,9 @@ async fn bootstrap_in_cluster_api_server(
     // match — 401 forever, until manual pod restart. Reading the
     // existing token sidesteps this and keeps re-bootstrap clean
     // when the pod is already up.
-    let bootstrap_token = read_existing_bootstrap_token().await.unwrap_or_else(random_bootstrap_token);
+    let bootstrap_token = read_existing_bootstrap_token()
+        .await
+        .unwrap_or_else(random_bootstrap_token);
     let manifest = render_in_cluster_api_server_manifest(&cfg, &image, &bootstrap_token);
     kubectl_apply_manifest(&manifest).await?;
 
@@ -2427,7 +2481,10 @@ async fn bootstrap_in_cluster_api_server(
     let api_server_url = if cfg.host_port == 80 {
         format!("http://{}", IN_CLUSTER_API_SERVER_HOSTNAME)
     } else {
-        format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, cfg.host_port)
+        format!(
+            "http://{}:{}",
+            IN_CLUSTER_API_SERVER_HOSTNAME, cfg.host_port
+        )
     };
     wait_for_api_server_url(&api_server_url, Duration::from_secs(60)).await?;
     let api_key = mint_api_key_url(&api_server_url, &bootstrap_token).await?;
@@ -2455,7 +2512,10 @@ async fn bootstrap_in_cluster_api_server(
 /// (the CLI's `appliance vm` resolves the same path), then PATH.
 fn vm_binary() -> Option<PathBuf> {
     if let Some(home) = home_dir() {
-        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm");
+        let managed = home
+            .join(SHARED_PROFILES_DIR)
+            .join("bin")
+            .join("appliance-vm");
         if managed.exists() {
             return Some(managed);
         }
@@ -2557,12 +2617,14 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
 /// This is what keeps `appliance vm dev up` (spawned via the bundled CLI,
 /// which resolves the managed binary) from running a stale engine that
 /// predates flags like `--dev`.
-async fn ensure_vm_installed(app: &AppHandle, on_event: &Channel<serde_json::Value>) -> Result<(), String> {
+async fn ensure_vm_installed(
+    app: &AppHandle,
+    on_event: &Channel<serde_json::Value>,
+) -> Result<(), String> {
     let Some(source) = vm_install_source(app) else {
         return Ok(());
     };
-    let dest = home_dir()
-        .map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm"));
+    let dest = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm"));
     let up_to_date = dest.as_ref().is_some_and(|dest| {
         dest.is_file()
             // Cheap length gate before reading both binaries in full.
@@ -2801,12 +2863,22 @@ async fn microvm_list() -> Result<Vec<MicroVmSummary>, String> {
     Ok(parsed
         .into_iter()
         .map(|v| {
-            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
             let cluster_id = microvm_cluster_id(&name);
             MicroVmSummary {
                 running: v.get("running").and_then(|r| r.as_bool()).unwrap_or(false),
-                cluster_ready: v.get("clusterReady").and_then(|r| r.as_bool()).unwrap_or(false),
-                phase: v.get("phase").and_then(|p| p.as_str()).map(|s| s.to_string()),
+                cluster_ready: v
+                    .get("clusterReady")
+                    .and_then(|r| r.as_bool())
+                    .unwrap_or(false),
+                phase: v
+                    .get("phase")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string()),
                 host_port: v.get("hostPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
                 api_port: v.get("apiPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
                 registry_port: v.get("registryPort").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
@@ -2824,7 +2896,10 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
     // Fallback URL before we know the VM's allocated port (binary
     // missing, or status failed). The default VM keeps 8081; a named VM
     // we can't probe yet gets its host:port filled in from status below.
-    let api_server_url = format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT);
+    let api_server_url = format!(
+        "http://{}:{}",
+        IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT
+    );
     let Some(bin) = vm_binary() else {
         let installable = vm_install_source(&app).is_some();
         return MicroVmStatus {
@@ -2886,7 +2961,10 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         Some(port) => format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, port),
         None => api_server_url,
     };
-    let running = parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+    let running = parsed
+        .get("running")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // The engine now reports `clusterReady` (kubeconfig fetched *and* the
     // host process alive) directly — prefer it. Fall back to the on-disk
     // kubeconfig check for older engine binaries that predate the field,
@@ -2922,7 +3000,10 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
     MicroVmStatus {
         available: true,
         installable: false,
-        exists: parsed.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
+        exists: parsed
+            .get("exists")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         running,
         kubeconfig_ready,
         phase,
@@ -3030,7 +3111,8 @@ async fn run_microvm_up(
             // adopt it as a desktop cluster right away so the deploy
             // wizard can target the engine without waiting for the
             // next status poll.
-            sync_microvm_cluster(&app, &name).map_err(|e| format!("register microVM cluster: {e}"))?;
+            sync_microvm_cluster(&app, &name)
+                .map_err(|e| format!("register microVM cluster: {e}"))?;
             Ok(())
         }
         code => Err(format!(
@@ -3065,7 +3147,11 @@ async fn microvm_delete(app: AppHandle, name: Option<String>) -> Result<(), Stri
         let (ok, stdout, _) = run_status_command(&[&bin, "status", &name]).await?;
         if ok {
             let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
-            if !parsed.get("running").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if !parsed
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 break;
             }
         }
@@ -3130,12 +3216,18 @@ struct EgressPolicy {
 /// unless the override is set, mirroring the engine. Read-only: this never
 /// writes the spec.
 fn microvm_netstack_enforced(name: &str) -> bool {
-    if std::env::var("APPLIANCE_NETSTACK").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("APPLIANCE_NETSTACK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return true;
     }
-    let Some(path) =
-        home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("vm").join(name).join("vm.json"))
-    else {
+    let Some(path) = home_dir().map(|h| {
+        h.join(SHARED_PROFILES_DIR)
+            .join("vm")
+            .join(name)
+            .join("vm.json")
+    }) else {
         return false;
     };
     let Ok(raw) = fs::read_to_string(&path) else {
@@ -3143,7 +3235,11 @@ fn microvm_netstack_enforced(name: &str) -> bool {
     };
     serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|spec| spec.get("netLink").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase()))
+        .and_then(|spec| {
+            spec.get("netLink")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase())
+        })
         .map(|link| link == "netstack")
         .unwrap_or(false)
 }
@@ -3174,7 +3270,11 @@ async fn microvm_egress_get(name: Option<String>) -> Result<EgressPolicy, String
     let mut policy: EgressPolicy = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
     policy.ca_path = microvm_ca_path(&name).map(|p| p.to_string_lossy().into_owned());
     policy.enforced = microvm_netstack_enforced(&name);
-    policy.net_link = if policy.enforced { "netstack".into() } else { "nat".into() };
+    policy.net_link = if policy.enforced {
+        "netstack".into()
+    } else {
+        "nat".into()
+    };
     Ok(policy)
 }
 
@@ -3207,7 +3307,11 @@ async fn microvm_egress_default(name: Option<String>, action: String) -> Result<
 /// thin typed subcommands — none of the desktop edit paths round-trip the
 /// effective JSON.)
 #[tauri::command]
-async fn microvm_egress_rule(name: Option<String>, action: String, host: String) -> Result<(), String> {
+async fn microvm_egress_rule(
+    name: Option<String>,
+    action: String,
+    host: String,
+) -> Result<(), String> {
     // action: "allow" | "deny"
     if action != "allow" && action != "deny" {
         return Err(format!("rule action must be allow|deny, got '{action}'"));
@@ -3283,7 +3387,10 @@ struct EgressEvent {
 }
 
 #[tauri::command]
-async fn microvm_egress_log(name: Option<String>, tail: Option<u32>) -> Result<Vec<EgressEvent>, String> {
+async fn microvm_egress_log(
+    name: Option<String>,
+    tail: Option<u32>,
+) -> Result<Vec<EgressEvent>, String> {
     let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
@@ -3301,8 +3408,7 @@ async fn microvm_egress_clear_log(name: Option<String>) -> Result<(), String> {
     let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, _o, stderr) =
-        run_status_command(&[&bin, "egress", "log", &name, "--clear"]).await?;
+    let (ok, _o, stderr) = run_status_command(&[&bin, "egress", "log", &name, "--clear"]).await?;
     if !ok {
         return Err(format!("clear egress log failed: {}", stderr.trim()));
     }
@@ -3374,8 +3480,14 @@ async fn microvm_creds_add(name: Option<String>, input: CredsAddInput) -> Result
     let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let mut args: Vec<String> =
-        vec![bin.clone(), "creds".into(), "add".into(), input.host.clone(), "--name".into(), name];
+    let mut args: Vec<String> = vec![
+        bin.clone(),
+        "creds".into(),
+        "add".into(),
+        input.host.clone(),
+        "--name".into(),
+        name,
+    ];
     if input.capture {
         args.push("--capture".into());
     }
@@ -3421,8 +3533,15 @@ async fn microvm_creds_set(
     let name = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let mut args: Vec<String> =
-        vec![bin.clone(), "creds".into(), "set".into(), host, value, "--name".into(), name];
+    let mut args: Vec<String> = vec![
+        bin.clone(),
+        "creds".into(),
+        "set".into(),
+        host,
+        value,
+        "--name".into(),
+        name,
+    ];
     if let Some(h) = header.filter(|h| !h.trim().is_empty()) {
         args.push("--header".into());
         args.push(h);
@@ -3529,7 +3648,8 @@ struct TerminalOpenInput {
 /// the CLI: a stable HOME on the persistent disk, cd into the
 /// workspace, and bash once the toolchain has installed it (sh until
 /// then).
-const DEV_SHELL_LOGIN: &str = "export HOME=/persist/workspace; cd /persist/workspace 2>/dev/null || true; \
+const DEV_SHELL_LOGIN: &str =
+    "export HOME=/persist/workspace; cd /persist/workspace 2>/dev/null || true; \
      if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi";
 
 /// Build the argv for a shell into the microVM host itself, riding
@@ -3538,7 +3658,10 @@ const DEV_SHELL_LOGIN: &str = "export HOME=/persist/workspace; cd /persist/works
 /// the provisioned toolchain; otherwise a raw root shell at /. Resolves
 /// the VM's single node name first (async kubectl), so this lives
 /// outside the sync `terminal_exec_argv`.
-async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result<Vec<String>, String> {
+async fn microvm_host_shell_argv(
+    input: &TerminalOpenInput,
+    dev: bool,
+) -> Result<Vec<String>, String> {
     // Prefer the fast vsock shell when the relay socket is up: it needs
     // no k3s and leaves no debugger pod behind. Falls through to
     // kubectl-debug for older VMs or before the guest agent is ready.
@@ -3555,7 +3678,11 @@ async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result
             .join(vm)
             .join("shell.sock");
         if sock.exists() {
-            let mut argv = vec![bin.to_string_lossy().into_owned(), "shell".to_string(), vm.to_string()];
+            let mut argv = vec![
+                bin.to_string_lossy().into_owned(),
+                "shell".to_string(),
+                vm.to_string(),
+            ];
             // Reattachable: attach to (or create) the named guest tmux
             // session so this shell survives a disconnect / desktop restart.
             // Only the vsock path is reattachable — the kubectl-debug
@@ -3568,7 +3695,10 @@ async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result
         }
     }
 
-    let target = kube_target_args(input.engine.as_deref(), input.cluster_name.as_deref().unwrap_or(""))?;
+    let target = kube_target_args(
+        input.engine.as_deref(),
+        input.cluster_name.as_deref().unwrap_or(""),
+    )?;
     // target is ["--kubeconfig", <path>]; reuse the path for the node lookup.
     let mut node_args: Vec<&str> = vec!["kubectl"];
     node_args.extend(target.iter().map(String::as_str));
@@ -3578,10 +3708,18 @@ async fn microvm_host_shell_argv(input: &TerminalOpenInput, dev: bool) -> Result
     if !ok || node.is_empty() {
         return Err(format!(
             "could not resolve the VM node — is the engine up?{}",
-            if stderr.trim().is_empty() { String::new() } else { format!(" ({})", stderr.trim()) }
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", stderr.trim())
+            }
         ));
     }
-    let entry = if dev { DEV_SHELL_LOGIN } else { "exec /bin/sh -l" };
+    let entry = if dev {
+        DEV_SHELL_LOGIN
+    } else {
+        "exec /bin/sh -l"
+    };
     let mut argv = vec!["kubectl".to_string()];
     argv.extend(target);
     argv.extend(
@@ -3613,7 +3751,10 @@ fn terminal_exec_argv(app: &AppHandle, input: &TerminalOpenInput) -> Result<Vec<
     };
     let cfg = resolve_runtime_config(app, &runtime_input)?;
     let mut argv = vec!["kubectl".to_string()];
-    argv.extend(kube_target_args(input.engine.as_deref(), &cfg.cluster_name)?);
+    argv.extend(kube_target_args(
+        input.engine.as_deref(),
+        &cfg.cluster_name,
+    )?);
     argv.push("-n".to_string());
     argv.push(cfg.namespace.clone());
     argv.push("exec".to_string());
@@ -3672,7 +3813,11 @@ async fn terminal_close(id: String) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct TerminalSessionInfo {
     id: String,
-    #[serde(default, alias = "last_activity", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "last_activity",
+        skip_serializing_if = "Option::is_none"
+    )]
     last_activity: Option<i64>,
 }
 
@@ -3687,7 +3832,10 @@ async fn terminal_sessions(name: Option<String>) -> Result<Vec<TerminalSessionIn
     let bin = bin.to_string_lossy().to_string();
     let (ok, stdout, stderr) = run_status_command(&[&bin, "sessions", "list", &vm]).await?;
     if !ok {
-        return Err(format!("appliance-vm sessions list failed: {}", stderr.trim()));
+        return Err(format!(
+            "appliance-vm sessions list failed: {}",
+            stderr.trim()
+        ));
     }
     serde_json::from_str(&stdout).map_err(|e| format!("could not parse session list: {e}"))
 }
@@ -3701,9 +3849,13 @@ async fn terminal_kill_session(name: Option<String>, id: String) -> Result<(), S
     let vm = vm_name(name);
     let bin = vm_binary().ok_or("appliance-vm is not installed")?;
     let bin = bin.to_string_lossy().to_string();
-    let (ok, _stdout, stderr) = run_status_command(&[&bin, "sessions", "kill", &id, "--name", &vm]).await?;
+    let (ok, _stdout, stderr) =
+        run_status_command(&[&bin, "sessions", "kill", &id, "--name", &vm]).await?;
     if !ok {
-        return Err(format!("appliance-vm sessions kill failed: {}", stderr.trim()));
+        return Err(format!(
+            "appliance-vm sessions kill failed: {}",
+            stderr.trim()
+        ));
     }
     Ok(())
 }
@@ -3745,7 +3897,14 @@ async fn microvm_dev_cleanup(name: Option<String>) -> Result<(), String> {
     if debuggers.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<&str> = vec!["kubectl", "--kubeconfig", &kc, "delete", "pod", "--wait=false"];
+    let mut args: Vec<&str> = vec![
+        "kubectl",
+        "--kubeconfig",
+        &kc,
+        "delete",
+        "pod",
+        "--wait=false",
+    ];
     args.extend(debuggers);
     let _ = run_status_command(&args).await;
     Ok(())
@@ -3795,7 +3954,8 @@ struct AgentStartInput {
     /// VM to launch in; null → the canonical `appliance` VM.
     #[serde(default)]
     name: Option<String>,
-    /// Adapter key — `claude-code` today.
+    /// Adapter key — `claude-code` / `copilot` / `codex`. Passed straight to
+    /// `agent start --type`; the CLI resolves + validates it.
     #[serde(rename = "type", default = "default_agent_type")]
     agent_type: String,
     /// Optional task prompt (interactive label / autonomous prompt).
@@ -3844,7 +4004,12 @@ async fn microvm_agent_start(app: AppHandle, input: AgentStartInput) -> Result<(
         "--dir".into(),
         dir,
     ];
-    if let Some(task) = input.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    if let Some(task) = input
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         args.push("--task".into());
         args.push(task.to_string());
     }
@@ -3914,7 +4079,10 @@ struct AgentInfo {
 /// an error, so rehydrate degrades to labelling agent tabs by their
 /// `agent-` id alone.
 #[tauri::command]
-async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<AgentInfo>, String> {
+async fn microvm_agent_list(
+    app: AppHandle,
+    name: Option<String>,
+) -> Result<Vec<AgentInfo>, String> {
     let vm = vm_name(name);
     let Some(dir) = vm_dev_mount(&vm) else {
         return Ok(Vec::new()); // no mounted project → no per-project registry
@@ -3924,7 +4092,11 @@ async fn microvm_agent_list(app: AppHandle, name: Option<String>) -> Result<Vec<
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .current_dir(dir)
-        .args(["agent".to_string(), "list".to_string(), "--json".to_string()]);
+        .args([
+            "agent".to_string(),
+            "list".to_string(),
+            "--json".to_string(),
+        ]);
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -3978,7 +4150,11 @@ async fn kill_guest_session(vm: &str, id: &str) {
 /// non-zero (which covers both "row not found, never killed" and "session
 /// already gone" — the direct kill is idempotent either way).
 #[tauri::command]
-async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) -> Result<(), String> {
+async fn microvm_agent_stop(
+    app: AppHandle,
+    name: Option<String>,
+    id: String,
+) -> Result<(), String> {
     let id = id.trim().to_string();
     if id.is_empty() {
         return Err("an agent id is required to stop an agent".to_string());
@@ -4018,30 +4194,77 @@ async fn microvm_agent_stop(app: AppHandle, name: Option<String>, id: String) ->
 }
 
 // ============================================================
-// Agent credential login (Phase 5, L3 — docs/agent-login.md §4).
+// Agent credential login (Phase 5, L3 / multi-agent G3 —
+// docs/agent-login.md §4, docs/multi-agent-adapters.md §4).
 //
-// Lets a DESKTOP-only user authenticate the agent — API key OR subscription
-// OAuth ("Sign in with Claude") — without a terminal. The credential is
-// stored host-side ONLY and is NEVER sent to the VM: the egress broker
-// injects it host-side on the outbound request (the VM holds at most an
-// inert placeholder). This mirrors the CLI's host store
-// (`packages/cli/src/utils/agent.ts` writeAgentKey / parseStoredCred): the
-// SAME Keychain item (`sh.appliance.agent` / `anthropic`) / 0600 file and the
-// SAME kind-tagged JSON envelope `{"kind":"…","value":"…"}`, so L1's
-// `print-key` (run by the broker at inject time) reads it back unchanged.
+// Lets a DESKTOP-only user authenticate a coding agent — claude-code (API key
+// OR subscription OAuth "Sign in with Claude"), copilot (fine-grained GitHub
+// PAT), codex (OpenAI API key) — without a terminal. Each agent's credential is
+// stored host-side ONLY, in its OWN PER-PROVIDER store (so three agents never
+// collide), and is NEVER sent to the VM: the egress broker injects it host-side
+// on the outbound request (the VM holds at most an inert placeholder). This
+// mirrors the CLI's host store (`packages/cli/src/utils/agent.ts`
+// writeAgentKey(provider, value, kind) / parseStoredCred / readAgentKey): the
+// SAME Keychain item (`sh.appliance.agent`, account = the agent's provider) /
+// `<provider>-cred` 0600 file and the SAME kind-tagged JSON envelope
+// `{"kind":"…","value":"…"}`, so the broker's `print-key --type <agent>` (run
+// at inject time) reads it back unchanged.
 //
-// IMPORTANT: the envelope format MUST stay in sync with parseStoredCred in
-// packages/cli/src/utils/agent.ts — a drift fails the broker CLOSED.
+// IMPORTANT: the envelope format + per-provider store keys MUST stay in sync
+// with utils/agent.ts — a drift fails the broker CLOSED.
 // ============================================================
 
 const AGENT_KEYCHAIN_SERVICE: &str = "sh.appliance.agent";
-const AGENT_KEYCHAIN_ACCOUNT: &str = "anthropic";
 
-/// The off-macOS host store path (`~/.appliance/agent/anthropic-key`).
-/// Mirrors `agentKeyFile()` in the CLI.
+/// Map an agent `--type` to its per-provider host cred-store key, mirroring the
+/// CLI registry (utils/agent.ts adapters): claude-code→anthropic,
+/// copilot→github-copilot, codex→openai. The provider is the Keychain account
+/// on macOS and the `<provider>-cred` 0600 filename off-macOS. None for an
+/// unknown type (the caller errors actionably).
+fn provider_for_agent_type(agent_type: &str) -> Option<&'static str> {
+    match agent_type {
+        "claude-code" => Some("anthropic"),
+        "copilot" => Some("github-copilot"),
+        "codex" => Some("openai"),
+        _ => None,
+    }
+}
+
+/// Which credential kinds a provider's agent accepts — mirrors the CLI
+/// adapters' `authModes`: anthropic = api-key|oauth, github-copilot = pat,
+/// openai = api-key. The stored kind selects the broker auth mode per agent.
+fn provider_accepts_kind(provider: &str, kind: &str) -> bool {
+    match provider {
+        "anthropic" => kind == "api-key" || kind == "oauth",
+        "github-copilot" => kind == "pat",
+        "openai" => kind == "api-key",
+        _ => false,
+    }
+}
+
+/// The off-macOS host store path (`~/.appliance/agent/<provider>-cred`).
+/// Mirrors `agentKeyFile(provider)` in the CLI.
 #[cfg(not(target_os = "macos"))]
-fn agent_key_file() -> Option<PathBuf> {
-    Some(home_dir()?.join(".appliance").join("agent").join("anthropic-key"))
+fn agent_key_file(provider: &str) -> Option<PathBuf> {
+    Some(
+        home_dir()?
+            .join(".appliance")
+            .join("agent")
+            .join(format!("{provider}-cred")),
+    )
+}
+
+/// The legacy pre-multi-agent Anthropic 0600 file (`anthropic-key`), read as a
+/// fallback so a non-macOS user who logged in before the per-provider rename
+/// keeps working until they next sign in. Mirrors `legacyAnthropicKeyFile()`.
+#[cfg(not(target_os = "macos"))]
+fn legacy_anthropic_key_file() -> Option<PathBuf> {
+    Some(
+        home_dir()?
+            .join(".appliance")
+            .join("agent")
+            .join("anthropic-key"),
+    )
 }
 
 /// Whether a host credential is stored, and (best-effort) its kind. Never
@@ -4049,19 +4272,19 @@ fn agent_key_file() -> Option<PathBuf> {
 #[derive(Serialize)]
 struct AgentAuthStatus {
     configured: bool,
-    /// `api-key` | `oauth` when known; null on macOS (we do NOT read the
-    /// secret just to render a label — that would trigger a Keychain access
+    /// `api-key` | `oauth` | `pat` when known; null on macOS (we do NOT read
+    /// the secret just to render a label — that would trigger a Keychain access
     /// prompt) or when nothing is stored.
     kind: Option<String>,
 }
 
-/// Write the kind-tagged credential envelope to the host Keychain (macOS).
-/// `security add-generic-password -U` upserts. The secret is briefly on
-/// `security`'s argv — the SAME documented tradeoff as the CLI's
-/// writeAgentKey (there's no stdin form); it is passed via execvp (no shell),
-/// so it cannot be word-split or interpreted. NEVER logged.
+/// Write the kind-tagged credential envelope to the host Keychain (macOS),
+/// under `provider`'s account. `security add-generic-password -U` upserts. The
+/// secret is briefly on `security`'s argv — the SAME documented tradeoff as the
+/// CLI's writeAgentKey (there's no stdin form); it is passed via execvp (no
+/// shell), so it cannot be word-split or interpreted. NEVER logged.
 #[cfg(target_os = "macos")]
-fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
+fn store_agent_cred_envelope(provider: &str, envelope: &str) -> Result<(), String> {
     let out = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
@@ -4069,7 +4292,7 @@ fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
             "-s",
             AGENT_KEYCHAIN_SERVICE,
             "-a",
-            AGENT_KEYCHAIN_ACCOUNT,
+            provider,
             "-w",
             envelope,
         ])
@@ -4084,13 +4307,14 @@ fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Write the kind-tagged credential envelope to a 0600 file off-macOS.
-/// Mirrors the CLI's writeAgentKey fallback. NEVER logged.
+/// Write the kind-tagged credential envelope to a 0600 file off-macOS, under
+/// `<provider>-cred`. Mirrors the CLI's writeAgentKey fallback. NEVER logged.
 #[cfg(not(target_os = "macos"))]
-fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
-    let file = agent_key_file().ok_or("cannot resolve the home directory")?;
+fn store_agent_cred_envelope(provider: &str, envelope: &str) -> Result<(), String> {
+    let file = agent_key_file(provider).ok_or("cannot resolve the home directory")?;
     if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("could not create the agent store dir: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create the agent store dir: {e}"))?;
     }
     std::fs::write(&file, envelope).map_err(|e| format!("could not write the agent store: {e}"))?;
     #[cfg(unix)]
@@ -4102,24 +4326,53 @@ fn store_agent_cred_envelope(envelope: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Store an Anthropic credential host-side, tagged by `kind` (L3). Builds the
-/// SAME `{"kind","value"}` envelope the CLI's writeAgentKey writes, so the
-/// broker's `print-key` reads it back. The credential is written ONLY to the
-/// host store — it is NEVER sent to the VM. NEVER logs the value.
+/// Store an agent credential host-side under `agent_type`'s provider store,
+/// tagged by `kind` (L3 + multi-agent). Builds the SAME `{"kind","value"}`
+/// envelope the CLI's writeAgentKey writes, so the broker's `print-key` reads it
+/// back. The credential is written ONLY to the host store — NEVER sent to the
+/// VM. NEVER logs the value.
 #[tauri::command]
-async fn microvm_agent_login(kind: String, value: String) -> Result<(), String> {
+async fn microvm_agent_login(
+    agent_type: String,
+    kind: String,
+    value: String,
+) -> Result<(), String> {
+    let agent_type = agent_type.trim();
+    let Some(provider) = provider_for_agent_type(agent_type) else {
+        return Err(format!("unknown agent type '{agent_type}'"));
+    };
     let kind = kind.trim();
-    if kind != "api-key" && kind != "oauth" {
-        return Err(format!("unknown credential kind '{kind}' (expected 'api-key' or 'oauth')"));
+    if !provider_accepts_kind(provider, kind) {
+        return Err(format!(
+            "credential kind '{kind}' is not valid for agent '{agent_type}'"
+        ));
     }
     let value = value.trim();
     if value.is_empty() {
-        return Err("refusing to store an empty Anthropic credential".to_string());
+        return Err(format!("refusing to store an empty {provider} credential"));
+    }
+    // Copilot PAT hard guard (defense-in-depth, mirrors the CLI's
+    // validateCopilotPat — docs/multi-agent-adapters.md §4/§7): a host-keyed PAT
+    // is injected on ALL guest→api.github.com traffic, so it MUST be a
+    // fine-grained `github_pat_` token (scoped to Copilot Requests), never a
+    // classic `ghp_` token that carries the user's full account scope.
+    if kind == "pat" {
+        if value.starts_with("ghp_") {
+            return Err(
+                "classic ghp_ PAT rejected — use a fine-grained github_pat_ token scoped to Copilot Requests only."
+                    .to_string(),
+            );
+        }
+        if !value.starts_with("github_pat_") {
+            return Err(
+                "expected a fine-grained GitHub PAT starting with github_pat_.".to_string(),
+            );
+        }
     }
     // serde_json escapes the value safely; parseStoredCred reads the envelope
     // order-independently, so this matches the CLI's JSON.stringify shape.
     let envelope = serde_json::json!({ "kind": kind, "value": value }).to_string();
-    store_agent_cred_envelope(&envelope)
+    store_agent_cred_envelope(provider, &envelope)
 }
 
 /// Parse ONLY the kind out of a stored envelope (off-macOS), mirroring
@@ -4139,7 +4392,7 @@ fn parse_cred_kind(raw: &str) -> Option<String> {
             .get("value")
             .and_then(|x| x.as_str())
             .is_some_and(|x| !x.trim().is_empty());
-        if (kind == "api-key" || kind == "oauth") && value_ok {
+        if (kind == "api-key" || kind == "oauth" || kind == "pat") && value_ok {
             return Some(kind.to_string());
         }
         return None;
@@ -4147,66 +4400,96 @@ fn parse_cred_kind(raw: &str) -> Option<String> {
     Some("api-key".to_string()) // legacy bare string → api-key
 }
 
-/// macOS: does the Keychain item EXIST? Attribute lookup (no `-w`), which
-/// does NOT decrypt the secret and so does NOT trigger an access prompt. We
-/// deliberately don't read the secret just to label it, so `kind` is null.
+/// macOS: does `provider`'s Keychain item EXIST? Attribute lookup (no `-w`),
+/// which does NOT decrypt the secret and so does NOT trigger an access prompt.
+/// We deliberately don't read the secret just to label it, so `kind` is null.
 #[cfg(target_os = "macos")]
-fn read_agent_cred_status() -> AgentAuthStatus {
+fn read_agent_cred_status(provider: &str) -> AgentAuthStatus {
     let configured = std::process::Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-s",
             AGENT_KEYCHAIN_SERVICE,
             "-a",
-            AGENT_KEYCHAIN_ACCOUNT,
+            provider,
         ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    AgentAuthStatus { configured, kind: None }
+    AgentAuthStatus {
+        configured,
+        kind: None,
+    }
 }
 
 /// Off-macOS: the 0600 file is plain-readable, so report the parsed kind.
+/// Reads `<provider>-cred`, falling back to the legacy `anthropic-key` for the
+/// anthropic provider (mirrors readAgentKey's legacy fallback).
 #[cfg(not(target_os = "macos"))]
-fn read_agent_cred_status() -> AgentAuthStatus {
-    let kind = agent_key_file()
+fn read_agent_cred_status(provider: &str) -> AgentAuthStatus {
+    let raw = agent_key_file(provider)
         .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|raw| parse_cred_kind(&raw));
-    AgentAuthStatus { configured: kind.is_some(), kind }
+        .or_else(|| {
+            if provider == "anthropic" {
+                legacy_anthropic_key_file().and_then(|f| std::fs::read_to_string(f).ok())
+            } else {
+                None
+            }
+        });
+    let kind = raw.and_then(|raw| parse_cred_kind(&raw));
+    AgentAuthStatus {
+        configured: kind.is_some(),
+        kind,
+    }
 }
 
-/// Report whether a host Anthropic credential is stored (+ best-effort kind),
-/// for the desktop's "signed in as …" indicator. Never exposes the secret.
+/// Report whether `agent_type`'s host credential is stored (+ best-effort
+/// kind), for the desktop's per-agent "signed in" indicator. Never exposes the
+/// secret.
 #[tauri::command]
-async fn microvm_agent_login_status() -> Result<AgentAuthStatus, String> {
-    Ok(read_agent_cred_status())
+async fn microvm_agent_login_status(agent_type: String) -> Result<AgentAuthStatus, String> {
+    let agent_type = agent_type.trim();
+    let Some(provider) = provider_for_agent_type(agent_type) else {
+        return Err(format!("unknown agent type '{agent_type}'"));
+    };
+    Ok(read_agent_cred_status(provider))
 }
 
-/// Forget the stored host credential (macOS Keychain item / 0600 file).
+/// Forget `provider`'s stored host credential (macOS Keychain item / 0600
+/// file). Off-macOS also drops the legacy `anthropic-key` for anthropic.
 #[cfg(target_os = "macos")]
-fn forget_agent_cred() {
+fn forget_agent_cred(provider: &str) {
     let _ = std::process::Command::new("/usr/bin/security")
         .args([
             "delete-generic-password",
             "-s",
             AGENT_KEYCHAIN_SERVICE,
             "-a",
-            AGENT_KEYCHAIN_ACCOUNT,
+            provider,
         ])
         .output();
 }
 
 #[cfg(not(target_os = "macos"))]
-fn forget_agent_cred() {
-    if let Some(f) = agent_key_file() {
+fn forget_agent_cred(provider: &str) {
+    if let Some(f) = agent_key_file(provider) {
         let _ = std::fs::remove_file(f);
+    }
+    if provider == "anthropic" {
+        if let Some(f) = legacy_anthropic_key_file() {
+            let _ = std::fs::remove_file(f);
+        }
     }
 }
 
-/// Forget the stored host Anthropic credential (the desktop "sign out").
+/// Forget `agent_type`'s stored host credential (the desktop "sign out").
 #[tauri::command]
-async fn microvm_agent_logout() -> Result<(), String> {
-    forget_agent_cred();
+async fn microvm_agent_logout(agent_type: String) -> Result<(), String> {
+    let agent_type = agent_type.trim();
+    let Some(provider) = provider_for_agent_type(agent_type) else {
+        return Err(format!("unknown agent type '{agent_type}'"));
+    };
+    forget_agent_cred(provider);
     Ok(())
 }
 
@@ -4217,7 +4500,10 @@ async fn microvm_agent_logout() -> Result<(), String> {
 /// resolves the same as in the user's shell.
 #[tauri::command]
 async fn microvm_agent_has_host_claude() -> bool {
-    matches!(run_status_command(&["claude", "--version"]).await, Ok((true, _, _)))
+    matches!(
+        run_status_command(&["claude", "--version"]).await,
+        Ok((true, _, _))
+    )
 }
 
 /// Best-effort: open Terminal.app running `claude setup-token` (macOS) so the
@@ -4235,7 +4521,10 @@ async fn open_setup_token_terminal() -> Result<bool, String> {
     ])
     .await?;
     if !ok {
-        return Err(format!("could not open Terminal to run `claude setup-token`: {}", err.trim()));
+        return Err(format!(
+            "could not open Terminal to run `claude setup-token`: {}",
+            err.trim()
+        ));
     }
     Ok(true)
 }
@@ -4316,11 +4605,17 @@ async fn read_appliance_manifest(
 
     // Probe for a programmatic manifest. First hit wins, matching the
     // CLI's resolution order so both surfaces pick the same file.
-    let code_manifest = ["appliance.ts", "appliance.mts", "appliance.cts",
-                        "appliance.js", "appliance.mjs", "appliance.cjs"]
-        .iter()
-        .map(|n| dir.join(n))
-        .find(|p| p.exists());
+    let code_manifest = [
+        "appliance.ts",
+        "appliance.mts",
+        "appliance.cts",
+        "appliance.js",
+        "appliance.mjs",
+        "appliance.cjs",
+    ]
+    .iter()
+    .map(|n| dir.join(n))
+    .find(|p| p.exists());
 
     let Some(code_path) = code_manifest else {
         return Err(format!(
@@ -4633,7 +4928,12 @@ async fn crane_push_fallback(
 
     let tar_path = std::env::temp_dir().join(format!("appliance-image-{}.tar", std::process::id()));
     let tar_str = tar_path.to_string_lossy().to_string();
-    let save_args: Vec<String> = vec!["save".into(), "-o".into(), tar_str.clone(), image_ref.into()];
+    let save_args: Vec<String> = vec![
+        "save".into(),
+        "-o".into(),
+        tar_str.clone(),
+        image_ref.into(),
+    ];
     stream_child_to_channel("docker", &save_args, on_event).await?;
 
     let result = run_status_command(&[&crane, "push", "--insecure", &tar_str, image_ref]).await;
@@ -4739,10 +5039,7 @@ fn ensure_user_paths_on_path() {
         }
     }
 
-    let existing: Vec<PathBuf> = candidates
-        .into_iter()
-        .filter(|p| p.is_dir())
-        .collect();
+    let existing: Vec<PathBuf> = candidates.into_iter().filter(|p| p.is_dir()).collect();
     prepend_to_path(&existing);
 }
 
@@ -4753,13 +5050,19 @@ fn prepend_to_path(dirs: &[PathBuf]) {
     if dirs.is_empty() {
         return;
     }
-    let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let sep = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
     let current = std::env::var("PATH").unwrap_or_default();
     let existing: std::collections::HashSet<&str> = current.split(sep).collect();
 
     let mut prefix = String::new();
     for dir in dirs {
-        let Some(dir_str) = dir.to_str() else { continue };
+        let Some(dir_str) = dir.to_str() else {
+            continue;
+        };
         if existing.contains(dir_str) || prefix.split(sep).any(|p| p == dir_str) {
             continue;
         }
@@ -5015,7 +5318,10 @@ mod tests {
         // No keychain entry and no shared secret: don't fabricate an
         // empty profile. Leave the (meta-only or absent) state alone.
         let cluster = test_cluster("prod");
-        assert_eq!(decide_seed(&cluster, None, None), SeedDecision::NothingToSeed);
+        assert_eq!(
+            decide_seed(&cluster, None, None),
+            SeedDecision::NothingToSeed
+        );
     }
 
     // ---- Keychain-first secret placement (E4.4) ------------------

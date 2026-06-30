@@ -61,10 +61,11 @@ const MOCK_UPDATE_AVAILABLE = true;
 // version isn't available to desktop-package source — see check()).
 const MOCK_CURRENT_VERSION = '1.48.0';
 
-// Agent-login mock (Phase 5, L3): the host-side credential store, in memory.
-// Flip `MOCK_HAS_HOST_CLAUDE` to false to QA the "Sign in with Claude" gate
-// (no host `claude` → install guidance / use an API key).
-let mockAgentCred: AgentAuthKind | null = null;
+// Agent-login mock (Phase 5, L3 / multi-agent G3): the host-side credential
+// store, in memory, keyed PER AGENT TYPE (each agent has its own provider
+// store). Flip `MOCK_HAS_HOST_CLAUDE` to false to QA the "Sign in with Claude"
+// gate (no host `claude` → install guidance / use an API key).
+const mockAgentCreds = new Map<string, AgentAuthKind>();
 const MOCK_HAS_HOST_CLAUDE = true;
 
 /** Bump the minor of a semver string for the mock update feed. */
@@ -284,18 +285,19 @@ export function createMockHost(): ConsoleHost {
     // "Sign in with Claude" gate; `runSetupToken` returns false so the UI
     // exercises the manual-command fallback (no real Terminal in a browser).
     agentAuth: {
-      async status(): Promise<AgentAuthStatus> {
+      async status(agentType: string): Promise<AgentAuthStatus> {
         await sleep(60);
-        return mockAgentCred ? { configured: true, kind: mockAgentCred } : { configured: false, kind: null };
+        const kind = mockAgentCreds.get(agentType);
+        return kind ? { configured: true, kind } : { configured: false, kind: null };
       },
-      async login(input: { kind: AgentAuthKind; value: string }) {
+      async login(input: { agentType: string; kind: AgentAuthKind; value: string }) {
         await sleep(150);
-        if (!input.value.trim()) throw new Error('refusing to store an empty Anthropic credential');
-        mockAgentCred = input.kind;
+        if (!input.value.trim()) throw new Error('refusing to store an empty credential');
+        mockAgentCreds.set(input.agentType, input.kind);
       },
-      async logout() {
+      async logout(agentType: string) {
         await sleep(80);
-        mockAgentCred = null;
+        mockAgentCreds.delete(agentType);
       },
       async hasHostClaude() {
         await sleep(60);

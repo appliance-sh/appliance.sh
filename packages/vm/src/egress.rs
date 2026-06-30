@@ -116,13 +116,16 @@ fn policy_path(name: &str) -> PathBuf {
 }
 
 /// The baked sane default allowlist for `net_link = Netstack` VMs
-/// (docs/egress-firewall.md §5): the package mirrors, registries, git
-/// hosts, and the model API a fresh agent/dev VM needs, suffix-matched by
-/// [`host_matches`]. `githubusercontent.com` is the suffix form of the
-/// doc's `*.githubusercontent.com` wildcard.
+/// (docs/egress-firewall.md §5; docs/multi-agent-adapters.md §5): the package
+/// mirrors, registries, git hosts, and the model APIs a fresh agent/dev VM
+/// needs, suffix-matched by [`host_matches`]. `githubusercontent.com` is the
+/// suffix form of the doc's `*.githubusercontent.com` wildcard;
+/// `githubcopilot.com` covers `api.githubcopilot.com` + `*.githubcopilot.com`.
 pub const NETSTACK_ALLOWLIST: &[&str] = &[
     // api / model
     "api.anthropic.com",
+    "api.openai.com",     // codex (OpenAI Codex CLI) — docs/multi-agent-adapters.md §5
+    "githubcopilot.com",  // copilot model leg: api.githubcopilot.com + *.githubcopilot.com — §5
     // alpine packages
     "dl-cdn.alpinelinux.org",
     // language package registries
@@ -131,7 +134,9 @@ pub const NETSTACK_ALLOWLIST: &[&str] = &[
     "files.pythonhosted.org",
     "crates.io",
     "static.crates.io",
-    // git
+    // git  (these ALSO cover Copilot's github hosts: github.com covers
+    // api.github.com — the PAT-broker leg — and githubusercontent.com covers
+    // copilot-proxy. + origin-tracker.githubusercontent.com)
     "github.com",
     "codeload.github.com",
     "githubusercontent.com",
@@ -990,6 +995,12 @@ mod tests {
         assert!(eff.allows("api.anthropic.com:443"));
         assert!(eff.allows("github.com:443"));
         assert!(eff.allows("internal.corp:443"));
+        // Multi-agent bakes: Codex's api.openai.com and Copilot's model leg
+        // (suffix-matched: api.githubcopilot.com) are reachable. Copilot's
+        // PAT-broker leg api.github.com is covered by the github.com suffix.
+        assert!(eff.allows("api.openai.com:443"));
+        assert!(eff.allows("api.githubcopilot.com:443"));
+        assert!(eff.allows("api.github.com:443"));
         // Deny still wins, and everything off-list is refused.
         assert!(!eff.allows("gist.github.com:443"));
         assert!(!eff.allows("evil.test:443"));
