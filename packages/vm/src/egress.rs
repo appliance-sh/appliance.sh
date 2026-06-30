@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::mitm;
-use crate::spec::VmPaths;
+use crate::spec::{NetLink, VmPaths};
 
 /// What the proxy does with a connection no explicit rule covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +161,118 @@ pub fn netstack_policy(name: &str) -> EgressPolicy {
         }
     }
     p
+}
+
+/// Does this VM enforce the host-side netstack boundary? True when the
+/// VM's resolved link is `Netstack` (persisted, or forced by the global
+/// `APPLIANCE_NETSTACK=1` override). This is the gate the effective-policy
+/// display keys off: a Netstack VM enforces default-Deny + the baked
+/// allowlist regardless of the persisted file's serde-default `Allow`,
+/// whereas a NAT VM enforces exactly its (cooperative) persisted policy.
+/// Mirrors the `spec.net_link()` gate the backend uses to wire the link
+/// (`backend/vz/mod.rs`), so what we show is what is enforced.
+pub fn is_netstack(name: &str) -> bool {
+    match crate::store::load_spec(name).ok().flatten() {
+        Some(spec) => spec.net_link() == NetLink::Netstack,
+        // No persisted spec yet: only the global override can force it on.
+        None => std::env::var("APPLIANCE_NETSTACK").map(|v| v == "1").unwrap_or(false),
+    }
+}
+
+/// The policy actually enforced at the boundary for this VM — the single
+/// source of truth for display, so `egress policy`/`list` never lie about
+/// what's enforced (Quinn's F2 observability nit). A Netstack VM's
+/// enforced policy is the hard default-Deny + baked allowlist boundary
+/// ([`netstack_policy`]); a NAT VM's is exactly its persisted cooperative
+/// policy ([`load_policy`], default-Allow). Keeping NAT on `load_policy`
+/// is what leaves NAT-VM behaviour unchanged.
+pub fn effective_policy(name: &str) -> EgressPolicy {
+    if is_netstack(name) {
+        netstack_policy(name)
+    } else {
+        load_policy(name)
+    }
+}
+
+/// Render the **effective** egress policy as a human-readable report.
+///
+/// For a Netstack VM this reconciles the persisted file (which keeps the
+/// serde-default `Allow` so the legacy callers are untouched) with what
+/// the netstack forces in memory: a hard default-**Deny** plus the baked
+/// [`NETSTACK_ALLOWLIST`]. It distinguishes the three categories an
+/// operator needs to reason about reachability — **baked-allow**
+/// (always-on for Netstack VMs), **operator-allow** (rules you added),
+/// and **operator-deny** (which win over either) — annotating any
+/// allow entry a deny rule overrides. For a NAT VM it shows the persisted
+/// cooperative policy as-is. Pure (takes the persisted policy + the link
+/// kind) so the rendering is unit-tested without a VM.
+pub fn render_effective_policy(name: &str, persisted: &EgressPolicy, netstack: bool) -> String {
+    let denied = |h: &str| persisted.deny.iter().any(|d| host_matches(h, d));
+    let mut out = String::new();
+
+    if netstack {
+        out.push_str(&format!(
+            "EFFECTIVE egress policy for '{name}'  (net_link=Netstack — host-enforced boundary)\n"
+        ));
+        out.push_str(
+            "  default: DENY  (host-enforced; the persisted file keeps the serde-default allow, the netstack forces deny)\n",
+        );
+    } else {
+        let default = match persisted.default {
+            Action::Allow => "ALLOW",
+            Action::Deny => "DENY",
+        };
+        out.push_str(&format!(
+            "egress policy for '{name}'  (net_link=Nat — cooperative proxy)\n"
+        ));
+        out.push_str(&format!("  default: {default}\n"));
+    }
+
+    // Deny rules first — they win over every allow (baked or operator).
+    out.push_str("\n  operator deny rules (deny wins over any allow):\n");
+    if persisted.deny.is_empty() {
+        out.push_str("    (none)\n");
+    } else {
+        for h in &persisted.deny {
+            out.push_str(&format!("    ✗ {h}\n"));
+        }
+    }
+
+    if netstack {
+        out.push_str("\n  baked allowlist (always-on for Netstack VMs):\n");
+        for h in NETSTACK_ALLOWLIST {
+            if denied(h) {
+                out.push_str(&format!("    ✗ {h}  (overridden by an operator deny rule)\n"));
+            } else {
+                out.push_str(&format!("    ✓ {h}\n"));
+            }
+        }
+    }
+
+    // Operator allow rules: the hosts the operator added beyond the baked
+    // set (a Netstack VM merges the baked list into `allow`, so filter it
+    // out here to keep the two categories distinct).
+    let is_baked = |h: &str| NETSTACK_ALLOWLIST.iter().any(|b| b.eq_ignore_ascii_case(h));
+    let operator_allow: Vec<&String> =
+        persisted.allow.iter().filter(|h| !(netstack && is_baked(h))).collect();
+    out.push_str("\n  operator allow rules:\n");
+    if operator_allow.is_empty() {
+        out.push_str("    (none)\n");
+    } else {
+        for h in operator_allow {
+            if denied(h) {
+                out.push_str(&format!("    ✗ {h}  (overridden by an operator deny rule)\n"));
+            } else {
+                out.push_str(&format!("    ✓ {h}\n"));
+            }
+        }
+    }
+
+    out.push_str(&format!(
+        "\n  TLS interception (mitm): {}\n",
+        if persisted.mitm { "on" } else { "off" }
+    ));
+    out
 }
 
 /// Load the VM's policy, or a permissive default when none is set.
@@ -790,5 +902,101 @@ mod tests {
         assert_eq!(split_host_port("example.com"), ("example.com".to_string(), 443));
         // Garbage port falls back to 443 rather than panicking.
         assert_eq!(split_host_port("example.com:notaport"), ("example.com".to_string(), 443));
+    }
+
+    #[test]
+    fn netstack_policy_forces_deny_and_bakes_allowlist() {
+        // The persisted file keeps the serde-default Allow + an operator
+        // rule; the effective Netstack policy forces Deny and merges the
+        // baked allowlist over the operator's allow (deny still wins).
+        let name = "egress-netstack-policy-test";
+        let dir = VmPaths::for_name(name).dir;
+        let _ = std::fs::create_dir_all(&dir);
+        save_policy(
+            name,
+            &EgressPolicy {
+                default: Action::Allow,
+                allow: vec!["internal.corp".into()],
+                deny: vec!["gist.github.com".into()],
+                mitm: false,
+            },
+        )
+        .unwrap();
+
+        let eff = netstack_policy(name);
+        // Default flipped to Deny regardless of the persisted Allow.
+        assert_eq!(eff.default, Action::Deny);
+        // Baked hosts are reachable; the operator's own allow survives.
+        assert!(eff.allows("api.anthropic.com:443"));
+        assert!(eff.allows("github.com:443"));
+        assert!(eff.allows("internal.corp:443"));
+        // Deny still wins, and everything off-list is refused.
+        assert!(!eff.allows("gist.github.com:443"));
+        assert!(!eff.allows("evil.test:443"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_effective_distinguishes_baked_operator_and_deny_for_netstack() {
+        let persisted = EgressPolicy {
+            default: Action::Allow, // persisted serde-default — overridden on display
+            allow: vec!["internal.corp".into(), "github.com".into()],
+            deny: vec!["gist.github.com".into()],
+            mitm: false,
+        };
+        let out = render_effective_policy("agent", &persisted, true);
+
+        // The EFFECTIVE boundary is shown as Deny, not the persisted Allow.
+        assert!(out.contains("net_link=Netstack"));
+        assert!(out.contains("default: DENY"));
+        assert!(!out.contains("default: ALLOW"));
+
+        // Baked-allow is its own section and lists the baked hosts.
+        assert!(out.contains("baked allowlist (always-on for Netstack VMs):"));
+        assert!(out.contains("✓ api.anthropic.com"));
+        assert!(out.contains("✓ github.com")); // baked, shown under baked
+
+        // Operator-allow is distinct from baked: `internal.corp` is the
+        // operator's own rule; `github.com` is filtered out as baked.
+        assert!(out.contains("operator allow rules:"));
+        assert!(out.contains("✓ internal.corp"));
+
+        // Operator-deny wins and is called out.
+        assert!(out.contains("operator deny rules (deny wins over any allow):"));
+        assert!(out.contains("✗ gist.github.com"));
+    }
+
+    #[test]
+    fn render_effective_keeps_nat_persisted_default() {
+        // A NAT VM shows its persisted (cooperative) policy as-is — default
+        // Allow, no baked allowlist, behaviour unchanged.
+        let persisted = EgressPolicy {
+            default: Action::Allow,
+            allow: vec!["example.com".into()],
+            deny: vec![],
+            mitm: true,
+        };
+        let out = render_effective_policy("dev", &persisted, false);
+        assert!(out.contains("net_link=Nat"));
+        assert!(out.contains("default: ALLOW"));
+        assert!(!out.contains("baked allowlist"));
+        assert!(out.contains("✓ example.com"));
+        assert!(out.contains("TLS interception (mitm): on"));
+    }
+
+    #[test]
+    fn render_effective_marks_baked_host_overridden_by_deny() {
+        // The recommended hardening (doc §8.1 #6): deny `github.com` on a
+        // Netstack VM. The baked entry must render as overridden, not as a
+        // live allow, so the operator sees the boundary really blocks it.
+        let persisted = EgressPolicy {
+            default: Action::Allow,
+            allow: vec![],
+            deny: vec!["github.com".into()],
+            mitm: false,
+        };
+        let out = render_effective_policy("agent", &persisted, true);
+        assert!(out.contains("✗ github.com  (overridden by an operator deny rule)"));
     }
 }
