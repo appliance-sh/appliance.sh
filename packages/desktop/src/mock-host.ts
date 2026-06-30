@@ -539,6 +539,11 @@ export function createMockHost(): ConsoleHost {
               const list = action === 'allow' ? vm.egress.allow : vm.egress.deny;
               if (!list.includes(host)) list.push(host);
             },
+            async removeRule(host: string) {
+              await sleep(150);
+              vm.egress.allow = vm.egress.allow.filter((h) => h !== host);
+              vm.egress.deny = vm.egress.deny.filter((h) => h !== host);
+            },
             async setMitm(enabled: boolean) {
               await sleep(150);
               vm.egress.mitm = enabled;

@@ -259,6 +259,9 @@ export const tauriHost: ConsoleHost = {
           async addRule(action: 'allow' | 'deny', host: string) {
             await invoke('microvm_egress_rule', { name: vm, action, host });
           },
+          async removeRule(host: string) {
+            await invoke('microvm_egress_remove', { name: vm, host });
+          },
           async setMitm(enabled: boolean) {
             await invoke('microvm_egress_mitm', { name: vm, enabled });
           },

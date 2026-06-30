@@ -968,6 +968,32 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
     void act(() => egress.addRule(action, h));
   };
 
+  // Allow a host. On the ENFORCED (Netstack) boundary a one-click allow
+  // silently WIDENS the boundary, and the engine's `egress allow` also
+  // drops an EXACT-match operator deny (deny.retain) — so confirm first
+  // and name the deny removal when one will actually be deleted. The
+  // cooperative/NAT proxy is already bypassable, so it stays one-click.
+  const allowHost = (host: string) => {
+    if (policy && enforced) {
+      const removesDeny = policy.deny.includes(host);
+      const msg =
+        `Allow egress to ${host}? This widens the enforced boundary` +
+        (removesDeny ? `, and removes your deny rule for ${host}` : '') +
+        '.';
+      if (!window.confirm(msg)) return;
+    }
+    void act(() => egress.addRule('allow', host));
+  };
+
+  // Per-rule remove (the "×" on a rule): incremental drop of one host from
+  // the persisted policy — never a whole effective-policy write-back.
+  // "Reset rules" stays the clear-everything path.
+  const removeHost = (host: string) => void act(() => egress.removeRule(host));
+
+  // Distinct denied destinations — surfaced as a badge on the collapsed
+  // summary so a hung install (everything blocked) self-advertises.
+  const deniedCount = React.useMemo(() => aggregateDenied(events).length, [events]);
+
   return (
     <details className="rounded-md border border-[var(--color-border)] p-3">
       <summary className="cursor-pointer text-xs font-medium">
@@ -977,6 +1003,9 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
             {enforced ? 'enforced · default DENY' : `cooperative · default ${policy.default}`}
             {policy.mitm ? ' · TLS interception on' : ''}
           </span>
+        ) : null}
+        {deniedCount > 0 ? (
+          <span className="ml-1.5 text-[10px] font-medium text-red-300">· {deniedCount} denied</span>
         ) : null}
       </summary>
 
@@ -1005,6 +1034,9 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
                   <span className="text-emerald-200">default-DENY</span> plus an allowlist, enforced even for a rooted
                   guest that drops the proxy env or dials a raw IP. The rules below are the effective policy. Deny wins
                   over allow.
+                  <br />
+                  <span className="text-amber-200">It controls where traffic goes, not what leaves</span> — trim the
+                  allowlist (e.g. drop <code className="font-mono">github.com</code>) for untrusted code.
                 </>
               ) : (
                 <>
@@ -1095,21 +1127,32 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
               always-on; operator rules are shown apart so it's clear what's
               inherited vs what you added. */}
           {enforced ? <BakedAllowlist deny={policy.deny} /> : null}
-          <RuleList label={enforced ? 'Operator allow' : 'Allowed'} hosts={operatorAllow} tone="green" />
-          <RuleList label={enforced ? 'Operator deny (wins over allow)' : 'Denied'} hosts={policy.deny} tone="red" />
-
-          <DeniedAttempts
-            events={events}
-            policy={policy}
+          <RuleList
+            label={enforced ? 'Operator allow' : 'Allowed'}
+            hosts={operatorAllow}
+            tone="green"
             busy={busy}
-            onAllow={(h) => void act(() => egress.addRule('allow', h))}
+            onRemove={removeHost}
           />
+          <RuleList
+            label={enforced ? 'Operator deny (wins over allow)' : 'Denied'}
+            hosts={policy.deny}
+            tone="red"
+            busy={busy}
+            onRemove={removeHost}
+          />
+
+          {trafficQuery.isError ? (
+            <p className="text-[11px] text-red-300">Failed to load traffic: {errMessage(trafficQuery.error)}</p>
+          ) : null}
+
+          <DeniedAttempts events={events} policy={policy} busy={busy} onAllow={allowHost} />
 
           <TrafficView
             events={events}
             policy={policy}
             busy={busy}
-            onAllow={(h) => void act(() => egress.addRule('allow', h))}
+            onAllow={allowHost}
             onBlock={(h) => void act(() => egress.addRule('deny', h))}
             onClear={() =>
               void egress
@@ -1118,6 +1161,9 @@ function EgressPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string }) {
             }
           />
         </div>
+      ) : policyQuery.isError ? (
+        // Don't spin on "Loading policy…" forever when egress.get() rejects.
+        <p className="mt-2 text-xs text-red-300">Failed to load egress policy: {errMessage(policyQuery.error)}</p>
       ) : (
         <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading policy…</p>
       )}
@@ -1157,6 +1203,9 @@ function BakedAllowlist({ deny }: { deny: string[] }) {
               )}
             >
               {h}
+              {/* The strikethrough is visual-only; spell the state out for
+                  screen readers (CSS line-through isn't announced). */}
+              {off ? <span className="sr-only"> (overridden by an operator deny rule)</span> : null}
             </li>
           );
         })}
@@ -1181,7 +1230,9 @@ function aggregateDenied(events: EgressEvent[]): DeniedHost[] {
   const byDest = new Map<string, DeniedHost>();
   for (const e of events) {
     if (e.decision !== 'deny') continue;
-    const key = `${e.host} ${e.port}`;
+    // Explicit `|` separator (a hostname has neither a space nor a pipe)
+    // — never a raw NUL byte, which reads as file corruption to tooling.
+    const key = `${e.host}|${e.port}`;
     const cur = byDest.get(key);
     if (cur) {
       cur.count += 1;
@@ -1214,12 +1265,16 @@ function DeniedAttempts({
       <div className="text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">Denied attempts</div>
       {denied.length === 0 ? (
         <p className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-1.5 text-[11px] text-[var(--color-muted-foreground)]">
-          Nothing blocked yet. Egress the boundary denies shows up here — allow a host in one click.
+          Nothing blocked yet. Traffic the boundary denies will show up here — allow a host in one click.
         </p>
       ) : (
         <ul className="max-h-44 space-y-0.5 overflow-auto rounded-md border border-[var(--color-border)] p-1">
           {denied.map((d) => {
-            const allowed = policy.allow.some((s) => hostMatches(d.host, s));
+            // Deny-first (ruledStatus): a broader suffix deny keeps a host
+            // denied even when an allow rule matches, so only a TRUE
+            // 'allowed' shows the green badge — otherwise keep the Allow
+            // affordance (a still-denied row must not read as allowed).
+            const status = ruledStatus(policy, d.host);
             return (
               <li key={`${d.host}:${d.port}`} className="flex items-center gap-2 px-1 py-0.5 text-[11px]">
                 <span className="w-8 shrink-0 text-right font-mono text-[10px] text-[var(--color-muted-foreground)]">
@@ -1230,17 +1285,28 @@ function DeniedAttempts({
                   <span className="text-[var(--color-muted-foreground)]">:{d.port}</span>
                 </span>
                 <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted-foreground)]">×{d.count}</span>
-                {allowed ? (
+                {status === 'allowed' ? (
                   <span className="shrink-0 text-[10px] text-green-300">allowed</span>
                 ) : (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => onAllow(d.host)}
-                    className="shrink-0 rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
-                  >
-                    Allow
-                  </button>
+                  <>
+                    {status === 'denied' ? (
+                      <span
+                        className="shrink-0 text-[10px] text-red-300"
+                        title="A deny rule still blocks this host — remove it below to allow"
+                      >
+                        deny rule
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      disabled={busy}
+                      aria-label={`Allow egress to ${d.host}:${d.port}`}
+                      onClick={() => onAllow(d.host)}
+                      className="shrink-0 rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
+                    >
+                      Allow
+                    </button>
+                  </>
                 )}
               </li>
             );
@@ -1273,12 +1339,7 @@ function TrafficView({
   const rows = [...events].reverse().slice(0, 40);
   const tone = (d: EgressEvent['decision']) =>
     d === 'deny' ? 'text-red-300' : d === 'mitm' ? 'text-cyan-300' : 'text-green-300';
-  const ruled = (host: string) =>
-    policy.deny.some((s) => hostMatches(host, s))
-      ? 'denied'
-      : policy.allow.some((s) => hostMatches(host, s))
-        ? 'allowed'
-        : null;
+  const ruled = (host: string) => ruledStatus(policy, host);
 
   return (
     <div className="space-y-1.5">
@@ -1317,6 +1378,7 @@ function TrafficView({
                   <button
                     type="button"
                     disabled={busy}
+                    aria-label={`Block egress to ${e.host}:${e.port}`}
                     onClick={() => onBlock(e.host)}
                     className="shrink-0 rounded border border-red-500/40 px-1.5 text-[10px] text-red-200 hover:bg-red-500/10 disabled:opacity-50"
                   >
@@ -1326,6 +1388,7 @@ function TrafficView({
                   <button
                     type="button"
                     disabled={busy}
+                    aria-label={`Allow egress to ${e.host}:${e.port}`}
                     onClick={() => onAllow(e.host)}
                     className="shrink-0 rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
                   >
@@ -1336,6 +1399,7 @@ function TrafficView({
                     <button
                       type="button"
                       disabled={busy}
+                      aria-label={`Allow egress to ${e.host}:${e.port}`}
                       onClick={() => onAllow(e.host)}
                       className="rounded border border-green-500/40 px-1.5 text-[10px] text-green-200 hover:bg-green-500/10 disabled:opacity-50"
                     >
@@ -1344,6 +1408,7 @@ function TrafficView({
                     <button
                       type="button"
                       disabled={busy}
+                      aria-label={`Block egress to ${e.host}:${e.port}`}
                       onClick={() => onBlock(e.host)}
                       className="rounded border border-red-500/40 px-1.5 text-[10px] text-red-200 hover:bg-red-500/10 disabled:opacity-50"
                     >
@@ -1366,6 +1431,23 @@ function hostMatches(host: string, suffix: string): boolean {
   const h = host.trim().replace(/\.$/, '').toLowerCase();
   const s = suffix.trim().replace(/^\./, '').replace(/\.$/, '').toLowerCase();
   return s !== '' && (h === s || h.endsWith('.' + s));
+}
+
+/** Deny-first effective status of a host against the policy — deny WINS
+ *  over allow, mirroring the engine's `EgressPolicy::allows`. A broader
+ *  suffix deny keeps a host denied even when an allow rule also matches
+ *  (the engine's `egress allow` only drops an EXACT-match deny), so the
+ *  denied-attempts row must use this rather than `allow.some(...)` alone
+ *  or it would show a still-blocked host as green "allowed". */
+function ruledStatus(policy: EgressPolicy, host: string): 'denied' | 'allowed' | null {
+  if (policy.deny.some((s) => hostMatches(host, s))) return 'denied';
+  if (policy.allow.some((s) => hostMatches(host, s))) return 'allowed';
+  return null;
+}
+
+/** Best-effort message from an unknown thrown/rejected value. */
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 // Per-host credential capture/injection (apiKeyHelper): the proxy can
@@ -1560,7 +1642,21 @@ function CredentialsPanel({ vm, name }: { vm: MicroVmInstanceHost; name: string 
   );
 }
 
-function RuleList({ label, hosts, tone }: { label: string; hosts: string[]; tone: 'green' | 'red' }) {
+function RuleList({
+  label,
+  hosts,
+  tone,
+  busy,
+  onRemove,
+}: {
+  label: string;
+  hosts: string[];
+  tone: 'green' | 'red';
+  busy?: boolean;
+  /** When set, each rule gets a per-rule remove (×) — the incremental
+   *  counterpart of "Reset rules" (which clears every rule). */
+  onRemove?: (host: string) => void;
+}) {
   if (hosts.length === 0) return null;
   return (
     <div>
@@ -1570,11 +1666,23 @@ function RuleList({ label, hosts, tone }: { label: string; hosts: string[]; tone
           <li
             key={h}
             className={cn(
-              'rounded-md border px-1.5 py-0.5 font-mono text-[11px]',
+              'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px]',
               tone === 'green' ? 'border-green-500/30 text-green-200' : 'border-red-500/30 text-red-200'
             )}
           >
             {h}
+            {onRemove ? (
+              <button
+                type="button"
+                disabled={busy}
+                aria-label={`Remove ${tone === 'green' ? 'allow' : 'deny'} rule ${h}`}
+                title="Remove this rule"
+                onClick={() => onRemove(h)}
+                className="rounded text-[10px] leading-none text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] disabled:opacity-50"
+              >
+                ×
+              </button>
+            ) : null}
           </li>
         ))}
       </ul>

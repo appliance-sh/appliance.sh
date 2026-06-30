@@ -3223,6 +3223,25 @@ async fn microvm_egress_rule(name: Option<String>, action: String, host: String)
     Ok(())
 }
 
+/// Incrementally remove ONE operator allow/deny rule for an exact host —
+/// the per-rule counterpart of `microvm_egress_reset` (which nukes every
+/// rule). Drives the engine's typed `egress remove <host>` (load → drop
+/// the host from both lists → save). Like `microvm_egress_rule` it must
+/// stay incremental: never a `get-effective → modify → set` round-trip,
+/// which would bake `default=Deny` + the baked allowlist into the file.
+#[tauri::command]
+async fn microvm_egress_remove(name: Option<String>, host: String) -> Result<(), String> {
+    let name = vm_name(name);
+    let bin = vm_binary().ok_or("appliance-vm is not installed")?;
+    let bin = bin.to_string_lossy().to_string();
+    let (ok, _o, stderr) =
+        run_status_command(&[&bin, "egress", "remove", &host, "--name", &name]).await?;
+    if !ok {
+        return Err(format!("remove rule failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn microvm_egress_mitm(name: Option<String>, enabled: bool) -> Result<(), String> {
     let name = vm_name(name);
@@ -4858,6 +4877,7 @@ pub fn run() {
             microvm_egress_get,
             microvm_egress_default,
             microvm_egress_rule,
+            microvm_egress_remove,
             microvm_egress_mitm,
             microvm_egress_reset,
             microvm_egress_log,

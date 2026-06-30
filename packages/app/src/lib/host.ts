@@ -512,6 +512,11 @@ export interface MicroVmEgressHost {
   get(): Promise<EgressPolicy>;
   setDefault(action: 'allow' | 'deny'): Promise<void>;
   addRule(action: 'allow' | 'deny', host: string): Promise<void>;
+  /** Remove a single operator allow/deny rule for an exact host — the
+   *  per-rule counterpart of `reset` (which clears every rule).
+   *  Incremental, like `addRule`: never a whole effective-policy
+   *  write-back. */
+  removeRule(host: string): Promise<void>;
   setMitm(enabled: boolean): Promise<void>;
   reset(): Promise<void>;
   /** Recent recorded traffic, oldest-first. */

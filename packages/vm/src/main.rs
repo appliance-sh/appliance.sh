@@ -296,6 +296,14 @@ enum EgressCmd {
         #[arg(long, default_value = DEFAULT_VM)]
         name: String,
     },
+    /// Remove a single operator allow/deny rule for an exact host — the
+    /// per-rule counterpart of `reset` (which nukes every rule).
+    /// Incremental: load → drop this exact host from both lists → save.
+    Remove {
+        host: String,
+        #[arg(long, default_value = DEFAULT_VM)]
+        name: String,
+    },
     /// Clear all rules and reset to the permissive default.
     Reset {
         #[arg(default_value = DEFAULT_VM)]
@@ -896,6 +904,19 @@ fn run_egress(action: EgressCmd) -> Result<()> {
             egress::save_policy(&name, &policy)?;
             let _ = egress::publish_configmap(&name);
             println!("egress: deny {host}");
+            Ok(())
+        }
+        EgressCmd::Remove { host, name } => {
+            // Per-rule remove: drop this exact host from both lists,
+            // mirroring the load→edit→save contract of allow/deny so the
+            // persisted file stays minimal (never write the effective
+            // merged policy back).
+            let mut policy = egress::load_policy(&name);
+            policy.allow.retain(|h| h != &host);
+            policy.deny.retain(|h| h != &host);
+            egress::save_policy(&name, &policy)?;
+            let _ = egress::publish_configmap(&name);
+            println!("egress: remove {host}");
             Ok(())
         }
         EgressCmd::Reset { name } => {
