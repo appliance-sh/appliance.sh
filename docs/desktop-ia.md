@@ -1,0 +1,388 @@
+# Desktop information architecture — target IA, move-map, staging
+
+Status: **plan** (no feature code). This is the blueprint phases **I1–I5** build to.
+Scope: the Appliance **desktop app** (`packages/app`, the shared `Console`). The same
+bundle is the web PWA, so every surface below is **host-capability gated** — the web
+shell must keep rendering nothing for desktop-only surfaces (`host.vm`,
+`host.agentAuth`, `host.local`, `host.terminal`, `host.updater`, `host.bootstrap`).
+
+Owner-locked decisions (do not relitigate in the build phases):
+
+- **Five top-level areas:** ① Setup · ② Clusters · ③ Projects · ④ Agents · ⑤ Settings.
+- The **egress firewall** + **credential broker** live under ② (per-runtime).
+- **Agent sign-in moves OUT of Settings into ④.**
+- The **persistent terminal/console dock stays as global chrome** — it survives
+  navigation (Phase-4 nav-survival contract via `terminal-sessions-provider`).
+- Default landing: **Setup if unconfigured, else Projects.**
+
+---
+
+## 1. Why — the drift we are removing
+
+The current app is a flat 6–7-item sidebar over pages that grew by accretion. The
+worst offender is `pages/local-runtime/index.tsx` (**2 429 lines**) — a single route
+that is simultaneously a doctor, a VM lifecycle manager, an egress firewall, a
+credential broker, an agent launcher, and a workloads/logs browser. `settings.tsx`
+(**1 244 lines**) is the second kitchen sink: cluster CRUD + four cloud-lifecycle
+panels + a destroy button + agent auth + updates + about.
+
+Naming has drifted three ways and must be made canonical:
+
+| Concept                  | Names in the tree today                                                                                                                                                                                                  | Canonical (this doc)                                                                                                                                               |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Project-grid home        | `Dashboard` (nav label + index route), `Overview` (the page's own `<h1>`)                                                                                                                                                | **Projects** — area ③ landing. Retire **both** "Dashboard" and "Overview".                                                                                         |
+| The local microVM engine | `Runtimes` (nav label `app-shell.tsx:34` + section `<h2>` `index.tsx:230`), `Local runtime`/`Local Runtime` (page `<h1>`, wizard, get-started card), `/local-runtime` (route), `MicroVM Runtime` (`microVmClusterLabel`) | **Local runtimes** — a section of ② Clusters. Route base `/clusters`. The cluster-switcher badge stays the existing `sandboxed`.                                   |
+| Deploy target            | "cluster" / "engine" / "runtime" / "VM" used interchangeably                                                                                                                                                             | A **cluster** is any deploy target (cloud or local). A **local runtime** is a microVM-backed cluster (`isMicroVmClusterId`). "engine" stays an internal term only. |
+
+---
+
+## 2. Target nav + route tree
+
+Five sidebar items (replacing today's `baseNav`/`tailNav` in
+`components/layout/app-shell.tsx`) + the persistent terminal/console dock as global
+chrome (not a nav item). The header keeps the **`ClusterSwitcher`** (cluster
+selection is always one click away) and gains no new chrome.
+
+```
+Sidebar (top → bottom)            Route base     Gated by
+────────────────────────────────  ─────────────  ──────────────────────────────────
+① Setup            (icon: Wand)   /setup         always (web = Connect-only)
+② Clusters         (icon: Server) /clusters      always (local-runtime bits: host.vm)
+③ Projects         (icon: Folder) /projects      always (needs a selected cluster)
+④ Agents           (icon: Bot)    /agents        host.vm  (hidden on web, like Runtimes today)
+⑤ Settings         (icon: Cog)    /settings      always
+────────────────────────────────────────────────────────────────────────────────────
+[ Terminal/console dock ]  global chrome — TerminalDock + TerminalLayer, OUTSIDE <Outlet/>
+```
+
+Default landing — replace the bare `index` element with a redirect resolver:
+
+```
+/  →  Setup if unconfigured (no clusters / none selected), else /projects
+```
+
+"Unconfigured" = `useSelectedCluster()` resolves no cluster (`config.clusters` empty
+or `selectedClusterId` null). This subsumes today's `DashboardPage` branch that flips
+between `FirstRunWelcome`/`GetStarted` and `Overview`.
+
+### Full route table
+
+```
+PUBLIC (no AppShell)
+  (none — Setup/Connect/Bootstrap move INSIDE the shell so the dock + switcher persist)
+
+/  → redirect resolver (Setup | Projects)
+
+① /setup
+   /setup                      onboarding hub (first-run welcome + the three paths)
+   /setup/connect              Connect form (was /connect)
+   /setup/bootstrap            new-installation wizard: mode picker + AWS form + local-runtime form (was /bootstrap)
+   /setup/bootstrap/run        bring-up progress / phase ladder (was /bootstrap/run)
+   /setup/doctor               prerequisite preflight (was the PreflightPanel atop /local-runtime)
+
+② /clusters
+   /clusters                   connected clusters list (select/switch/add/remove) + local-runtimes overview
+   /clusters/:id               cluster detail — dispatches on cluster kind:
+                                 · cloud cluster → lifecycle ops (baseline / api-server / promote / demote / destroy)
+                                 · local runtime → VM lifecycle (start/stop/delete, dev-env, mount, shell) + egress + credentials + facts
+
+③ /projects
+   /projects                   project grid + recent activity  (replaces Dashboard/Overview; the new index)
+   /projects/deploy            deploy wizard (was /local-runtime/deploy); accepts ?project=&environment=
+   /projects/:id               project detail
+   /projects/:projectId/environments/:id   environment detail + Workloads (deployments/pods/logs/pod-shell)
+   /deployments                cross-project deployment activity (reachable from ③, not a nav item)
+   /deployments/:id            deployment detail
+
+④ /agents
+   /agents                     agent sign-in (per-type) + launcher + agent-run list across runtimes
+                                (observe terminals continue to live in the global dock)
+
+⑤ /settings
+   /settings                   Updates · About · Preferences  (slimmed)
+```
+
+Notes:
+
+- **Environments and Deployments lose their top-level nav entries.** They are
+  sub-surfaces of ③ Projects (reachable from the grid, project detail, and env
+  detail), keeping the nav at five. Their routes stay live so existing links resolve.
+- Setup/Bootstrap/Connect move **inside** `AppShell` (today they are siblings of it
+  in `routes.tsx`). That is deliberate: it keeps the dock + cluster switcher mounted
+  during onboarding and removes a class of "naked page" with no way back.
+
+---
+
+## 3. Page plan per area (decompose, don't relabel)
+
+### ① Setup — `/setup`
+
+- **Onboarding hub** (`/setup`): one entry that unifies today's three first-run
+  surfaces. The "Get started → boot the default microVM" express path
+  (`FirstRunWelcome`) is the primary CTA; "More options" reveals the three cards
+  (Local runtime / Bootstrap on AWS / Connect) from `GetStarted`.
+- **Connect** (`/setup/connect`): the add-a-cluster form (probe URL → verify creds →
+  `host.addCluster`). The single canonical add-cluster surface.
+- **Bootstrap** (`/setup/bootstrap` + `/setup/bootstrap/run`): mode picker → AWS form
+  or local-runtime form → live phase ladder (AWS 3-phase Pulumi, or microVM
+  media→booting→network→cluster→ready). Unchanged engine; relocated + deduped entry.
+- **Doctor** (`/setup/doctor`): the prerequisite preflight (docker / kubectl, daemon
+  up, auto-install, "Start runtime"). Lifted out of the runtimes page so a failing
+  prereq is a first-class setup step, not a banner buried above VM cards.
+
+### ② Clusters — `/clusters`
+
+- **Clusters index** (`/clusters`): the connected-cluster list (select / switch / add
+  / remove) — today's Settings "Clusters" section — **plus** the local-runtimes
+  overview (one card per microVM, the default `appliance` VM always surfaced, "New
+  VM"). Cloud clusters and local runtimes in one list, tagged by kind.
+- **Cluster detail** (`/clusters/:id`): dispatches on `isMicroVmClusterId`:
+  - **Cloud cluster** → lifecycle ops: update baseline, update api-server, promote /
+    demote installer state, **destroy** (all gated on `host.bootstrap.*`).
+  - **Local runtime (microVM)** → VM lifecycle (install engine, start / start-dev /
+    stop / delete, dev-env toggle, host-folder mount, **Open shell**), the **Egress
+    firewall** panel, the **Credentials broker** panel, and the at-a-glance facts
+    (k8s URL, cluster id, allocated ports). "Deploy application" here deep-links to
+    ③ `/projects/deploy` with this cluster selected. "Run agent" deep-links to ④.
+
+### ③ Projects — `/projects`
+
+- **Project grid** (`/projects`): the Vercel-style card grid + per-project health
+  rollup + recent-activity feed (today's `Overview`). The new home; canonical name
+  "Projects".
+- **Deploy wizard** (`/projects/deploy`): pick folder → configure → build+deploy. One
+  wizard, reachable from every contextual "Deploy" CTA.
+- **Project detail** (`/projects/:id`) and **Environment detail**
+  (`/projects/:projectId/environments/:id`). Env detail absorbs the **Workloads**
+  surface (deployments / pods / services tables, live pod-log drawer, **pod-shell**)
+  from the runtimes page — workloads belong with the thing deployed, not the engine.
+- **Deployments** activity (`/deployments`, `/deployments/:id`): cross-project run
+  history, reachable in-area.
+
+### ④ Agents — `/agents`
+
+- **Agent sign-in**: the per-type credential UI (`AgentLoginPanel` + the type picker
+  with "signed in" dots), moved out of Settings. Claude (API key / Sign in with
+  Claude), Copilot (fine-grained PAT), Codex (OpenAI key). Host-side keychain;
+  never enters the VM.
+- **Launcher**: pick a runtime + agent type + task, spawn into the VM's shared
+  workspace, attach an observe tab to the **global dock**.
+- **Runs list**: the agents reconciled from each runtime's registry (`agent.list`),
+  with their live status — the durable index behind the dock's agent tabs.
+
+### ⑤ Settings — `/settings`
+
+- **Updates** (`host.updater`): check / download / relaunch.
+- **About**: version, build time, shell kind.
+- **Preferences**: app-level prefs (e.g. onboarding-dismissed reset; future home).
+  Cluster CRUD, cloud lifecycle, and agent auth have all left this page.
+
+---
+
+## 4. THE MOVE-MAP (load-bearing)
+
+Every current surface → its new home. Component names are exact.
+
+### 4a. Decompose `pages/local-runtime/index.tsx` (2 429 lines)
+
+| Component(s) in `local-runtime/index.tsx`                                                                                                                                        | Does                                                                                                                                               | New home                                                                                  |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `LocalRuntimePage` (shell/header)                                                                                                                                                | page frame, "Deploy" header CTA, supported-gate                                                                                                    | **dissolved** — split into ② index + ② detail; header "Deploy" CTA → ③ `/projects/deploy` |
+| `PreflightPanel`, `PreflightRow`, `checkReady`                                                                                                                                   | docker/kubectl preflight, auto-install, Start-runtime                                                                                              | **① `/setup/doctor`**                                                                     |
+| `EnginesSection`, `EngineCard`, `EngineTag`, `NewVmButton`                                                                                                                       | list of microVMs, "New VM"                                                                                                                         | **② `/clusters`** (local-runtimes overview)                                               |
+| `MicroVmPanel`                                                                                                                                                                   | per-VM lifecycle: `install`/`up`/`devUp`/`stop`/`remove`, dev-env checkbox, mount picker, **Open shell**, deploy-here, ready/serving state machine | **② `/clusters/:id`** (local-runtime detail)                                              |
+| `MicroVmFacts`, `microVmClusterLabel`                                                                                                                                            | k8s URL / cluster id / ports facts                                                                                                                 | **② `/clusters/:id`**                                                                     |
+| `LaunchAgentButton`, `looksLikeAuthFailure`                                                                                                                                      | agent type picker + launch + keyless-login gate + reauth nudge                                                                                     | **④ `/agents`** (launcher). Detail page keeps a thin "Run agent →" deep-link.             |
+| `EgressPanel` + `BakedAllowlist`, `DeniedAttempts`, `TrafficView`, `RuleList` + helpers (`isBaked`, `aggregateDenied`, `hostMatches`, `ruledStatus`, `errMessage`, `DeniedHost`) | egress firewall: policy, rules, traffic feed, denied-attempts allow loop                                                                           | **② `/clusters/:id`** (Egress firewall) — owner-locked under ②                            |
+| `CredentialsPanel` (+ shared `RuleList`)                                                                                                                                         | per-host capture/inject credential rules + stored secrets                                                                                          | **② `/clusters/:id`** (Credentials broker) — owner-locked under ②                         |
+| `WorkloadsPanel`, `DeploymentsTable`, `PodsTable`, `ServicesTable`, `PodLogsDrawer`, `relativeAge`                                                                               | workloads/pods/services tables, live log tail, **pod-shell** launch                                                                                | **③ env detail** (`/projects/:projectId/environments/:id`)                                |
+
+`pages/local-runtime/index.tsx` ends up **deleted**; `pages/local-runtime/deploy.tsx`
+moves to `pages/projects/deploy.tsx`; `pages/local-runtime/terminal-drawer.tsx`
+(`TerminalLayer`/`TerminalDrawerView`) stays a layout concern — see §6.
+
+### 4b. Slim `pages/settings.tsx` (1 244 lines)
+
+| Component in `settings.tsx`                                                     | Does                                                                  | New home                                           |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------- |
+| `SettingsPage` "Clusters" section + `ClusterRow`                                | cluster list, select/switch, remove, "Add cluster" / "Bootstrap" CTAs | **② `/clusters`** (clusters index)                 |
+| `UpdateBaselinePanel`                                                           | re-run phase 1 baseline                                               | **② `/clusters/:id`** (cloud detail)               |
+| `UpdateApiServerPanel`                                                          | mirror + redeploy api-server/worker                                   | **② `/clusters/:id`** (cloud detail)               |
+| `StateMigrationPanel` (`promote`/`demote`) + `setClusterStateBackendIfPossible` | detach/reattach installer state                                       | **② `/clusters/:id`** (cloud detail)               |
+| `DestroyClusterPanel`                                                           | `pulumi destroy` the installer stack                                  | **② `/clusters/:id`** (cloud detail)               |
+| `AgentAuthSection`                                                              | per-agent host-side sign-in                                           | **④ `/agents`**                                    |
+| `UpdatesSection`                                                                | self-update                                                           | **⑤ `/settings`** (keep)                           |
+| "About" rows + `Section`/`Row` helpers                                          | version/build/shell                                                   | **⑤ `/settings`** (keep; `Section`/`Row` → shared) |
+
+`SettingsPage` shrinks to Updates + About + Preferences.
+
+### 4c. Other current surfaces
+
+| Current surface                                                      | New home                                                  |
+| -------------------------------------------------------------------- | --------------------------------------------------------- |
+| `pages/dashboard.tsx` `Overview` (grid + recent activity)            | ③ `/projects` (the index)                                 |
+| `pages/dashboard.tsx` `FirstRunWelcome`, `GetStarted`, `ActionCard`  | ① `/setup` (onboarding hub)                               |
+| `pages/dashboard.tsx` `EmptyProjects`                                | ③ `/projects` empty state                                 |
+| `pages/connect.tsx` `ConnectPage`                                    | ① `/setup/connect`                                        |
+| `pages/bootstrap/wizard.tsx` (mode picker + forms)                   | ① `/setup/bootstrap`                                      |
+| `pages/bootstrap/progress.tsx` (phase ladder)                        | ① `/setup/bootstrap/run`                                  |
+| `pages/projects.tsx`, `pages/projects/detail.tsx`                    | ③ (unchanged paths)                                       |
+| `pages/environments.tsx`, `pages/environments/detail.tsx`            | ③ — folded under Projects; nav entry removed, routes kept |
+| `pages/deployments/list.tsx`, `pages/deployments/detail.tsx`         | ③ — reachable in-area; nav entry removed, routes kept     |
+| `components/layout/cluster-switcher.tsx`                             | header chrome (unchanged)                                 |
+| `components/agent-login.tsx` (`AgentLoginPanel`, `useAgentSignedIn`) | shared — consumed by ④ (and the launcher's keyless gate)  |
+| `pages/placeholder.tsx` (`PlaceholderPage`)                          | **deleted** — no importers (dead)                         |
+
+---
+
+## 5. Dedup plan
+
+1. **Onboarding: 3+ entries → 1.** Today the first-run choice exists in
+   `dashboard.tsx` (`FirstRunWelcome` + `GetStarted`), in `bootstrap/wizard.tsx`
+   (`ModePicker` + `LocalRuntimeForm`), and as a hint block on `connect.tsx`. Collapse
+   to a single **① `/setup`** hub; the wizard becomes the "advanced path" the hub
+   links into, not a parallel doorway.
+2. **Add-cluster: 4 → 1.** Entry points today: `settings.tsx` "Add cluster" (×2 —
+   empty + populated states), `cluster-switcher.tsx` "Add cluster", `connect.tsx`
+   itself, and the `GetStarted` "Connect" card. One canonical form at
+   **① `/setup/connect`**; ② `/clusters` and the switcher link to it.
+3. **Deploy: ~7 → 1.** Entry points today (from the census): `local-runtime/index.tsx`
+   header CTA + `MicroVmPanel.deployHere`, `dashboard.tsx` `EmptyProjects`,
+   `environments.tsx`, `environments/detail.tsx`, and `bootstrap/progress.tsx` (×2).
+   These are all _links into the same wizard_ — keep the contextual CTAs, but there is
+   **one wizard implementation** at **③ `/projects/deploy`** (today
+   `/local-runtime/deploy`). No duplicate wizards; just one canonical route.
+4. **Delete dead `pages/placeholder.tsx`.** `PlaceholderPage` has no importers
+   (verified) — remove the file.
+5. **Egress double-fetch.** `EgressPanel` and `CredentialsPanel` each register their
+   own `useQuery(['microvm', name, 'egress'], () => egress.get(), { refetchInterval:
+15_000 })` (`index.tsx:1064` and `:1622`). TanStack dedupes the _cache_ by key, but
+   both observers keep an independent 15 s poll, and `CredentialsPanel` only needs
+   `policy.mitm`. Lift one egress-policy query into the ② local-runtime **detail
+   container** and pass `policy` (or just `mitm`) down to the credentials panel — one
+   poll, one source of truth.
+
+---
+
+## 6. Preserve (do not break)
+
+- **Persistent terminal/console dock — the Phase-4 nav-survival contract.**
+  `TerminalSessionsProvider` is mounted **above** the router in `App.tsx`; `App.tsx`,
+  the provider, `TerminalDock`, and `TerminalLayer` are unchanged. The new `AppShell`
+  must keep rendering `<TerminalDock/>` + `<TerminalLayer/>` as grid rows **OUTSIDE**
+  the route `<Outlet/>` (today's `app-shell.tsx:92,97`). Live shells, the off-screen
+  xterm holder, de-dupe-by-key, and on-launch rehydrate all live in the provider —
+  none of that moves. Routes may swap freely underneath; sessions outlive them.
+- **Agent observe tabs.** Agent tabs are dock sessions tagged with `AgentTabMeta`
+  (`agentSessionKey`, `mintAgentSessionId`, the running-agent status poll, and the
+  `agent-`-prefixed rehydrate path). ④ Agents launches **through the same provider**
+  (`terminals.openSession({ agent: … })`) — it does not own a second terminal stack.
+  The launcher's close→`agent.stop` and rehydrate enrichment stay in the provider.
+- **Providers.** `HostProvider`, `QueryClientProvider`, `ToastProvider`,
+  `ConfirmProvider`, `TerminalSessionsProvider` and their nesting order in `App.tsx`
+  are untouched. This is an IA/routing refactor, not a provider refactor.
+- **Host-capability gating (web shell renders nothing for desktop-only surfaces).**
+  The contract per area:
+  | Capability absent (web) | Effect |
+  |---|---|
+  | `host.vm` | ④ Agents nav item hidden; ② local-runtimes overview + detail hidden (cluster list still shows cloud/BYO clusters); ③ deploy gated |
+  | `host.local` | ① Doctor + ③ deploy wizard show the "desktop app only" message |
+  | `host.terminal` | "Open shell" / pod-shell omitted; dock shows the inert error session |
+  | `host.bootstrap` | ① Bootstrap path + ② cloud lifecycle ops hidden (Connect still works) |
+  | `host.agentAuth` | ④ sign-in + launcher keyless gate render nothing (`AgentLoginPanel` already returns `null`) |
+  | `host.updater` | ⑤ Updates section hidden |
+  Keep using the existing `Boolean(host.x)` checks — do not introduce a new gating
+  mechanism. The web build must compile and run with every optional capability absent.
+
+---
+
+## 7. Staging (de-risk — never big-bang)
+
+Each phase is independently shippable and leaves `scripts/verify.sh`
+(build → typecheck → lint:check → test, + the Rust crate) **green**. The rule that
+keeps the tree green mid-migration: **never delete a page/symbol until its replacement
+is mounted and every importer points at it; until then the old route stays reachable
+behind a redirect.**
+
+### I1 — New shell + 5-area nav + route skeleton
+
+- Rewrite `app-shell.tsx` nav to the five items, host-gated (Agents hidden when
+  `!host.vm`, mirroring today's Runtimes gate). Keep `<TerminalDock/>`/`<TerminalLayer/>`.
+- Add the new route paths in `routes.tsx`. Initially each new path renders the
+  **existing** page component (or a thin redirect to it) — e.g. `/clusters` →
+  `LocalRuntimePage` + a clusters stub, `/projects` → `DashboardPage`, `/setup` →
+  the onboarding branch. Old paths (`/`, `/local-runtime`, `/environments`,
+  `/deployments`, `/bootstrap`, `/connect`, `/settings`) stay live.
+- Add the `/` redirect resolver (Setup-if-unconfigured-else-Projects).
+- **Green because:** every old page still mounts; nothing is moved yet, only
+  re-pointed and re-labelled. Pure routing/nav change.
+
+### I2 — Clusters (②)
+
+- Stand up `/clusters` + `/clusters/:id`. Move `EnginesSection`/`MicroVmPanel`/
+  `MicroVmFacts`/`EgressPanel`/`CredentialsPanel` out of `local-runtime/index.tsx` and
+  the four cloud-lifecycle panels + cluster list out of `settings.tsx`. Fix the egress
+  double-fetch (lift the policy query to the detail container).
+- Point `/local-runtime` → redirect `/clusters`; the cluster-switcher + Settings
+  "Add/Manage" CTAs point at ②.
+- Leave the **doctor**, **deploy wizard**, **workloads**, and **launcher** still
+  rendering from their old locations until their phases land (so nothing 404s).
+- **Green because:** ② becomes the live owner of cluster/runtime management; the old
+  `LocalRuntimePage` is reduced to a redirect and the moved Settings panels are
+  imported by ② instead. No dangling imports.
+
+### I3 — Projects (③)
+
+- `/projects` becomes the project grid (move `Overview` out of `dashboard.tsx`). Move
+  the deploy wizard to `/projects/deploy`; move `WorkloadsPanel` (+ tables, log
+  drawer, pod-shell) into env detail. Fold Environments/Deployments under the area
+  (drop their nav entries; keep routes).
+- Redirect `/` index, `/local-runtime/deploy`, and the old Dashboard path into ③.
+- **Green because:** the grid + wizard + workloads now live in ③; the contextual
+  deploy CTAs already point at one route (§5.3), so re-homing the wizard is a path
+  rename + redirect.
+
+### I4 — Agents (④)
+
+- Stand up `/agents`: move `AgentAuthSection`/`AgentLoginPanel` usage and
+  `LaunchAgentButton` here; add the runs list (`agent.list` across runtimes). Wire the
+  launcher to the **existing** `TerminalSessionsProvider` — observe tabs are unchanged.
+- ② detail's "Run agent" becomes a deep-link into ④.
+- **Green because:** the dock/provider already power agent tabs; ④ is a new consumer
+  of the same provider + `agent-login` component, not a new terminal stack.
+
+### I5 — Setup + Settings + cleanup
+
+- Build the `/setup` hub consolidating `FirstRunWelcome`/`GetStarted` + Connect +
+  Bootstrap + the **Doctor** (preflight). Slim `settings.tsx` to Updates/About/Prefs.
+- **Delete** `pages/local-runtime/index.tsx`, `pages/placeholder.tsx`, and the dead
+  redirects/old nav. Final canonical-naming pass (retire "Dashboard"/"Overview";
+  "Local runtimes" everywhere).
+- **Green because:** every consumer of the deleted files was re-pointed in I1–I4;
+  this phase removes now-orphaned code and the temporary redirects last.
+
+---
+
+## 8. Open questions
+
+- **Q1 (owner): ② sub-routing for local runtimes.** I propose **one** `/clusters/:id`
+  detail that dispatches on cluster kind (cloud vs microVM). Acceptable, or do you
+  want a distinct `/clusters/runtimes/:name` namespace for microVMs (clearer URLs, but
+  two detail components)?
+- **Q2 (owner): Environments/Deployments as routes-only.** Dropping their **nav**
+  entries (folding them under ③) is what keeps the nav at five. Confirm you're happy
+  losing the top-level shortcuts, or do you want a secondary in-area tab strip?
+- **Q3 (Devon): does Setup belong in the sidebar permanently,** or should ① collapse
+  to a header affordance once a cluster exists (so configured users see a 4-item nav)?
+  The locked decision is five areas; this is only about whether ① is always visible.
+- **Q4 (Parker): the Doctor's home.** I placed prerequisite preflight under
+  ① `/setup/doctor`. It's also a recurring troubleshooting surface (a daemon can stop
+  any time). Keep it in Setup, or also surface a "Re-run checks" entry from ② Clusters?
+- **Q5 (Devon/Parker): deploy CTA target when no runtime is up.** Today several CTAs
+  deep-link to the wizard while the VM is down (the wizard then nags). With ② owning
+  runtime start, should those CTAs route to ② `/clusters/:id` first when nothing is
+  running, instead of into a wizard that can't finish?
+
+```
+
+```
