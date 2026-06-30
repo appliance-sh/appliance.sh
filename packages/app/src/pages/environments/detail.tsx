@@ -265,9 +265,15 @@ export function EnvironmentDetailPage() {
           {/* Runtime workloads (deployments / pods / services + live logs +
               pod-shell), moved here from the runtimes page — it belongs with
               the env that was deployed. Local microVM runtimes only; cloud /
-              web env-detail relies on the Health section above. */}
+              web env-detail relies on the Health section above. The panel is
+              runtime-scoped (it backs ②'s aggregate), so it carries a scope
+              clarifier here under a single environment (Parker I3). */}
           {workloadsVmName && selectedCluster ? (
-            <WorkloadsPanel clusterId={selectedCluster.id} vmName={workloadsVmName} />
+            <WorkloadsPanel
+              clusterId={selectedCluster.id}
+              vmName={workloadsVmName}
+              scopeNote="All workloads on this runtime — across every project, not just this environment."
+            />
           ) : null}
 
           <section className="rounded-md border border-[var(--color-border)]">

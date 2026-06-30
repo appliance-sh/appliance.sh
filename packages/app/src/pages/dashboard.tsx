@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueries, useQueryClient } from '@tanstack/react-query';
-import { Plug, Wand, Laptop, Plus, Search, Trash2 } from 'lucide-react';
+import { Plug, Wand, Laptop, Plus, Search, Stethoscope, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -178,7 +178,7 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Overview</h1>
+          <h1 className="text-xl font-semibold tracking-tight">Projects</h1>
           <p className="mt-0.5 text-sm text-[var(--color-muted-foreground)]">
             {clusterName} · <span className="font-mono text-xs">{serverUrl}</span>
           </p>
@@ -520,11 +520,11 @@ function RecentActivity({
 function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () => void }) {
   const navigate = useNavigate();
   const getStarted = () => {
-    // The local runtime is a microVM. /bootstrap/run boots the default
-    // VM with live phases (media → booting → network → cluster → ready)
-    // and connects automatically once it's ready.
+    // The local runtime is a microVM. /setup/bootstrap/run boots the
+    // default VM with live phases (media → booting → network → cluster →
+    // ready) and connects automatically once it's ready.
     const values: WizardValues = { mode: 'microvm' };
-    navigate('/bootstrap/run', { state: values });
+    navigate('/setup/bootstrap/run', { state: values });
   };
   return (
     <div className="mx-auto flex min-h-[60vh] max-w-lg flex-col justify-center space-y-7 text-center">
@@ -559,10 +559,12 @@ function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () 
 }
 
 function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; canBootstrap: boolean }) {
-  // The local runtime is the recommended starting point — zero cloud
-  // cost, no AWS credentials, runs on the operator's own machine. It's
-  // one option (sandboxed-by-default); AWS / Connect sit alongside as
-  // alternatives.
+  // ① Setup hub — the single get-started doorway. Each path links to a
+  // canonical `/setup/*` child (Bootstrap / Connect / Doctor): one wizard,
+  // one add-cluster form, one Doctor — no parallel entry points. The local
+  // runtime is the recommended starting point on desktop (zero cloud cost,
+  // no AWS credentials); on the web shell only Connect is available, so it
+  // leads.
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div>
@@ -580,7 +582,7 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
             title="Local runtime"
             body="A cluster + api-server on this machine, sandboxed in a virtual machine. Apps publish at *.appliance.localhost. No cloud account needed."
             cta="Set up"
-            to="/bootstrap?mode=local"
+            to="/setup/bootstrap?mode=local"
             primary
           />
         ) : null}
@@ -590,7 +592,7 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
             title="Bootstrap on AWS"
             body="Provision the base AWS infrastructure from this machine using your current credentials."
             cta="Start wizard"
-            to="/bootstrap?mode=aws"
+            to="/setup/bootstrap?mode=aws"
             primary={!caps.any}
           />
         ) : null}
@@ -599,9 +601,21 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
           title="Connect to existing"
           body="Point this console at an api-server you already have by entering its URL and an API key."
           cta="Connect"
-          to="/connect"
+          to="/setup/connect"
           primary={!canBootstrap && !caps.any}
         />
+        {/* Doctor — the prerequisite preflight, desktop-only (it checks the
+            local-runtime toolchain). Reachable from the hub so a failing
+            prereq is a first-class setup step, not a buried banner. */}
+        {caps.any ? (
+          <ActionCard
+            icon={Stethoscope}
+            title="Doctor"
+            body="Check the local-runtime prerequisites — Docker / kubectl and a running container-runtime daemon — and fix them in one click."
+            cta="Run checks"
+            to="/setup/doctor"
+          />
+        ) : null}
       </div>
     </div>
   );

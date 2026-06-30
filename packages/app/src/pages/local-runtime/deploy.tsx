@@ -79,7 +79,7 @@ export function LocalRuntimeDeployPage() {
   // front since the wizard is reachable while the VM is down (deep
   // links, or the user stopped it mid-session). A non-microVM selection
   // is a cloud / BYO cluster the client already targets. Query keys are
-  // shared with the Runtimes page so the two views never disagree.
+  // shared with the Clusters area so the two views never disagree.
   const { cluster: selectedCluster } = useSelectedCluster();
   const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
   const isMicroVmTarget = vmName !== null;
@@ -200,8 +200,8 @@ export function LocalRuntimeDeployPage() {
       setRunStatus('failed');
       setRunError(
         isMicroVmTarget
-          ? 'The microVM engine is not running. Start it from the Runtimes page, then retry.'
-          : 'The local runtime is not running. Start it from the Runtimes page, then retry.'
+          ? 'The microVM engine is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
+          : 'The local runtime is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
       );
       return;
     }

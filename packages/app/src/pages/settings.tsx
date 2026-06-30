@@ -3,30 +3,37 @@ import { RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
+import { resetOnboarding } from '@/lib/local-runtime';
 import type { AvailableUpdate, UpdateProgress } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
-// ⑤ Settings — slimmed (docs/desktop-ia.md §3 / move-map 4b). Cluster CRUD
-// and the cloud-lifecycle panels moved to ② Clusters (`/clusters` +
-// `/clusters/:id`); agent sign-in moved to ④ Agents (I4). What stays: Updates
-// and About (I5 finalizes the area to Updates / About / Preferences).
+// ⑤ Settings — slimmed to Updates · About · Preferences (docs/desktop-ia.md
+// §3 / move-map 4b). Cluster CRUD and the cloud-lifecycle panels moved to ②
+// Clusters (`/clusters` + `/clusters/:id`) in I2; agent sign-in moved to ④
+// Agents in I4. The header keeps the "find them under Clusters / Agents"
+// redirect note so no one dead-ends here looking for the old surfaces.
 export function SettingsPage() {
   const host = useHost();
   const canBootstrap = Boolean(host.bootstrap);
   const canSelfUpdate = Boolean(host.updater);
+  // The first-run "replay setup" preference only has an effect where the
+  // first-run welcome shows — the desktop local-runtime shell (host.vm).
+  const canReplaySetup = Boolean(host.vm);
 
   return (
     <div className="max-w-2xl space-y-8">
       <div>
         <h1 className="text-xl font-semibold">Settings</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Shell info and updates. Manage clusters under{' '}
+          Shell info, updates, and app preferences. Manage clusters under{' '}
           <span className="font-medium text-[var(--color-foreground)]">Clusters</span>, and sign in to coding agents
           under <span className="font-medium text-[var(--color-foreground)]">Agents</span>.
         </p>
       </div>
 
       {canSelfUpdate ? <UpdatesSection /> : null}
+
+      {canReplaySetup ? <PreferencesSection /> : null}
 
       <Section title="About">
         <Row label="Version" value={<code className="font-mono text-xs">{__APPLIANCE_VERSION__}</code>} />
@@ -195,6 +202,35 @@ function UpdatesSection() {
             {error}
           </div>
         ) : null}
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * App-level preferences (⑤ Settings → Preferences). Today this is just the
+ * "replay first-run setup" control: it clears the onboarding-dismissed flag
+ * so the welcome screen shows again next time the shell is unconfigured.
+ * Only rendered on the desktop shell, where the first-run welcome exists.
+ */
+function PreferencesSection() {
+  const { toast } = useToast();
+  const onReplay = () => {
+    resetOnboarding();
+    toast('First-run setup will show again the next time no cluster is connected');
+  };
+  return (
+    <Section title="Preferences" description="App-level preferences for this shell.">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div className="text-sm">Replay first-run setup</div>
+          <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
+            Re-show the welcome + get-started prompt the next time this shell has no cluster connected.
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={onReplay}>
+          <RefreshCw className="h-3.5 w-3.5" /> Reset
+        </Button>
       </div>
     </Section>
   );

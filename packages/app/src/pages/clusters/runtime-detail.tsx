@@ -20,7 +20,7 @@ import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
 import { cn } from '@/lib/utils';
 import type { MicroVmStatus, MicroVmSummary } from '@/lib/host';
-import { DoctorPanel } from '@/pages/local-runtime';
+import { DoctorPanel } from '@/pages/setup/doctor';
 // PARKER CONTINUITY: workloads moved to ③ env-detail in I3, but the
 // runtime-scoped "what's running on THIS engine, across all projects" view
 // stays reachable here as the ② cluster-detail Workloads tab — it imports the
@@ -436,7 +436,10 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
                     so "run an agent on this VM" stays one click from detail. */}
                 {host.terminal && host.vm ? (
                   <Button asChild variant="outline" size="sm">
-                    <Link to={`/agents?runtime=${encodeURIComponent(name)}`} title="Launch a coding agent in ④ Agents">
+                    <Link
+                      to={`/agents?runtime=${encodeURIComponent(name)}`}
+                      title="Launch a coding agent in the Agents area"
+                    >
                       <Bot className="h-4 w-4" /> Run agent →
                     </Link>
                   </Button>

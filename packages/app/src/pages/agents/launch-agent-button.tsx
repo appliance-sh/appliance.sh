@@ -2,7 +2,7 @@ import * as React from 'react';
 import { Bot, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
-import { AGENT_ADAPTERS, agentAdapter, agentLabel, DEFAULT_AGENT_TYPE } from '@/lib/agents';
+import { AGENT_ADAPTERS, agentAdapter, agentLabel } from '@/lib/agents';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions, mintAgentSessionId, agentSessionKey } from '@/providers/terminal-sessions-provider';
 import { cn } from '@/lib/utils';
@@ -51,14 +51,25 @@ export function looksLikeAuthFailure(message: string): boolean {
 // `agent-<id>` tmux session is created first (so it exists), then the observe
 // tab attaches via the reattachable host-shell transport. Only rendered for dev
 // VMs with a shared workspace folder.
-export function LaunchAgentButton({ name, disabledReason }: { name: string; disabledReason?: string | null }) {
+export function LaunchAgentButton({
+  name,
+  agentType,
+  onAgentTypeChange,
+  disabledReason,
+}: {
+  name: string;
+  // The agent to launch + authenticate (the `--type` key). CONTROLLED by ④
+  // AgentsPage (Devon I4) so this picker and the sign-in section above share
+  // one selection — switching here updates sign-in, and vice versa. Drives the
+  // login panel, the per-agent sign-in status, and the launch/tab metadata.
+  agentType: string;
+  onAgentTypeChange: (type: string) => void;
+  disabledReason?: string | null;
+}) {
   const host = useHost();
   const terminals = useTerminalSessions();
   const agentAuth = host.agentAuth;
   const [open, setOpen] = React.useState(false);
-  // Which agent to launch + authenticate (the `--type` key). Drives the login
-  // panel, the per-agent sign-in status, and the launch/tab metadata.
-  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
   const [task, setTask] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
@@ -209,7 +220,7 @@ export function LaunchAgentButton({ name, disabledReason }: { name: string; disa
             aria-pressed={active}
             title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
             disabled={busy}
-            onClick={() => setAgentType(a.type)}
+            onClick={() => onAgentTypeChange(a.type)}
             className={cn(
               'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors disabled:opacity-50',
               active

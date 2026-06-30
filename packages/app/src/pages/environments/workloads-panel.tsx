@@ -21,7 +21,20 @@ import type { LocalDeploymentInfo, LocalPodInfo, LocalServiceInfo } from '@/lib/
 // objects. So the SAME component still backs the ② cluster-detail Workloads
 // tab (a deep-link to "what's running on THIS engine, across all projects"),
 // which imports it from here. Don't collapse it to a single-env filter.
-export function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmName?: string }) {
+//
+// `scopeNote` (Parker I3): in the ③ env-detail context this card sits under a
+// single environment but still shows the WHOLE runtime, so env-detail passes a
+// clarifier ("all on this runtime") to make the scope unmistakable. ② cluster
+// detail omits it — there the runtime scope is already self-evident.
+export function WorkloadsPanel({
+  clusterId,
+  vmName,
+  scopeNote,
+}: {
+  clusterId: string;
+  vmName?: string;
+  scopeNote?: string;
+}) {
   const host = useHost();
   const terminals = useTerminalSessions();
   const queryClient = useQueryClient();
@@ -53,8 +66,11 @@ export function WorkloadsPanel({ clusterId, vmName }: { clusterId: string; vmNam
   return (
     <>
       <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Workloads · {vmName ?? 'appliance'}</h2>
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-sm font-semibold">Workloads · {vmName ?? 'appliance'}</h2>
+            {scopeNote ? <p className="mt-0.5 text-[11px] text-[var(--color-muted-foreground)]">{scopeNote}</p> : null}
+          </div>
           <Button
             variant="ghost"
             size="icon"

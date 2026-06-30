@@ -10,7 +10,7 @@ import { EnvironmentDetailPage } from '@/pages/environments/detail';
 import { DeploymentsPage } from '@/pages/deployments/list';
 import { DeploymentDetailPage } from '@/pages/deployments/detail';
 import { SettingsPage } from '@/pages/settings';
-import { LocalRuntimePage } from '@/pages/local-runtime';
+import { SetupDoctorPage } from '@/pages/setup/doctor';
 import { AgentsPage } from '@/pages/agents';
 import { ClustersPage } from '@/pages/clusters';
 import { ClusterDetailPage } from '@/pages/clusters/detail';
@@ -54,14 +54,14 @@ export const routes: RouteObject[] = [
 
       // ① Setup — onboarding hub + its children. The hub is DashboardPage's
       // adaptive first-run branch (host-gated: microVM-express CTA on
-      // desktop, Connect-led on web). Doctor's canonical home is here; for
-      // I1 it renders the page that hosts the PreflightPanel (I5 extracts a
-      // standalone Doctor). `/setup` stays routable even once configured.
+      // desktop, Connect-led on web). Doctor is its own standalone page
+      // (I5 extracted it out of the deleted kitchen-sink runtimes page).
+      // `/setup` stays routable even once configured.
       { path: 'setup', element: <DashboardPage /> },
       { path: 'setup/connect', element: <ConnectPage /> },
       { path: 'setup/bootstrap', element: <BootstrapWizardPage /> },
       { path: 'setup/bootstrap/run', element: <BootstrapProgressPage /> },
-      { path: 'setup/doctor', element: <LocalRuntimePage /> },
+      { path: 'setup/doctor', element: <SetupDoctorPage /> },
 
       // ② Clusters — the live owner of cluster/runtime management (I2). The
       // list (cloud clusters + local runtimes) and the single ADAPTIVE
@@ -102,8 +102,8 @@ export const routes: RouteObject[] = [
       { path: 'bootstrap/run', element: <BootstrapProgressPage /> },
       // ② now owns runtime management — the old runtimes page redirects to
       // the cluster list (I2). The doctor preflight it used to host now
-      // stands alone at /setup/doctor (still rendered by LocalRuntimePage,
-      // slimmed to the Doctor host until I5 extracts a standalone page).
+      // stands alone at /setup/doctor (its own `SetupDoctorPage`; the old
+      // kitchen-sink page was deleted in I5).
       { path: 'local-runtime', element: <Navigate to="/clusters" replace /> },
       // Deploy wizard moved to ③ /projects/deploy (I3); alias preserves the
       // `?project=&environment=` intent on the redirect.

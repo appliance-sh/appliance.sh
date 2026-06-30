@@ -6,18 +6,17 @@ import { useHost } from '@/providers/host-provider';
 import { cn } from '@/lib/utils';
 import type { LocalPreflightCheck } from '@/lib/host';
 
-// ① Setup → Doctor host (docs/desktop-ia.md §3 / move-map 4a). The
-// prerequisite preflight that used to sit atop the runtimes page now stands
-// alone as the canonical Doctor at `/setup/doctor`; I5 extracts a dedicated
-// page, so for now this thin page hosts the shared `DoctorPanel`. The runtime
-// management itself (engines list, lifecycle, egress, credentials, facts)
-// moved to ② Clusters (`pages/clusters/*`), `WorkloadsPanel` to ③ env-detail
+// ① Setup → Doctor (docs/desktop-ia.md §3 / move-map 4a). The prerequisite
+// preflight that used to sit atop the runtimes page now stands alone as the
+// canonical Doctor at `/setup/doctor`. I5 extracted it here out of the old
+// `pages/local-runtime/index.tsx` kitchen-sink page (now deleted); everything
+// else that page once carried already moved in I2–I4 — runtime management to
+// ② Clusters (`pages/clusters/*`), `WorkloadsPanel` to ③ env-detail
 // (`pages/environments/workloads-panel.tsx`), and the agent launcher
-// (`LaunchAgentButton`) to ④ Agents (`pages/agents/launch-agent-button.tsx`)
-// in I4. What's left here is only the shared `DoctorPanel` + its `PreflightPanel`
-// (consumed by ① /setup/doctor and the ② runtime-detail "Re-run checks"
-// entry); I5 extracts a standalone Doctor page and deletes this module.
-export function LocalRuntimePage() {
+// (`LaunchAgentButton`) to ④ Agents (`pages/agents/launch-agent-button.tsx`).
+// This page hosts the shared `DoctorPanel`, which is also rendered from the ②
+// runtime-detail "Re-run checks" entry — one PreflightPanel, two entry points.
+export function SetupDoctorPage() {
   const host = useHost();
   const supported = Boolean(host.vm);
 

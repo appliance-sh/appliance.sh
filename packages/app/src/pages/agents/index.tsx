@@ -32,6 +32,13 @@ export function AgentsPage() {
   const [authBump, setAuthBump] = React.useState(0);
   const signedIn = useAgentSignedIn(canAgentAuth, authBump);
 
+  // ONE agent-type selection for the whole page (Devon I4): the sign-in section
+  // and the launcher used to each own an independent, identical picker, so they
+  // could desync — sign in Copilot up top while the launcher still defaulted to
+  // Claude. Lifting `agentType` here makes the page about a single agent: its
+  // sign-in state AND launching it. Both pickers read/write this one source.
+  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
+
   if (!supported) {
     return (
       <div className="max-w-2xl space-y-4">
@@ -66,9 +73,16 @@ export function AgentsPage() {
           onto a launcher whose first action would 502 on a missing key. */}
       {noAgentSignedIn ? <NoSignedInAgentBanner /> : null}
 
-      {canAgentAuth ? <AgentSignIn signedIn={signedIn} onAuthenticated={() => setAuthBump((n) => n + 1)} /> : null}
+      {canAgentAuth ? (
+        <AgentSignIn
+          signedIn={signedIn}
+          agentType={agentType}
+          onAgentTypeChange={setAgentType}
+          onAuthenticated={() => setAuthBump((n) => n + 1)}
+        />
+      ) : null}
 
-      <LauncherSection />
+      <LauncherSection agentType={agentType} onAgentTypeChange={setAgentType} />
 
       <RunsList />
     </div>
@@ -92,16 +106,21 @@ function NoSignedInAgentBanner() {
 
 // Per-agent sign-in (moved out of ⑤ Settings — docs/desktop-ia.md move-map 4b).
 // The agent-type picker + per-type "signed in" dots + the shared
-// `AgentLoginPanel`. Presentational: the signed-in map + login refresh are
-// owned by the page so the cold-start banner stays in lock-step.
+// `AgentLoginPanel`. Fully presentational: the signed-in map, the login
+// refresh, AND the selected `agentType` are owned by the page so this picker
+// and the launcher's share one selection (Devon I4) and the cold-start banner
+// stays in lock-step.
 function AgentSignIn({
   signedIn,
+  agentType,
+  onAgentTypeChange,
   onAuthenticated,
 }: {
   signedIn: Record<string, boolean>;
+  agentType: string;
+  onAgentTypeChange: (type: string) => void;
   onAuthenticated: () => void;
 }) {
-  const [agentType, setAgentType] = React.useState<string>(DEFAULT_AGENT_TYPE);
   return (
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
       <div>
@@ -120,7 +139,7 @@ function AgentSignIn({
               type="button"
               aria-pressed={active}
               title={signedIn[a.type] ? `${a.blurb} — signed in` : a.blurb}
-              onClick={() => setAgentType(a.type)}
+              onClick={() => onAgentTypeChange(a.type)}
               className={cn(
                 'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors',
                 active
@@ -144,11 +163,19 @@ function AgentSignIn({
   );
 }
 
-// The launcher — pick a RUNTIME, then the agent type + task (the latter two are
-// the moved `LaunchAgentButton`). Agents need a running local runtime with a
-// shared workspace; we list the running VMs and gate the launch on the selected
-// one's `devMount`, mirroring the gating ② cluster detail used to apply.
-function LauncherSection() {
+// The launcher — pick a RUNTIME, then the task (the `LaunchAgentButton`). The
+// agent TYPE is the page-level selection shared with the sign-in section above
+// (Devon I4), so the launcher targets exactly the agent the user just signed in
+// to. Agents need a running local runtime with a shared workspace; we list the
+// running VMs and gate the launch on the selected one's `devMount`, mirroring
+// the gating ② cluster detail used to apply.
+function LauncherSection({
+  agentType,
+  onAgentTypeChange,
+}: {
+  agentType: string;
+  onAgentTypeChange: (type: string) => void;
+}) {
   const host = useHost();
   const [searchParams] = useSearchParams();
   // ② "Run agent →" deep-links with `?runtime=<name>` so the picker preselects
@@ -199,7 +226,9 @@ function LauncherSection() {
       ) : (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
           {runningVms.length > 1 ? <RuntimePicker vms={runningVms} selected={selected} onSelect={setSelected} /> : null}
-          {selected ? <RuntimeLauncher name={selected} /> : null}
+          {selected ? (
+            <RuntimeLauncher name={selected} agentType={agentType} onAgentTypeChange={onAgentTypeChange} />
+          ) : null}
         </div>
       )}
     </section>
@@ -243,9 +272,18 @@ function RuntimePicker({
 
 // The launch affordance for one runtime: resolve its status to gate on a shared
 // workspace (the launcher needs `devMount`), then render the moved
-// `LaunchAgentButton`. Shares the `['microvm', name, 'status']` query key with
-// ② cluster detail, so TanStack dedupes the poll.
-function RuntimeLauncher({ name }: { name: string }) {
+// `LaunchAgentButton` with the page-shared agent type. Shares the
+// `['microvm', name, 'status']` query key with ② cluster detail, so TanStack
+// dedupes the poll.
+function RuntimeLauncher({
+  name,
+  agentType,
+  onAgentTypeChange,
+}: {
+  name: string;
+  agentType: string;
+  onAgentTypeChange: (type: string) => void;
+}) {
   const host = useHost();
   const statusQuery = useQuery({
     queryKey: ['microvm', name, 'status'],
@@ -277,7 +315,12 @@ function RuntimeLauncher({ name }: { name: string }) {
           </>
         ) : null}
       </p>
-      <LaunchAgentButton name={name} disabledReason={disabledReason} />
+      <LaunchAgentButton
+        name={name}
+        agentType={agentType}
+        onAgentTypeChange={onAgentTypeChange}
+        disabledReason={disabledReason}
+      />
     </div>
   );
 }
