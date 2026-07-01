@@ -1,3 +1,25 @@
+## 1.50.0 (2026-07-01)
+
+### Features
+
+- dev environments and shell inside microVMs ([8573c00](https://github.com/appliance-sh/appliance.sh/commit/8573c00))
+- share a host folder into the dev microVM over VirtioFS ([f77d496](https://github.com/appliance-sh/appliance.sh/commit/f77d496))
+- k3s-independent shell over vsock ([4a65547](https://github.com/appliance-sh/appliance.sh/commit/4a65547))
+- microVM container sandbox — appliance up + clock-sync 401 fix ([#48](https://github.com/appliance-sh/appliance.sh/pull/48))
+- Phase 4 — microVM default runtime, non-root guest, unified control plane, reattachable shells, one-tap onboarding ([#50](https://github.com/appliance-sh/appliance.sh/pull/50))
+- support for appliance cluster destruction ([b09cbaf](https://github.com/appliance-sh/appliance.sh/commit/b09cbaf))
+- **vm:** surface microVM bring-up phases; distinguish VM running from cluster ready ([#47](https://github.com/appliance-sh/appliance.sh/pull/47))
+
+### Bug Fixes
+
+- update package with tauri build scripts ([15123a1](https://github.com/appliance-sh/appliance.sh/commit/15123a1))
+- detect and handle argv indexing ([08a9e3e](https://github.com/appliance-sh/appliance.sh/commit/08a9e3e))
+- **desktop:** refresh the managed microVM engine when stale, not just missing ([5169ce1](https://github.com/appliance-sh/appliance.sh/commit/5169ce1))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.49.0 (2026-06-17)
 
 ### Features
