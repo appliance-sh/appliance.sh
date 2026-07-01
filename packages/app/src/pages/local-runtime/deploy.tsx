@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { isKubernetesBase } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -94,6 +95,25 @@ export function LocalRuntimeDeployPage() {
   const targetUp = isMicroVmTarget ? vmUp : Boolean(client);
   const targetLoading = isMicroVmTarget ? vmQuery.isLoading : false;
   const readyToDeploy = targetUp && Boolean(client);
+
+  // Probe the selected cloud target's base type up front. The desktop
+  // builds container images (Kubernetes / local-runtime targets); an
+  // AWS/Lambda cloud base deploys an uploaded bundle instead, which the
+  // desktop can't build. When the target is such a base we surface a CLI
+  // handoff on the TARGET step — before the user picks a folder and
+  // configures — rather than letting them reach a run step that can only
+  // fail. microVMs are always Kubernetes, so skip the probe for them.
+  const baseConfigQuery = useQuery({
+    queryKey: ['deploy', 'target-base', selectedCluster?.id],
+    enabled: Boolean(client) && !isMicroVmTarget,
+    queryFn: async () => {
+      const r = await client!.getClusterInfo();
+      if (!r.success) throw r.error;
+      return r.data.baseConfig;
+    },
+    retry: false,
+  });
+  const targetIsAwsBase = !isMicroVmTarget && baseConfigQuery.data ? !isKubernetesBase(baseConfigQuery.data) : false;
 
   // Q5: the wizard opens on the TARGET step so the first decision is always
   // "where does this deploy?". A user with a ready runtime confirms + clicks
@@ -408,6 +428,7 @@ export function LocalRuntimeDeployPage() {
           vmName={vmName}
           readyToDeploy={readyToDeploy}
           targetLoading={targetLoading}
+          targetIsAwsBase={targetIsAwsBase}
           onNext={() => setPhase('pick')}
         />
       ) : null}
@@ -447,7 +468,7 @@ export function LocalRuntimeDeployPage() {
             setPhase('run');
             void runDeploy();
           }}
-          canNext={canRun && readyToDeploy}
+          canNext={canRun && readyToDeploy && !targetIsAwsBase}
         />
       ) : null}
 
@@ -480,12 +501,14 @@ function TargetStep({
   vmName,
   readyToDeploy,
   targetLoading,
+  targetIsAwsBase,
   onNext,
 }: {
   selectedCluster: Cluster | null;
   vmName: string | null;
   readyToDeploy: boolean;
   targetLoading: boolean;
+  targetIsAwsBase: boolean;
   onNext: () => void;
 }) {
   const host = useHost();
@@ -635,10 +658,31 @@ function TargetStep({
         </div>
       ) : null}
 
+      {/* Selected target deploys uploaded bundles, not container images
+          (an AWS/Lambda cloud base). The desktop only builds images, so
+          hand off to the CLI up front — a plain next-step, not an error —
+          rather than letting the user configure a deploy that can't run. */}
+      {targetIsAwsBase ? (
+        <div className="space-y-2 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 p-3">
+          <p className="text-xs text-[var(--color-muted-foreground)]">
+            <span className="font-medium text-[var(--color-foreground)]">{selectedCluster?.name}</span> runs on an AWS
+            base, which deploys an uploaded bundle rather than a container image. The desktop builds container images
+            (for Kubernetes / local-runtime targets), so deploy to this cloud with the CLI — it builds and uploads the
+            bundle for you. Run this from your app folder:
+          </p>
+          <CommandSnippet command="appliance deploy" />
+        </div>
+      ) : null}
+
       <div className="flex items-center justify-between gap-3">
         <p className="text-xs text-[var(--color-muted-foreground)]">
           {selectedCluster ? (
-            readyToDeploy ? (
+            targetIsAwsBase ? (
+              <>
+                Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>{' '}
+                deploys via the CLI (see above).
+              </>
+            ) : readyToDeploy ? (
               <>
                 Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> is
                 ready.
@@ -652,7 +696,7 @@ function TargetStep({
             'No cluster selected yet.'
           )}
         </p>
-        <Button onClick={onNext} disabled={!readyToDeploy}>
+        <Button onClick={onNext} disabled={!readyToDeploy || targetIsAwsBase}>
           Next: pick folder <ChevronRight className="h-4 w-4" />
         </Button>
       </div>

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Rocket, Trash2 } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
@@ -51,6 +52,13 @@ function DeployToCloudCard({ cluster }: { cluster: Cluster }) {
   const isSelected = config?.selectedClusterId === cluster.id;
   const [busy, setBusy] = React.useState(false);
 
+  // The in-app deploy wizard is desktop-only — it shells out to docker to
+  // build a container image. On the web shell there's nothing to build
+  // with, so hand off to the CLI instead of routing to a "desktop only"
+  // wall. This also reconciles the sibling lifecycle copy below, which
+  // tells web users "this shell can deploy to the cluster".
+  const canDeployInApp = Boolean(host.local?.buildAndImportImage);
+
   const deployHere = async () => {
     setBusy(true);
     try {
@@ -68,18 +76,30 @@ function DeployToCloudCard({ cluster }: { cluster: Cluster }) {
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[var(--color-border)] p-4">
-      <div className="min-w-0">
-        <div className="text-sm font-medium">Deploy an app to this cloud</div>
-        <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-          Build a local project and ship it to{' '}
-          <span className="font-medium text-[var(--color-foreground)]">{cluster.name}</span> in one step — the wizard
-          targets this cluster.
-        </p>
+    <div className="rounded-md border border-[var(--color-border)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Deploy an app to this cloud</div>
+          <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+            Build a local project and ship it to{' '}
+            <span className="font-medium text-[var(--color-foreground)]">{cluster.name}</span>
+            {canDeployInApp
+              ? ' — the wizard targets this cluster.'
+              : ' with the CLI (the in-app wizard is desktop-only).'}
+          </p>
+        </div>
+        {canDeployInApp ? (
+          <Button onClick={() => void deployHere()} disabled={busy}>
+            <Rocket className="h-4 w-4" /> {busy ? 'Opening…' : 'Deploy an app'}
+          </Button>
+        ) : null}
       </div>
-      <Button onClick={() => void deployHere()} disabled={busy}>
-        <Rocket className="h-4 w-4" /> {busy ? 'Opening…' : 'Deploy an app'}
-      </Button>
+      {canDeployInApp ? null : (
+        <div className="mt-3 space-y-1.5">
+          <p className="text-xs text-[var(--color-muted-foreground)]">Run this from your app folder:</p>
+          <CommandSnippet command="appliance deploy" />
+        </div>
+      )}
     </div>
   );
 }
