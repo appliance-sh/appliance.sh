@@ -908,6 +908,7 @@ function TargetStep({
                     <button
                       key={e}
                       type="button"
+                      aria-pressed={aws.env.trim() === e}
                       onClick={() => aws.setEnv(e)}
                       className={cn(
                         'rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-[11px]',
@@ -922,7 +923,10 @@ function TargetStep({
                 </div>
               ) : null}
               <div className="flex items-center gap-2">
-                <Button size="sm" onClick={aws.onConfirm} disabled={!aws.env.trim()}>
+                {/* Empty env resolves to `production` (label above +
+                    confirmCloudDeploy both default it), so keep the button
+                    enabled — no "says production, refuses" contradiction. */}
+                <Button size="sm" onClick={aws.onConfirm}>
                   <Rocket className="h-3.5 w-3.5" />
                   Deploy to {selectedCluster?.name ?? 'cloud'} / {aws.env.trim() || 'production'}
                 </Button>
