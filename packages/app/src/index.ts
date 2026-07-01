@@ -35,6 +35,7 @@ export type {
   LocalServiceInfo,
   LocalApplianceManifest,
   LocalBuildAndImportInput,
+  LocalDeployToCloudInput,
   LocalLogEvent,
   MicroVmHost,
   MicroVmInstanceHost,

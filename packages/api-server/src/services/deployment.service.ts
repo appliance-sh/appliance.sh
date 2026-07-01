@@ -13,6 +13,7 @@ import { environmentService } from './environment.service';
 import { envVarService } from './env-var.service';
 import { projectService } from './project.service';
 import { executeDeployment, type WorkerEvent } from './deployment-executor.service';
+import { getCurrentTenant } from './tenant-context';
 import { logger } from '../logger';
 
 const COLLECTION = 'deployments';
@@ -109,6 +110,10 @@ export class DeploymentService {
         stackName: environment.stackName,
       },
       priorEnvStatus,
+      // Capture the caller's tenant (server-derived, from the ambient
+      // request context) so the inline/background executor re-establishes
+      // the same scope. Undefined in single-tenant mode.
+      tenantId: getCurrentTenant(),
     };
 
     try {

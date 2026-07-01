@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
 import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
 import { apiKeyService } from '../services/api-key.service';
+import { DEFAULT_TENANT, runWithTenant, tenantIdForKey } from '../services/tenant-context';
 import { logger } from '../logger';
 
 /**
@@ -49,6 +50,11 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   }
   const url = `${req.protocol}://${host}${req.originalUrl}`;
 
+  // Resolve the owning principal (tenant) from the SERVER-STORED key as a
+  // side effect of the signature-verification lookup — never from a
+  // client-asserted header/body. A legacy key maps to the default tenant.
+  let principalTenantId: string | undefined;
+
   const result = await verifySignedRequest(
     {
       method: req.method,
@@ -58,6 +64,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     async (keyId: string) => {
       const key = await apiKeyService.getByKeyId(keyId);
       if (!key) return null;
+      principalTenantId = tenantIdForKey(key);
       return { secret: key.secret };
     }
   );
@@ -74,12 +81,22 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   }
 
   req.apiKeyId = result.keyId;
+  // principalTenantId was set (already defaulted via tenantIdForKey) when
+  // the key resolved during verification; default once more defensively.
+  const tenantId = principalTenantId ?? DEFAULT_TENANT;
+  req.tenantId = tenantId;
 
   if (result.keyId) {
     apiKeyService.updateLastUsed(result.keyId).catch(() => {});
   }
 
-  next();
+  // Establish the tenant scope for the ENTIRE downstream request by
+  // construction. Because every authenticated route mounts this one
+  // middleware, there is no per-route opt-in to forget — an unguarded
+  // route cannot exist without also skipping auth. The storage choke
+  // point reads this ambient tenant; outside it (multi-tenant on, no
+  // context) keyed access fails closed.
+  runWithTenant(tenantId, () => next());
 }
 
 // Redacted snapshot of the inbound request to help diagnose signature

@@ -1,8 +1,10 @@
 import * as React from 'react';
+import { useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Trash2 } from 'lucide-react';
+import { Rocket, Trash2 } from 'lucide-react';
 import { applianceBaseConfig, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
@@ -23,6 +25,90 @@ import { cn } from '@/lib/utils';
 // affordance. Host-capability gated on `host.bootstrap.*` (§6: absent on
 // web → the whole surface is hidden behind a desktop-only note).
 export function CloudClusterDetail({ cluster }: { cluster: Cluster }) {
+  // The one-click deploy wedge: "ship a local app to this cloud" is a
+  // first-class action on the cloud cluster's own page (parity with the
+  // local-runtime detail's "Deploy application"), above the installer
+  // lifecycle ops. It's shown regardless of `host.bootstrap` — a
+  // Connect-added cluster can't run installer ops but can still be a
+  // deploy target.
+  return (
+    <div className="space-y-4">
+      <DeployToCloudCard cluster={cluster} />
+      <CloudLifecyclePanels cluster={cluster} />
+    </div>
+  );
+}
+
+// One-click "deploy a local app to this cloud". Selects this cluster (the
+// deploy wizard targets the selection + the SDK client binds to it), then
+// opens the target-aware wizard at ③ /projects/deploy. The wizard's own
+// Target step lets the user confirm / switch, so selection here is a
+// convenience, not a hard dependency.
+function DeployToCloudCard({ cluster }: { cluster: Cluster }) {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const { config } = useSelectedCluster();
+  const isSelected = config?.selectedClusterId === cluster.id;
+  const [busy, setBusy] = React.useState(false);
+
+  // The in-app deploy wizard is desktop-only — it shells out to docker to
+  // build a container image. On the web shell there's nothing to build
+  // with, so hand off to the CLI instead of routing to a "desktop only"
+  // wall. This also reconciles the sibling lifecycle copy below, which
+  // tells web users "this shell can deploy to the cluster".
+  const canDeployInApp = Boolean(host.local?.buildAndImportImage);
+
+  const deployHere = async () => {
+    setBusy(true);
+    try {
+      if (!isSelected) {
+        await host.selectCluster(cluster.id);
+        await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      }
+    } catch {
+      // Selection is best-effort — the wizard's Target step surfaces the
+      // real target either way, so never dead-end here.
+    } finally {
+      setBusy(false);
+    }
+    navigate('/projects/deploy');
+  };
+
+  return (
+    <div className="rounded-md border border-[var(--color-border)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Deploy an app to this cloud</div>
+          <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+            Build a local project and ship it to{' '}
+            <span className="font-medium text-[var(--color-foreground)]">{cluster.name}</span>
+            {canDeployInApp
+              ? ' — the wizard targets this cluster.'
+              : ' with the CLI (the in-app wizard is desktop-only).'}
+          </p>
+        </div>
+        {canDeployInApp ? (
+          <Button onClick={() => void deployHere()} disabled={busy}>
+            <Rocket className="h-4 w-4" /> {busy ? 'Opening…' : 'Deploy an app'}
+          </Button>
+        ) : null}
+      </div>
+      {canDeployInApp ? null : (
+        <div className="mt-3 space-y-1.5">
+          <p className="text-xs text-[var(--color-muted-foreground)]">Run this from your app folder:</p>
+          <CommandSnippet command="appliance deploy" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Installer-level lifecycle ops for a cloud cluster (baseline / api-server
+// updates, state migration, destroy). Split out of `CloudClusterDetail` so
+// the deploy action above it always renders, even on shells / states where
+// these panels are gated behind a "switch first" or "desktop only" note.
+function CloudLifecyclePanels({ cluster }: { cluster: Cluster }) {
   const host = useHost();
   const queryClient = useQueryClient();
   const { config } = useSelectedCluster();

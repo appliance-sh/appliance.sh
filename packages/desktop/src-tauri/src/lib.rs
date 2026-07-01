@@ -4963,6 +4963,146 @@ async fn crane_push_fallback(
     Ok(digest_ref)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeployToCloudInput {
+    /// Project folder — the CLI's working directory. It holds the manifest
+    /// the CLI builds `appliance.zip` from, and is where that zip is written.
+    path: String,
+    /// CLI profile to authenticate with == the selected cluster's id. The
+    /// desktop already mirrors every cluster into ~/.appliance/profiles.json
+    /// keyed by id (secret Keychain-first on macOS), so `--profile <id>`
+    /// resolves the same cloud + creds the app selected — no interactive login.
+    profile: String,
+    /// Target project name (first positional arg to `appliance deploy`).
+    project: String,
+    /// Target environment name (second positional arg).
+    environment: String,
+}
+
+/// Drive a BYO **AWS / bundle** cloud deploy by shelling the bundled
+/// `appliance` CLI — the SAME `app.shell().sidecar("appliance")` path
+/// `local_helper_install` / `microvm_agent_start` use. An AWS base deploys
+/// an uploaded manifest zip (not a container image), which the desktop can't
+/// build itself; `appliance deploy` auto-builds `appliance.zip` from the
+/// manifest and uploads it via the SDK's base-URL-agnostic presigned PUT, so
+/// we delegate to it rather than re-authoring the build/upload host-side.
+///
+/// Runs headless: `deploy <project> <env> --profile <clusterId> --yes` with
+/// the CWD set to the project folder, so there are no prompts and no prior
+/// `appliance setup` needed. Auth is the mirrored profile — nothing sensitive
+/// is passed on argv. The CLI's stdout/stderr stream back line-by-line as
+/// `{type:"log", stream, message}` LocalLogEvents so the wizard renders a
+/// live log pane; a non-zero exit resolves to Err with the stderr tail.
+#[tauri::command]
+async fn deploy_to_cloud(
+    app: AppHandle,
+    input: DeployToCloudInput,
+    on_event: Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let path = input.path.trim();
+    let profile = input.profile.trim();
+    let project = input.project.trim();
+    let environment = input.environment.trim();
+    if path.is_empty() {
+        return Err("a project folder is required to deploy".to_string());
+    }
+    if profile.is_empty() {
+        return Err("no cluster profile to deploy with — select a cloud cluster first".to_string());
+    }
+    if project.is_empty() || environment.is_empty() {
+        return Err("both a project and an environment name are required to deploy".to_string());
+    }
+
+    let args: Vec<String> = vec![
+        "deploy".into(),
+        project.to_string(),
+        environment.to_string(),
+        "--profile".into(),
+        profile.to_string(),
+        "--yes".into(),
+    ];
+
+    // Echo the command (minus nothing sensitive — the profile is just an id)
+    // so the log pane reads like a terminal.
+    let _ = on_event.send(serde_json::json!({
+        "type": "log",
+        "stream": "meta",
+        "message": format!("$ appliance deploy {project} {environment} --profile {profile} --yes"),
+    }));
+
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| {
+            format!(
+                "Bundled appliance CLI is unavailable: {e}. Rebuild with `pnpm --filter @appliance.sh/desktop build` so the CLI binary lands in src-tauri/binaries/."
+            )
+        })?
+        .current_dir(path)
+        .args(&args);
+
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
+
+    // Keep a bounded tail of stderr so a non-zero exit surfaces an
+    // actionable message rather than a bare code.
+    let mut stderr_tail = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut spawn_error: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => forward_cli_output(&bytes, "stdout", &on_event),
+            CommandEvent::Stderr(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                stderr_tail.push_str(&text);
+                if stderr_tail.len() > 4096 {
+                    let cut = stderr_tail.len() - 4096;
+                    stderr_tail.drain(..cut);
+                }
+                forward_cli_output(&bytes, "stderr", &on_event);
+            }
+            CommandEvent::Error(msg) => spawn_error = Some(msg),
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
+        }
+    }
+
+    if let Some(msg) = spawn_error {
+        return Err(format!("appliance deploy error: {msg}"));
+    }
+    if exit_code != Some(0) {
+        let tail = stderr_tail.trim();
+        return Err(if tail.is_empty() {
+            format!("appliance deploy exited with code {exit_code:?}")
+        } else {
+            tail.to_string()
+        });
+    }
+    Ok(())
+}
+
+/// Split a chunk of CLI output into lines and forward each non-empty one as a
+/// `{type:"log", stream, message}` LocalLogEvent. The CLI's human-readable
+/// output isn't NDJSON, and sidecar reads don't align to line boundaries, so
+/// we split on '\n' (dropping a trailing CR) rather than parsing.
+fn forward_cli_output(bytes: &[u8], stream: &str, on_event: &Channel<serde_json::Value>) {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let _ = on_event.send(serde_json::json!({
+            "type": "log",
+            "stream": stream,
+            "message": line,
+        }));
+    }
+}
+
 /// Resolve the helper-managed bin dir (`~/.appliance/bin` on POSIX,
 /// `%LOCALAPPDATA%\Appliance\bin` on Windows) so we can prepend it to
 /// PATH before spawning child processes. Mirrors `helperBinDir()` in
@@ -5160,6 +5300,7 @@ pub fn run() {
             start_container_runtime,
             read_appliance_manifest,
             build_and_import_image,
+            deploy_to_cloud,
             bootstrap_in_cluster_api_server,
             microvm_list,
             microvm_status,
