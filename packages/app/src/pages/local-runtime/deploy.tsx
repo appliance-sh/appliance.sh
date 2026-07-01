@@ -14,6 +14,7 @@ import {
   X,
   History,
 } from 'lucide-react';
+import { isKubernetesBase } from '@appliance.sh/sdk';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
@@ -213,18 +214,37 @@ export function LocalRuntimeDeployPage() {
     const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
 
     try {
-      // 1. Resolve the registry from the *selected cluster's* own
-      //    /cluster-info — the microVM advertises its forwarded in-VM
-      //    registry (localhost:5052). Without it there's nowhere to
-      //    push the built image, so fail with an actionable hint.
-      let registryUrl: string | undefined;
+      // 1. Route the build to the target's deploy pipeline, gated on its
+      //    base type (mirrors the CLI's `isKubernetesBase` split). The
+      //    microVM runtime AND BYO Kubernetes cloud clusters take a
+      //    container image pushed to their advertised registry; AWS/Lambda
+      //    cloud bases take an uploaded bundle instead — which the desktop
+      //    can't build yet (no host-side zip capability), so hand off to
+      //    the CLI with a clear message rather than dead-ending on a
+      //    cryptic "no registry" error.
       const info = await client.getClusterInfo();
-      if (info.success) {
-        registryUrl = info.data.baseConfig.kubernetes?.registry?.url ?? undefined;
+      if (!info.success) {
+        throw new Error(`could not read the target's cluster info (/cluster-info): ${info.error.message}`);
       }
+      const baseConfig = info.data.baseConfig;
+      if (!isKubernetesBase(baseConfig)) {
+        throw new Error(
+          `${selectedCluster?.name ?? 'This cluster'} runs on an AWS base, which deploys uploaded bundles rather ` +
+            'than container images. The desktop app builds container images (for Kubernetes / local-runtime targets); ' +
+            'to deploy a bundle to this cloud, run `appliance deploy` from the project folder — the CLI builds and ' +
+            'uploads the zip for you.'
+        );
+      }
+      // The microVM advertises its forwarded in-VM registry
+      // (localhost:5052); a BYO cluster advertises its own. Without one
+      // there's nowhere to push the built image, so fail with an
+      // actionable hint.
+      const registryUrl = baseConfig.kubernetes?.registry?.url ?? undefined;
       if (!registryUrl) {
         throw new Error(
-          'the api-server did not advertise its registry (/cluster-info) — run "appliance vm up" to reconcile it, then retry'
+          'the target Kubernetes cluster did not advertise a registry (/cluster-info) — for a local runtime run ' +
+            '"appliance vm up" to reconcile it; for a BYO cluster ensure its base config includes a reachable ' +
+            'registry, then retry'
         );
       }
 
