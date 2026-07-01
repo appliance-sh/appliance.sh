@@ -85,6 +85,25 @@ describe('tenant-context', () => {
         expect(() => scopePath('projects/p1.json')).toThrow(TenantScopeError);
       });
     });
+
+    it('rejects an unsafe tenant id (traversal / separator / control char)', () => {
+      withFlag('true', () => {
+        for (const bad of ['../evil', 'a/b', '..', 'foo.bar', 'a b', 'with space', 'tenant/../x']) {
+          expect(() => runWithTenant(bad, () => scopePath('projects/p1.json'))).toThrow(TenantScopeError);
+        }
+      });
+    });
+
+    it('accepts a valid tenant id and the default tenant unchanged', () => {
+      withFlag('true', () => {
+        expect(runWithTenant('acme-1', () => scopePath('projects/p1.json'))).toBe('tenants/acme-1/projects/p1.json');
+        expect(runWithTenant('tenant_ABC', () => scopePath('projects/p1.json'))).toBe(
+          'tenants/tenant_ABC/projects/p1.json'
+        );
+        // The default tenant stays at the root and is never charset-checked.
+        expect(runWithTenant(DEFAULT_TENANT, () => scopePath('projects/p1.json'))).toBe('projects/p1.json');
+      });
+    });
   });
 
   describe('runWithTenant / getCurrentTenant', () => {

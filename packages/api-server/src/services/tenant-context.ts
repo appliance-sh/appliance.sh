@@ -39,6 +39,19 @@ export const DEFAULT_TENANT = 'default';
 export const TENANT_PREFIX = 'tenants';
 
 /**
+ * Safe charset a non-default tenant id must match BEFORE it is
+ * interpolated into a `tenants/<id>/…` storage key. Rejects anything
+ * that could break out of the intended prefix — path separators (`/`),
+ * `.` (so no `..` traversal), whitespace, and control characters —
+ * while allowing alphanumerics plus `-`/`_` (covers generated and
+ * DNS-style ids). Length-bounded to keep keys sane. This is inert in P0
+ * (only the default tenant exists), but `scopePath` is the seam P1 mints
+ * real tenants onto, so the guard lives at the choke point from the
+ * start.
+ */
+const TENANT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/**
  * Thrown when multi-tenant enforcement is on but no principal/tenant is
  * resolvable for a keyed access. The scoping choke point raises this to
  * FAIL CLOSED — it must NEVER silently fall back to the global/unscoped
@@ -104,6 +117,16 @@ export function scopePath(rawPath: string): string {
   }
 
   if (tenant === DEFAULT_TENANT) return rawPath;
+
+  // Validate the tenant id before it becomes part of a storage key so a
+  // malformed/hostile principal can never traverse or inject outside its
+  // `tenants/<id>/` namespace. Fail closed on anything unsafe.
+  if (!TENANT_ID_PATTERN.test(tenant)) {
+    throw new TenantScopeError(
+      `Refusing storage access for tenant "${tenant}": tenant id is not a safe [a-zA-Z0-9_-] value`
+    );
+  }
+
   return `${TENANT_PREFIX}/${tenant}/${rawPath}`;
 }
 
