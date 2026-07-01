@@ -114,6 +114,10 @@ export function LocalRuntimeDeployPage() {
     retry: false,
   });
   const targetIsAwsBase = !isMicroVmTarget && baseConfigQuery.data ? !isKubernetesBase(baseConfigQuery.data) : false;
+  // Devon's probe-race nit: `targetIsAwsBase` reads false until this probe
+  // resolves, so a fast Next click could advance a cloud target before we
+  // know it's an AWS base. Gate Next on the probe while it's in flight.
+  const baseProbeLoading = baseConfigQuery.isLoading;
 
   // Q5: the wizard opens on the TARGET step so the first decision is always
   // "where does this deploy?". A user with a ready runtime confirms + clicks
@@ -142,6 +146,21 @@ export function LocalRuntimeDeployPage() {
   const [runError, setRunError] = React.useState<string | null>(null);
   const [resultUrl, setResultUrl] = React.useState<string | null>(null);
   const logBoxRef = React.useRef<HTMLPreElement | null>(null);
+
+  // AWS / bundle cloud one-click deploy (W2). An AWS base deploys an
+  // uploaded manifest zip, which the desktop can't build itself — so the
+  // Target step shells the bundled `appliance deploy` (which builds the zip
+  // + uploads it via the SDK's presigned PUT) against the selected cluster's
+  // mirrored CLI profile, streaming into this same run/log UI. `cloudDeploy`
+  // is set while (and after) an AWS run so Retry re-runs it without
+  // re-opening the folder picker; the k8s image path leaves it null.
+  const canShellDeploy = Boolean(local?.deployToCloud);
+  const [cloudDeploy, setCloudDeploy] = React.useState<{
+    path: string;
+    project: string;
+    environment: string;
+  } | null>(null);
+  const [cloudPickBusy, setCloudPickBusy] = React.useState(false);
 
   React.useEffect(() => {
     // Autoscroll to tail as new lines arrive.
@@ -344,6 +363,87 @@ export function LocalRuntimeDeployPage() {
   };
 
   // ============================================================
+  // AWS / bundle cloud base — shell the bundled `appliance deploy`.
+  // ============================================================
+  // The streaming run itself (reused by the Target-step Deploy action and
+  // by Retry). Delegates the build+upload entirely to the CLI; we only
+  // stream its output and watch for the final deployed URL banner.
+  const runCloudDeploy = async (target: { path: string; project: string; environment: string }) => {
+    if (!local?.deployToCloud || !selectedCluster) return;
+    setRunStatus('running');
+    setLogs([]);
+    setRunError(null);
+    setResultUrl(null);
+    const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
+    append({
+      stream: 'meta',
+      message: `==> deploying ${target.project}/${target.environment} to ${selectedCluster.name} via the bundled CLI`,
+    });
+    let deployedUrl: string | null = null;
+    try {
+      await local.deployToCloud(
+        {
+          path: target.path,
+          profile: selectedCluster.id,
+          project: target.project,
+          environment: target.environment,
+        },
+        (event: LocalLogEvent) => {
+          append({ stream: event.stream, message: event.message });
+          // The CLI prints a `URL: <url>` banner on success — capture it so
+          // the run step can render the same "Deployed at" link the k8s path
+          // shows. (chalk colour is off in the non-TTY sidecar, so it's plain.)
+          if (/url/i.test(event.message)) {
+            const m = event.message.match(/https?:\/\/\S+/);
+            if (m) deployedUrl = m[0];
+          }
+        }
+      );
+      if (deployedUrl) setResultUrl(deployedUrl);
+      // Shipped — remember the folder so the wizard offers it as a chip next
+      // time, and nudge the rest of the UI to refetch.
+      recordRecentFolder({ path: target.path, projectName: target.project });
+      queryClient.invalidateQueries({ queryKey: ['deployments'] });
+      queryClient.invalidateQueries({ queryKey: ['environments'] });
+      setRunStatus('succeeded');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      append({ stream: 'stderr', message });
+      setRunError(message);
+      setRunStatus('failed');
+    }
+  };
+
+  // Target-step entry point: pick the project folder, then kick off the run.
+  // Reading the manifest up front names the project and confirms the folder
+  // actually has one before we shell the CLI (which needs it to build the
+  // zip). A preset project/environment (deep link) wins over the defaults.
+  const pickAndDeployToCloud = async () => {
+    if (!local?.deployToCloud || !local?.pickDirectory || !selectedCluster) return;
+    setCloudPickBusy(true);
+    setPickError(null);
+    try {
+      const picked = await local.pickDirectory();
+      if (!picked) return;
+      const m = await local.readApplianceManifest(picked);
+      const project = (presetProject ?? m.name).trim();
+      const environment = (presetEnvironment ?? 'production').trim();
+      const target = { path: picked, project, environment };
+      setFolderPath(picked);
+      setManifest(m);
+      setProjectName(project);
+      setEnvName(environment);
+      setCloudDeploy(target);
+      setPhase('run');
+      void runCloudDeploy(target);
+    } catch (err) {
+      setPickError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCloudPickBusy(false);
+    }
+  };
+
+  // ============================================================
   // Render
   // ============================================================
   if (!local?.buildAndImportImage) {
@@ -429,6 +529,10 @@ export function LocalRuntimeDeployPage() {
           readyToDeploy={readyToDeploy}
           targetLoading={targetLoading}
           targetIsAwsBase={targetIsAwsBase}
+          baseProbeLoading={baseProbeLoading}
+          canShellDeploy={canShellDeploy}
+          cloudDeployBusy={cloudPickBusy}
+          onDeployToCloud={() => void pickAndDeployToCloud()}
           onNext={() => setPhase('pick')}
         />
       ) : null}
@@ -479,7 +583,7 @@ export function LocalRuntimeDeployPage() {
           logBoxRef={logBoxRef}
           error={runError}
           resultUrl={resultUrl}
-          onRetry={runDeploy}
+          onRetry={cloudDeploy ? () => void runCloudDeploy(cloudDeploy) : runDeploy}
           onDone={() => navigate('/projects')}
         />
       ) : null}
@@ -502,6 +606,10 @@ function TargetStep({
   readyToDeploy,
   targetLoading,
   targetIsAwsBase,
+  baseProbeLoading,
+  canShellDeploy,
+  cloudDeployBusy,
+  onDeployToCloud,
   onNext,
 }: {
   selectedCluster: Cluster | null;
@@ -509,6 +617,10 @@ function TargetStep({
   readyToDeploy: boolean;
   targetLoading: boolean;
   targetIsAwsBase: boolean;
+  baseProbeLoading: boolean;
+  canShellDeploy: boolean;
+  cloudDeployBusy: boolean;
+  onDeployToCloud: () => void;
   onNext: () => void;
 }) {
   const host = useHost();
@@ -658,45 +770,64 @@ function TargetStep({
         </div>
       ) : null}
 
-      {/* Selected target deploys uploaded bundles, not container images
-          (an AWS/Lambda cloud base). The desktop only builds images, so
-          hand off to the CLI up front — a plain next-step, not an error —
-          rather than letting the user configure a deploy that can't run. */}
+      {/* Selected target deploys an uploaded bundle, not a container image
+          (an AWS/Lambda cloud base). The desktop can't build that bundle
+          itself — but the bundled `appliance` CLI can. When we can shell it,
+          this is a real one-click "Deploy": it runs `appliance deploy`
+          against the selected cloud's mirrored profile and streams the
+          output into the run step. On a host that can't shell (web), fall
+          back to the copyable snippet so the user can run it themselves. */}
       {targetIsAwsBase ? (
         <div className="space-y-2 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 p-3">
           <p className="text-xs text-[var(--color-muted-foreground)]">
             <span className="font-medium text-[var(--color-foreground)]">{selectedCluster?.name}</span> runs on an AWS
-            base, which deploys an uploaded bundle rather than a container image. The desktop builds container images
-            (for Kubernetes / local-runtime targets), so deploy to this cloud with the CLI — it builds and uploads the
-            bundle for you. Run this from your app folder:
+            base, which deploys an uploaded bundle rather than a container image.{' '}
+            {canShellDeploy
+              ? 'Pick your app folder and deploy it right here — the bundled CLI builds and uploads the bundle for you.'
+              : 'The desktop builds container images (for Kubernetes / local-runtime targets), so deploy to this cloud with the CLI — it builds and uploads the bundle for you. Run this from your app folder:'}
           </p>
-          <CommandSnippet command="appliance deploy" />
+          {canShellDeploy ? (
+            <>
+              <Button size="sm" onClick={onDeployToCloud} disabled={cloudDeployBusy || baseProbeLoading}>
+                <Rocket className={cn('h-3.5 w-3.5', cloudDeployBusy && 'animate-pulse')} />
+                {cloudDeployBusy ? 'Opening folder…' : `Deploy to ${selectedCluster?.name ?? 'cloud'}`}
+              </Button>
+              <p className="text-[10px] text-[var(--color-muted-foreground)]">
+                Prefer the terminal? Run <code className="font-mono">appliance deploy</code> from your app folder.
+              </p>
+            </>
+          ) : (
+            <CommandSnippet command="appliance deploy" />
+          )}
         </div>
       ) : null}
 
       <div className="flex items-center justify-between gap-3">
         <p className="text-xs text-[var(--color-muted-foreground)]">
-          {selectedCluster ? (
-            targetIsAwsBase ? (
-              <>
-                Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>{' '}
-                deploys via the CLI (see above).
-              </>
-            ) : readyToDeploy ? (
-              <>
-                Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> is
-                ready.
-              </>
-            ) : (
-              <>
-                Selected <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>.
-              </>
-            )
-          ) : (
+          {!selectedCluster ? (
             'No cluster selected yet.'
+          ) : baseProbeLoading ? (
+            <>
+              Checking how <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>{' '}
+              deploys…
+            </>
+          ) : targetIsAwsBase ? (
+            <>
+              Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> deploys{' '}
+              {canShellDeploy ? 'with the button above' : 'via the CLI (see above)'}.
+            </>
+          ) : readyToDeploy ? (
+            <>
+              Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> is
+              ready.
+            </>
+          ) : (
+            <>
+              Selected <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>.
+            </>
           )}
         </p>
-        <Button onClick={onNext} disabled={!readyToDeploy || targetIsAwsBase}>
+        <Button onClick={onNext} disabled={!readyToDeploy || targetIsAwsBase || baseProbeLoading}>
           Next: pick folder <ChevronRight className="h-4 w-4" />
         </Button>
       </div>

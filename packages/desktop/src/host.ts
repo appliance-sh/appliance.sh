@@ -31,6 +31,7 @@ import type {
   LatestGhcrTagInput,
   LocalApplianceManifest,
   LocalBuildAndImportInput,
+  LocalDeployToCloudInput,
   LocalHelperInstallResult,
   LocalLogEvent,
   LocalPreflightCheck,
@@ -204,6 +205,16 @@ export const tauriHost: ConsoleHost = {
       const channel = new Channel<LocalLogEvent>();
       channel.onmessage = onEvent;
       return invoke<string>('build_and_import_image', { input, onEvent: channel });
+    },
+    async deployToCloud(input: LocalDeployToCloudInput, onEvent: (event: LocalLogEvent) => void): Promise<void> {
+      // Shells the SAME bundled `appliance` sidecar the helper-install /
+      // agent paths use (src-tauri: app.shell().sidecar("appliance")), with
+      // `deploy <project> <env> --profile <clusterId> --yes` run from the
+      // project folder. The Rust side streams the CLI's stdout/stderr back
+      // as LocalLogEvents over this Channel.
+      const channel = new Channel<LocalLogEvent>();
+      channel.onmessage = onEvent;
+      await invoke('deploy_to_cloud', { input, onEvent: channel });
     },
     async bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult> {
       return invoke<BootstrapInClusterResult>('bootstrap_in_cluster_api_server', { input: input ?? {} });

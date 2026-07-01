@@ -114,12 +114,8 @@ pub fn open(
         }
         let code = {
             let mut map = lock();
-            map.remove(&id).and_then(|mut s| {
-                s.child
-                    .wait()
-                    .ok()
-                    .map(|status| status.exit_code() as i32)
-            })
+            map.remove(&id)
+                .and_then(|mut s| s.child.wait().ok().map(|status| status.exit_code() as i32))
         };
         let _ = on_event.send(TermEvent::Exit { code });
     });

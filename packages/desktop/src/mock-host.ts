@@ -423,6 +423,32 @@ export function createMockHost(): ConsoleHost {
         return ref;
       },
 
+      // Stand-in for the bundled `appliance deploy` shell (AWS/bundle cloud
+      // base). Streams the CLI's real output shape so the wizard's AWS
+      // one-click path + its live log pane can be QA'd in a browser.
+      async deployToCloud(input, onEvent) {
+        onEvent({
+          type: 'log',
+          stream: 'meta',
+          message: `$ appliance deploy ${input.project} ${input.environment} --profile ${input.profile} --yes`,
+        });
+        const lines = [
+          'No appliance.zip found — building first.',
+          'Built: appliance.zip (2.4 MB)',
+          `Using existing project: ${input.project}`,
+          'Uploading build (2.4 MB)...',
+          'Build uploaded: build_mock',
+          `Deploying ${input.project}/${input.environment} — pending`,
+          `Deploying ${input.project}/${input.environment} — in_progress`,
+          `▲ Deployed ${input.project}/${input.environment}`,
+          `  URL: https://${input.project}.mock.appliance.sh`,
+        ];
+        for (const message of lines) {
+          await sleep(350);
+          onEvent({ type: 'log', stream: 'stdout', message });
+        }
+      },
+
       async bootstrapInClusterApiServer() {
         await sleep(1_200);
         return {

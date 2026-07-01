@@ -743,6 +743,30 @@ export interface LocalLogEvent {
   message: string;
 }
 
+/** Drive the bundled `appliance deploy` for a BYO AWS / bundle cloud base.
+ *  Unlike a Kubernetes target (which takes a host-built container image
+ *  pushed to a registry), an AWS base deploys an uploaded manifest zip —
+ *  which the desktop can't produce itself. So instead of re-authoring the
+ *  build/upload host-side, the desktop shells the bundled CLI, which
+ *  auto-builds `appliance.zip` from the manifest and uploads it via the
+ *  SDK's presigned PUT. */
+export interface LocalDeployToCloudInput {
+  /** Project folder — used as the CLI's working directory (it holds the
+   *  manifest and is where `appliance.zip` is written). */
+  path: string;
+  /** CLI profile to authenticate the deploy with. This is the selected
+   *  cluster's id, which the desktop already mirrors into
+   *  `~/.appliance/profiles.json` (secret resolved Keychain-first on
+   *  macOS) — so the CLI targets the same cloud + creds the app selected,
+   *  with no interactive login. */
+  profile: string;
+  /** Target project name — passed as a positional arg so the headless
+   *  (`--yes`) deploy never needs a prompt or a prior `appliance setup`. */
+  project: string;
+  /** Target environment name — the second positional arg. */
+  environment: string;
+}
+
 /**
  * One row in the prerequisite report rendered before the user can start
  * the local runtime. The desktop probes each tool with `<tool> --version`
@@ -848,6 +872,16 @@ export interface LocalRuntimeHost {
    *  onEvent. Resolves with the registry-qualified image ref on
    *  success. */
   buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
+  /** Shell the bundled `appliance deploy` for a BYO AWS / bundle cloud
+   *  base: the CLI builds the manifest `appliance.zip` and uploads it via
+   *  the SDK's base-URL-agnostic presigned PUT, authenticated by the
+   *  selected cluster's mirrored CLI profile (`--profile`). Runs headless
+   *  (`--yes` + explicit project/environment args, no prompts) and streams
+   *  the CLI's stdout/stderr onto onEvent. Resolves once the CLI exits 0;
+   *  rejects with its stderr tail otherwise. Optional — only the desktop
+   *  can shell the CLI; the web shell omits it and the wizard falls back
+   *  to the copyable `appliance deploy` snippet. */
+  deployToCloud?(input: LocalDeployToCloudInput, onEvent: (event: LocalLogEvent) => void): Promise<void>;
   /** Apply the in-cluster api-server manifest to the local cluster
    *  (Deployment + Service + Ingress + RBAC + PVC), wait for it to
    *  become reachable at `api.appliance.localhost`, mint a first
