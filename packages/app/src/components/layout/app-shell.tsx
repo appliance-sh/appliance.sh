@@ -1,8 +1,9 @@
 import * as React from 'react';
 import { NavLink, Outlet } from 'react-router';
-import { LayoutDashboard, Folder, Box, Rocket, Settings, Server } from 'lucide-react';
+import { Wand, Server, Boxes, Folder, Bot, Cog } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
+import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 import { TerminalDock } from './terminal-dock';
@@ -11,28 +12,39 @@ type NavItem = {
   to: string;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-  end?: boolean;
+  // Setup is highlighted while the shell is unconfigured (Q3); a ring
+  // makes "start here" obvious without a second style of nav entry.
+  prominent?: boolean;
 };
 
-const baseNav: NavItem[] = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
-  { to: '/projects', label: 'Projects', icon: Folder },
-  { to: '/environments', label: 'Environments', icon: Box },
-  { to: '/deployments', label: 'Deployments', icon: Rocket },
-];
-
-const tailNav: NavItem[] = [{ to: '/settings', label: 'Settings', icon: Settings }];
-
 export function AppShell() {
+  // Adaptive Setup (docs/desktop-ia.md §8 Q3): ① is a prominent nav item
+  // while unconfigured and is demoted out of the primary nav once a
+  // cluster is selected (its recurring children — add-cluster, doctor —
+  // surface from ② Clusters). "Unconfigured" = no selected cluster, the
+  // same predicate the `/` landing resolver uses.
+  const { cluster, isLoading } = useSelectedCluster();
+  const configured = Boolean(cluster);
+
+  // ④ Agents is desktop-only — it launches coding agents into a local
+  // runtime (host.vm). The web shell hides it, mirroring today's Runtimes
+  // gate; the `/agents` route itself renders a "desktop app only" message.
   const host = useHost();
-  // Surface Local Runtime only when the host can actually drive it
-  // (desktop, via the microVM engine). The web shell omits `vm`, so
-  // the link would 404 on first click — better to hide it than disable
-  // it.
+  const showAgents = Boolean(host.vm);
+
+  // Five-area IA (§2): Setup (adaptive) / Clusters / Projects / Agents /
+  // Settings — canonical labels only (no Dashboard/Overview/Runtimes drift).
+  // Clusters stays always-visible — its desktop-only bits are host-gated
+  // inside the page, not hidden from the rail; Agents is gated OFF the rail on
+  // web since the whole area is desktop-only. Clusters uses `Boxes` (a
+  // distinct icon, not the brand mark's `Server`) so the nav item doesn't read
+  // as a second logo (Devon); Agents uses `Bot`.
   const nav: NavItem[] = [
-    ...baseNav,
-    ...(host.vm ? ([{ to: '/local-runtime', label: 'Runtimes', icon: Server }] as NavItem[]) : []),
-    ...tailNav,
+    ...(!isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
+    { to: '/clusters', label: 'Clusters', icon: Boxes },
+    { to: '/projects', label: 'Projects', icon: Folder },
+    ...(showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    { to: '/settings', label: 'Settings', icon: Cog },
   ];
 
   return (
@@ -58,14 +70,16 @@ export function AppShell() {
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.end}
               title={item.label}
               // Hover only brightens the text; the filled background is
               // reserved for the active route so the two states never
               // read the same while the pointer rests on the sidebar.
               className={({ isActive }) =>
                 cn(
-                  'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]',
+                  'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium',
+                  item.prominent
+                    ? 'text-[var(--color-foreground)] ring-1 ring-inset ring-[var(--color-border-strong)]'
+                    : 'text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]',
                   isActive && 'bg-[var(--color-accent)] text-[var(--color-foreground)]'
                 )
               }

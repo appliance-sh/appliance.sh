@@ -117,7 +117,9 @@ export function ClusterSwitcher() {
           </ul>
           <div className="border-t border-[var(--color-border)] p-1">
             <Link
-              to="/connect"
+              // Canonical add-cluster surface (§5.2 dedup / Devon nit) —
+              // the onboarding Connect form, not the old bare /connect.
+              to="/setup/connect"
               onClick={() => setOpen(false)}
               className="flex items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-[var(--color-muted)]"
             >

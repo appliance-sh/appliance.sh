@@ -136,7 +136,7 @@ function ConnectedEnvironments() {
         const project = projectsById.get(env.projectId);
         const projectName = project?.name ?? env.projectId;
         navigate(
-          `/local-runtime/deploy?project=${encodeURIComponent(projectName)}&environment=${encodeURIComponent(env.name)}`
+          `/projects/deploy?project=${encodeURIComponent(projectName)}&environment=${encodeURIComponent(env.name)}`
         );
       }
     },

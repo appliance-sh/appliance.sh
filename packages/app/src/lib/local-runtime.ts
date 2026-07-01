@@ -41,3 +41,14 @@ export function dismissOnboarding(): void {
     // best-effort — re-showing the prompt next launch is harmless.
   }
 }
+
+/** Clear the dismissed flag so the first-run setup prompt shows again —
+ *  the "replay setup" preference (⑤ Settings → Preferences). Best-effort;
+ *  a blocked store just means the prompt was never dismissed anyway. */
+export function resetOnboarding(): void {
+  try {
+    localStorage.removeItem(ONBOARDING_KEY);
+  } catch {
+    // best-effort — nothing to recover if the store is unavailable.
+  }
+}

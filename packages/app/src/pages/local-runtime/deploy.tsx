@@ -1,21 +1,38 @@
 import * as React from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, ChevronLeft, FolderOpen, Trash2, Plus, ChevronRight, Rocket, X, History } from 'lucide-react';
+import {
+  AlertTriangle,
+  Check,
+  ChevronLeft,
+  FolderOpen,
+  Trash2,
+  Plus,
+  ChevronRight,
+  Play,
+  Rocket,
+  X,
+  History,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
-import { microVmNameFromClusterId } from '@/lib/host';
-import type { LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
+import { isMicroVmClusterId, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import type { Cluster, LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
-// Docker Desktop-style deploy wizard for the local runtime (a
-// microVM). It deploys into the *selected* cluster — each microVM
-// registers as a regular cluster — gating readiness on that VM and
-// routing the image to its in-VM registry. Three steps:
+// Docker Desktop-style deploy wizard, the canonical ③ /projects/deploy
+// (I3). It deploys into the *selected* cluster — each microVM registers
+// as a regular cluster — gating readiness on that VM and routing the
+// image to its in-VM registry. Four steps:
+//   0. TARGET (Q5) — choose the target cluster. When the chosen local
+//      runtime isn't serving yet, start it inline (one click brings the
+//      microVM up, installing the engine if needed) rather than dead-ending
+//      the wizard. The deploy intent (?project=&environment=) is captured
+//      on mount and survives the bring-up, so the user never loses it.
 //   1. Pick a folder containing an appliance.{json,ts,js} manifest
 //      + a Dockerfile. Programmatic .ts/.js manifests run in the
 //      CLI's QuickJS sandbox (sidecar invocation).
@@ -30,7 +47,7 @@ import { extractDeploymentUrl } from '@/lib/deployment';
 // the selected cluster's signed credentials. That keeps the new
 // Rust-side surface small (just shell-outs to docker / kubectl).
 
-type Phase = 'pick' | 'configure' | 'run';
+type Phase = 'target' | 'pick' | 'configure' | 'run';
 
 type RunStatus = 'idle' | 'running' | 'succeeded' | 'failed';
 
@@ -62,7 +79,7 @@ export function LocalRuntimeDeployPage() {
   // front since the wizard is reachable while the VM is down (deep
   // links, or the user stopped it mid-session). A non-microVM selection
   // is a cloud / BYO cluster the client already targets. Query keys are
-  // shared with the Runtimes page so the two views never disagree.
+  // shared with the Clusters area so the two views never disagree.
   const { cluster: selectedCluster } = useSelectedCluster();
   const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
   const isMicroVmTarget = vmName !== null;
@@ -77,7 +94,10 @@ export function LocalRuntimeDeployPage() {
   const targetLoading = isMicroVmTarget ? vmQuery.isLoading : false;
   const readyToDeploy = targetUp && Boolean(client);
 
-  const [phase, setPhase] = React.useState<Phase>('pick');
+  // Q5: the wizard opens on the TARGET step so the first decision is always
+  // "where does this deploy?". A user with a ready runtime confirms + clicks
+  // Next; a user with none starts one inline without leaving the wizard.
+  const [phase, setPhase] = React.useState<Phase>('target');
 
   // Step 1 — folder + manifest
   const [folderPath, setFolderPath] = React.useState<string | null>(null);
@@ -180,8 +200,8 @@ export function LocalRuntimeDeployPage() {
       setRunStatus('failed');
       setRunError(
         isMicroVmTarget
-          ? 'The microVM engine is not running. Start it from the Runtimes page, then retry.'
-          : 'The local runtime is not running. Start it from the Runtimes page, then retry.'
+          ? 'The microVM engine is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
+          : 'The local runtime is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
       );
       return;
     }
@@ -304,8 +324,8 @@ export function LocalRuntimeDeployPage() {
     <div className="max-w-3xl space-y-6">
       <div>
         <Button asChild variant="ghost" size="sm" className="-ml-2">
-          <Link to="/local-runtime">
-            <ChevronLeft className="h-4 w-4" /> Local Runtime
+          <Link to="/clusters">
+            <ChevronLeft className="h-4 w-4" /> Clusters
           </Link>
         </Button>
       </div>
@@ -332,22 +352,19 @@ export function LocalRuntimeDeployPage() {
         ) : null}
       </header>
 
-      {!readyToDeploy && !targetLoading ? (
+      {/* Once past the target step, if the runtime fell out of ready (e.g. it
+          was stopped mid-flow), nudge back to the target step where it can be
+          restarted inline — never a dead link off to another page (Q5). */}
+      {phase !== 'target' && !readyToDeploy && !targetLoading ? (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
-            {!targetUp ? (
-              <>
-                The {isMicroVmTarget ? 'sandboxed ' : ''}local runtime isn&apos;t running — builds deploy into its
-                cluster, so the final step needs it up.{' '}
-                <Link to="/local-runtime" className="underline">
-                  Start it from the Local runtime page
-                </Link>{' '}
-                first. You can still pick a folder and configure in the meantime.
-              </>
-            ) : (
-              <>No cluster is selected. Starting the local runtime registers its cluster automatically.</>
-            )}
+            The {isMicroVmTarget ? 'sandboxed ' : ''}target cluster isn&apos;t serving — builds deploy into it, so the
+            final step needs it up.{' '}
+            <button type="button" className="underline" onClick={() => setPhase('target')}>
+              Back to choose / start a target
+            </button>
+            . You can still pick a folder and configure in the meantime.
           </span>
         </div>
       ) : null}
@@ -364,6 +381,16 @@ export function LocalRuntimeDeployPage() {
       ) : null}
 
       <Stepper phase={phase} />
+
+      {phase === 'target' ? (
+        <TargetStep
+          selectedCluster={selectedCluster}
+          vmName={vmName}
+          readyToDeploy={readyToDeploy}
+          targetLoading={targetLoading}
+          onNext={() => setPhase('pick')}
+        />
+      ) : null}
 
       {phase === 'pick' ? (
         <PickStep
@@ -412,7 +439,7 @@ export function LocalRuntimeDeployPage() {
           error={runError}
           resultUrl={resultUrl}
           onRetry={runDeploy}
-          onDone={() => navigate('/local-runtime')}
+          onDone={() => navigate('/projects')}
         />
       ) : null}
     </div>
@@ -421,11 +448,248 @@ export function LocalRuntimeDeployPage() {
 
 // ----- step UIs ------------------------------------------------------
 
+// Q5 — TARGET step. Choose where this app deploys (cloud cluster or local
+// runtime), and when the chosen runtime isn't serving yet, START IT INLINE
+// instead of bouncing the operator to ② Clusters. Selecting a target makes
+// it the active cluster (the SDK client binds to the selection), so by the
+// time the wizard reaches "Build & deploy" the credentials + registry are
+// the target's. The page captures `?project=&environment=` on mount, so the
+// intent survives the bring-up here.
+function TargetStep({
+  selectedCluster,
+  vmName,
+  readyToDeploy,
+  targetLoading,
+  onNext,
+}: {
+  selectedCluster: Cluster | null;
+  vmName: string | null;
+  readyToDeploy: boolean;
+  targetLoading: boolean;
+  onNext: () => void;
+}) {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const showRuntimes = Boolean(host.vm);
+  const { config } = useSelectedCluster();
+
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
+    enabled: showRuntimes,
+    queryFn: () => host.vm!.list(),
+    refetchInterval: 6_000,
+  });
+  const vms = vmListQuery.data ?? [];
+
+  const cloudClusters = (config?.clusters ?? []).filter((c) => !isMicroVmClusterId(c.id));
+  const runtimeNames = React.useMemo(() => {
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    for (const n of ['appliance', ...vms.map((v) => v.name)]) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        ordered.push(n);
+      }
+    }
+    return ordered;
+  }, [vms]);
+
+  const selectTarget = async (id: string) => {
+    if (selectedCluster?.id === id) return;
+    try {
+      await host.selectCluster(id);
+    } catch {
+      // A never-started microVM has no registered cluster to select yet —
+      // the inline Start below registers it, then selects it.
+    }
+    queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+  };
+
+  // Inline start (Q5). Targets the SELECTED microVM, or the default
+  // `appliance` runtime when nothing is selected yet — one click installs
+  // the engine if needed and brings the VM up, then makes it the selection.
+  const startTargetName = vmName ?? (!selectedCluster && showRuntimes ? 'appliance' : null);
+  const needsStart = !readyToDeploy && Boolean(startTargetName);
+  const [starting, setStarting] = React.useState(false);
+  const [startLog, setStartLog] = React.useState<string[]>([]);
+  const [startError, setStartError] = React.useState<string | null>(null);
+
+  const startRuntime = async () => {
+    if (!host.vm || !startTargetName) return;
+    setStarting(true);
+    setStartError(null);
+    setStartLog([]);
+    const append = (m: string) => setStartLog((p) => [...p.slice(-120), m]);
+    try {
+      const vm = host.vm.instance(startTargetName);
+      const st = await vm.status();
+      if (!st.available && st.installable) {
+        append('Installing engine…');
+        await host.vm.install();
+      }
+      await vm.up((e) => append(e.message));
+      // `up` registers the microVM cluster — make it the selection so the
+      // SDK client + readiness gate track it for the deploy.
+      try {
+        await host.selectCluster(microVmClusterId(startTargetName));
+      } catch {
+        // best-effort; the status poll + invalidate below reconcile it
+      }
+    } catch (e) {
+      setStartError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStarting(false);
+      queryClient.invalidateQueries({ queryKey: ['microvm'] });
+      queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+    }
+  };
+
+  return (
+    <section className="space-y-4 rounded-md border border-[var(--color-border)] p-4">
+      <div>
+        <h2 className="text-sm font-semibold">Choose a target cluster</h2>
+        <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+          Builds deploy into the selected cluster. Pick where this app should run — you can also switch from the cluster
+          menu in the top bar.
+        </p>
+      </div>
+
+      <ul className="divide-y divide-[var(--color-border)] rounded-md border border-[var(--color-border)]">
+        {cloudClusters.map((c) => (
+          <TargetRow
+            key={c.id}
+            name={c.name}
+            sub={c.apiServerUrl}
+            kind="cloud"
+            selected={selectedCluster?.id === c.id}
+            stateLabel="ready"
+            onSelect={() => void selectTarget(c.id)}
+          />
+        ))}
+        {showRuntimes
+          ? runtimeNames.map((name) => {
+              const id = microVmClusterId(name);
+              const summary = vms.find((v) => v.name === name);
+              const state = !summary
+                ? 'not created'
+                : summary.running
+                  ? summary.clusterReady
+                    ? 'running'
+                    : summary.phase === 'failed'
+                      ? 'failed'
+                      : 'starting…'
+                  : 'stopped';
+              return (
+                <TargetRow
+                  key={id}
+                  name={name}
+                  sub={id}
+                  kind="local runtime"
+                  selected={selectedCluster?.id === id}
+                  stateLabel={state}
+                  onSelect={() => void selectTarget(id)}
+                />
+              );
+            })
+          : null}
+      </ul>
+
+      {/* Selected target isn't serving — start it here, don't dead-end. */}
+      {needsStart ? (
+        <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+          <p className="text-xs text-amber-200">
+            {targetLoading
+              ? 'Checking the selected runtime…'
+              : `The ${startTargetName === vmName ? 'selected' : 'default'} local runtime (${startTargetName}) isn’t serving yet — start it to finish the deploy. Your project / environment selection is kept.`}
+          </p>
+          <Button size="sm" onClick={() => void startRuntime()} disabled={starting || targetLoading}>
+            <Play className={cn('h-3.5 w-3.5', starting && 'animate-pulse')} />
+            {starting ? 'Starting…' : 'Start the local runtime'}
+          </Button>
+          {startError ? <p className="font-mono text-[10px] text-red-300">{startError}</p> : null}
+          {starting || startLog.length > 0 ? (
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/40 p-2 font-mono text-[10px] leading-relaxed">
+              {startLog.join('\n') || 'Starting…'}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          {selectedCluster ? (
+            readyToDeploy ? (
+              <>
+                Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> is
+                ready.
+              </>
+            ) : (
+              <>
+                Selected <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>.
+              </>
+            )
+          ) : (
+            'No cluster selected yet.'
+          )}
+        </p>
+        <Button onClick={onNext} disabled={!readyToDeploy}>
+          Next: pick folder <ChevronRight className="h-4 w-4" />
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+function TargetRow({
+  name,
+  sub,
+  kind,
+  selected,
+  stateLabel,
+  onSelect,
+}: {
+  name: string;
+  sub: string;
+  kind: 'cloud' | 'local runtime';
+  selected: boolean;
+  stateLabel: string;
+  onSelect: () => void;
+}) {
+  return (
+    <li className="flex items-center gap-3 px-3 py-2.5">
+      <div className="w-4 shrink-0">{selected ? <Check className="h-4 w-4 text-[var(--color-accent)]" /> : null}</div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className={cn('truncate text-sm font-medium', kind === 'local runtime' && 'font-mono')}>{name}</span>
+          <span
+            className={cn(
+              'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
+              kind === 'local runtime'
+                ? 'bg-cyan-500/15 text-cyan-300'
+                : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
+            )}
+          >
+            {kind}
+          </span>
+        </div>
+        <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">{sub}</div>
+      </div>
+      <span className="shrink-0 text-xs text-[var(--color-muted-foreground)]">{stateLabel}</span>
+      {!selected ? (
+        <Button variant="outline" size="sm" onClick={onSelect}>
+          Select
+        </Button>
+      ) : null}
+    </li>
+  );
+}
+
 function Stepper({ phase }: { phase: Phase }) {
   const steps: Array<{ id: Phase; label: string }> = [
-    { id: 'pick', label: '1. Pick folder' },
-    { id: 'configure', label: '2. Configure' },
-    { id: 'run', label: '3. Build & deploy' },
+    { id: 'target', label: '1. Target' },
+    { id: 'pick', label: '2. Pick folder' },
+    { id: 'configure', label: '3. Configure' },
+    { id: 'run', label: '4. Build & deploy' },
   ];
   const activeIdx = steps.findIndex((s) => s.id === phase);
   return (
