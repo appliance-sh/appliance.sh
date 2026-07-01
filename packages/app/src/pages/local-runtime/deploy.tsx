@@ -161,6 +161,16 @@ export function LocalRuntimeDeployPage() {
     environment: string;
   } | null>(null);
   const [cloudPickBusy, setCloudPickBusy] = React.useState(false);
+  // Pre-fire confirm state (W2 polish). A cloud deploy ships to real
+  // infra — often production — so after the folder is picked we surface a
+  // confirm (project + folder + cluster + a chosen environment) rather than
+  // firing silently. `cloudPending` holds the picked folder/project until
+  // the user confirms; `cloudEnv` is the editable target env (default
+  // `production`); `cloudKnownEnvs` are the project's existing envs, fetched
+  // best-effort for quick-pick when the project already exists.
+  const [cloudPending, setCloudPending] = React.useState<{ path: string; project: string } | null>(null);
+  const [cloudEnv, setCloudEnv] = React.useState('production');
+  const [cloudKnownEnvs, setCloudKnownEnvs] = React.useState<string[]>([]);
 
   React.useEffect(() => {
     // Autoscroll to tail as new lines arrive.
@@ -390,13 +400,13 @@ export function LocalRuntimeDeployPage() {
         },
         (event: LocalLogEvent) => {
           append({ stream: event.stream, message: event.message });
-          // The CLI prints a `URL: <url>` banner on success — capture it so
-          // the run step can render the same "Deployed at" link the k8s path
-          // shows. (chalk colour is off in the non-TTY sidecar, so it's plain.)
-          if (/url/i.test(event.message)) {
-            const m = event.message.match(/https?:\/\/\S+/);
-            if (m) deployedUrl = m[0];
-          }
+          // The CLI prints a `  URL: <url>` banner on success. Anchor the
+          // match to that exact line shape so a `curl …` / "presigned url …"
+          // line in the build/upload output can't false-match. Nothing
+          // matches → no link, just a "Succeeded" state (fine). (chalk colour
+          // is off in the non-TTY sidecar, so the line is plain text.)
+          const m = event.message.match(/^\s*URL:\s*(https?:\/\/\S+)/);
+          if (m) deployedUrl = m[1];
         }
       );
       if (deployedUrl) setResultUrl(deployedUrl);
@@ -414,11 +424,12 @@ export function LocalRuntimeDeployPage() {
     }
   };
 
-  // Target-step entry point: pick the project folder, then kick off the run.
-  // Reading the manifest up front names the project and confirms the folder
-  // actually has one before we shell the CLI (which needs it to build the
-  // zip). A preset project/environment (deep link) wins over the defaults.
-  const pickAndDeployToCloud = async () => {
+  // Target-step entry point: pick the project folder, then raise the
+  // pre-fire confirm (it does NOT deploy yet). Reading the manifest up front
+  // names the project and confirms the folder actually has one before we
+  // shell the CLI (which needs it to build the zip). A preset project /
+  // environment (deep link) wins over the defaults.
+  const pickFolderForCloud = async () => {
     if (!local?.deployToCloud || !local?.pickDirectory || !selectedCluster) return;
     setCloudPickBusy(true);
     setPickError(null);
@@ -427,20 +438,52 @@ export function LocalRuntimeDeployPage() {
       if (!picked) return;
       const m = await local.readApplianceManifest(picked);
       const project = (presetProject ?? m.name).trim();
-      const environment = (presetEnvironment ?? 'production').trim();
-      const target = { path: picked, project, environment };
       setFolderPath(picked);
       setManifest(m);
       setProjectName(project);
-      setEnvName(environment);
-      setCloudDeploy(target);
-      setPhase('run');
-      void runCloudDeploy(target);
+      setCloudEnv((presetEnvironment ?? 'production').trim() || 'production');
+      setCloudKnownEnvs([]);
+      setCloudPending({ path: picked, project });
+      // Best-effort: if the project already exists on the target, offer its
+      // known environments as quick-pick chips. A brand-new project has none
+      // yet — the editable field still lets the user name one.
+      void fetchKnownCloudEnvs(project);
     } catch (err) {
       setPickError(err instanceof Error ? err.message : String(err));
     } finally {
       setCloudPickBusy(false);
     }
+  };
+
+  const fetchKnownCloudEnvs = async (projectName: string) => {
+    if (!client) return;
+    try {
+      const projects = await client.listProjects();
+      if (!projects.success) return;
+      const proj = projects.data.find((p) => p.name === projectName);
+      if (!proj) return; // new project → no known envs yet
+      const envs = await client.listEnvironments(proj.id);
+      if (envs.success) setCloudKnownEnvs(envs.data.map((e) => e.name));
+    } catch {
+      // best-effort — a fetch hiccup just means no quick-pick chips.
+    }
+  };
+
+  // Confirm → fire the deploy with the chosen environment.
+  const confirmCloudDeploy = () => {
+    if (!cloudPending) return;
+    const environment = cloudEnv.trim() || 'production';
+    const target = { path: cloudPending.path, project: cloudPending.project, environment };
+    setEnvName(environment);
+    setCloudDeploy(target);
+    setCloudPending(null);
+    setPhase('run');
+    void runCloudDeploy(target);
+  };
+
+  const cancelCloudDeploy = () => {
+    setCloudPending(null);
+    setCloudKnownEnvs([]);
   };
 
   // ============================================================
@@ -530,9 +573,17 @@ export function LocalRuntimeDeployPage() {
           targetLoading={targetLoading}
           targetIsAwsBase={targetIsAwsBase}
           baseProbeLoading={baseProbeLoading}
-          canShellDeploy={canShellDeploy}
-          cloudDeployBusy={cloudPickBusy}
-          onDeployToCloud={() => void pickAndDeployToCloud()}
+          aws={{
+            canShell: canShellDeploy,
+            busy: cloudPickBusy,
+            pending: cloudPending,
+            env: cloudEnv,
+            setEnv: setCloudEnv,
+            knownEnvs: cloudKnownEnvs,
+            onPickFolder: () => void pickFolderForCloud(),
+            onConfirm: confirmCloudDeploy,
+            onCancel: cancelCloudDeploy,
+          }}
           onNext={() => setPhase('pick')}
         />
       ) : null}
@@ -600,6 +651,29 @@ export function LocalRuntimeDeployPage() {
 // time the wizard reaches "Build & deploy" the credentials + registry are
 // the target's. The page captures `?project=&environment=` on mount, so the
 // intent survives the bring-up here.
+// Controls for the AWS/bundle-base one-click deploy affordance. Grouped so
+// TargetStep's own signature stays about "choose a target", with the deploy
+// flow (folder pick → env pick + confirm → fire) threaded as one object.
+interface AwsDeployControls {
+  /** Host can shell the bundled CLI (desktop). False → web/no-CLI fallback. */
+  canShell: boolean;
+  /** A folder pick is in flight. */
+  busy: boolean;
+  /** Picked folder + resolved project, awaiting the pre-fire confirm. */
+  pending: { path: string; project: string } | null;
+  /** The chosen (editable) target environment. */
+  env: string;
+  setEnv: (v: string) => void;
+  /** The project's existing environments, for quick-pick (may be empty). */
+  knownEnvs: string[];
+  /** Open the folder picker, then raise the confirm. */
+  onPickFolder: () => void;
+  /** Fire the deploy with the chosen env. */
+  onConfirm: () => void;
+  /** Dismiss the confirm without deploying. */
+  onCancel: () => void;
+}
+
 function TargetStep({
   selectedCluster,
   vmName,
@@ -607,9 +681,7 @@ function TargetStep({
   targetLoading,
   targetIsAwsBase,
   baseProbeLoading,
-  canShellDeploy,
-  cloudDeployBusy,
-  onDeployToCloud,
+  aws,
   onNext,
 }: {
   selectedCluster: Cluster | null;
@@ -618,9 +690,7 @@ function TargetStep({
   targetLoading: boolean;
   targetIsAwsBase: boolean;
   baseProbeLoading: boolean;
-  canShellDeploy: boolean;
-  cloudDeployBusy: boolean;
-  onDeployToCloud: () => void;
+  aws: AwsDeployControls;
   onNext: () => void;
 }) {
   const host = useHost();
@@ -779,25 +849,104 @@ function TargetStep({
           back to the copyable snippet so the user can run it themselves. */}
       {targetIsAwsBase ? (
         <div className="space-y-2 rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 p-3">
-          <p className="text-xs text-[var(--color-muted-foreground)]">
-            <span className="font-medium text-[var(--color-foreground)]">{selectedCluster?.name}</span> runs on an AWS
-            base, which deploys an uploaded bundle rather than a container image.{' '}
-            {canShellDeploy
-              ? 'Pick your app folder and deploy it right here — the bundled CLI builds and uploads the bundle for you.'
-              : 'The desktop builds container images (for Kubernetes / local-runtime targets), so deploy to this cloud with the CLI — it builds and uploads the bundle for you. Run this from your app folder:'}
-          </p>
-          {canShellDeploy ? (
+          {!aws.canShell ? (
+            // Web / no-CLI host: explain + hand off the copyable snippet.
             <>
-              <Button size="sm" onClick={onDeployToCloud} disabled={cloudDeployBusy || baseProbeLoading}>
-                <Rocket className={cn('h-3.5 w-3.5', cloudDeployBusy && 'animate-pulse')} />
-                {cloudDeployBusy ? 'Opening folder…' : `Deploy to ${selectedCluster?.name ?? 'cloud'}`}
+              <p className="text-xs text-[var(--color-muted-foreground)]">
+                <span className="font-medium text-[var(--color-foreground)]">{selectedCluster?.name}</span> runs on an
+                AWS base, which deploys an uploaded bundle rather than a container image. The desktop builds container
+                images (for Kubernetes / local-runtime targets), so deploy to this cloud with the CLI — it builds and
+                uploads the bundle for you. Run this from your app folder:
+              </p>
+              <CommandSnippet command="appliance deploy" />
+            </>
+          ) : aws.pending ? (
+            // Pre-fire confirm: a cloud deploy ships to real infra, so review
+            // project + folder + cluster and pick the target environment
+            // before it fires. Non-prod is first-class here, not CLI-only.
+            <div className="space-y-3">
+              <p className="text-xs font-medium text-[var(--color-foreground)]">Review this deploy</p>
+              <dl className="grid grid-cols-[5.5rem_1fr] gap-y-1 rounded-md border border-[var(--color-border)] p-2.5 text-sm">
+                <Row label="Project" value={<code className="font-mono text-xs">{aws.pending.project}</code>} />
+                <Row
+                  label="Folder"
+                  value={<code className="block truncate font-mono text-xs">{aws.pending.path}</code>}
+                />
+                <Row
+                  label="Cluster"
+                  value={<span className="text-xs">{selectedCluster?.name ?? 'selected cloud'}</span>}
+                />
+              </dl>
+              <label className="block space-y-1">
+                <span className="block text-xs font-medium">Environment</span>
+                <input
+                  type="text"
+                  value={aws.env}
+                  list="aws-known-envs"
+                  onChange={(e) => aws.setEnv(e.target.value)}
+                  placeholder="production"
+                  className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono text-xs"
+                />
+                {aws.knownEnvs.length > 0 ? (
+                  <datalist id="aws-known-envs">
+                    {aws.knownEnvs.map((e) => (
+                      <option key={e} value={e} />
+                    ))}
+                  </datalist>
+                ) : null}
+                <span className="block text-[10px] text-[var(--color-muted-foreground)]">
+                  Created if it doesn&rsquo;t exist. Deploys to{' '}
+                  <code className="font-mono">
+                    {aws.pending.project}/{aws.env.trim() || 'production'}
+                  </code>
+                  .
+                </span>
+              </label>
+              {aws.knownEnvs.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {aws.knownEnvs.map((e) => (
+                    <button
+                      key={e}
+                      type="button"
+                      onClick={() => aws.setEnv(e)}
+                      className={cn(
+                        'rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-[11px]',
+                        aws.env.trim() === e
+                          ? 'bg-[var(--color-accent)] text-[var(--color-accent-foreground)]'
+                          : 'hover:text-[var(--color-accent)]'
+                      )}
+                    >
+                      {e}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={aws.onConfirm} disabled={!aws.env.trim()}>
+                  <Rocket className="h-3.5 w-3.5" />
+                  Deploy to {selectedCluster?.name ?? 'cloud'} / {aws.env.trim() || 'production'}
+                </Button>
+                <Button size="sm" variant="outline" onClick={aws.onCancel}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            // Initial: one click opens the folder picker, then the confirm.
+            <>
+              <p className="text-xs text-[var(--color-muted-foreground)]">
+                <span className="font-medium text-[var(--color-foreground)]">{selectedCluster?.name}</span> runs on an
+                AWS base, which deploys an uploaded bundle rather than a container image. Pick your app folder — the
+                bundled CLI builds and uploads the bundle for you.
+              </p>
+              <Button size="sm" onClick={aws.onPickFolder} disabled={aws.busy || baseProbeLoading}>
+                <Rocket className={cn('h-3.5 w-3.5', aws.busy && 'animate-pulse')} />
+                {aws.busy ? 'Opening folder…' : `Deploy to ${selectedCluster?.name ?? 'cloud'}`}
               </Button>
               <p className="text-[10px] text-[var(--color-muted-foreground)]">
                 Prefer the terminal? Run <code className="font-mono">appliance deploy</code> from your app folder.
               </p>
             </>
-          ) : (
-            <CommandSnippet command="appliance deploy" />
           )}
         </div>
       ) : null}
@@ -814,7 +963,7 @@ function TargetStep({
           ) : targetIsAwsBase ? (
             <>
               Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> deploys{' '}
-              {canShellDeploy ? 'with the button above' : 'via the CLI (see above)'}.
+              {aws.canShell ? 'with the button above' : 'via the CLI (see above)'}.
             </>
           ) : readyToDeploy ? (
             <>
