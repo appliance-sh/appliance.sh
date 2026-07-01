@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ApiKeyService } from './api-key.service';
+import { DEFAULT_TENANT, runWithTenant } from './tenant-context';
 
 const mockStore = new Map<string, string>();
 
@@ -110,5 +111,36 @@ describe('ApiKeyService', () => {
   it('rotate returns null for an unknown key id', async () => {
     const result = await service.rotate('apikey_unknown');
     expect(result).toBeNull();
+  });
+
+  describe('principal binding (Seam #1: server-derived, immutable)', () => {
+    it('stamps the default tenant when minted with no ambient principal', async () => {
+      const created = await service.create('cli');
+      const stored = await service.getByKeyId(created.id);
+      expect(stored!.tenantId).toBe(DEFAULT_TENANT);
+    });
+
+    it('binds the ambient (server-derived) tenant at mint time', async () => {
+      const created = await runWithTenant('acme', () => service.create('cli'));
+      const stored = await service.getByKeyId(created.id);
+      expect(stored!.tenantId).toBe('acme');
+    });
+
+    it('rotation inherits the prior key principal (immutable across rotation)', async () => {
+      const created = await runWithTenant('acme', () => service.create('cli'));
+      // Rotate from a DIFFERENT ambient context to prove the tenant is
+      // inherited from the stored key, not re-derived from the caller.
+      const rotated = await runWithTenant('globex', () => service.rotate(created.id));
+      const stored = await service.getByKeyId(rotated!.id);
+      expect(stored!.tenantId).toBe('acme');
+    });
+
+    it('existsForTenant is principal-scoped, unlike the server-bootstrap gate', async () => {
+      await runWithTenant('acme', () => service.create('cli'));
+      expect(await service.existsForTenant('acme')).toBe(true);
+      expect(await service.existsForTenant('globex')).toBe(false);
+      // The server-bootstrap gate is a global "any key" check.
+      expect(await service.exists()).toBe(true);
+    });
   });
 });

@@ -4,6 +4,8 @@ declare module 'express-serve-static-core' {
   interface Request {
     requestId?: string;
     apiKeyId?: string;
+    /** Server-derived owning principal (tenant) for the request. */
+    tenantId?: string;
     rawBody?: Buffer;
   }
 }

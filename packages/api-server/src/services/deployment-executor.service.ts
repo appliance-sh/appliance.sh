@@ -17,6 +17,7 @@ import {
 import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
 import { buildService, type ResolvedBuild } from './build.service';
+import { getCurrentTenant, runWithTenant, DEFAULT_TENANT } from './tenant-context';
 import { logger } from '../logger';
 
 // Project + env name pair that triggers the dogfood role override.
@@ -56,6 +57,13 @@ export const workerEventSchema = z.object({
   // Refreshing; absent for Deploy/Destroy actions which compute
   // their own terminal env status.
   priorEnvStatus: z.nativeEnum(EnvironmentStatus).optional(),
+  // Owning principal (tenant), captured SERVER-SIDE at dispatch from the
+  // caller's ambient context so the background/inline execution path —
+  // which runs OUTSIDE the request's async context — re-establishes the
+  // same tenant scope for its storage + build-artifact access. On the
+  // HTTP worker path the re-signed request's own auth resolves the tenant
+  // from the key, which is authoritative and takes precedence.
+  tenantId: z.string().optional(),
 });
 
 export type WorkerEvent = z.infer<typeof workerEventSchema>;
@@ -63,8 +71,20 @@ export type WorkerEvent = z.infer<typeof workerEventSchema>;
 /**
  * Execute a deployment job: resolve build, run Pulumi, update status.
  * Idempotent: skips work if the deployment is not in Pending state.
+ *
+ * Re-establishes the tenant scope before doing any storage or
+ * build-artifact work: the inline dispatch path runs in a detached
+ * async context that has lost the request's ambient tenant, so we
+ * restore it from the (server-captured) event. On the HTTP worker path
+ * the re-signed request's auth has already set the ambient tenant from
+ * the key — that is authoritative, so it wins over the event value.
  */
 export async function executeDeployment(event: WorkerEvent): Promise<void> {
+  const tenantId = getCurrentTenant() ?? event.tenantId ?? DEFAULT_TENANT;
+  return runWithTenant(tenantId, () => executeDeploymentInTenant(event));
+}
+
+async function executeDeploymentInTenant(event: WorkerEvent): Promise<void> {
   const { deploymentId, input, metadata, priorEnvStatus } = event;
   const storage = getStorageService();
 
