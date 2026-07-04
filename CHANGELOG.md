@@ -1,3 +1,13 @@
+## 1.51.2 (2026-07-04)
+
+### Bug Fixes
+
+- **build:** build the CLI + workspace deps before the desktop bundles them ([75761fe](https://github.com/appliance-sh/appliance.sh/commit/75761fe))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.51.1 (2026-07-04)
 
 ### Bug Fixes
