@@ -186,6 +186,22 @@ old "security fork", not (a)).
 Both surfaces still share **one** `profiles.json` for metadata + cluster
 discovery, so desktop and CLI see the same set of clusters everywhere.
 
+**Forgetting a cluster (distinct from teardown).** Dropping a cluster from that
+shared set is a pure local-registry op — the inverse of _registering_ it, not of
+_bootstrapping_ it — and never touches any infrastructure. On the CLI it's
+`appliance cluster rm <name>` (the `appliance cluster` group is the user-facing
+view of the profile store, framed as clusters to match the desktop; `appliance
+profile` remains the lower-level alias). It removes the profile via
+`removeProfile` (which re-points `activeProfile` to a surviving cluster) and, on
+macOS, the desktop mirror's Keychain entry ages out on the next reconcile. For a
+local microVM cluster, `--delete-vm` additionally removes the backing VM + its
+state (sharing the `deleteVmAndProfile` helper `appliance vm delete` uses); the
+default leaves the VM on disk. On the desktop the same forget is the per-row
+**Remove** action on a connected cluster (`host.removeCluster`, a non-destructive
+confirm), visually distinct from the red **Destroy** panel. Destroying the actual
+cloud infrastructure stays `appliance teardown` / the Destroy panel (`pulumi
+destroy`), never `cluster rm`.
+
 ### Implementation
 
 **CLI — read (`packages/cli/src/utils/keychain.ts`, wired in

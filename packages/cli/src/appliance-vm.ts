@@ -5,8 +5,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ensureHelperBinOnPath, DEFAULT_LOCAL_NAMESPACE } from '@appliance.sh/helper';
-import { removeProfile } from './utils/profile-store.js';
-import { DEFAULT_VM_NAME, profileForVm, vmDir, vmBinary, runVm, runUp } from './utils/microvm-up.js';
+import {
+  DEFAULT_VM_NAME,
+  profileForVm,
+  vmDir,
+  vmBinary,
+  runVm,
+  runUp,
+  deleteVmAndProfile,
+} from './utils/microvm-up.js';
 
 // `appliance vm` — the microVM runtime engine (appliance-vm), the sole
 // local runtime now that bare k3d has been removed. Workloads run inside
@@ -92,27 +99,13 @@ for (const [cmd, desc] of [
     });
 }
 
-// `delete`/`prune` are not plain passthroughs. The Rust engine removes
-// the VM and its on-disk state, but the credential profile that `vm up`
-// minted (`microvm` for the default VM, `microvm-<name>` otherwise)
-// lives in the CLI profile store — which the engine knows nothing about.
-// Without pruning it, a deleted VM leaves an orphan cluster behind in
-// both the CLI and the desktop (both read ~/.appliance/profiles.json).
-
-/** Delete a microVM via the engine, then prune its CLI credential
- *  profile. The profile is only removed once the engine confirms the VM
- *  is gone (exit 0), so a failed delete never strips a usable profile.
- *  Returns the engine's exit code. */
-function deleteVmAndProfile(name: string): number {
-  const code = runVm(['delete', name]);
-  if (code === 0) {
-    const profile = profileForVm(name);
-    if (removeProfile(profile)) {
-      console.log(chalk.dim(`removed credential profile '${profile}'`));
-    }
-  }
-  return code;
-}
+// `delete`/`prune` are not plain passthroughs: the Rust engine removes
+// the VM and its on-disk state, but the credential profile `vm up`
+// minted lives in the CLI profile store, which the engine knows nothing
+// about. `deleteVmAndProfile` (utils/microvm-up) removes both so a
+// deleted VM never leaves an orphan cluster behind in the CLI or the
+// desktop (both read ~/.appliance/profiles.json). `appliance cluster rm
+// --delete-vm` shares the same helper.
 
 program
   .command('delete')

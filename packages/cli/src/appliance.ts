@@ -50,6 +50,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'builds the appliance in the current working directory',
     load: () => import('./appliance-build.js'),
   },
+  cluster: {
+    description: 'list, switch, and forget clusters (shared with the desktop app)',
+    load: () => import('./appliance-cluster.js'),
+  },
   configure: {
     description: 'configures the appliance in the current working directory',
     load: () => import('./appliance-configure.js'),
@@ -114,7 +118,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-open.js'),
   },
   profile: {
-    description: 'manage credential profiles (shared with the desktop app)',
+    description: 'manage credential profiles (the lower-level store behind `appliance cluster`)',
     load: () => import('./appliance-profile.js'),
   },
   teardown: {

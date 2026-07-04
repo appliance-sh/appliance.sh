@@ -1,9 +1,11 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, ChevronRight, Plus, Server } from 'lucide-react';
+import { Check, ChevronRight, Plus, Server, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
+import { useConfirm } from '@/components/ui/confirm-dialog';
+import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
@@ -117,6 +119,7 @@ function ClusterRow({ cluster, isSelected }: { cluster: Cluster; isSelected: boo
             Switch
           </Button>
         ) : null}
+        <RemoveClusterButton cluster={cluster} />
         <Button asChild variant="ghost" size="icon" aria-label={`Manage ${cluster.name}`}>
           <Link to={`/clusters/${cluster.id}`}>
             <ChevronRight className="h-4 w-4" />
@@ -124,6 +127,56 @@ function ClusterRow({ cluster, isSelected }: { cluster: Cluster; isSelected: boo
         </Button>
       </div>
     </li>
+  );
+}
+
+// Forget a connected cluster — drop its saved URL + key from this device.
+// Deliberately NOT a teardown: no infrastructure is touched, so this is a
+// low-key ghost action (an `X`, not the red Trash2 the Destroy panel uses)
+// with a non-destructive confirm. Available on any connected cluster row
+// regardless of selection, since forgetting is a pure local-registry op
+// (the host's removeCluster re-points selection to a surviving cluster).
+// Local runtimes aren't offered this — they auto-register with their VM,
+// so "remove" for those means deleting the VM from its detail page.
+function RemoveClusterButton({ cluster }: { cluster: Cluster }) {
+  const host = useHost();
+  const queryClient = useQueryClient();
+  const confirm = useConfirm();
+  const { toast } = useToast();
+  const removeMutation = useMutation({
+    mutationFn: async () => host.removeCluster(cluster.id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      toast(`Removed cluster "${cluster.name}"`);
+    },
+    onError: (err) => toast(err instanceof Error ? err.message : String(err), { variant: 'error' }),
+  });
+
+  const onClick = async () => {
+    const ok = await confirm({
+      title: `Remove cluster "${cluster.name}"?`,
+      description:
+        'Forgets this cluster’s saved URL and API key on this device. It does NOT destroy any cloud ' +
+        'infrastructure — you can re-add it later from Add cluster. To tear down the AWS resources instead, open the ' +
+        'cluster and use Destroy.',
+      confirmLabel: 'Remove cluster',
+      destructive: false,
+    });
+    if (!ok) return;
+    removeMutation.mutate();
+  };
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      aria-label={`Remove ${cluster.name} from this device`}
+      title="Remove from this device"
+      onClick={onClick}
+      disabled={removeMutation.isPending}
+    >
+      <X className="h-4 w-4" />
+    </Button>
   );
 }
 

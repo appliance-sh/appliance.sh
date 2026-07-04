@@ -12,7 +12,7 @@ import {
 import type { ProgressEvent } from '@appliance.sh/helper';
 import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './credentials.js';
-import { readProfiles } from './profile-store.js';
+import { readProfiles, removeProfile } from './profile-store.js';
 
 // Shared microVM bring-up core.
 //
@@ -114,6 +114,30 @@ export function runVm(args: string[]): number {
   const bin = vmBinary();
   const r = spawnSync(bin, args, { stdio: 'inherit' });
   return r.status ?? 1;
+}
+
+// Deleting a microVM is not a plain engine passthrough. The Rust engine
+// removes the VM and its on-disk state, but the credential profile that
+// `vm up` minted (`microvm` for the default VM, `microvm-<name>`
+// otherwise) lives in the CLI profile store — which the engine knows
+// nothing about. Without pruning it, a deleted VM leaves an orphan
+// cluster behind in both the CLI and the desktop (both read
+// ~/.appliance/profiles.json). So both `appliance vm delete` and
+// `appliance cluster rm --delete-vm` route through this one helper.
+
+/** Delete a microVM via the engine, then prune its CLI credential
+ *  profile. The profile is only removed once the engine confirms the VM
+ *  is gone (exit 0), so a failed delete never strips a usable profile.
+ *  Returns the engine's exit code. */
+export function deleteVmAndProfile(name: string): number {
+  const code = runVm(['delete', name]);
+  if (code === 0) {
+    const profile = profileForVm(name);
+    if (removeProfile(profile)) {
+      console.log(chalk.dim(`removed credential profile '${profile}'`));
+    }
+  }
+  return code;
 }
 
 // Module-private: only this file's bring-up steps render progress events.
