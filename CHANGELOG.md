@@ -1,3 +1,17 @@
+## 1.51.0 (2026-07-04)
+
+### Features
+
+- **cli:** forget clusters without teardown ([df0a92c](https://github.com/appliance-sh/appliance.sh/commit/df0a92c))
+
+### Bug Fixes
+
+- **infra:** update tsbuildinfo location ([82232a4](https://github.com/appliance-sh/appliance.sh/commit/82232a4))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.50.0 (2026-07-01)
 
 ### Features
