@@ -76,18 +76,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build the workspace deps the desktop bundle imports at compile
-      # time, topologically. Same order as release-cli-binaries.yml; the
-      # desktop additionally needs @appliance.sh/app (the React console)
-      # built so the Tauri frontendDist has something to bundle.
+      # Build the desktop's compile-time workspace deps from the nx
+      # dependency graph: the CLI (bundled as the sidecar binary) and the
+      # @appliance.sh/app React frontend (the Tauri frontendDist), plus
+      # their transitive deps (sdk → infra → bootstrap → helper), all in
+      # topological order. nx derives the order from the graph — no
+      # hand-maintained list shared with release-cli-binaries.yml to drift.
       - name: Build desktop prerequisites
-        run: |
-          pnpm --filter @appliance.sh/sdk run build
-          pnpm --filter @appliance.sh/infra run build
-          pnpm --filter @appliance.sh/bootstrap run build
-          pnpm --filter @appliance.sh/helper run build
-          pnpm --filter @appliance.sh/cli run build
-          pnpm --filter @appliance.sh/app run build
+        run: pnpm exec nx run-many -t build -p @appliance.sh/cli @appliance.sh/app
 
       # nx-release bumps the package.json versions but does NOT touch the
       # Rust-side version sources (tauri.conf.json, Cargo.toml). The

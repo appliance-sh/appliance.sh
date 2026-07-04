@@ -46,20 +46,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build prerequisites in topological order so each package's
-      # workspace imports resolve at compile time. Bootstrap depends
-      # on infra (Pulumi types live there), so infra must build
-      # before bootstrap even though the CLI doesn't import infra
-      # directly. The `...` ellipsis filter would pull these in
-      # automatically via the dep graph, but the explicit list is
-      # easier to grep when something breaks.
+      # Build the CLI and its workspace deps in topological order straight
+      # from the nx dependency graph (sdk → infra → bootstrap → helper →
+      # cli) so every workspace import resolves to fresh dist at compile
+      # time. nx is the single source of truth for the order — no
+      # hand-maintained list to drift out of sync with the graph. nx prints
+      # each task it runs, so a break is still easy to trace.
       - name: Build CLI prerequisites
-        run: |
-          pnpm --filter @appliance.sh/sdk run build
-          pnpm --filter @appliance.sh/infra run build
-          pnpm --filter @appliance.sh/bootstrap run build
-          pnpm --filter @appliance.sh/helper run build
-          pnpm --filter @appliance.sh/cli run build
+        run: pnpm exec nx build @appliance.sh/cli
 
       # `bun build --compile --target=...` bundles each binary with
       # its matching Bun runtime, so we can cross-compile every

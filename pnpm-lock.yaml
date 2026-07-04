@@ -355,6 +355,9 @@ importers:
         specifier: ^19.0.0
         version: 19.2.5(react@19.2.5)
     devDependencies:
+      '@appliance.sh/cli':
+        specifier: workspace:*
+        version: link:../cli
       '@tauri-apps/cli':
         specifier: ^2.1.0
         version: 2.10.1
