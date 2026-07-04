@@ -1,3 +1,13 @@
+## 1.51.1 (2026-07-04)
+
+### Bug Fixes
+
+- **cli:** auto-pull published api-server image when local build is wrong arch ([2fc35e1](https://github.com/appliance-sh/appliance.sh/commit/2fc35e1))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.51.0 (2026-07-04)
 
 ### Features
