@@ -315,13 +315,23 @@ async function deliverApiServerImage(imageOverride: string | undefined, targetRe
     .map((ref) => ({ ref, arch: inspectArch(ref) }))
     .filter((c): c is { ref: string; arch: string } => c.arch !== null);
 
-  // Nothing local and no explicit --image: pull the pinned published
-  // image so a fresh machine boots a VM without a manual build or
-  // `docker tag`. Mirrors the bootstrap default (phases/phase2.ts) — the
-  // same versioned ghcr ref every surface uses.
-  if (present.length === 0 && !imageOverride) {
+  // Auto-pull the pinned published image whenever nothing local can serve
+  // the VM's architecture — either nothing is present at all, or every
+  // local build is the wrong arch. The amd64 Lambda default (what
+  // docker-prep.sh + `docker build` produce by default) is the common
+  // culprit on Apple Silicon: as a present-but-wrong-arch candidate it
+  // used to mask this fallback and hard-fail the bring-up. Gating on the
+  // arch instead of mere presence lets `vm up` self-heal. Mirrors the
+  // bootstrap default (phases/phase2.ts) — the same versioned ghcr ref
+  // every surface uses. Skipped when the caller pinned --image: honor
+  // their exact ref and let the arch check below explain any mismatch
+  // rather than silently substituting a different image.
+  const hasHostArch = present.some((c) => c.arch === VM_HOST_ARCH);
+  if (!hasHostArch && !imageOverride) {
     const pulled = pullPublishedApiServer();
-    if (pulled) present = [pulled];
+    // Prepend so the freshly-pulled host-arch image is tried first; keep
+    // any wrong-arch locals for the diagnostic if the pull also fails.
+    if (pulled) present = [pulled, ...present];
   }
 
   if (present.length === 0) throw new Error(missingImageMessage(imageOverride));
@@ -375,7 +385,7 @@ const PUBLISHED_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.re
  *  caller then surfaces the build/--image guidance. */
 function pullPublishedApiServer(): { ref: string; arch: string } | null {
   const ref = PUBLISHED_API_SERVER_IMAGE;
-  console.log(chalk.cyan(`» no local api-server image — pulling ${ref}`));
+  console.log(chalk.cyan(`» no local api-server image for linux/${VM_HOST_ARCH} — pulling ${ref}`));
   const pull = spawnSync('docker', ['pull', '--platform', `linux/${VM_HOST_ARCH}`, ref], { stdio: 'inherit' });
   if (pull.status !== 0) return null;
   const arch = inspectArch(ref);
