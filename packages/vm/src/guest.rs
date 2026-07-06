@@ -79,14 +79,43 @@ fn assets_dir() -> PathBuf {
     crate::store::vm_root().join("images").join("guest-assets")
 }
 
+/// Download (once) + verify the pinned k3s binary for this arch. Shared
+/// by the FAT boot-media assembly (vz/kvm) and the WSL2 backend (which
+/// copies it into the imported distro over drvfs and re-verifies it
+/// guest-side). Returns the on-disk path and the committed sha256.
+/// Sasha #3: hash-pinned and verified before use, every boot — a
+/// cached/tampered artifact is rejected, not silently embedded.
+pub fn ensure_k3s() -> Result<(PathBuf, &'static str)> {
+    let (_, k3s_asset) = arch_tuple()?;
+    let k3s_sha = match std::env::consts::ARCH {
+        "aarch64" => K3S_SHA256_ARM64,
+        "x86_64" => K3S_SHA256_AMD64,
+        other => bail!("unsupported host architecture: {other}"),
+    };
+    let dir = assets_dir();
+    fs::create_dir_all(&dir)?;
+    let k3s = dir.join(format!("k3s-{K3S_VERSION}"));
+    crate::images::download_and_verify(
+        &format!(
+            "https://github.com/k3s-io/k3s/releases/download/{}/{}",
+            K3S_VERSION.replace('+', "%2B"),
+            k3s_asset
+        ),
+        &k3s,
+        k3s_sha,
+    )?;
+    Ok((k3s, k3s_sha))
+}
+
 /// Download (once) + verify the module loop + k3s binary the boot media
 /// embeds. Sasha #3: both are hash-pinned and verified before use, every
 /// boot — a cached/tampered artifact is rejected, not silently embedded.
+#[cfg_attr(windows, allow(dead_code))]
 fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
-    let (alpine_arch, k3s_asset) = arch_tuple()?;
-    let (modloop_sha, k3s_sha) = match std::env::consts::ARCH {
-        "aarch64" => (MODLOOP_SHA256_AARCH64, K3S_SHA256_ARM64),
-        "x86_64" => (MODLOOP_SHA256_X86_64, K3S_SHA256_AMD64),
+    let (alpine_arch, _) = arch_tuple()?;
+    let modloop_sha = match std::env::consts::ARCH {
+        "aarch64" => MODLOOP_SHA256_AARCH64,
+        "x86_64" => MODLOOP_SHA256_X86_64,
         other => bail!("unsupported host architecture: {other}"),
     };
     let dir = assets_dir();
@@ -101,16 +130,7 @@ fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
         modloop_sha,
     )?;
 
-    let k3s = dir.join(format!("k3s-{K3S_VERSION}"));
-    crate::images::download_and_verify(
-        &format!(
-            "https://github.com/k3s-io/k3s/releases/download/{}/{}",
-            K3S_VERSION.replace('+', "%2B"),
-            k3s_asset
-        ),
-        &k3s,
-        k3s_sha,
-    )?;
+    let (k3s, _) = ensure_k3s()?;
 
     Ok((modloop, k3s))
 }
@@ -186,14 +206,17 @@ __K3S_PROVISION__
 
 /// The k3s control-plane region of `APPLIANCE_START`, substituted for
 /// the `__K3S_PROVISION__` marker on a normal (non-agent-only) VM:
-/// byte-for-byte the original inline block — the k3s binary copy,
-/// `registries.yaml`, the in-VM registry manifest, `k3s server`, and the
-/// kubeconfig handoff. Agent-only VMs swap in `AGENT_HANDOFF` instead.
+/// byte-for-byte the original inline block — the k3s binary copy
+/// (`K3S_MEDIA_COPY`), then `K3S_COMMON` (`registries.yaml`, the in-VM
+/// registry manifest, `k3s server`, the kubeconfig handoff). Agent-only
+/// VMs swap in `AGENT_HANDOFF` instead. Split in two so the WSL2
+/// backend can reuse the common core behind its own copy preamble
+/// (there is no FAT boot media inside a WSL distro).
 ///
 /// Carries nested `__REGISTRY_HOST_PORT__` / `__REGISTRY_NODEPORT__` /
 /// `__KUBECONFIG_PORT__` markers, so it MUST be injected before those
 /// port markers are substituted (Quinn gap #1; see `build_apkovl`).
-const K3S_PROVISION: &str = r#"# --- k3s -------------------------------------------------------------
+const K3S_MEDIA_COPY: &str = r#"# --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
 # runs without noexec/permission concerns.
 MEDIA=$(dirname "$(find /media -maxdepth 2 -name k3s 2>/dev/null | head -1)")
@@ -203,7 +226,13 @@ if [ -z "$MEDIA" ]; then
 fi
 cp "$MEDIA/k3s" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
+"#;
 
+/// The backend-neutral half of the k3s provisioning: assumes
+/// `/usr/local/bin/k3s` is in place and `$PERSIST` is mounted; wires the
+/// registry mirror + manifest, launches `k3s server`, and serves the
+/// kubeconfig handoff. Reused verbatim by the WSL2 backend.
+pub(crate) const K3S_COMMON: &str = r#"
 mkdir -p "$PERSIST/k3s" /etc/rancher/k3s
 
 # containerd pull-through: image refs pushed from the host as
@@ -362,7 +391,7 @@ mkdir -p /srv/handoff
 /// the real `/usr/bin/docker` on PATH — but is only ever written on a
 /// no-docker agent boot (the marker is empty when `--docker` is set), so
 /// it never shadows a real engine.
-const AGENT_DOCKER_STUB: &str = r#"# docker not provisioned in this agent sandbox: fail honestly instead of
+pub(crate) const AGENT_DOCKER_STUB: &str = r#"# docker not provisioned in this agent sandbox: fail honestly instead of
 # a silent command-not-found. Skipped (marker empty) on a --docker VM.
 mkdir -p /usr/local/bin
 cat > /usr/local/bin/docker <<'DOCKERSTUB'
@@ -393,7 +422,7 @@ chmod +x /usr/local/bin/docker"#;
 /// image's `bin` (agent-only VMs, via `__AGENT_BIN_PATH__`) so the baked,
 /// read-only CLIs win and an agent can't shadow them, then the npm prefix
 /// `bin` for any self-healed installs.
-const APP_USER_PROVISION: &str = r#"
+pub(crate) const APP_USER_PROVISION: &str = r#"
 echo "appliance-user: provisioning the non-root appliance user"
 # uid/gid are PINNED (host uid/gid on --mount VMs, 1000 otherwise) so
 # /persist ownership stays stable across the diskless rebuild each boot.
@@ -451,6 +480,21 @@ export PATH="__AGENT_BIN_PATH__/persist/npm-global/bin:$PATH"
 PROFILE
 "#;
 
+/// The host user's uid/gid. Unix: the real ids, so a shared workspace
+/// keeps host-side ownership writable. Windows: there is no host uid to
+/// mirror — the WSL2 backend's drvfs automount does its own ownership
+/// mapping — so the conventional 1000/1000 is pinned.
+fn host_ids() -> (u32, u32) {
+    #[cfg(unix)]
+    unsafe {
+        (libc::getuid(), libc::getgid())
+    }
+    #[cfg(windows)]
+    {
+        (1000, 1000)
+    }
+}
+
 /// Resolve the `appliance` user's uid/gid for the guest. On a
 /// VirtioFS-mounted (`--mount`) VM the host folder is shared at the
 /// user's HOME (`/persist/workspace`) and presents **host-side
@@ -486,7 +530,7 @@ fn resolve_app_ids(mount: bool, host_uid: u32, host_gid: u32) -> (u32, u32) {
 ///     the background so it never delays k3s readiness (what `vm up`
 ///     waits on); a `.dev-ready` marker records completion for
 ///     `vm dev status`.
-const DEV_PROVISION: &str = r#"
+pub(crate) const DEV_PROVISION: &str = r#"
 echo "appliance-dev: provisioning development environment"
 # HOME is /persist/workspace now (consolidated; the appliance user's
 # passwd entry points there), so no separate /persist/home.
@@ -566,7 +610,7 @@ fi"#;
 /// (the host sits on the .1 of the vz NAT subnet) since the leased IP
 /// isn't known when the boot media is built. `__EGRESS_PORT__` is the
 /// per-VM egress proxy port, substituted from the spec at build time.
-const DOCKER_PROVISION: &str = r#"
+pub(crate) const DOCKER_PROVISION: &str = r#"
 echo "appliance-docker: provisioning in-guest Docker engine"
 mkdir -p /persist/docker /persist/apk-cache
 # Share the persistent apk cache (DEV_PROVISION also points it here; the
@@ -727,7 +771,7 @@ exec su -s "$__SH" -l appliance
 /// short escape-time so key passthrough feels raw, a large scrollback that
 /// survives detach/reattach, and `destroy-unattached off` so a session
 /// lives on while no client is attached — the whole point of reattach.
-const TMUX_CONF: &str = r#"set -g status off
+pub(crate) const TMUX_CONF: &str = r#"set -g status off
 set -g default-terminal "tmux-256color"
 set -g escape-time 10
 set -g history-limit 50000
@@ -805,8 +849,8 @@ fn build_apkovl(
     // The non-root appliance user is provisioned on every VM. uid/gid
     // are pinned here: the host user's own ids on a VirtioFS-mounted VM
     // (so the shared workspace stays writable), 1000 otherwise.
-    let (app_uid, app_gid) =
-        resolve_app_ids(mount, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let (host_uid, host_gid) = host_ids();
+    let (app_uid, app_gid) = resolve_app_ids(mount, host_uid, host_gid);
     let app_user_provision = APP_USER_PROVISION
         .replace("__APP_UID__", &app_uid.to_string())
         .replace("__APP_GID__", &app_gid.to_string());
@@ -824,7 +868,11 @@ fn build_apkovl(
             // an injected __KUBECONFIG_PORT__ as a literal.
             .replace(
                 "__K3S_PROVISION__",
-                if agent_only { AGENT_HANDOFF } else { K3S_PROVISION },
+                &if agent_only {
+                    AGENT_HANDOFF.to_string()
+                } else {
+                    format!("{K3S_MEDIA_COPY}{K3S_COMMON}")
+                },
             )
             .replace(
                 "__AGENT_DOCKER_STUB__",
@@ -1291,8 +1339,7 @@ mod tests {
         // except when the host is root, where the resolver falls back to
         // 1000 (asserted separately), so derive the expected ids the same
         // way and don't hard-code the live host's values.
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        let (host_uid, host_gid) = host_ids();
         let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
         let shared = build_apkovl(5052, None, true, true, false, 5053, false, "").unwrap();
         let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();

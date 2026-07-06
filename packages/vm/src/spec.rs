@@ -349,9 +349,18 @@ impl VmPaths {
     pub fn host_log(&self) -> PathBuf {
         self.dir.join("host.log")
     }
+    /// Cross-platform stop request: `appliance-vm stop` drops this file
+    /// and the resident host process's parking loop acts on it. On Unix
+    /// SIGTERM is the primary channel and this file is the fallback; on
+    /// Windows (no SIGTERM) it is the only one. Cleared on every boot.
+    pub fn stop_request(&self) -> PathBuf {
+        self.dir.join("stop.request")
+    }
     /// Per-VM Unix socket the resident host process serves: it bridges
     /// each connection to a fresh guest vsock shell. `appliance-vm
-    /// shell` connects here.
+    /// shell` connects here. Unix engines only — the Windows client
+    /// rides `wsl.exe` instead, so no relay socket exists there.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn shell_sock(&self) -> PathBuf {
         self.dir.join("shell.sock")
     }

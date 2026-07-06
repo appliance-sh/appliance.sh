@@ -1,22 +1,39 @@
-//! `appliance-vm shell` client: connects to a VM's per-VM Unix socket
-//! (served by the resident host process, bridged to a guest vsock PTY),
-//! puts the local terminal in raw mode, and relays bytes both ways —
-//! an interactive shell with no SSH and no dependency on k3s.
+//! `appliance-vm shell` client.
 //!
-//! The guest agent reads one leading `rows R cols C` line and applies it
-//! as the PTY size before exec'ing the login shell, so the shell starts
-//! at the caller's terminal size.
+//! Unix: connects to a VM's per-VM Unix socket (served by the resident
+//! host process, bridged to a guest vsock PTY), puts the local terminal
+//! in raw mode, and relays bytes both ways — an interactive shell with
+//! no SSH and no dependency on k3s. The guest agent reads one leading
+//! `rows R cols C` line and applies it as the PTY size before exec'ing
+//! the login shell, so the shell starts at the caller's terminal size.
+//!
+//! Windows: the WSL2 backend's guest *is* a WSL distro, and `wsl.exe`
+//! already provides a ConPTY-backed interactive channel into it — so
+//! the client drives `wsl.exe -d <distro>` directly (no relay socket,
+//! no raw-mode handling of our own). Sessions ride the same in-guest
+//! tmux sockets the vsock agent uses, so semantics match.
 
-use crate::spec::VmPaths;
-use anyhow::{anyhow, bail, Result};
-use std::fs::File;
+use anyhow::{bail, Result};
 use std::io::{Read, Write};
+
+#[cfg(unix)]
+use crate::spec::VmPaths;
+#[cfg(unix)]
+use anyhow::anyhow;
+#[cfg(windows)]
+use anyhow::Context;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 /// Connect to a VM's shell socket, or a clear error when the relay isn't
 /// up (VM down, or booted by a non-vsock engine).
+#[cfg(unix)]
 fn connect(name: &str) -> Result<UnixStream> {
     let sock = VmPaths::for_name(name).shell_sock();
     UnixStream::connect(&sock).map_err(|e| {
@@ -35,6 +52,7 @@ fn connect(name: &str) -> Result<UnixStream> {
 /// interactive-only addition, so it's silently dropped when a one-shot
 /// `command` is given (that path must stay the byte-for-byte sentinel
 /// shell). Returns the process exit code to propagate.
+#[cfg(unix)]
 pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option<&str>) -> Result<i32> {
     let mut stream = connect(name)?;
 
@@ -109,6 +127,7 @@ pub struct SessionInfo {
 /// real outcome over the status-less byte pipe: `KILL_MARK` when `tmux
 /// kill-session` actually removed a session (exit 0), the no-session
 /// marker otherwise. Kept in sync with `guest.rs`'s SHELL_AGENT.
+#[cfg(unix)]
 const KILL_MARK: &str = "__APPLIANCE_VM_KILLED__";
 
 /// List the VM's reattachable sessions. `root` enumerates the separate
@@ -118,6 +137,7 @@ const KILL_MARK: &str = "__APPLIANCE_VM_KILLED__";
 /// connection: send the `[root] list` verb, read the agent's
 /// `appliance-<id> <activity>` lines to EOF, parse them clean. No raw
 /// mode, no sentinel — the connection closing is the whole protocol.
+#[cfg(unix)]
 pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
     let mut stream = connect(name)?;
     let (rows, cols) = term_size();
@@ -136,6 +156,7 @@ pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
 /// `tmux kill-session` and echoes a marker keyed on its exit status, so
 /// killing a non-existent id reports honestly rather than a blanket
 /// success.
+#[cfg(unix)]
 pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
     validate_session_id(id)?;
     let mut stream = connect(name)?;
@@ -193,6 +214,10 @@ fn validate_session_id(id: &str) -> Result<()> {
 }
 
 /// Marker the one-shot command appends as `\n<RC_MARK><n>__END__\n`.
+/// (Unix relay only — on Windows `wsl.exe` propagates the guest exit
+/// code natively — but compiled everywhere so the parser tests run on
+/// every platform.)
+#[cfg_attr(windows, allow(dead_code))]
 const RC_MARK: &str = "__APPLIANCE_VM_RC__";
 
 /// Stream guest output to `w`, watching for the exit-code sentinel. Lines
@@ -206,6 +231,7 @@ const RC_MARK: &str = "__APPLIANCE_VM_RC__";
 /// command's exit code could be reported — e.g. the `su -l appliance`
 /// drop failed — so return a non-zero code (255) rather than a silent
 /// success-with-empty-output that would mask such breakage.
+#[cfg_attr(windows, allow(dead_code))]
 fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -244,6 +270,7 @@ fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
 
 /// Parse `<RC_MARK><digits>__END__` out of a line, if the code is present
 /// and expanded (the echoed command keeps a literal `%d` and won't parse).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_rc(line: &str) -> Option<i32> {
     let start = line.find(RC_MARK)? + RC_MARK.len();
     let rest = &line[start..];
@@ -253,6 +280,7 @@ fn parse_rc(line: &str) -> Option<i32> {
 
 /// dup a std fd into an owned `File` (unbuffered, and closing it never
 /// touches the original descriptor).
+#[cfg(unix)]
 fn dup_file(fd: RawFd) -> Result<File> {
     let dup = unsafe { libc::dup(fd) };
     if dup < 0 {
@@ -261,12 +289,14 @@ fn dup_file(fd: RawFd) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(dup) })
 }
 
+#[cfg(unix)]
 fn is_tty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
 /// The controlling terminal's size, or a sane 24x80 fallback when stdout
 /// isn't a tty (piped/CI).
+#[cfg(unix)]
 fn term_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -279,11 +309,13 @@ fn term_size() -> (u16, u16) {
 
 /// RAII raw-mode guard for the local terminal: restores the saved
 /// termios on drop (clean exit, error, or panic).
+#[cfg(unix)]
 struct RawMode {
     fd: RawFd,
     orig: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enable() -> Result<Self> {
         let fd = libc::STDIN_FILENO;
@@ -300,10 +332,112 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
     }
+}
+
+/// Base `wsl.exe -d <distro> -u <user>` invocation for the named VM,
+/// with the same "is it even running?" gate the Unix client gets from
+/// its socket connect.
+#[cfg(windows)]
+fn wsl_command(name: &str, root: bool) -> Result<std::process::Command> {
+    if crate::store::read_live_pid(name).is_none() {
+        bail!(
+            "no shell channel for VM '{name}' — is it running? (appliance vm up)"
+        );
+    }
+    let distro = crate::backend::wsl::distro_name(name);
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-d", &distro, "-u", if root { "root" } else { "appliance" }]);
+    Ok(cmd)
+}
+
+/// The tmux socket for a privilege level — matches the vsock agent's
+/// `appliance` / `appliance-root` split so the two privilege levels
+/// never cross-attach, whichever client created the session.
+#[cfg(windows)]
+fn tmux_socket(root: bool) -> &'static str {
+    if root {
+        "appliance-root"
+    } else {
+        "appliance"
+    }
+}
+
+/// Windows client: `wsl.exe` IS the PTY channel (ConPTY + exit-code
+/// propagation for free), so the shell runs the same in-guest shapes
+/// the vsock agent would — a login shell as the `appliance` user, a
+/// one-shot `sh -lc`, or an attach-or-create tmux session.
+#[cfg(windows)]
+pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option<&str>) -> Result<i32> {
+    let mut cmd = wsl_command(name, root)?;
+    match (command, session) {
+        (Some(one_shot), _) => {
+            // One-shot: session is interactive-only (dropped, like the
+            // Unix client); wsl.exe returns the guest command's code.
+            cmd.args(["--cd", "~", "--", "sh", "-lc", one_shot]);
+        }
+        (None, Some(id)) => {
+            validate_session_id(id)?;
+            cmd.args([
+                "--cd", "~", "--",
+                "tmux", "-L", tmux_socket(root), "-f", "/etc/appliance/tmux.conf",
+                "new-session", "-A", "-s",
+            ]);
+            cmd.arg(format!("appliance-{id}"));
+        }
+        (None, None) => {
+            // Login shell: bash if the dev toolchain installed it, else sh.
+            cmd.args([
+                "--cd", "~", "--",
+                "sh", "-lc", "command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
+            ]);
+        }
+    }
+    let status = cmd.status().context("run wsl.exe")?;
+    Ok(status.code().unwrap_or(255))
+}
+
+/// Piped (non-interactive) wsl.exe call: never pop a console window —
+/// the desktop calls these with no console of its own.
+#[cfg(windows)]
+fn hide_console(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Windows session list: ask the in-guest tmux directly. A missing tmux
+/// server (no sessions yet) exits non-zero — that is an empty list, not
+/// an error; `parse_session_list` drops the noise either way.
+#[cfg(windows)]
+pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args([
+        "--",
+        "tmux", "-L", tmux_socket(root), "-f", "/etc/appliance/tmux.conf",
+        "list-sessions", "-F", "#{session_name} #{session_activity}",
+    ]);
+    let out = cmd.output().context("run wsl.exe")?;
+    Ok(parse_session_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Windows session kill: tmux's own exit status is the honest outcome
+/// (`kill-session` exits non-zero when the id doesn't exist), so no
+/// marker protocol is needed here.
+#[cfg(windows)]
+pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
+    validate_session_id(id)?;
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args(["--", "tmux", "-L", tmux_socket(root), "kill-session", "-t"]);
+    cmd.arg(format!("appliance-{id}"));
+    let out = cmd.output().context("run wsl.exe")?;
+    Ok(out.status.success())
 }
 
 #[cfg(test)]

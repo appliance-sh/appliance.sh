@@ -30,8 +30,18 @@ pub trait VmBackend {
 
     /// Host the VM in this process; return once the guest has stopped.
     /// Implementations install their own SIGTERM handling so `stop`
-    /// (signal to the pidfile's process) triggers a graceful shutdown.
+    /// (signal to the pidfile's process) triggers a graceful shutdown —
+    /// on Windows (no SIGTERM) the stop channel is the per-VM
+    /// `stop.request` file the parking loop polls.
     fn run_foreground(&self, spec: &VmSpec) -> Result<()>;
+
+    /// Tear down backend-owned state when a VM is deleted, beyond the
+    /// VM dir the store removes. Default: nothing (vz/kvm keep all
+    /// their state in the VM dir). The WSL2 backend unregisters the
+    /// imported distro, which deletes its VHDX.
+    fn destroy(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The platform's backend.

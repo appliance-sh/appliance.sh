@@ -2,10 +2,19 @@ mod backend;
 mod bringup;
 mod creds;
 mod egress;
+// guest/images/net/netstack carry the vz/kvm boot-media and
+// host-networking surfaces. They compile everywhere (their pure parts
+// are unit-tested on every platform, and the WSL backend reuses several
+// fragments), but only the macOS backend exercises all of them — so the
+// dead-code lint is scoped off on Windows and stays live on macOS.
+#[cfg_attr(windows, allow(dead_code))]
 mod guest;
+#[cfg_attr(windows, allow(dead_code))]
 mod images;
 mod mitm;
+#[cfg_attr(windows, allow(dead_code))]
 mod net;
+#[cfg_attr(windows, allow(dead_code))]
 mod netstack;
 mod shell;
 mod spec;
@@ -423,7 +432,7 @@ fn run() -> Result<()> {
             };
             store::save_spec(&spec)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
             println!(
                 "created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk{})",
                 if dev { ", dev environment" } else { "" }
@@ -440,7 +449,7 @@ fn run() -> Result<()> {
             }
             let spec = ensure_spec(&name)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
 
             // Re-exec ourselves detached to host the VM: the hypervisor
             // session lives inside a process, so something must stay
@@ -649,7 +658,7 @@ fn run() -> Result<()> {
             backend.availability()?;
             let spec = ensure_spec(&name)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
             store::write_pidfile(&name)?;
             // Start the egress proxy alongside the VM so the desktop's
             // outbound-traffic policy takes effect without a separate
@@ -669,12 +678,7 @@ fn run() -> Result<()> {
         Cmd::Stop { name } => {
             match store::read_live_pid(&name) {
                 Some(pid) => {
-                    // SIGTERM → the host process's signal handler asks the
-                    // hypervisor for a guest stop, then exits.
-                    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-                    if rc != 0 {
-                        bail!("failed to signal pid {pid}");
-                    }
+                    request_stop(&name, pid)?;
                     println!("stop requested for VM '{name}' (pid {pid})");
                 }
                 None => println!("VM '{name}' is not running"),
@@ -812,6 +816,9 @@ fn run() -> Result<()> {
             if let Some(pid) = store::read_live_pid(&name) {
                 bail!("VM '{name}' is running (pid {pid}) — stop it first");
             }
+            // Backend-owned state first (e.g. the WSL2 backend's registered
+            // distro), then the on-disk VM dir.
+            backend.destroy(&name)?;
             store::delete_vm_dir(&name)?;
             println!("deleted VM '{name}'");
             Ok(())
@@ -1078,6 +1085,39 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
     Ok(spec)
 }
 
+/// Ask a resident host process to stop its VM. Unix: SIGTERM — the
+/// host's signal handler requests a guest stop and exits. Windows has
+/// no SIGTERM, so drop the stop-request file the host's parking loop
+/// polls (the WSL backend clears it on every boot).
+#[cfg(unix)]
+fn request_stop(_name: &str, pid: i32) -> Result<()> {
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        bail!("failed to signal pid {pid}");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn request_stop(name: &str, _pid: i32) -> Result<()> {
+    let paths = VmPaths::for_name(name);
+    std::fs::write(paths.stop_request(), b"stop\n")
+        .with_context(|| format!("write {}", paths.stop_request().display()))?;
+    Ok(())
+}
+
+/// Pre-fetch the boot artifacts a backend needs before the VM can run.
+/// The vz/kvm backends boot a pinned kernel + initramfs pair; the WSL2
+/// backend imports a distro instead and fetches its own tarball inside
+/// `run_foreground`, so on Windows there is nothing to prefetch here.
+fn prefetch_boot_artifacts(spec: &VmSpec) -> Result<()> {
+    #[cfg(not(windows))]
+    images::ensure_image(&spec.image)?;
+    #[cfg(windows)]
+    let _ = spec;
+    Ok(())
+}
+
 /// Spawn the resident VM host process (this same binary, `run`),
 /// detached, with its output captured in the per-VM host.log — a
 /// silently discarded stderr turns every host-side failure (a proxy
@@ -1089,13 +1129,23 @@ fn spawn_host_process(name: &str) -> Result<std::process::Child> {
     let log = std::fs::File::create(paths.host_log()).context("create host.log")?;
     let log_err = log.try_clone()?;
     let exe = std::env::current_exe().context("resolve current executable")?;
-    Command::new(exe)
-        .args(["run", name])
+    let mut cmd = Command::new(exe);
+    cmd.args(["run", name])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(log_err))
-        .spawn()
-        .context("spawn VM host process")
+        .stderr(std::process::Stdio::from(log_err));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: the host must outlive the launching terminal
+        // (a console child dies with its console on Windows).
+        // CREATE_NEW_PROCESS_GROUP: Ctrl-C in that terminal never
+        // reaches it.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().context("spawn VM host process")
 }
 
 /// Last `n` lines of a log file, or a placeholder when unreadable.

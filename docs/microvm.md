@@ -77,10 +77,16 @@ devices and keep it running".
   unavailable with a clear message. There is no k3d fallback — Linux
   has no local runtime in the interim (use a BYO
   `appliance-base-kubernetes` cluster).
-- **Windows — WSL2.** WSL2 _is_ a managed utility VM; the backend
-  drives `wsl.exe` (import a purpose-built distro tarball, run k3s
+- **Windows — WSL2** _(implemented)_. WSL2 _is_ a managed utility VM;
+  the backend drives `wsl.exe` (import the hash-pinned Alpine
+  minirootfs as a per-VM distro, run the same provisioning + k3s
   inside it) rather than booting a kernel ourselves. Same guest
-  contract, different mechanics.
+  contract, different mechanics: the distro's VHDX is the persistence
+  (no data disk), `--mount` is a drvfs bind mount (no VirtioFS), the
+  shell rides `wsl.exe`'s ConPTY channel (no vsock), and stop is a
+  per-VM `stop.request` file (no SIGTERM) that terminates the distro.
+  The Netstack hard egress boundary stays vz-only; a WSL VM polices
+  egress cooperatively through the proxy, like a NAT VM.
 
 ### Guest
 
