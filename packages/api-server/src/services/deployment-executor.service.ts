@@ -366,6 +366,9 @@ async function executeLocalAction(
         imageUri,
         port,
         environment: env,
+        // Omitted → the service preserves the live Deployment's scale,
+        // so a bare redeploy doesn't reset a scaled environment to 1.
+        replicas: input.replicas,
       });
       return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }

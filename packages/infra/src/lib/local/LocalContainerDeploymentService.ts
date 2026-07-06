@@ -47,6 +47,9 @@ export interface LocalResolvedBuild {
   /** Container port to expose. Falls back to 8080 if unset. */
   port?: number;
   environment?: Record<string, string>;
+  /** Desired pod count. When unset, a redeploy preserves the live
+   *  Deployment's scale (first deploy: 1). */
+  replicas?: number;
 }
 
 export interface LocalDeploymentResult {
@@ -254,6 +257,10 @@ export class KubernetesDeploymentService {
     const nodePort = deterministicNodePort(stackName);
     const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
     const egress = await this.resolveEgress();
+    // No explicit replica count → keep the environment's current scale
+    // so a redeploy (or a manual `kubectl scale`) isn't silently reset
+    // to 1 by the re-rendered manifest.
+    const replicas = build.replicas ?? (await this.getDeploymentReplicas(stackName)) ?? 1;
     const manifest = renderManifest({
       name: stackName,
       namespace: this.cluster.namespace,
@@ -261,6 +268,7 @@ export class KubernetesDeploymentService {
       port: build.port ?? 8080,
       nodePort,
       env: build.environment ?? {},
+      replicas,
       metadata,
       hostname,
       ingressClassName: this.cluster.ingressClassName,
@@ -402,6 +410,19 @@ export class KubernetesDeploymentService {
     try {
       const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
       return dep.spec?.template?.spec?.containers?.[0]?.image ?? undefined;
+    } catch (err) {
+      if (isNotFoundError(err)) return undefined;
+      throw err;
+    }
+  }
+
+  /** The live Deployment's desired replica count, or undefined when the
+   *  stack has never been deployed. Lets a deploy without an explicit
+   *  `replicas` preserve the current scale instead of resetting it. */
+  async getDeploymentReplicas(stackName: string): Promise<number | undefined> {
+    try {
+      const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
+      return dep.spec?.replicas ?? undefined;
     } catch (err) {
       if (isNotFoundError(err)) return undefined;
       throw err;
@@ -926,6 +947,8 @@ export interface ManifestParams {
    *  deterministically per stack via deterministicNodePort(). */
   nodePort?: number;
   env: Record<string, string>;
+  /** Desired pod count. Defaults to 1 when omitted. */
+  replicas?: number;
   metadata: LocalDeploymentMetadata;
   /** Public hostname Traefik routes to this appliance via the
    *  generated Ingress. Typically `<stackName>.appliance.localhost`. */
@@ -1005,6 +1028,7 @@ export function deterministicNodePort(stackName: string): number {
 
 export function renderManifest(params: ManifestParams): string {
   const { name, namespace, image, port, nodePort, metadata, hostname, ingressClassName, egress } = params;
+  const replicas = params.replicas ?? 1;
   // Egress confinement overlays proxy/CA vars on the user env (egress
   // wins) and, when intercepting, mounts the CA the proxy signs with.
   const env: Record<string, string> = egress ? { ...params.env, ...egressEnv(egress) } : params.env;
@@ -1045,7 +1069,7 @@ metadata:
     appliance.sh/project-id: ${yamlString(metadata.projectId)}
     appliance.sh/environment-id: ${yamlString(metadata.environmentId)}
 spec:
-  replicas: 1
+  replicas: ${replicas}
   selector:
     matchLabels:
       app.kubernetes.io/name: ${yamlString(name)}

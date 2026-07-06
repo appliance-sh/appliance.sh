@@ -152,8 +152,11 @@ describe('adapterForType', () => {
 describe('autonomous result capture (A6)', () => {
   it('agentResultPaths puts host + guest results under .appliance/agent-results', () => {
     const p = agentResultPaths('/work/proj', 'agent-7f3c');
-    expect(p.hostJson).toBe(path.join('/work/proj', '.appliance', 'agent-results', 'agent-7f3c.json'));
-    expect(p.hostRc).toBe(path.join('/work/proj', '.appliance', 'agent-results', 'agent-7f3c.rc'));
+    // The impl resolves projectDir first (on Windows that adds the
+    // drive letter), so mirror that here rather than assuming POSIX.
+    const root = path.resolve('/work/proj');
+    expect(p.hostJson).toBe(path.join(root, '.appliance', 'agent-results', 'agent-7f3c.json'));
+    expect(p.hostRc).toBe(path.join(root, '.appliance', 'agent-results', 'agent-7f3c.rc'));
     expect(p.guestJson).toBe('/persist/workspace/.appliance/agent-results/agent-7f3c.json');
     expect(p.guestRc).toBe('/persist/workspace/.appliance/agent-results/agent-7f3c.rc');
     expect(p.guestDir).toBe('/persist/workspace/.appliance/agent-results');
@@ -250,10 +253,11 @@ describe('printKeyHelperCommand', () => {
     const cmd = printKeyHelperCommand('claude-code');
     // The pinned helper carries the agent type so it reads that provider's store.
     expect(cmd.endsWith("print-key --type 'claude-code'")).toBe(true);
-    // First quoted token is the absolute interpreter (execPath).
+    // First quoted token is the absolute interpreter (execPath) —
+    // absolute in the host platform's own path style.
     const firstQuoted = cmd.match(/^'([^']+)'/)?.[1];
     expect(firstQuoted).toBe(process.execPath);
-    expect(firstQuoted?.startsWith('/')).toBe(true);
+    expect(path.isAbsolute(firstQuoted ?? '')).toBe(true);
     // The node/interpreter path targets the runnable agent entry directly.
     expect(cmd).toContain('appliance-agent.js');
     // The type rides through per agent.

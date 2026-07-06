@@ -34,8 +34,8 @@ program
   .option('--attach-zone', 'attach an existing Route53 zone')
   .option(
     '--phases <phases>',
-    `comma-separated phases to run (${ALL_PHASES.join(',')}); phase 2/3 are not implemented yet`,
-    'phase1'
+    `comma-separated phases to run (${ALL_PHASES.join(',')} or 'all'); default runs the full installation`,
+    'all'
   )
   .option('--cache-dir <dir>', 'override ~/.appliance cache directory')
   .option(

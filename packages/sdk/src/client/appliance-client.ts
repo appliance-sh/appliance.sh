@@ -410,6 +410,12 @@ export class ApplianceClient {
       /** Lambda CPU architecture(s). Must match the image's platform for container builds. */
       architectures?: ('x86_64' | 'arm64')[];
       /**
+       * Pod count for Kubernetes bases (microVM local runtime + BYO
+       * clusters). Omitted → redeploys preserve the current scale.
+       * Ignored on Lambda bases.
+       */
+      replicas?: number;
+      /**
        * Reconcile Pulumi state with cloud reality before applying the
        * diff (sets `pulumi up --refresh`). Use when state may have
        * drifted from reality (e.g. partial prior deploy, manual edits).
@@ -430,6 +436,7 @@ export class ApplianceClient {
         ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}),
         ...(options?.storage !== undefined ? { storage: options.storage } : {}),
         ...(options?.architectures ? { architectures: options.architectures } : {}),
+        ...(options?.replicas !== undefined ? { replicas: options.replicas } : {}),
         ...(options?.refresh !== undefined ? { refresh: options.refresh } : {}),
       },
       600000

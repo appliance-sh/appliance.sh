@@ -56,6 +56,8 @@ appliance setup       # Link this folder to a project/environment (one-time)
 appliance deploy      # Build, upload, and deploy
 ```
 
+No server yet? `appliance init` is the local-first path: it boots the microVM runtime on your machine, saves the `microvm` profile, and hands you straight into the first deploy — no login or setup needed.
+
 `appliance setup` writes a `.appliance/link.json` recording which project and environment this folder targets. After linking, `appliance deploy` (with no arguments) builds the manifest, uploads it, and rolls the linked environment forward — re-deploys are a single command.
 
 If no `appliance.zip` exists, `appliance deploy` builds one automatically. On a first deploy without `setup`, you can still pass `appliance deploy <project> <environment>` explicitly; the CLI will create both as needed and record the link.
@@ -90,6 +92,7 @@ Optional fields available on all types:
 - `includes` / `excludes` — filter which files get deployed (framework type only)
 - `port` — port your app listens on (required for container, optional for framework)
 - `platform` — container platform (defaults to `linux/amd64`, container type only)
+- `replicas` — pod count on Kubernetes bases (the microVM local runtime and BYO clusters); ignored on Lambda bases. When omitted, redeploys keep the environment's current scale.
 
 ## CLI Commands
 
@@ -104,6 +107,10 @@ Optional fields available on all types:
 | `appliance unlink`                  | Remove the local project/environment link                                           |
 | `appliance deploy [project] [env]`  | Build (if needed), upload, and deploy; defaults to the linked target                |
 | `appliance destroy [project] [env]` | Destroy an environment; defaults to the linked target                               |
+| `appliance stack init`              | Scan subdirectories for manifests and write an `appliance.stack.json` collection    |
+| `appliance stack deploy [env]`      | Deploy every app in the stack, in file order, with a combined URL summary           |
+| `appliance stack status [env]`      | Show every stack app's environment status and URL                                   |
+| `appliance stack destroy [env]`     | Destroy every stack app's environment (one confirmation for the whole set)          |
 | `appliance open [project] [env]`    | Open the latest deployment URL in a browser                                         |
 | `appliance status [project]`        | Show application and environment status; defaults to the linked project             |
 | `appliance list`                    | List all applications and environments                                              |
@@ -129,7 +136,7 @@ APPLIANCE_PROFILE=microvm appliance deploy my-app dev
 
 The same API and SDK drive both targets — deploys against the local runtime build a container image and push it to the in-VM registry, while cloud deploys upload a build for server-side processing.
 
-> The microVM is the sole local runtime; the host-side k3d runtime (`appliance local`) has been removed. macOS / Virtualization.framework is supported today — Linux/Windows wait on the KVM/WSL2 backend.
+> The microVM is the sole local runtime; the host-side k3d runtime (`appliance local`) has been removed. macOS (Virtualization.framework) and Windows (WSL2) are supported today — Linux waits on the KVM backend.
 
 ### The link file
 
@@ -144,6 +151,42 @@ appliance unlink   # forget the link if you want to start fresh
 
 The link file is safe to commit — it contains no secrets, only names. Credentials live in `~/.appliance/profiles.json`.
 
+### Stacks — collections of appliances
+
+For local testing, demos, and prototyping you rarely want one app — you want the whole set. An `appliance.stack.json` names a collection of appliance directories so they deploy, report, and tear down as a unit:
+
+```json
+{
+  "manifest": "v1",
+  "type": "stack",
+  "name": "demos",
+  "environment": "dev",
+  "apps": [{ "dir": "web" }, { "dir": "api", "project": "api-server" }]
+}
+```
+
+```bash
+appliance stack init          # scaffold the file by scanning subdirectories
+appliance stack deploy        # deploy every member, print a combined URL table
+appliance stack status        # every member's status + URL at a glance
+appliance stack destroy       # tear the whole set down (asks once)
+```
+
+Each member still becomes an ordinary project + environment on the server, so the same stack file drives the local microVM **and** a cloud installation — `appliance stack deploy --profile <cloud-profile>` spins up an identical set in the cloud, and `appliance stack deploy demo2` clones the collection into a fresh environment. Environment precedence per app: CLI argument > per-app `environment` > stack `environment` > `dev`.
+
+### Coding agents in the sandbox
+
+Appliance can also run coding agents (Claude Code, GitHub Copilot, OpenAI Codex) inside an isolated sandbox microVM with your working tree mounted — credentials stay host-side and are injected per-request by the egress broker, never written into the VM:
+
+```bash
+appliance agent login                                  # one-time, per provider (--type copilot|codex)
+appliance agent start                                  # boots the sandbox VM, launches the agent on cwd
+appliance agent start --autonomous --task "…" --wait   # headless run to completion
+appliance agent list / attach <id> / stop <id>         # session lifecycle
+```
+
+Note: `appliance agent` uses the shared sandbox VM (`appliance-sbx`), which boots in seconds — it is separate from the k3s deploy runtime that `appliance init` / `appliance vm up` boot. See [`docs/agent-sandbox.md`](docs/agent-sandbox.md) for the threat model and its limits.
+
 ## Examples
 
 See the [`examples/`](examples/) directory:
@@ -152,6 +195,12 @@ See the [`examples/`](examples/) directory:
 - **demo-node-container** — Node.js app deployed as a container
 - **demo-python-framework** — Python app deployed as a framework type
 - **demo-python-container** — Python app deployed as a container
+
+The directory also carries an [`appliance.stack.json`](examples/appliance.stack.json), so all four come up with one command:
+
+```bash
+cd examples && appliance stack deploy
+```
 
 ## Local Kubernetes runtime
 
@@ -162,8 +211,9 @@ api-server's `LocalContainerDeploymentService` (the generic
 Deployment + Service + Ingress via the k8s API — the same engine that
 drives a bring-your-own (`appliance-base-kubernetes`) cluster.
 
-Requirements: macOS with Virtualization.framework, plus `docker` /
-`kubectl` for building and pushing application images. Quick start:
+Requirements: macOS with Virtualization.framework or Windows with
+WSL2, plus `docker` / `kubectl` for building and pushing application
+images. Quick start:
 
 ```bash
 appliance vm up
@@ -180,10 +230,11 @@ The host-side k3d local runtime has been removed. Replace it as follows:
   images are delivered via the in-VM registry (registry-only — there is
   no `k3d image import` step). `appliance up` remains the near-zero-config
   way to run a single repo's container in the shared sandbox microVM.
-- **CI / headless / non-macOS:** point deploys at a real bring-your-own
+- **CI / headless / Linux:** point deploys at a real bring-your-own
   `appliance-base-kubernetes` cluster (inline `kubeconfig`, or
-  `server` + `token`, plus a `dataDir`). The k3d-in-Docker path is gone
-  until the KVM/WSL2 microVM backend lands.
+  `server` + `token`, plus a `dataDir`). The k3d-in-Docker path is gone;
+  the microVM runs on macOS (Virtualization.framework) and Windows
+  (WSL2) today, with Linux waiting on the KVM backend.
 
 ## Development
 

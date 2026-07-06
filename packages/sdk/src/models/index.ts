@@ -9,3 +9,4 @@ export * from './api-key';
 export * from './invite';
 export * from './build';
 export * from './workloads';
+export * from './stack';

@@ -92,6 +92,17 @@ describe('renderManifest', () => {
     expect(yaml.split('---').length).toBe(3);
   });
 
+  it('defaults to a single replica when none is supplied', () => {
+    const yaml = renderManifest(baseParams);
+    expect(yaml).toContain('replicas: 1');
+  });
+
+  it('renders the requested replica count', () => {
+    const yaml = renderManifest({ ...baseParams, replicas: 3 });
+    expect(yaml).toContain('replicas: 3');
+    expect(yaml).not.toContain('replicas: 1');
+  });
+
   it('routes the Ingress to the appliance hostname via the configured ingress class', () => {
     const yaml = renderManifest({
       ...baseParams,

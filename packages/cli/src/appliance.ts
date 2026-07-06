@@ -34,7 +34,7 @@ interface SubcommandDef {
 
 const SUBCOMMANDS: Record<string, SubcommandDef> = {
   agent: {
-    description: 'run a coding agent (Claude Code) inside the microVM sandbox',
+    description: 'run a coding agent (Claude Code, Copilot, Codex) inside the sandbox microVM',
     load: () => import('./appliance-agent.js'),
   },
   app: {
@@ -102,7 +102,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-logs.js'),
   },
   vm: {
-    description: 'manage the microVM runtime (isolated VM engine)',
+    description: 'manage the microVM runtimes (deploy VM `appliance`; `up`/`agent` use sandbox VM `appliance-sbx`)',
     load: () => import('./appliance-vm.js'),
   },
   login: {
@@ -120,6 +120,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
   profile: {
     description: 'manage credential profiles (the lower-level store behind `appliance cluster`)',
     load: () => import('./appliance-profile.js'),
+  },
+  stack: {
+    description: 'deploy, inspect, and destroy a collection of appliances as a unit (appliance.stack.json)',
+    load: () => import('./appliance-stack.js'),
   },
   teardown: {
     description: 'destroy a bootstrap installation (reverses `appliance bootstrap`)',
@@ -171,16 +175,56 @@ const ALIAS_MAP: Record<string, string> = (() => {
   return m;
 })();
 
+// Help groups the commands by workflow instead of alphabetically: the
+// three things people come here to do (run this repo in the sandbox,
+// deploy appliances, operate runtimes/servers) beat a flat A–Z wall.
+// Names must exist in SUBCOMMANDS; anything unlisted lands in "Other"
+// so a newly-registered command is never silently hidden.
+const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
+  {
+    title: 'Run this repo locally (shared sandbox microVM)',
+    names: ['up', 'down', 'shell', 'logs', 'agent'],
+  },
+  {
+    title: 'Deploy appliances (local microVM or cloud — same commands, switch with --profile)',
+    names: [
+      'init',
+      'deploy',
+      'stack',
+      'open',
+      'app',
+      'build',
+      'configure',
+      'manifest',
+      'env',
+      'deployment',
+      'destroy',
+      'link',
+      'unlink',
+    ],
+  },
+  {
+    title: 'Runtimes, servers & credentials',
+    names: ['vm', 'doctor', 'login', 'whoami', 'profile', 'cluster', 'keys', 'test', 'bootstrap', 'teardown', 'local'],
+  },
+];
+
 function showHelp(): void {
   console.log('Usage: appliance <command> [options]');
-  console.log();
-  console.log('Commands:');
-  const names = Object.keys(SUBCOMMANDS).sort();
-  const width = Math.max(...names.map((n) => n.length));
-  for (const name of names) {
-    const def = SUBCOMMANDS[name];
-    const aliasTail = def.aliases && def.aliases.length > 0 ? ` (alias: ${def.aliases.join(', ')})` : '';
-    console.log(`  ${name.padEnd(width)}  ${def.description}${aliasTail}`);
+  const allNames = Object.keys(SUBCOMMANDS);
+  const width = Math.max(...allNames.map((n) => n.length));
+  const grouped = new Set(COMMAND_GROUPS.flatMap((g) => g.names));
+  const leftovers = allNames.filter((n) => !grouped.has(n)).sort();
+  const groups = [...COMMAND_GROUPS, ...(leftovers.length > 0 ? [{ title: 'Other', names: leftovers }] : [])];
+  for (const group of groups) {
+    console.log();
+    console.log(`${group.title}:`);
+    for (const name of group.names) {
+      const def = SUBCOMMANDS[name];
+      if (!def) continue;
+      const aliasTail = def.aliases && def.aliases.length > 0 ? ` (alias: ${def.aliases.join(', ')})` : '';
+      console.log(`  ${name.padEnd(width)}  ${def.description}${aliasTail}`);
+    }
   }
   console.log();
   console.log('Shortcuts:');
@@ -189,10 +233,11 @@ function showHelp(): void {
   }
   console.log();
   console.log('Getting started:');
-  console.log('  appliance init                  from nothing to a reachable runtime (boots the local microVM)');
-  console.log('  appliance deploy                build and ship your app to the runtime');
-  console.log('  appliance open                  open the deployed URL in a browser');
-  console.log('  appliance init --remote <url>   set up credentials for a remote/cloud api-server instead');
+  console.log('  Deploy your first app:      appliance init  →  appliance deploy  →  appliance open');
+  console.log('  Run this repo, no manifest: appliance up          (Dockerfile / compose / devcontainer)');
+  console.log('  Run a coding agent:         appliance agent login  →  appliance agent start');
+  console.log('  A collection of apps:       appliance stack init  →  appliance stack deploy');
+  console.log('  Cloud on AWS:               appliance bootstrap  →  appliance login  →  appliance deploy');
   console.log();
   console.log('Environment variables:');
   console.log('  APPLIANCE_PROFILE               credential profile to use (overrides the active profile)');

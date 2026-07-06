@@ -36,7 +36,7 @@ appliance status [--vm <name>] [--json]         # per-service state + URL map
 
 ## 3. Project → VM
 
-Run in a **single shared default sandbox VM** (`--vm` overrides; default name `appliance`, reusing `DEFAULT_VM_NAME`). One-VM-per-project is rejected: it multiplies 4-GiB/2-CPU VMs (`spec.rs:59-62`) and fragments the shared dockerd image cache on `/persist/docker`. Projects coexist by Docker Compose project name (§5) inside one dockerd, exactly as `docker compose` isolates projects on one daemon.
+Run in a **single shared default sandbox VM** (`--vm` overrides; default name `appliance-sbx`, `DEFAULT_SANDBOX_VM` in `utils/sandbox.ts` — deliberately separate from the k3s deploy VM `appliance` so `up`/`agent` don't pay the k3s bring-up). One-VM-per-project is rejected: it multiplies 4-GiB/2-CPU VMs (`spec.rs:59-62`) and fragments the shared dockerd image cache on `/persist/docker`. Projects coexist by Docker Compose project name (§5) inside one dockerd, exactly as `docker compose` isolates projects on one daemon.
 
 The workspace reaches the guest by **reusing VirtioFS `--mount`** (`guest.rs:43,295-300`): `up` shares cwd at `/persist/workspace` and runs the build there (matches `docs/sandbox.md` Task B). `up` re-shares on each invocation; an existing different mount errors with the `vm up --no-mount` hint rather than silently re-pointing.
 
