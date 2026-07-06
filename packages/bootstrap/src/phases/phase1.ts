@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as auto from '@pulumi/pulumi/automation';
 import { applianceInfra, ApplianceBaseAwsPublic } from '@appliance.sh/infra';
-import { isKubernetesBase, type ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { isDockerBase, isKubernetesBase, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import type { BootstrapEvent, BootstrapInput } from '../types';
 import { awsCredsFromEnv, forwardPulumiEvent, homeEnv } from './helpers';
 
@@ -40,6 +40,11 @@ export async function runPhase1(input: BootstrapInput, opts: Phase1Options): Pro
   if (isKubernetesBase(input.base.config)) {
     throw new Error(
       `${input.base.config.type} bases skip phase 1 — there is no Pulumi-managed baseline for the k8s-backed runtime.`
+    );
+  }
+  if (isDockerBase(input.base.config)) {
+    throw new Error(
+      `${input.base.config.type} bases are not bootstrapped — start the local server with \`appliance server start\`.`
     );
   }
   const baseRegion = input.base.config.region;

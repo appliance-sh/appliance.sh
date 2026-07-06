@@ -10,6 +10,8 @@
     "directory": "packages/api-server"
   },
   "license": "MIT",
+  "main": "dist/src/app.js",
+  "types": "dist/src/app.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",

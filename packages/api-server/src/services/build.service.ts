@@ -1,6 +1,6 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
-import { applianceBaseConfig, applianceInput, BuildType, isKubernetesBase } from '@appliance.sh/sdk';
+import { applianceBaseConfig, applianceInput, BuildType, isDockerBase, isKubernetesBase } from '@appliance.sh/sdk';
 import type { ApplianceBaseConfig, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -65,12 +65,13 @@ export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
     const config = getBaseConfig();
 
-    // Kubernetes-base shortcut (local microVM + generic k8s): only
-    // `remote-image` builds are supported (uploads have no S3 path).
-    // Pass the stored source through as imageUri verbatim — the
-    // KubernetesDeploymentService consumes the image reference
-    // directly (image delivery is registry-only).
-    if (isKubernetesBase(config)) {
+    // Container-runtime shortcut (local microVM, generic k8s, and the
+    // plain-Docker daemon): only `remote-image` builds are supported
+    // (uploads have no S3 path). Pass the stored source through as
+    // imageUri verbatim — the runtime service consumes the image
+    // reference directly (registry-delivered for k8s; already present
+    // in the daemon for docker bases).
+    if (isKubernetesBase(config) || isDockerBase(config)) {
       const stored = await buildUploadService.get(buildId);
       if (!stored) throw new Error(`Build not found: ${buildId}`);
       if (stored.type !== BuildType.RemoteImage) {

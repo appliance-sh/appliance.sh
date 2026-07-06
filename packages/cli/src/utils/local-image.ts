@@ -36,6 +36,46 @@ export interface PublishLocalImageOptions {
 }
 
 /**
+ * Build the appliance image into the LOCAL docker daemon and return
+ * its immutable image ID (`sha256:...`). The docker-base deploy path
+ * (`appliance server start`'s runtime) runs containers on the same
+ * daemon the build lands in, so there is no push/delivery step at all
+ * — deploying by image ID both skips the registry and makes redeploys
+ * roll exactly when the content changed (same source → same ID →
+ * idempotent no-op).
+ */
+export async function buildLocalApplianceImage(opts: Omit<PublishLocalImageOptions, 'registryUrl'>): Promise<string> {
+  const tag = `${opts.name}:latest`;
+  if (opts.buildScript) {
+    // The user's build script produced an image tagged `<name>`
+    // (same contract as the zip pipeline's packageContainer).
+  } else {
+    const args = ['build', ...provenanceArgs(), '-t', tag];
+    if (opts.platform) args.push('--platform', opts.platform);
+    args.push(opts.context ?? '.');
+    console.log(chalk.dim(`Building container: docker ${args.join(' ')}`));
+    try {
+      execFileSync('docker', args, { stdio: 'inherit' });
+    } catch {
+      throw new Error('Docker build failed.');
+    }
+  }
+  const ref = opts.buildScript ? opts.name : tag;
+  const inspect = spawnSync('docker', ['image', 'inspect', '--format', '{{.Id}}', ref], { encoding: 'utf8' });
+  if (inspect.status !== 0) {
+    throw new Error(
+      `built image ${ref} not found in the docker daemon` +
+        (opts.buildScript ? ' — the build script must tag it.' : '.')
+    );
+  }
+  const imageId = inspect.stdout.trim();
+  if (!imageId.startsWith('sha256:')) {
+    throw new Error(`unexpected image id for ${ref}: ${imageId || '(empty)'}`);
+  }
+  return imageId;
+}
+
+/**
  * Build the appliance image and make it runnable by the cluster.
  * Returns the image reference to register as a remote-image build.
  */

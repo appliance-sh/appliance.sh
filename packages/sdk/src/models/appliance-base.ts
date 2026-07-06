@@ -17,6 +17,11 @@ export enum ApplianceBaseType {
   // server + token). The microVM local runtime uses this variant. The
   // sole Kubernetes-driven base going forward.
   ApplianceKubernetes = 'appliance-base-kubernetes',
+  // Plain-Docker base: the api-server orchestrates containers on a
+  // Docker daemon directly — no cluster, no registry, no manifests.
+  // This is the single-binary local daemon runtime (`appliance server
+  // start`): state in a filesystem dataDir, deploys as `docker run`.
+  ApplianceDocker = 'appliance-base-docker',
 }
 
 // True for any base whose deploys go through the Kubernetes API
@@ -32,6 +37,14 @@ export function isKubernetesBase<T extends { type: ApplianceBaseType }>(
   config: T
 ): config is T & { type: ApplianceBaseType.ApplianceLocal | ApplianceBaseType.ApplianceKubernetes } {
   return config.type === ApplianceBaseType.ApplianceLocal || config.type === ApplianceBaseType.ApplianceKubernetes;
+}
+
+// True for the plain-Docker base (the single-binary local daemon).
+// Deploys are containers on a Docker daemon: no Pulumi, no k8s client.
+export function isDockerBase<T extends { type: ApplianceBaseType }>(
+  config: T
+): config is T & { type: ApplianceBaseType.ApplianceDocker } {
+  return config.type === ApplianceBaseType.ApplianceDocker;
 }
 
 export const applianceBaseInput = z.object({
@@ -145,11 +158,43 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
 
 export type ApplianceKubernetesInput = z.infer<typeof applianceKubernetesInput>;
 
+// Shared shape of the plain-Docker runtime config. Used verbatim by
+// both the input schema and the resolved base config — unlike the
+// cloud bases there is no provisioning step that enriches it.
+const dockerBlock = z.object({
+  // Absolute path backing the FilesystemObjectStore (projects,
+  // environments, deployments, api-keys). The daemon owns this dir.
+  dataDir: z.string(),
+  // Optional DOCKER_HOST override for the daemon's docker CLI calls.
+  // Omit to use the ambient environment (the common case).
+  host: z.string().optional(),
+  // Host-port window deploys draw from. Each stack hashes to a stable
+  // port inside it. Defaults to 8300-8699.
+  portRange: z
+    .object({
+      min: z.number().int().min(1).max(65535),
+      max: z.number().int().min(1).max(65535),
+    })
+    .optional(),
+});
+
+// Plain-Docker base: containers on a Docker daemon, driven by the
+// single-binary local server. `dns` is omitted for the same reason as
+// the Kubernetes bases — services are reached via published host
+// ports, not DNS records.
+export const applianceDockerInput = applianceBaseInput.omit({ dns: true }).extend({
+  type: z.literal(ApplianceBaseType.ApplianceDocker),
+  docker: dockerBlock,
+});
+
+export type ApplianceDockerInput = z.infer<typeof applianceDockerInput>;
+
 export const applianceBaseConfigInput = z.discriminatedUnion('type', [
   applianceAwsPublicInput,
   applianceAwsVpcInput,
   applianceLocalInput,
   applianceKubernetesInput,
+  applianceDockerInput,
 ]);
 
 export type ApplianceBaseConfigInput = z.infer<typeof applianceBaseConfigInput>;
@@ -261,6 +306,10 @@ export const applianceBaseConfig = z.object({
         .optional(),
     })
     .optional(),
+  // Plain-Docker runtime config. Present for `appliance-base-docker`
+  // bases (the single-binary local daemon). Same shape as the input —
+  // there is no provisioning step that enriches it.
+  docker: dockerBlock.optional(),
 });
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
@@ -297,4 +346,24 @@ export function getKubernetesParams(config: ApplianceBaseConfig): {
     };
   }
   return null;
+}
+
+/**
+ * Docker runtime parameters extracted from an `appliance-base-docker`
+ * config. Returns null for every other base type. Defaults for the
+ * optional fields (port range) are consumer-side, mirroring
+ * getKubernetesParams.
+ */
+export function getDockerParams(config: ApplianceBaseConfig): {
+  dataDir: string;
+  host?: string;
+  portRange?: { min: number; max: number };
+} | null {
+  if (config.type !== ApplianceBaseType.ApplianceDocker) return null;
+  if (!config.docker) return null;
+  return {
+    dataDir: config.docker.dataDir,
+    host: config.docker.host,
+    portRange: config.docker.portRange,
+  };
 }

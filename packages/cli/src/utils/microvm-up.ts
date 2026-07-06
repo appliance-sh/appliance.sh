@@ -171,7 +171,14 @@ export async function runUp(
   // engine regardless of its working directory (it canonicalizes too).
   if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
   const status = runVm(upArgs);
-  if (status !== 0) process.exit(status);
+  if (status !== 0) {
+    console.error(
+      chalk.dim(
+        'Tip: for local deploys without a VM, `appliance server start` runs the control plane as a host daemon (needs only Docker).'
+      )
+    );
+    process.exit(status);
+  }
   // Re-read ports: `vm up` creates the spec (with allocated ports) if
   // it didn't exist, so the canonical-fallback above may be stale now.
   Object.assign(ports, vmPorts(name));
@@ -282,7 +289,8 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
       throw new Error(
         `in-VM registry not reachable at ${url} after ${Math.round(timeoutMs / 1000)}s.\n` +
           'The VM booted but its registry forward never came up. Inspect the boot log with `appliance vm console`, ' +
-          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.'
+          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.\n' +
+          'Or skip the VM entirely: `appliance server start` runs the control plane as a lightweight host daemon.'
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));

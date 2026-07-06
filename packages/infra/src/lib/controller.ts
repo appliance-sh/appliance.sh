@@ -18,5 +18,11 @@ export function lookup(baseConfig: ApplianceBaseConfigInput) {
       throw new Error(
         `${baseConfig.type} bases do not have a Pulumi-managed baseline; bring up the microVM runtime (\`appliance vm up\`) or apply the api-server manifest directly to manage cluster lifecycle.`
       );
+    case ApplianceBaseType.ApplianceDocker:
+      // Docker bases are the single-binary local daemon's runtime —
+      // containers on a Docker daemon, no cloud baseline to provision.
+      throw new Error(
+        `${baseConfig.type} bases do not have a Pulumi-managed baseline; start the local server (\`appliance server start\`) instead.`
+      );
   }
 }

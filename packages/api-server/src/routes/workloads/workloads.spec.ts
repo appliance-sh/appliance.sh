@@ -116,7 +116,7 @@ describe('Workloads + pod-logs routes', () => {
       process.env.APPLIANCE_BASE_CONFIG = AWS_BASE;
       const res = await request(appWithFakeAuth()).get('/api/v1/workloads');
       expect(res.status).toBe(409);
-      expect(res.body.message).toMatch(/Kubernetes-driven/);
+      expect(res.body.message).toMatch(/container-runtime/);
       expect(mockListWorkloads).not.toHaveBeenCalled();
     });
   });
@@ -141,7 +141,7 @@ describe('Workloads + pod-logs routes', () => {
       process.env.APPLIANCE_BASE_CONFIG = AWS_BASE;
       const res = await request(appWithFakeAuth()).get('/api/v1/environments/env-1/workloads');
       expect(res.status).toBe(409);
-      expect(res.body.message).toMatch(/Kubernetes-driven/);
+      expect(res.body.message).toMatch(/container-runtime/);
       // The base gate runs first, so we never touch the environment store.
       expect(mockEnvironmentService.get).not.toHaveBeenCalled();
       expect(mockListWorkloads).not.toHaveBeenCalled();

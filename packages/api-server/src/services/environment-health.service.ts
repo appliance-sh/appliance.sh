@@ -1,5 +1,11 @@
-import { applianceBaseConfig, isKubernetesBase, EnvironmentHealth, EnvironmentHealthStatus } from '@appliance.sh/sdk';
-import { LocalContainerDeploymentService, type DeploymentHealth } from '@appliance.sh/infra';
+import {
+  applianceBaseConfig,
+  isDockerBase,
+  isKubernetesBase,
+  EnvironmentHealth,
+  EnvironmentHealthStatus,
+} from '@appliance.sh/sdk';
+import { DockerDeploymentService, LocalContainerDeploymentService, type DeploymentHealth } from '@appliance.sh/infra';
 import { environmentService } from './environment.service';
 import { logger } from '../logger';
 
@@ -30,17 +36,20 @@ export class EnvironmentHealthService {
       return this.unknown(environmentId, 'Cluster base config is unavailable on the api-server.');
     }
 
-    // AWS/Lambda and other non-Kubernetes bases have no pod/restart
-    // state to read — surface "unknown" rather than pretending.
-    if (!isKubernetesBase(baseConfig)) {
+    // AWS/Lambda bases have no pod/restart state to read — surface
+    // "unknown" rather than pretending. Kubernetes-driven and
+    // plain-Docker bases both carry container health.
+    if (!isKubernetesBase(baseConfig) && !isDockerBase(baseConfig)) {
       return this.unknown(
         environmentId,
-        `Health metrics are only available for Kubernetes-driven bases (got '${baseConfig.type}').`
+        `Health metrics are only available for container-runtime bases (got '${baseConfig.type}').`
       );
     }
 
     try {
-      const service = new LocalContainerDeploymentService(baseConfig);
+      const service = isDockerBase(baseConfig)
+        ? new DockerDeploymentService(baseConfig)
+        : new LocalContainerDeploymentService(baseConfig);
       const health = await service.getDeploymentHealth(environment.stackName);
       return this.fromDeploymentHealth(environmentId, health);
     } catch (error) {

@@ -4,6 +4,7 @@ import {
   applianceBaseConfig,
   BuildType,
   generateId,
+  isDockerBase,
   isKubernetesBase,
   type ApplianceBaseConfig,
   type Build,
@@ -34,15 +35,16 @@ export class BuildUploadService {
     const config = getBaseConfig();
     const buildId = generateId('build');
 
-    // Kubernetes-driven bases have no presigned-URL story — the
-    // upload pipeline is the cloud path's reason for existing.
-    // Callers running against a k8s base should be using
-    // `createRemoteImage` with an image reference instead (pushed
-    // to a registry the cluster can reach). Fail loud rather than
-    // silently returning a useless empty uploadUrl.
-    if (isKubernetesBase(config)) {
+    // Kubernetes-driven and Docker bases have no presigned-URL story —
+    // the upload pipeline is the cloud path's reason for existing.
+    // Callers running against these bases should be using
+    // `createRemoteImage` with an image reference instead (pushed to a
+    // registry the cluster can reach, or already present in the local
+    // daemon for docker bases). Fail loud rather than silently
+    // returning a useless empty uploadUrl.
+    if (isKubernetesBase(config) || isDockerBase(config)) {
       throw new Error(
-        `Upload-flow builds are not supported on ${config.type} bases. Use a remote-image build referencing a registry-pushed image.`
+        `Upload-flow builds are not supported on ${config.type} bases. Use a remote-image build referencing a container image.`
       );
     }
 

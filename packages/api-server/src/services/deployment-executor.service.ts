@@ -5,12 +5,15 @@ import {
   DeploymentAction,
   EnvironmentStatus,
   deploymentInput,
+  isDockerBase,
   isKubernetesBase,
   z,
 } from '@appliance.sh/sdk';
 import {
   createApplianceDeploymentService,
+  DockerDeploymentService,
   LocalContainerDeploymentService,
+  type ContainerDeploymentBackend,
   type ApplianceStackMetadata,
   type PulumiStackHandle,
 } from '@appliance.sh/infra';
@@ -114,6 +117,12 @@ export async function executeDeployment(event: WorkerEvent): Promise<void> {
       // instead of the AWS-shaped ResolvedBuild.
       const local = new LocalContainerDeploymentService(baseConfig);
       result = await executeLocalAction(local, input, metadata, deployment.id);
+    } else if (baseConfig && isDockerBase(baseConfig)) {
+      // Plain-Docker runtime (the single-binary local daemon) —
+      // same container-backend contract as the Kubernetes branch,
+      // pointed at a Docker daemon instead of a cluster.
+      const docker = new DockerDeploymentService(baseConfig);
+      result = await executeLocalAction(docker, input, metadata, deployment.id);
     } else {
       const infraService = createApplianceDeploymentService();
       result = await executeCloudAction(infraService, input, metadata, deployment.id, onStack);
@@ -314,7 +323,7 @@ async function executeCloudAction(
 }
 
 async function executeLocalAction(
-  local: LocalContainerDeploymentService,
+  local: ContainerDeploymentBackend,
   input: WorkerEvent['input'],
   metadata: ApplianceStackMetadata,
   deploymentId: string

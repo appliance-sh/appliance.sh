@@ -121,6 +121,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'manage credential profiles (the lower-level store behind `appliance cluster`)',
     load: () => import('./appliance-profile.js'),
   },
+  server: {
+    description: 'run the control plane as a lightweight local daemon — deploys to your Docker daemon, no VM/k3s',
+    load: () => import('./appliance-server.js'),
+  },
   stack: {
     description: 'deploy, inspect, and destroy a collection of appliances as a unit (appliance.stack.json)',
     load: () => import('./appliance-stack.js'),
@@ -205,7 +209,20 @@ const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
   },
   {
     title: 'Runtimes, servers & credentials',
-    names: ['vm', 'doctor', 'login', 'whoami', 'profile', 'cluster', 'keys', 'test', 'bootstrap', 'teardown', 'local'],
+    names: [
+      'server',
+      'vm',
+      'doctor',
+      'login',
+      'whoami',
+      'profile',
+      'cluster',
+      'keys',
+      'test',
+      'bootstrap',
+      'teardown',
+      'local',
+    ],
   },
 ];
 
@@ -233,7 +250,8 @@ function showHelp(): void {
   }
   console.log();
   console.log('Getting started:');
-  console.log('  Deploy your first app:      appliance init  →  appliance deploy  →  appliance open');
+  console.log('  Fastest local deploys:      appliance server start  →  appliance deploy  →  appliance open');
+  console.log('  Isolated local runtime:     appliance init  →  appliance deploy   (microVM + k3s)');
   console.log('  Run this repo, no manifest: appliance up          (Dockerfile / compose / devcontainer)');
   console.log('  Run a coding agent:         appliance agent login  →  appliance agent start');
   console.log('  A collection of apps:       appliance stack init  →  appliance stack deploy');
