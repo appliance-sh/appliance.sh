@@ -16,3 +16,5 @@ cdk.*/
 
 # pnpm lockfile — generator-owned.
 pnpm-lock.yaml
+
+examples/*
