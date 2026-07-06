@@ -172,13 +172,22 @@ function printBanner(port: number, dataDir: string, opts: { alreadyRunning?: boo
  * the CLI — route back through the `server` subcommand.
  */
 function selfInvocation(runArgs: string[]): { cmd: string; args: string[] } {
-  try {
-    const self = fileURLToPath(import.meta.url);
-    if (fs.existsSync(self)) {
-      return { cmd: process.execPath, args: [self, ...runArgs] };
+  // Under a bun single-binary, import.meta.url points into the virtual
+  // bunfs — which exists()-checks true — so the Node branch below would
+  // spawn the CLI with that bogus path as argv[1] and the dispatcher
+  // would parse `run` as an unknown top-level command (printing help)
+  // instead of `server run`. execPath IS the CLI there, so route back
+  // through the `server` subcommand. Only the plain-Node dev path (where
+  // the dispatcher rewrote argv[1] to a fake name) needs the self-file.
+  if (!process.versions.bun) {
+    try {
+      const self = fileURLToPath(import.meta.url);
+      if (fs.existsSync(self)) {
+        return { cmd: process.execPath, args: [self, ...runArgs] };
+      }
+    } catch {
+      // import.meta.url isn't file-resolvable — fall through
     }
-  } catch {
-    // compiled binary — import.meta.url isn't file-resolvable
   }
   return { cmd: process.execPath, args: ['server', ...runArgs] };
 }
