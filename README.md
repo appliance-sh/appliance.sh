@@ -192,6 +192,21 @@ appliance stack destroy       # tear the whole set down (asks once)
 
 Each member still becomes an ordinary project + environment on the server, so the same stack file drives the local microVM **and** a cloud installation — `appliance stack deploy --profile <cloud-profile>` spins up an identical set in the cloud, and `appliance stack deploy demo2` clones the collection into a fresh environment. Environment precedence per app: CLI argument > per-app `environment` > stack `environment` > `dev`.
 
+#### Wiring members together
+
+A stack entry can declare deploy-time env vars whose values reference sibling members by `dir`:
+
+```json
+{
+  "apps": [{ "dir": "api" }, { "dir": "web", "env": { "API_URL": "{{service:api}}" } }]
+}
+```
+
+- `{{service:<dir>}}` → the member's in-network address, `http://<project>-<environment>:<port>`. Local-server deploys serve it via a docker network alias, Kubernetes bases via the Service DNS name — the same value works on both, and it's deterministic, so it doesn't depend on deploy order.
+- `{{url:<dir>}}` → the member's host-facing URL from its deploy this run (the member must appear earlier in `apps`) — for values that end up in a browser.
+
+Because references are interpolated per deploy, `appliance stack deploy demo2` rewires the whole set for the fresh environment with no file edits. Stack env beats manifest `env` and loses to `--env-file`-style local overrides (`.env.<environment>` files in the member directory). See [`examples/demo-stack-3tier`](examples/demo-stack-3tier) for a frontend → bff → backend stack wired this way.
+
 ### Coding agents in the sandbox
 
 Appliance can also run coding agents (Claude Code, GitHub Copilot, OpenAI Codex) inside an isolated sandbox microVM with your working tree mounted — credentials stay host-side and are injected per-request by the egress broker, never written into the VM:
@@ -213,6 +228,7 @@ See the [`examples/`](examples/) directory:
 - **demo-node-container** — Node.js app deployed as a container
 - **demo-python-framework** — Python app deployed as a framework type
 - **demo-python-container** — Python app deployed as a container
+- **demo-stack-3tier** — frontend → bff → backend stack with `{{service:…}}` env wiring
 
 The directory also carries an [`appliance.stack.json`](examples/appliance.stack.json), so all four come up with one command:
 

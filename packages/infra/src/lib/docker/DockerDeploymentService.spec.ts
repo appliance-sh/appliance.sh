@@ -5,6 +5,7 @@ import {
   DockerDeploymentService,
   DEFAULT_DOCKER_PORT_MIN,
   DEFAULT_DOCKER_PORT_MAX,
+  APPLIANCE_NETWORK,
   containerNameFor,
   type DockerExec,
 } from './DockerDeploymentService';
@@ -41,7 +42,10 @@ function runningInspect(overrides: Record<string, unknown> = {}): string {
       },
       State: { Status: 'running', Running: true, ExitCode: 0 },
       RestartCount: 2,
-      NetworkSettings: { Ports: { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '8342' }] } },
+      NetworkSettings: {
+        Ports: { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '8342' }] },
+        Networks: { appliance: { Aliases: ['demo-dev'] } },
+      },
       ...overrides,
     },
   ]);
@@ -103,6 +107,7 @@ describe('DockerDeploymentService', () => {
           : runningInspect({ Config: { Image: 'sha256:def', Labels: { 'sh.appliance.stack': 'demo-dev' } } });
       }
       if (args[0] === 'rm') return '';
+      if (args[0] === 'network') return '';
       if (args[0] === 'run') {
         phase = 'after';
         return 'containerid\n';
@@ -125,12 +130,85 @@ describe('DockerDeploymentService', () => {
     expect(calls.some((c) => c[0] === 'rm' && c.includes('appliance-demo-dev'))).toBe(true);
   });
 
+  it('joins the shared network with the stack name as alias and maps host.docker.internal', async () => {
+    let started = false;
+    const { exec, calls } = execScript((args) => {
+      if (args[0] === 'inspect') {
+        return started ? runningInspect() : new Error('Error: No such container: appliance-demo-dev');
+      }
+      if (args[0] === 'network') return '';
+      if (args[0] === 'run') {
+        started = true;
+        return 'id\n';
+      }
+      return new Error(`unexpected: ${args.join(' ')}`);
+    });
+    const svc = new DockerDeploymentService(baseConfig, exec);
+    const result = await svc.deploy('demo-dev', metadata, { imageUri: 'sha256:abc', port: 3000 });
+    expect(calls.some((c) => c[0] === 'network' && c[1] === 'create' && c.includes(APPLIANCE_NETWORK))).toBe(true);
+    const run = calls.find((c) => c[0] === 'run')!;
+    expect(run[run.indexOf('--network') + 1]).toBe(APPLIANCE_NETWORK);
+    expect(run[run.indexOf('--network-alias') + 1]).toBe('demo-dev');
+    expect(run[run.indexOf('--add-host') + 1]).toBe('host.docker.internal:host-gateway');
+    expect(result.message).toContain('service-to-service: http://demo-dev:3000');
+  });
+
+  it('treats an "already exists" network create as success', async () => {
+    let started = false;
+    const { exec } = execScript((args) => {
+      if (args[0] === 'inspect') {
+        return started ? runningInspect() : new Error('Error: No such container: appliance-demo-dev');
+      }
+      if (args[0] === 'network') return new Error('Error: network with name appliance already exists');
+      if (args[0] === 'run') {
+        started = true;
+        return 'id\n';
+      }
+      return new Error(`unexpected: ${args.join(' ')}`);
+    });
+    const svc = new DockerDeploymentService(baseConfig, exec);
+    const result = await svc.deploy('demo-dev', metadata, { imageUri: 'sha256:abc', port: 3000 });
+    expect(result.ok).toBe(true);
+  });
+
+  it('recreates an unchanged container that predates the shared network', async () => {
+    let migrated = false;
+    const { exec, calls } = execScript((args) => {
+      if (args[0] === 'inspect') {
+        return migrated
+          ? runningInspect()
+          : runningInspect({
+              NetworkSettings: {
+                Ports: { '3000/tcp': [{ HostIp: '0.0.0.0', HostPort: '8342' }] },
+                Networks: { bridge: {} },
+              },
+            });
+      }
+      if (args[0] === 'rm') return '';
+      if (args[0] === 'network') return '';
+      if (args[0] === 'run') {
+        migrated = true;
+        return 'id\n';
+      }
+      return new Error(`unexpected: ${args.join(' ')}`);
+    });
+    const svc = new DockerDeploymentService(baseConfig, exec);
+    const result = await svc.deploy('demo-dev', metadata, {
+      imageUri: 'sha256:abc',
+      port: 3000,
+      environment: { PORT: '3000' },
+    });
+    expect(result.idempotentNoop).toBe(false);
+    expect(calls.some((c) => c[0] === 'run')).toBe(true);
+  });
+
   it('notes ignored replicas in the deploy message', async () => {
     let started = false;
     const { exec } = execScript((args) => {
       if (args[0] === 'inspect') {
         return started ? runningInspect() : new Error('Error: No such container: appliance-demo-dev');
       }
+      if (args[0] === 'network') return '';
       if (args[0] === 'run') {
         started = true;
         return 'id\n';
@@ -155,6 +233,7 @@ describe('DockerDeploymentService', () => {
           },
         ]);
       }
+      if (args[0] === 'network') return '';
       if (args[0] === 'run') {
         started = true;
         return 'id\n';
@@ -225,6 +304,7 @@ describe('DockerDeploymentService', () => {
         return started ? runningInspect() : new Error('Error: No such container: appliance-demo-dev');
       }
       if (args[0] === 'rm') return '';
+      if (args[0] === 'network') return '';
       if (args[0] === 'run') {
         runs += 1;
         if (runs === 1) return new Error('driver failed: Bind for 0.0.0.0:8342 failed: port is already allocated');

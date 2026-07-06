@@ -44,6 +44,9 @@ export interface DeployOptions {
   imageUri?: string;
   /** Env file with runtime variables; defaults to `.env.<environment>`. */
   envFile?: string;
+  /** Pre-resolved deploy-time env from an orchestrator (stack deploy's
+   *  wiring). Beats manifest env, loses to --env-file. */
+  extraEnv?: Record<string, string>;
   /** Never prompt; fail when input would be needed. */
   yes: boolean;
 }
@@ -500,11 +503,13 @@ export async function runDeploy(params: RunDeployParams): Promise<DeployOutcome>
   const manifestRuntime = await renderRuntimeConfig(program, projectName, environmentName);
   const envFileVars = loadEnvFile(opts.envFile, environmentName);
 
-  // --env-file wins on conflict: it's the most local, ad-hoc
-  // override surface (typically holds secrets or per-deploy
-  // values), while manifest env represents declared defaults.
+  // Cascade, least to most local: manifest env (declared defaults) <
+  // orchestrator extraEnv (stack wiring) < --env-file (ad-hoc,
+  // per-deploy overrides, typically secrets).
   const envVars: Record<string, string> | undefined =
-    manifestRuntime?.env || envFileVars ? { ...(manifestRuntime?.env ?? {}), ...(envFileVars ?? {}) } : undefined;
+    manifestRuntime?.env || opts.extraEnv || envFileVars
+      ? { ...(manifestRuntime?.env ?? {}), ...(opts.extraEnv ?? {}), ...(envFileVars ?? {}) }
+      : undefined;
 
   const result = await client.deploy(environment.id, {
     buildId,

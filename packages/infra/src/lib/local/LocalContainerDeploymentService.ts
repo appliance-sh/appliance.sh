@@ -278,12 +278,24 @@ export class KubernetesDeploymentService {
     const before = await this.getDeploymentImage(stackName);
     const objects = k8s.loadAllYaml(manifest) as k8s.KubernetesObject[];
     for (const obj of objects) {
-      await this.applyObject(obj);
+      try {
+        await this.applyObject(obj);
+      } catch (err) {
+        // The deterministic NodePort pin can collide with a port the
+        // cluster already allocated — two stack names can hash to the
+        // same value. Mirror the docker backend's fallback: drop the
+        // pin and let the cluster pick a free port; the read-back
+        // below reports whatever it chose.
+        if (obj.kind !== 'Service' || !isNodePortCollision(err)) throw err;
+        const ports = ((obj as k8s.V1Service).spec?.ports ?? []) as Array<{ nodePort?: number }>;
+        for (const p of ports) delete p.nodePort;
+        await this.applyObject(obj);
+      }
     }
     await this.waitForRollout(stackName);
-    // Read back the live NodePort — if k8s accepted our pinned value
-    // it'll match `nodePort`; if not (e.g. collision), it picks one
-    // and we report whatever the cluster recorded.
+    // Read back the live NodePort — when the pin survived it matches
+    // `nodePort`; after a collision fallback the cluster picked one
+    // and we report whatever it recorded.
     const liveNodePort = (await this.getServiceNodePort(stackName)) ?? nodePort;
 
     // Primary URL goes through the cluster's Ingress (Traefik), so it
@@ -784,6 +796,16 @@ function isNotFoundError(err: unknown): boolean {
     return /not\s*found/i.test(e.message) || /Error from server \(NotFound\)/i.test(e.message);
   }
   return false;
+}
+
+/** True when the apiserver rejected a Service because its pinned
+ *  `nodePort` is already taken. The 422's message is stable across
+ *  k8s versions: `provided port is already allocated`. */
+export function isNodePortCollision(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { message?: string; body?: unknown };
+  const text = `${e.message ?? ''} ${typeof e.body === 'string' ? e.body : JSON.stringify(e.body ?? '')}`;
+  return /provided port is already allocated/i.test(text);
 }
 
 /**

@@ -6,6 +6,10 @@ import { spawnSync } from 'node:child_process';
 import {
   bootstrapInClusterApiServer,
   ensureDockerRunning,
+  kubectlApplyManifest,
+  readExistingBootstrapToken,
+  renderInClusterApiServerManifest,
+  resolveRuntimeConfig,
   waitForApiServerUrl,
   apiServerUrlForHostPort,
 } from '@appliance.sh/helper';
@@ -240,13 +244,32 @@ export async function runUp(
   }
   if (verified) {
     console.log(`${chalk.green('✓')} api-server reachable; profile ${chalk.bold(profile)} already authenticated`);
+    // Credentials survive, but the delivered image only lands in the
+    // registry — re-apply the manifests so a changed digest (a fresh
+    // `--image`, or a newer published build) actually rolls the
+    // Deployment. Deploy-by-digest makes this a no-op when unchanged.
+    const token = await readExistingBootstrapToken({ kubeconfigPath });
+    if (token) {
+      const cfg = await resolveRuntimeConfig(runtime);
+      await kubectlApplyManifest(renderInClusterApiServerManifest(cfg, vmImage, token), { kubeconfigPath });
+      console.log(chalk.dim(`api-server manifests reconciled (image ${vmImage})`));
+    }
   } else {
+    // The bootstrap applies its manifests with kubectl. Auto-install it
+    // like crane above — a fresh machine shouldn't fail the bring-up
+    // over a tool the helper knows how to provision.
+    await ensureKubectl();
     const result = await bootstrapInClusterApiServer({
       runtime,
       image: vmImage,
       kubeconfigPath,
       keyName: name === DEFAULT_VM_NAME ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`,
       onProgress: printProgress,
+      // First boot pulls + unpacks the multi-GB api-server image from
+      // the in-VM registry into containerd before the pod can start —
+      // the default 240s readiness budget is calibrated for re-applies,
+      // not that cold path.
+      readyTimeoutMs: 600_000,
     });
     saveCredentials({ apiUrl: result.apiServerUrl, keyId: result.apiKey.id, secret: result.apiKey.secret }, profile);
     console.log(`${chalk.green('✓')} api-server bootstrapped; credentials saved to profile ${chalk.bold(profile)}`);
@@ -456,11 +479,18 @@ function wrongArchMessage(present: { ref: string; arch: string }[], saveErr: str
   );
 }
 
+async function ensureKubectl(): Promise<void> {
+  const { runInstall } = await import('@appliance.sh/helper');
+  const outcomes = await runInstall({ tools: ['kubectl'], onProgress: printProgress });
+  const failed = outcomes.find((o) => o.status === 'failed');
+  if (failed) throw new Error(`kubectl install failed: ${failed.message}`);
+}
+
 async function ensureCrane(): Promise<string> {
   const { runInstall, helperBinDir } = await import('@appliance.sh/helper');
   const outcomes = await runInstall({ tools: ['crane'], onProgress: printProgress });
   const failed = outcomes.find((o) => o.status === 'failed');
   if (failed) throw new Error(`crane install failed: ${failed.message}`);
-  const managed = path.join(helperBinDir(), 'crane');
+  const managed = path.join(helperBinDir(), process.platform === 'win32' ? 'crane.exe' : 'crane');
   return fs.existsSync(managed) ? managed : 'crane';
 }

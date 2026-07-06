@@ -1,0 +1,11 @@
+{
+  "manifest": "v1",
+  "type": "stack",
+  "name": "demo-3tier",
+  "environment": "dev",
+  "apps": [
+    { "dir": "backend" },
+    { "dir": "bff", "env": { "BACKEND_URL": "{{service:backend}}" } },
+    { "dir": "frontend", "env": { "BFF_URL": "{{service:bff}}" } }
+  ]
+}

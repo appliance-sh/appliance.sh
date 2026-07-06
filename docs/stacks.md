@@ -67,6 +67,33 @@ deploy` (`utils/deploy-core.ts` `runDeploy`) with cwd switched into
 - **init** scaffolds the file by scanning immediate subdirectories for
   appliance manifests (`MANIFEST_FILENAMES` in `utils/common.ts`).
 
+## Wiring members together
+
+A stack entry may declare deploy-time env (`env` on `stackAppInput`)
+whose values reference sibling members by `dir`:
+
+```jsonc
+{
+  "apps": [{ "dir": "api" }, { "dir": "web", "env": { "API_URL": "{{service:api}}" } }],
+}
+```
+
+- `{{service:<dir>}}` → `http://<project>-<environment>:<port>`, the
+  member's in-network address. Deterministic (no deploy-order
+  dependency): the docker base serves it via a shared-network DNS alias
+  (`DockerDeploymentService`), Kubernetes bases via the Service name —
+  the same value works on both.
+- `{{url:<dir>}}` → the member's host-facing URL from its deploy this
+  run; requires the member to appear **earlier in `apps`** (members
+  deploy in file order). For values that end up in a browser.
+
+Interpolation happens per deploy (`resolveStackAppEnv` in
+`utils/stack.ts`), so `stack deploy demo2` rewires the clone with no
+file edits. Precedence: manifest `env` < stack `env` < `.env.<env>`
+file in the member directory. A bad reference fails that member's
+deploy with the known dirs listed. `examples/demo-stack-3tier` is the
+living demo (frontend → bff → backend).
+
 ## Relation to `appliance up` compose services
 
 `docs/up.md` §5 models N _services inside one project_ (a compose file)

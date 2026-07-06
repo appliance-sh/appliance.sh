@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { ensureHelperBinOnPath } from '@appliance.sh/helper';
+import { ensureHelperBinOnPath, ensureLocalhostFetch } from '@appliance.sh/helper';
 import * as sdk from '@appliance.sh/sdk';
 import { userArgs } from './utils/argv.js';
 
@@ -9,6 +9,11 @@ import { userArgs } from './utils/argv.js';
 // PATH lacks them. Idempotent; safe to also call from a subcommand
 // entry directly.
 ensureHelperBinOnPath();
+
+// Windows' resolver doesn't implement RFC 6761 `.localhost`, which the
+// microVM runtime's URLs (`api.appliance.localhost`, per-deploy
+// hostnames) depend on — teach this process' fetch to resolve them.
+ensureLocalhostFetch();
 
 // Dynamic-import dispatcher for the `appliance` umbrella command.
 //

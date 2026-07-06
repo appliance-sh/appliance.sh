@@ -33,6 +33,14 @@ const LABEL_PORT = 'sh.appliance.port';
 export const DEFAULT_DOCKER_PORT_MIN = 8300;
 export const DEFAULT_DOCKER_PORT_MAX = 8699;
 
+// User-defined bridge network every managed container joins. Docker's
+// default bridge has no DNS, so sibling stacks couldn't address each
+// other at all; on this network each container carries its stack name
+// as an alias, making `http://<stackName>:<port>` resolve exactly like
+// the Kubernetes backend's Service DNS — the same hostname works on
+// both local runtimes.
+export const APPLIANCE_NETWORK = 'appliance';
+
 // How long a freshly-run container gets to reach a stable Running
 // state before the deploy is reported as failed. Docker containers
 // start in milliseconds; the budget mostly covers slow entrypoints.
@@ -84,6 +92,8 @@ interface InspectedContainer {
   createdAt?: string;
   healthStatus?: string; // starting | healthy | unhealthy
   labels: Record<string, string>;
+  /** Names of the docker networks the container is attached to. */
+  networks: string[];
   /** First published host port, when any. */
   hostPort?: number;
   /** Container-side port of that binding. */
@@ -98,6 +108,11 @@ interface InspectedContainer {
  * the container, destroy removes it. No cluster, no registry, no
  * manifests: the image is whatever the local daemon already holds
  * (the CLI builds it there), referenced by tag or immutable image ID.
+ *
+ * Every container joins the shared `appliance` network with its stack
+ * name as a DNS alias, so sibling stacks reach each other at
+ * `http://<stackName>:<port>` — the same address the Kubernetes
+ * backend serves via its Service of the same name.
  *
  * Scale semantics: docker bases run a single container per stack.
  * A requested `replicas > 1` is not an error — the deploy proceeds
@@ -163,13 +178,15 @@ export class DockerDeploymentService implements ContainerDeploymentBackend {
     // is actually running — nothing to recreate. (The k8s path
     // re-applies its manifest and reports noop on image match alone;
     // here recreation restarts the process, so we only skip when the
-    // full deploy-time input is unchanged.)
+    // full deploy-time input is unchanged.) Containers predating the
+    // shared network count as changed so a redeploy migrates them.
     const unchanged =
       existing !== null &&
       existing.running &&
       existing.image === image &&
       (existing.labels[LABEL_ENV_JSON] ?? '{}') === JSON.stringify(env) &&
-      existing.labels[LABEL_PORT] === String(port);
+      existing.labels[LABEL_PORT] === String(port) &&
+      existing.networks.includes(APPLIANCE_NETWORK);
     if (unchanged) {
       const url = urlForHostPort(existing.hostPort);
       return {
@@ -190,6 +207,8 @@ export class DockerDeploymentService implements ContainerDeploymentBackend {
       await this.removeContainer(containerName);
     }
 
+    await this.ensureApplianceNetwork();
+
     const runArgs = (publish: string) => [
       'run',
       '--detach',
@@ -199,6 +218,17 @@ export class DockerDeploymentService implements ContainerDeploymentBackend {
       'unless-stopped',
       '--publish',
       publish,
+      // Sibling stacks resolve this container at `http://<stackName>:<port>`
+      // — the alias mirrors the Kubernetes backend's Service name.
+      '--network',
+      APPLIANCE_NETWORK,
+      '--network-alias',
+      stackName,
+      // Plain dockerd doesn't define host.docker.internal (Docker
+      // Desktop does) — map it so containers reach host services the
+      // same way on every daemon.
+      '--add-host',
+      'host.docker.internal:host-gateway',
       '--label',
       `${LABEL_MANAGED}=true`,
       '--label',
@@ -248,7 +278,7 @@ export class DockerDeploymentService implements ContainerDeploymentBackend {
       action: 'deploy',
       ok: true,
       idempotentNoop: false,
-      message: `Stack updated. URL: ${url}${replicasNote}`,
+      message: `Stack updated. URL: ${url} · service-to-service: http://${stackName}:${port}${replicasNote}`,
       stackName,
       url,
     };
@@ -418,6 +448,19 @@ export class DockerDeploymentService implements ContainerDeploymentBackend {
     return this.portMin + (Math.abs(hash) % range);
   }
 
+  /** Create the shared network if this daemon doesn't have it yet.
+   *  Racing deploys can both attempt the create — "already exists" is
+   *  the success case, not an error. */
+  private async ensureApplianceNetwork(): Promise<void> {
+    try {
+      await this.exec(['network', 'create', '--label', `${LABEL_MANAGED}=true`, APPLIANCE_NETWORK]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/already exists/i.test(message)) return;
+      throw new Error(`failed to create docker network ${APPLIANCE_NETWORK}: ${message}`);
+    }
+  }
+
   private async removeContainer(containerName: string): Promise<void> {
     try {
       await this.exec(['rm', '--force', containerName]);
@@ -511,6 +554,7 @@ interface RawInspect {
   RestartCount?: number;
   NetworkSettings?: {
     Ports?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
+    Networks?: Record<string, unknown> | null;
   };
   HostConfig?: {
     PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
@@ -544,6 +588,7 @@ function toInspectedContainer(raw: RawInspect): InspectedContainer {
     createdAt: raw.Created,
     healthStatus: raw.State?.Health?.Status,
     labels: raw.Config?.Labels ?? {},
+    networks: Object.keys(raw.NetworkSettings?.Networks ?? {}),
     hostPort,
     containerPort,
   };

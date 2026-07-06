@@ -9,7 +9,14 @@ import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { extractApplianceFile, MANIFEST_FILENAMES, registerManifestOptions } from './utils/common.js';
 import { DEFAULT_BUILD_OUTPUT, isPrintedError, runDeploy } from './utils/deploy-core.js';
-import { loadStack, resolveStackApps, STACK_FILENAME, type ResolvedStackApp } from './utils/stack.js';
+import {
+  loadStack,
+  resolveStackApps,
+  resolveStackAppEnv,
+  STACK_FILENAME,
+  type ResolvedStackApp,
+  type StackMemberInfo,
+} from './utils/stack.js';
 import { pollDeploymentUntilDone, urlsByEnvironment } from './utils/deploy-poll.js';
 import { startProgressLine, BRAND } from './utils/progress.js';
 import { printCliError } from './utils/errors.js';
@@ -202,13 +209,34 @@ program
       `${chalk.cyan(BRAND)} ${chalk.bold(stackName)} — deploying ${apps.length} app${apps.length === 1 ? '' : 's'}`
     );
 
+    // Env wiring: when any entry declares `env`, gather what the
+    // placeholders can reference — each member's project name and port
+    // from its manifest. Skipped entirely otherwise, so stacks without
+    // wiring don't pay an extra manifest evaluation per member.
+    const memberInfo = new Map<string, StackMemberInfo>();
+    if (apps.some((a) => a.env && Object.keys(a.env).length > 0)) {
+      for (const app of apps) {
+        const manifest = await withDir(app.dir, () => extractApplianceFile(manifestCommand()));
+        memberInfo.set(app.relDir, {
+          projectName: app.project ?? (manifest.success ? manifest.data.name : undefined),
+          environment: app.environment,
+          port: (manifest.success && 'port' in manifest.data && manifest.data.port) || 8080,
+        });
+      }
+    }
+
     const rows: StackRow[] = [];
+    const deployedUrls = new Map<string, string>();
     let failed = false;
 
     for (const [i, app] of apps.entries()) {
       console.log();
       console.log(chalk.bold(`[${i + 1}/${apps.length}] ${app.relDir}`) + chalk.dim(` → ${app.environment}`));
       try {
+        const extraEnv = resolveStackAppEnv(app, memberInfo, deployedUrls);
+        if (extraEnv) {
+          console.log(chalk.dim(`Stack env: ${Object.keys(extraEnv).join(', ')}`));
+        }
         const outcome = await withDir(app.dir, async () => {
           const projectName = await resolveProjectName(app);
           return runDeploy({
@@ -217,9 +245,10 @@ program
             program: manifestCommand(),
             cliProject: projectName,
             cliEnvironment: app.environment,
-            opts: { build: DEFAULT_BUILD_OUTPUT, yes: true },
+            opts: { build: DEFAULT_BUILD_OUTPUT, yes: true, extraEnv },
           });
         });
+        if (outcome.url) deployedUrls.set(app.relDir, outcome.url);
         const ok = outcome.deployment.status === DeploymentStatus.Succeeded;
         rows.push({
           app: app.relDir,

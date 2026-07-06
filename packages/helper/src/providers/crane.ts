@@ -49,14 +49,22 @@ export const craneProvider: Provider = {
       const res = await fetch(url, { redirect: 'follow' });
       if (!res.ok) throw new Error(`crane download failed: HTTP ${res.status}`);
       fs.writeFileSync(archive, Buffer.from(await res.arrayBuffer()));
-      // The release is a tar.gz with `crane` at its root. System tar
+      // The release is a tar.gz with the binary at its root — `crane`
+      // on macOS/Linux, `crane.exe` in the Windows tarball. System tar
       // handles it on every platform we ship (bsdtar on macOS/Windows,
-      // GNU tar on Linux).
-      await execFileAsync('tar', ['-xzf', archive, '-C', tmpDir, 'crane']);
-      const extracted = path.join(tmpDir, 'crane');
-      if (!fs.existsSync(extracted)) throw new Error('crane missing from release archive');
+      // GNU tar on Linux). On Windows, pin the System32 bsdtar by
+      // absolute path: a Git-Bash/MSYS environment puts GNU tar first
+      // on PATH, and GNU tar parses `C:\…` as a remote-host spec.
+      const member = process.platform === 'win32' ? 'crane.exe' : 'crane';
+      const tar =
+        process.platform === 'win32'
+          ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
+          : 'tar';
+      await execFileAsync(tar, ['-xzf', archive, '-C', tmpDir, member]);
+      const extracted = path.join(tmpDir, member);
+      if (!fs.existsSync(extracted)) throw new Error(`${member} missing from release archive`);
       fs.chmodSync(extracted, 0o755);
-      const dest = path.join(ctx.binDir, process.platform === 'win32' ? 'crane.exe' : 'crane');
+      const dest = path.join(ctx.binDir, member);
       fs.mkdirSync(ctx.binDir, { recursive: true });
       fs.copyFileSync(extracted, dest);
       fs.chmodSync(dest, 0o755);

@@ -4,6 +4,7 @@
 
 export * from './types.js';
 export { createContext, detectArch, detectPlatform, ensureHelperBinOnPath, helperBinDir } from './context.js';
+export { ensureLocalhostFetch } from './localhost-fetch.js';
 export { defaultProviders, findProvider } from './registry.js';
 export { runInstall, runStatus } from './install.js';
 export type { InstallOptions, InstallOutcome, StatusEntry } from './install.js';
@@ -31,6 +32,7 @@ export {
   bootstrapInClusterApiServer,
   buildInClusterBaseConfig,
   defaultLocalRuntimeDir,
+  kubectlApplyManifest,
   mintApiKey,
   readExistingBootstrapToken,
   renderInClusterApiServerManifest,

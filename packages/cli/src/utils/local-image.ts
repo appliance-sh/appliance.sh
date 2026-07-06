@@ -143,7 +143,7 @@ async function cranePush(imageRef: string): Promise<string> {
   const outcomes = await runInstall({ tools: ['crane'] });
   const failed = outcomes.find((o) => o.status === 'failed');
   if (failed) throw new Error(`crane install failed: ${failed.message}`);
-  const managed = path.join(helperBinDir(), 'crane');
+  const managed = path.join(helperBinDir(), process.platform === 'win32' ? 'crane.exe' : 'crane');
   const crane = fs.existsSync(managed) ? managed : 'crane';
 
   const tarPath = path.join(os.tmpdir(), `appliance-image-${process.pid}.tar`);

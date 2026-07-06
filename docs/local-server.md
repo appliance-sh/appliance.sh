@@ -61,6 +61,15 @@ credentials check. State lives in `~/.appliance/server/server.json`
    stack name, stable across redeploys) → `http://localhost:<port>`.
    Deploy-time env and port ride on `sh.appliance.*` labels so a bare
    redeploy preserves them, mirroring the k8s backend's contract.
+4. Every container joins the shared `appliance` docker network with
+   its stack name as a DNS alias, so stacks reach each other at
+   `http://<project>-<env>:<port>` — the same address the Kubernetes
+   backend serves via its Service name. (`localhost:<hostport>` URLs
+   are host-facing; inside a container, localhost is the container.)
+   `host.docker.internal` is also mapped (`host-gateway`) for
+   reaching services that run on the host itself. Stack files can
+   declare this wiring declaratively — see "Wiring members together"
+   in the README.
 
 Health, workloads, and container logs flow through the same
 `/api/v1/environments/:id/health|workloads` + `/api/v1/pods/:name/logs`
