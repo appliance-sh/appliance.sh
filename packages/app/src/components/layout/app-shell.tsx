@@ -4,6 +4,7 @@ import { Wand, Server, Boxes, Folder, Bot, Cog } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import { useKeyRole } from '@/hooks/use-key-role';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 import { TerminalDock } from './terminal-dock';
@@ -32,18 +33,25 @@ export function AppShell() {
   const host = useHost();
   const showAgents = Boolean(host.vm);
 
+  // Member keys (invite-onboarded teammates) get the task surface only:
+  // their apps and Settings. Clusters / Agents / Setup are operator
+  // tools — the API 403s a member on them anyway, so showing the nav
+  // items would only manufacture dead ends.
+  const { role } = useKeyRole();
+  const isOperator = role === 'admin';
+
   // Five-area IA (§2): Setup (adaptive) / Clusters / Projects / Agents /
   // Settings — canonical labels only (no Dashboard/Overview/Runtimes drift).
-  // Clusters stays always-visible — its desktop-only bits are host-gated
-  // inside the page, not hidden from the rail; Agents is gated OFF the rail on
-  // web since the whole area is desktop-only. Clusters uses `Boxes` (a
-  // distinct icon, not the brand mark's `Server`) so the nav item doesn't read
-  // as a second logo (Devon); Agents uses `Bot`.
+  // Clusters stays always-visible for operators — its desktop-only bits are
+  // host-gated inside the page, not hidden from the rail; Agents is gated OFF
+  // the rail on web since the whole area is desktop-only. Clusters uses
+  // `Boxes` (a distinct icon, not the brand mark's `Server`) so the nav item
+  // doesn't read as a second logo (Devon); Agents uses `Bot`.
   const nav: NavItem[] = [
-    ...(!isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
-    { to: '/clusters', label: 'Clusters', icon: Boxes },
-    { to: '/projects', label: 'Projects', icon: Folder },
-    ...(showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    ...(isOperator && !isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
+    ...(isOperator ? [{ to: '/clusters', label: 'Clusters', icon: Boxes }] : []),
+    { to: '/projects', label: 'Apps', icon: Folder },
+    ...(isOperator && showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
     { to: '/settings', label: 'Settings', icon: Cog },
   ];
 
@@ -102,13 +110,15 @@ export function AppShell() {
 
       {/* Terminal dock — a tab strip for ALL live shells, in the grid row
           below `<main>` and OUTSIDE the `<Outlet/>`. Reachable from every
-          route, so a running-but-hidden shell is never orphaned. */}
-      <TerminalDock />
+          route, so a running-but-hidden shell is never orphaned.
+          Operator-only: members have no shell-opening affordances, so the
+          dock (and layer) would be permanent dead chrome for them. */}
+      {isOperator ? <TerminalDock /> : null}
 
       {/* Persistent terminal layer — OUTSIDE the `<Outlet/>` so navigating
           never unmounts the active shell. Its sessions live in
           `TerminalSessionsProvider`; this only shows/hides the view. */}
-      <TerminalLayer />
+      {isOperator ? <TerminalLayer /> : null}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
 import { getStorageService } from './storage.service';
-import { ApiKeyCreateResponse, generateId } from '@appliance.sh/sdk';
+import { ApiKeyCreateResponse, ApiKeyRole, ApiKeySummary, generateId } from '@appliance.sh/sdk';
 
 const COLLECTION = 'api-keys';
 
@@ -12,10 +12,18 @@ interface StoredApiKey {
   secret: string;
   createdAt: string;
   lastUsedAt?: string;
+  // Absent on keys stored before roles existed — read as 'admin', since
+  // every pre-role key was full-access.
+  role?: ApiKeyRole;
+}
+
+/** Pre-role keys were all full-access, so absence reads as admin. */
+export function roleOf(key: { role?: ApiKeyRole }): ApiKeyRole {
+  return key.role ?? 'admin';
 }
 
 export class ApiKeyService {
-  async create(name: string): Promise<ApiKeyCreateResponse> {
+  async create(name: string, role: ApiKeyRole = 'admin'): Promise<ApiKeyCreateResponse> {
     const storage = getStorageService();
     const id = generateId('apikey');
     const secret = `sk_${randomBytes(32).toString('hex')}`;
@@ -26,11 +34,27 @@ export class ApiKeyService {
       name,
       secret,
       createdAt: now,
+      role,
     };
 
     await storage.set(COLLECTION, id, stored);
 
-    return { id, name, secret, createdAt: now };
+    return { id, name, secret, createdAt: now, role };
+  }
+
+  /** All keys, secrets stripped — safe to return to admins. */
+  async list(): Promise<ApiKeySummary[]> {
+    const storage = getStorageService();
+    const keys = await storage.getAll<StoredApiKey>(COLLECTION);
+    return keys
+      .map((k) => ({
+        id: k.id,
+        name: k.name,
+        role: roleOf(k),
+        createdAt: k.createdAt,
+        ...(k.lastUsedAt ? { lastUsedAt: k.lastUsedAt } : {}),
+      }))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async getByKeyId(keyId: string): Promise<StoredApiKey | null> {
@@ -77,7 +101,7 @@ export class ApiKeyService {
   async rotate(keyId: string): Promise<ApiKeyCreateResponse | null> {
     const existing = await this.getByKeyId(keyId);
     if (!existing) return null;
-    const replacement = await this.create(existing.name);
+    const replacement = await this.create(existing.name, roleOf(existing));
     // Revoke last: the replacement is already persisted and returned.
     await this.delete(keyId);
     return replacement;

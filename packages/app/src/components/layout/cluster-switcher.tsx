@@ -53,9 +53,16 @@ export function ClusterSwitcher() {
     mutationFn: async (id: string) => host.selectCluster(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
-      // Cluster-scoped data is going to be refetched. Reset to dashboard
-      // so deep-linked rows for the previous cluster don't 404.
-      navigate('/');
+      // Deep-linked rows (a project, an environment, a deployment)
+      // belong to the previous cluster and would 404 after the switch —
+      // those reset to the landing. Top-level sections carry no
+      // per-cluster ids and just refetch, so stay put instead of
+      // yanking the user off the page they were reading.
+      const segments = window.location.pathname.split('/').filter(Boolean);
+      const stayable = ['projects', 'clusters', 'settings', 'agents', 'environments', 'deployments'];
+      if (segments.length !== 1 || !stayable.includes(segments[0])) {
+        navigate('/');
+      }
       setOpen(false);
     },
   });

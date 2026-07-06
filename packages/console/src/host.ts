@@ -10,13 +10,18 @@ const LEGACY_API_SERVER_URL_KEY = 'appliance:api-server-url';
 const LEGACY_API_KEY_KEY = 'appliance:api-key';
 
 // Web host implementation. Cluster metadata + API keys live in
-// sessionStorage so they don't persist past the tab. A future
-// api-server-served build can inject one cluster via
-// window.__APPLIANCE_CONFIG__ — when present, it shows up as a
-// pre-existing cluster in the list at first load.
+// localStorage so a teammate stays signed in across tabs and restarts —
+// re-pasting a secret on every visit is exactly the friction the invite
+// flow removes. (Keys were briefly sessionStorage-scoped; that state is
+// migrated forward on first read.) An api-server-served build injects
+// runtime config via window.__APPLIANCE_CONFIG__.
 declare global {
   interface Window {
-    __APPLIANCE_CONFIG__?: { apiServerUrl?: string };
+    __APPLIANCE_CONFIG__?: {
+      apiServerUrl?: string;
+      consoleMode?: 'full' | 'bootstrap' | 'off';
+      consoleUrl?: string;
+    };
   }
 }
 
@@ -25,11 +30,61 @@ interface PersistedClusters {
   selectedClusterId: string | null;
 }
 
-function readPersisted(): PersistedClusters {
-  let clusters: Cluster[] = [];
-  let selectedClusterId: string | null = null;
+// One-time migrations into localStorage: (a) the sessionStorage era —
+// same keys, tab-scoped; (b) the legacy single-cluster shape. Both are
+// deleted after migrating so we don't re-migrate next time.
+function migrateOlderStorage(): void {
+  if (localStorage.getItem(CLUSTERS_KEY)) return;
 
-  const rawClusters = sessionStorage.getItem(CLUSTERS_KEY);
+  const sessionClusters = sessionStorage.getItem(CLUSTERS_KEY);
+  if (sessionClusters) {
+    try {
+      const parsed = JSON.parse(sessionClusters) as Cluster[];
+      if (Array.isArray(parsed)) {
+        localStorage.setItem(CLUSTERS_KEY, sessionClusters);
+        const selected = sessionStorage.getItem(SELECTED_KEY);
+        if (selected) localStorage.setItem(SELECTED_KEY, selected);
+        for (const cluster of parsed) {
+          const key = sessionStorage.getItem(apiKeyStorageKey(cluster.id));
+          if (key) localStorage.setItem(apiKeyStorageKey(cluster.id), key);
+        }
+      }
+    } catch {
+      // discard malformed
+    }
+    sessionStorage.removeItem(CLUSTERS_KEY);
+    sessionStorage.removeItem(SELECTED_KEY);
+    return;
+  }
+
+  const legacyUrl = window.__APPLIANCE_CONFIG__?.apiServerUrl ?? sessionStorage.getItem(LEGACY_API_SERVER_URL_KEY);
+  const legacyKeyRaw = sessionStorage.getItem(LEGACY_API_KEY_KEY);
+  if (legacyUrl && legacyKeyRaw) {
+    try {
+      const legacyKey = JSON.parse(legacyKeyRaw) as { id: string; secret: string };
+      const id = randomId();
+      const cluster: Cluster = {
+        id,
+        name: deriveNameFromUrl(legacyUrl),
+        apiServerUrl: legacyUrl,
+        createdAt: new Date().toISOString(),
+      };
+      localStorage.setItem(apiKeyStorageKey(id), JSON.stringify(legacyKey));
+      writePersisted({ clusters: [cluster], selectedClusterId: id });
+      sessionStorage.removeItem(LEGACY_API_SERVER_URL_KEY);
+      sessionStorage.removeItem(LEGACY_API_KEY_KEY);
+    } catch {
+      // discard malformed legacy state
+    }
+  }
+}
+
+function readPersisted(): PersistedClusters {
+  migrateOlderStorage();
+
+  let clusters: Cluster[] = [];
+
+  const rawClusters = localStorage.getItem(CLUSTERS_KEY);
   if (rawClusters) {
     try {
       const parsed = JSON.parse(rawClusters);
@@ -38,50 +93,22 @@ function readPersisted(): PersistedClusters {
       // discard malformed
     }
   }
-  selectedClusterId = sessionStorage.getItem(SELECTED_KEY);
-
-  if (clusters.length === 0) {
-    // Legacy single-cluster migration. Keys present on the old shape
-    // get folded into a single cluster entry; old keys are then
-    // deleted so we don't re-migrate next time.
-    const legacyUrl = window.__APPLIANCE_CONFIG__?.apiServerUrl ?? sessionStorage.getItem(LEGACY_API_SERVER_URL_KEY);
-    const legacyKeyRaw = sessionStorage.getItem(LEGACY_API_KEY_KEY);
-    if (legacyUrl && legacyKeyRaw) {
-      try {
-        const legacyKey = JSON.parse(legacyKeyRaw) as { id: string; secret: string };
-        const id = randomId();
-        const cluster: Cluster = {
-          id,
-          name: deriveNameFromUrl(legacyUrl),
-          apiServerUrl: legacyUrl,
-          createdAt: new Date().toISOString(),
-        };
-        sessionStorage.setItem(apiKeyStorageKey(id), JSON.stringify(legacyKey));
-        clusters = [cluster];
-        selectedClusterId = id;
-        writePersisted({ clusters, selectedClusterId });
-        sessionStorage.removeItem(LEGACY_API_SERVER_URL_KEY);
-        sessionStorage.removeItem(LEGACY_API_KEY_KEY);
-      } catch {
-        // discard malformed legacy state
-      }
-    }
-  }
+  const selectedClusterId = localStorage.getItem(SELECTED_KEY);
 
   return { clusters, selectedClusterId };
 }
 
 function writePersisted(state: PersistedClusters): void {
-  sessionStorage.setItem(CLUSTERS_KEY, JSON.stringify(state.clusters));
+  localStorage.setItem(CLUSTERS_KEY, JSON.stringify(state.clusters));
   if (state.selectedClusterId) {
-    sessionStorage.setItem(SELECTED_KEY, state.selectedClusterId);
+    localStorage.setItem(SELECTED_KEY, state.selectedClusterId);
   } else {
-    sessionStorage.removeItem(SELECTED_KEY);
+    localStorage.removeItem(SELECTED_KEY);
   }
 }
 
 function readApiKey(clusterId: string): { id: string; secret: string } | null {
-  const raw = sessionStorage.getItem(apiKeyStorageKey(clusterId));
+  const raw = localStorage.getItem(apiKeyStorageKey(clusterId));
   if (!raw) return null;
   try {
     return JSON.parse(raw) as { id: string; secret: string };
@@ -120,7 +147,7 @@ export const webHost: ConsoleHost = {
       apiServerUrl: input.apiServerUrl,
       createdAt: new Date().toISOString(),
     };
-    sessionStorage.setItem(apiKeyStorageKey(cluster.id), JSON.stringify(input.apiKey));
+    localStorage.setItem(apiKeyStorageKey(cluster.id), JSON.stringify(input.apiKey));
     writePersisted({
       clusters: [...clusters, cluster],
       selectedClusterId: cluster.id,
@@ -142,7 +169,7 @@ export const webHost: ConsoleHost = {
     if (next.length === clusters.length) {
       throw new Error(`cluster not found: ${clusterId}`);
     }
-    sessionStorage.removeItem(apiKeyStorageKey(clusterId));
+    localStorage.removeItem(apiKeyStorageKey(clusterId));
     const nextSelected = selectedClusterId === clusterId ? (next[0]?.id ?? null) : selectedClusterId;
     writePersisted({ clusters: next, selectedClusterId: nextSelected });
   },

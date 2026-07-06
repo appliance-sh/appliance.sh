@@ -145,6 +145,7 @@ program
         console.log(`  State backend:  ${result.stateBackendUrl}`);
         if (result.apiServerUrl) {
           console.log(`  API server:     ${result.apiServerUrl}`);
+          console.log(`  Web console:    ${chalk.cyan(result.apiServerUrl)}  (open it in a browser)`);
         }
         if (result.apiKey) {
           console.log(`  API key id:     ${result.apiKey.id}`);
@@ -159,6 +160,10 @@ program
           console.log(
             `  then ${chalk.cyan('appliance setup')} in your app folder and ${chalk.cyan('appliance deploy')}.`
           );
+          console.log(
+            `  To onboard teammates, open the web console and use ${chalk.cyan('Settings → Invite teammate')} —`
+          );
+          console.log('  they get a link that signs them in with their own key, no secrets to paste.');
         } else {
           console.log(
             '  Phase 2 (hoist api-server) has not run yet — re-run with `--phases all` to finish the installation.'

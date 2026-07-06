@@ -62,6 +62,20 @@ If no `appliance.zip` exists, `appliance deploy` builds one automatically. On a 
 
 The CLI polls until the deployment completes and prints the deployed URL when one is available. Check status anytime with `appliance status` (defaults to the linked project) or `appliance deployment status <deployment-id>`. Open the running app with `appliance open`.
 
+## Web console & inviting your team
+
+The api-server serves the web console itself: the server URL printed by `appliance bootstrap` **is** the console URL — open it in a browser. No separate hosting, no CORS setup.
+
+To onboard a teammate (including non-technical ones), open the console → **Settings → Team** → type their name → **Create invite link**, and send them the link. Opening it signs them in with their own credential — no server URL or secret to paste, and it persists across browser restarts. Invite links are single-use and expire (7 days by default). The same Team panel lists everyone with access and revokes it in one click.
+
+Invited teammates get a **member** key: they see and manage apps (deploy status, redeploys, environment variables) but not the operator surfaces (clusters, bootstrap, agents, key management). Keys created via `appliance bootstrap` / `appliance login` are **admins** with the full console.
+
+Console-serving is configurable on the server for hardened deployments:
+
+- `APPLIANCE_CONSOLE_MODE` — `full` (default), `bootstrap` (this origin only handles onboarding/invite redemption and points users at the hardened console), or `off` (API only).
+- `APPLIANCE_CONSOLE_URL` — canonical console URL when you host the console elsewhere (e.g. behind a VPN or SSO proxy). Invite links target it, and its origin is automatically CORS-allowed.
+- `APPLIANCE_CONSOLE_DIR` — override the console bundle location on disk.
+
 ## Application Types
 
 | Type          | Use case                                     | Required fields                                   |

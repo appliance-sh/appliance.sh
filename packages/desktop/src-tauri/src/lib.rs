@@ -2508,29 +2508,36 @@ async fn bootstrap_in_cluster_api_server(
 // the repo's cargo output, and `microvm_install` places it in
 // ~/.appliance/bin — the shared managed location the CLI resolves too.
 
+/// Platform file name of the microVM engine binary (cargo emits
+/// `appliance-vm.exe` on Windows, `appliance-vm` elsewhere). Every
+/// path that stores, stages, or resolves the engine must use this —
+/// a bare `appliance-vm` never matches on Windows.
+const VM_BIN_NAME: &str = if cfg!(windows) {
+    "appliance-vm.exe"
+} else {
+    "appliance-vm"
+};
+
 /// Locate the appliance-vm binary: the helper-managed bin dir first
 /// (the CLI's `appliance vm` resolves the same path), then PATH.
 fn vm_binary() -> Option<PathBuf> {
     if let Some(home) = home_dir() {
-        let managed = home
-            .join(SHARED_PROFILES_DIR)
-            .join("bin")
-            .join("appliance-vm");
+        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join(VM_BIN_NAME);
         if managed.exists() {
             return Some(managed);
         }
     }
-    which_path("appliance-vm")
+    which_path(VM_BIN_NAME)
 }
 
 /// Where an installable appliance-vm binary can come from: the
 /// bundled resource (packaged builds; placed by scripts/copy-vm.mjs),
 /// or — in dev builds — the repo checkout's cargo output.
 fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
-    if let Ok(resource) = app
-        .path()
-        .resolve("vm-bin/appliance-vm", tauri::path::BaseDirectory::Resource)
-    {
+    if let Ok(resource) = app.path().resolve(
+        &format!("vm-bin/{VM_BIN_NAME}"),
+        tauri::path::BaseDirectory::Resource,
+    ) {
         if resource.is_file() {
             return Some(resource);
         }
@@ -2539,7 +2546,7 @@ fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
     {
         let vm_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vm/target");
         for profile in ["release", "debug"] {
-            let candidate = vm_target.join(profile).join("appliance-vm");
+            let candidate = vm_target.join(profile).join(VM_BIN_NAME);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -2589,7 +2596,7 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
     let home = home_dir().ok_or("cannot resolve the home directory")?;
     let bin_dir = home.join(SHARED_PROFILES_DIR).join("bin");
     fs::create_dir_all(&bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
-    let dest = bin_dir.join("appliance-vm");
+    let dest = bin_dir.join(VM_BIN_NAME);
     // Unlink first: overwriting in place would truncate the inode a
     // still-running VM host process executes from.
     let _ = fs::remove_file(&dest);
@@ -2624,7 +2631,7 @@ async fn ensure_vm_installed(
     let Some(source) = vm_install_source(app) else {
         return Ok(());
     };
-    let dest = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm"));
+    let dest = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join(VM_BIN_NAME));
     let up_to_date = dest.as_ref().is_some_and(|dest| {
         dest.is_file()
             // Cheap length gate before reading both binaries in full.

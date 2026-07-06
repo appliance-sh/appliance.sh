@@ -15,6 +15,7 @@ vi.mock('../services/api-key.service', () => ({
     getByKeyId: async (keyId: string) => mockKeyStore.get(keyId) ?? null,
     updateLastUsed: async () => {},
   },
+  roleOf: (key: { role?: string }) => key.role ?? 'admin',
 }));
 
 function createTestApp() {

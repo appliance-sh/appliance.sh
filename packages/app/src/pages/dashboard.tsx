@@ -178,7 +178,7 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Projects</h1>
+          <h1 className="text-xl font-semibold tracking-tight">Apps</h1>
           <p className="mt-0.5 text-sm text-[var(--color-muted-foreground)]">
             {clusterName} · <span className="font-mono text-xs">{serverUrl}</span>
           </p>
@@ -189,7 +189,7 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
             <input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Search projects…"
+              placeholder="Search apps…"
               className="h-9 w-56 rounded-md border border-[var(--color-border)] bg-transparent pl-8 pr-3 text-sm placeholder:text-[var(--color-muted-foreground)] focus:border-[var(--color-border-strong)] focus:outline-none"
             />
           </div>
@@ -429,7 +429,7 @@ function EmptyProjects() {
   // for terminal-first users.
   return (
     <div className="mx-auto max-w-md space-y-4 py-16 text-center">
-      <h2 className="text-lg font-semibold">Deploy your first project</h2>
+      <h2 className="text-lg font-semibold">Deploy your first app</h2>
       <p className="text-sm text-[var(--color-muted-foreground)]">
         Pick an application folder with an <code className="font-mono">appliance.json</code> — the wizard creates the
         project, builds, and deploys in one step.
@@ -534,9 +534,8 @@ function FirstRunWelcome({ onLater, onMore }: { onLater: () => void; onMore: () 
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Run apps on a local cluster on this machine. One click boots a local runtime sandboxed in its own virtual
-          machine — the recommended, isolated default. You’ll watch it come up stage by stage, and it connects
-          automatically once it’s ready.
+          Run your apps right on this computer — no cloud account needed. One click sets everything up in a safe,
+          isolated space, and you can watch it get ready. Nothing to install or configure by hand.
         </p>
       </div>
       <div className="flex flex-col items-center gap-3">
@@ -570,8 +569,8 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Appliance</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Install and run applications on a cluster. Set up a local runtime on this device, provision an AWS cluster, or
-          connect to one you already have.
+          Pick where your apps should run: on this computer, on your own AWS account, or somewhere your team already set
+          up. Invited by a teammate? Just open the link they sent you — no setup needed here.
         </p>
       </div>
 
@@ -579,8 +578,8 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
         {caps.any ? (
           <ActionCard
             icon={Laptop}
-            title="Local runtime"
-            body="A cluster + api-server on this machine, sandboxed in a virtual machine. Apps publish at *.appliance.localhost. No cloud account needed."
+            title="On this computer"
+            body="The recommended start: everything runs in a safe, isolated space on this machine, and your apps get local web addresses. Free — no cloud account needed."
             cta="Set up"
             to="/setup/bootstrap?mode=local"
             primary
@@ -589,8 +588,8 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
         {canBootstrap ? (
           <ActionCard
             icon={Wand}
-            title="Bootstrap on AWS"
-            body="Provision the base AWS infrastructure from this machine using your current credentials."
+            title="On your AWS account"
+            body="For developers: creates the cloud infrastructure your team shares. Needs AWS credentials on this machine. Teammates then join via invite links — they never see this step."
             cta="Start wizard"
             to="/setup/bootstrap?mode=aws"
             primary={!caps.any}
@@ -598,8 +597,8 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
         ) : null}
         <ActionCard
           icon={Plug}
-          title="Connect to existing"
-          body="Point this console at an api-server you already have by entering its URL and an API key."
+          title="Join an existing setup"
+          body="Your team already runs Appliance somewhere? The easiest way in is an invite link from an admin. You can also connect manually with a server address and access key."
           cta="Connect"
           to="/setup/connect"
           primary={!canBootstrap && !caps.any}
@@ -610,8 +609,8 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
         {caps.any ? (
           <ActionCard
             icon={Stethoscope}
-            title="Doctor"
-            body="Check the local-runtime prerequisites — Docker / kubectl and a running container-runtime daemon — and fix them in one click."
+            title="Check this computer"
+            body="Something not working? This checks that the tools Appliance needs (like Docker) are installed and running, and fixes what it can in one click."
             cta="Run checks"
             to="/setup/doctor"
           />

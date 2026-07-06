@@ -135,6 +135,10 @@ COPY --from=build /app/packages/sdk/dist/ packages/sdk/dist/
 COPY --from=build /app/packages/infra/dist/ packages/infra/dist/
 COPY --from=build /app/packages/api-server/dist/ packages/api-server/dist/
 
+# Web console SPA (built host-side by docker-prep.sh). Served by the
+# api-server at / so the server URL is the console URL.
+COPY .docker-deps/console-dist/ packages/api-server/console-dist/
+
 ENV PORT=3000
 EXPOSE 3000
 

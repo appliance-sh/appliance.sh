@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
-import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
-import { apiKeyService } from '../services/api-key.service';
+import { verifySignedRequest, computeContentDigest, type ApiKeyRole } from '@appliance.sh/sdk';
+import { apiKeyService, roleOf } from '../services/api-key.service';
 import { logger } from '../logger';
 
 /**
@@ -49,6 +49,10 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   }
   const url = `${req.protocol}://${host}${req.originalUrl}`;
 
+  // Captured by the key-lookup callback so the verified request can
+  // carry its role without a second storage read.
+  let resolvedRole: ApiKeyRole | undefined;
+
   const result = await verifySignedRequest(
     {
       method: req.method,
@@ -58,6 +62,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     async (keyId: string) => {
       const key = await apiKeyService.getByKeyId(keyId);
       if (!key) return null;
+      resolvedRole = roleOf(key);
       return { secret: key.secret };
     }
   );
@@ -74,11 +79,32 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   }
 
   req.apiKeyId = result.keyId;
+  req.apiKeyRole = resolvedRole;
 
   if (result.keyId) {
     apiKeyService.updateLastUsed(result.keyId).catch(() => {});
   }
 
+  next();
+}
+
+/**
+ * Gate a route on the calling key's role. Runs after `signatureAuth`,
+ * which attaches `req.apiKeyRole`. Member keys get the data plane only;
+ * key/invite management stays admin-only so a teammate's leaked key
+ * cannot enumerate or revoke other credentials.
+ */
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (req.apiKeyRole !== 'admin') {
+    logger.warn('authz failed: admin role required', {
+      requestId: req.requestId,
+      path: req.originalUrl,
+      keyId: req.apiKeyId,
+      role: req.apiKeyRole,
+    });
+    res.status(403).json({ error: 'This action needs an admin key' });
+    return;
+  }
   next();
 }
 

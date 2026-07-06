@@ -318,7 +318,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
           </dl>
           {handoff === 'failed' && handoffError ? (
             <div className="rounded-md border border-red-500/50 bg-red-500/5 p-2 text-xs text-red-400">
-              {handoffError} — connect manually via Settings.
+              {handoffError} — connect manually under Clusters → Add cluster.
             </div>
           ) : null}
           <Button onClick={() => navigate('/')} disabled={handoff === 'saving'}>
@@ -377,7 +377,11 @@ const MICROVM_LADDER: {
   { phase: 'media', label: 'Boot media', detail: 'Preparing the VM kernel and disk image.' },
   { phase: 'booting', label: 'Booting guest', detail: 'Starting the virtual machine.' },
   { phase: 'network', label: 'Guest network', detail: 'Connecting the VM to the network.' },
-  { phase: 'cluster', label: 'Starting k3s', detail: 'First boot pulls images — this can take a few minutes.' },
+  {
+    phase: 'cluster',
+    label: 'Starting the app platform',
+    detail: 'First boot downloads a few components — this can take a few minutes.',
+  },
   {
     phase: 'ready',
     label: 'Cluster ready',

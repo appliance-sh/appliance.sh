@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { resetOnboarding } from '@/lib/local-runtime';
+import { TeamSection } from '@/pages/settings-team';
 import type { AvailableUpdate, UpdateProgress } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
@@ -30,6 +31,8 @@ export function SettingsPage() {
           under <span className="font-medium text-[var(--color-foreground)]">Agents</span>.
         </p>
       </div>
+
+      <TeamSection />
 
       {canSelfUpdate ? <UpdatesSection /> : null}
 

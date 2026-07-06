@@ -21,12 +21,28 @@ const PATTERNS: readonly RegExp[] = [
 ];
 
 function extraOrigins(): string[] {
+  const origins: string[] = [];
   const raw = process.env.APPLIANCE_CORS_ORIGINS;
-  if (!raw) return [];
-  return raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  if (raw) {
+    origins.push(
+      ...raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+  }
+  // The canonical console (APPLIANCE_CONSOLE_URL) is allowed
+  // automatically — a separately-hosted console must not require a
+  // second, easy-to-forget CORS env var to actually work.
+  const consoleUrl = process.env.APPLIANCE_CONSOLE_URL?.trim();
+  if (consoleUrl) {
+    try {
+      origins.push(new URL(consoleUrl).origin);
+    } catch {
+      // malformed URL — ignore; console-static logs the config surface
+    }
+  }
+  return origins;
 }
 
 function isAllowed(origin: string): boolean {

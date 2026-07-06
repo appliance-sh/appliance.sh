@@ -7,11 +7,13 @@ import { deploymentRoutes } from './routes/deployments';
 import { buildRoutes } from './routes/builds';
 import { bootstrapRoutes } from './routes/bootstrap';
 import { keyRoutes } from './routes/keys';
+import { inviteRoutes } from './routes/invites';
 import { clusterInfoRoutes } from './routes/cluster-info';
 import { workloadsRoutes, environmentWorkloadsRoutes, podLogsRoutes } from './routes/workloads';
 import { internalRoutes } from './routes/internal';
 import { signatureAuth } from './middleware/auth';
 import { corsMiddleware } from './middleware/cors';
+import { mountConsole } from './console-static';
 import { requestLogger, logger } from './logger';
 
 export type ApplianceMode = 'server' | 'worker';
@@ -42,6 +44,14 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
     })
   );
 
+  // Web console (SPA) — served same-origin when a bundle is staged, so
+  // the api-server's URL is the link teammates open. Registered before
+  // the API routers; its fallback next()s anything under /api, /bootstrap
+  // or the health probes, so the JSON surface is unaffected.
+  if (mode === 'server') {
+    mountConsole(app);
+  }
+
   // Health check is available in both modes
   app.use('/', indexRoutes);
 
@@ -51,6 +61,7 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
     app.use('/api/v1/projects/:projectId/environments', signatureAuth, environmentRoutes);
     app.use('/api/v1/deployments', signatureAuth, deploymentRoutes);
     app.use('/api/v1/keys', signatureAuth, keyRoutes);
+    app.use('/api/v1/invites', signatureAuth, inviteRoutes);
     app.use('/api/v1/builds', signatureAuth, buildRoutes);
     app.use('/api/v1/cluster-info', signatureAuth, clusterInfoRoutes);
     // Cluster workloads + pod logs (Kubernetes bases only; 409 elsewhere).

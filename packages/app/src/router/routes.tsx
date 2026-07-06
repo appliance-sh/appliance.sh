@@ -1,8 +1,12 @@
+import type * as React from 'react';
 import type { RouteObject } from 'react-router';
 import { Navigate, useLocation } from 'react-router';
 import { AppShell } from '@/components/layout/app-shell';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import { useKeyRole } from '@/hooks/use-key-role';
+import { isBootstrapOnlyConsole } from '@/lib/runtime-config';
 import { DashboardPage } from '@/pages/dashboard';
+import { InvitePage, BootstrapHandoffPage } from '@/pages/invite';
 import { ConnectPage } from '@/pages/connect';
 import { ProjectDetailPage } from '@/pages/projects/detail';
 import { EnvironmentsPage } from '@/pages/environments';
@@ -26,7 +30,23 @@ import { BootstrapProgressPage } from '@/pages/bootstrap/progress';
 function LandingRedirect() {
   const { cluster, isLoading } = useSelectedCluster();
   if (isLoading) return null;
+  // A bootstrap-only console (high-security deployments) never shows
+  // the app: once connected, hand off to the hardened console.
+  if (isBootstrapOnlyConsole()) {
+    return <Navigate to={cluster ? '/setup-complete' : '/setup'} replace />;
+  }
   return <Navigate to={cluster ? '/projects' : '/setup'} replace />;
+}
+
+// Operator-only surfaces (clusters, bootstrap, doctor, agents) are
+// hidden from member keys — the invite-minted role for teammates. The
+// api-server enforces the real boundary (403s on admin routes); this
+// guard just keeps members from landing on screens made of dead ends.
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { role, isLoading } = useKeyRole();
+  if (isLoading) return null;
+  if (role !== 'admin') return <Navigate to="/" replace />;
+  return <>{children}</>;
 }
 
 // The deploy wizard's canonical home is ③ `/projects/deploy` (I3); the old
@@ -46,6 +66,12 @@ function DeployAliasRedirect() {
 // `AppShell` so the terminal dock + cluster switcher persist during
 // onboarding (§2).
 export const routes: RouteObject[] = [
+  // Standalone (no AppShell chrome): the invite landing a teammate's
+  // link opens, and the "setup only" handoff a bootstrap-scoped console
+  // shows once connected. Both are first-run screens — nav, cluster
+  // switcher and the terminal dock would only add noise.
+  { path: '/invite', element: <InvitePage /> },
+  { path: '/setup-complete', element: <BootstrapHandoffPage /> },
   {
     path: '/',
     element: <AppShell />,
@@ -59,9 +85,30 @@ export const routes: RouteObject[] = [
       // `/setup` stays routable even once configured.
       { path: 'setup', element: <DashboardPage /> },
       { path: 'setup/connect', element: <ConnectPage /> },
-      { path: 'setup/bootstrap', element: <BootstrapWizardPage /> },
-      { path: 'setup/bootstrap/run', element: <BootstrapProgressPage /> },
-      { path: 'setup/doctor', element: <SetupDoctorPage /> },
+      {
+        path: 'setup/bootstrap',
+        element: (
+          <RequireAdmin>
+            <BootstrapWizardPage />
+          </RequireAdmin>
+        ),
+      },
+      {
+        path: 'setup/bootstrap/run',
+        element: (
+          <RequireAdmin>
+            <BootstrapProgressPage />
+          </RequireAdmin>
+        ),
+      },
+      {
+        path: 'setup/doctor',
+        element: (
+          <RequireAdmin>
+            <SetupDoctorPage />
+          </RequireAdmin>
+        ),
+      },
 
       // ② Clusters — the live owner of cluster/runtime management (I2). The
       // list (cloud clusters + local runtimes) and the single ADAPTIVE
@@ -69,8 +116,22 @@ export const routes: RouteObject[] = [
       // lifecycle ops; local runtime → tabbed VM management (lifecycle /
       // egress / credentials / facts). Desktop-only bits are host.vm-gated
       // inside the pages, so this is safe on the web shell too.
-      { path: 'clusters', element: <ClustersPage /> },
-      { path: 'clusters/:id', element: <ClusterDetailPage /> },
+      {
+        path: 'clusters',
+        element: (
+          <RequireAdmin>
+            <ClustersPage />
+          </RequireAdmin>
+        ),
+      },
+      {
+        path: 'clusters/:id',
+        element: (
+          <RequireAdmin>
+            <ClusterDetailPage />
+          </RequireAdmin>
+        ),
+      },
 
       // ③ Projects — the Overview grid home, deploy wizard, project detail,
       // and Environments/Deployments folded UNDER the area as nested routes
@@ -86,7 +147,14 @@ export const routes: RouteObject[] = [
       // across runtimes. Desktop-only (`host.vm`); the nav item is hidden on
       // web and the page renders a "desktop app only" message there. Observe
       // terminals stay in the global dock.
-      { path: 'agents', element: <AgentsPage /> },
+      {
+        path: 'agents',
+        element: (
+          <RequireAdmin>
+            <AgentsPage />
+          </RequireAdmin>
+        ),
+      },
 
       // ⑤ Settings
       { path: 'settings', element: <SettingsPage /> },
@@ -98,8 +166,22 @@ export const routes: RouteObject[] = [
       // These carry `?mode=` / router state, so we ALIAS (render the same
       // element at both paths) instead of redirecting — a redirect would
       // drop the query / `location.state` the wizard + progress pages read.
-      { path: 'bootstrap', element: <BootstrapWizardPage /> },
-      { path: 'bootstrap/run', element: <BootstrapProgressPage /> },
+      {
+        path: 'bootstrap',
+        element: (
+          <RequireAdmin>
+            <BootstrapWizardPage />
+          </RequireAdmin>
+        ),
+      },
+      {
+        path: 'bootstrap/run',
+        element: (
+          <RequireAdmin>
+            <BootstrapProgressPage />
+          </RequireAdmin>
+        ),
+      },
       // ② now owns runtime management — the old runtimes page redirects to
       // the cluster list (I2). The doctor preflight it used to host now
       // stands alone at /setup/doctor (its own `SetupDoctorPage`; the old

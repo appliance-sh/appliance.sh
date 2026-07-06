@@ -115,13 +115,14 @@ export function ConnectPage() {
   return (
     <div className="mx-auto max-w-md space-y-6 pt-16">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">Connect to a cluster</h1>
+        <h1 className="text-2xl font-semibold">Connect to your team&apos;s server</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Enter the URL of an Appliance api-server and an API key to add it to this shell.
+          Invited by a teammate? You don&apos;t need this form — just open the invite link they sent you and you&apos;re
+          in. This manual form is for connecting with a server address and access key an admin gave you.
           {canBootstrap ? null : (
             <>
               {' '}
-              Don&apos;t have a cluster yet? Run{' '}
+              Setting up from scratch instead? Run{' '}
               <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance vm up</code> for a local
               runtime, or <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance bootstrap</code> for
               AWS.

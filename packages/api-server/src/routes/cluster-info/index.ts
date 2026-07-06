@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { applianceBaseConfig, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { getConsoleMode, getExternalConsoleUrl, type ConsoleMode } from '../../console-static';
 import { logger } from '../../logger';
 
 export interface ClusterInfo {
@@ -13,6 +14,15 @@ export interface ClusterInfo {
    */
   version: string;
   baseConfig: ApplianceBaseConfig;
+  /**
+   * How this server exposes its web console (`full` | `bootstrap` |
+   * `off`), and where the canonical console lives when it is hosted
+   * separately. Clients building invite links use `consoleUrl` (falling
+   * back to the api-server URL) so teammates land on the console the
+   * operator intends. Absent on older servers — treat as full/same-origin.
+   */
+  consoleMode?: ConsoleMode;
+  consoleUrl?: string;
 }
 
 export const clusterInfoRoutes: Router = Router();
@@ -25,7 +35,13 @@ clusterInfoRoutes.get('/', async (req, res) => {
       return;
     }
     const baseConfig = applianceBaseConfig.parse(JSON.parse(raw));
-    const body: ClusterInfo = { version: VERSION, baseConfig };
+    const externalUrl = getExternalConsoleUrl();
+    const body: ClusterInfo = {
+      version: VERSION,
+      baseConfig,
+      consoleMode: getConsoleMode(),
+      ...(externalUrl ? { consoleUrl: externalUrl } : {}),
+    };
     res.json(body);
   } catch (error) {
     logger.error('get cluster-info failed', error, { requestId: req.requestId });

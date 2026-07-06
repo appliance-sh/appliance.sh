@@ -15,7 +15,7 @@
     "test:watch": "vitest",
     "clean": "rm -rf ./dist ./sidecar/dist ./src-tauri/binaries ./src-tauri/vm-bin",
     "deps:build": "nx run-many -t build -p @appliance.sh/cli @appliance.sh/app @appliance.sh/bootstrap @appliance.sh/helper",
-    "sidecar:build": "tsc -p sidecar/tsconfig.json && mv sidecar/dist/main.js sidecar/dist/main.cjs && (mv sidecar/dist/main.js.map sidecar/dist/main.cjs.map 2>/dev/null || true)",
+    "sidecar:build": "tsc -p sidecar/tsconfig.json && node scripts/finalize-sidecar.mjs",
     "cli:bundle": "node scripts/copy-cli.mjs",
     "vm:build": "node scripts/build-vm.mjs",
     "vm:bundle": "node scripts/copy-vm.mjs",
