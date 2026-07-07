@@ -6,6 +6,13 @@ It sits on the microVM-only world (bare k3d deleted) with the api-server
 running as a guest binary inside the VM and reads for workloads/logs served
 over HTTP (`packages/api-server/src/main.ts`, `routes/workloads/index.ts`).
 
+> **Prerequisites.** The managed VM needs a hypervisor: macOS uses
+> Virtualization.framework (nothing to install); Windows needs **WSL2**
+> (`wsl --install`, then reboot). **Linux support is coming soon** (KVM
+> backend). First boot
+> downloads a few components and can take a few minutes; subsequent boots are
+> fast.
+
 > **Naming (owner decision, 2026-06-28).** The onboarding command is
 > **`appliance init`** (not the spike's proposed `appliance start`). Bare
 > `appliance init` runs local microVM onboarding; the historical remote/cloud

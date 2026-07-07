@@ -6,6 +6,7 @@ import { attachProfileOption } from './utils/profile-flag.js';
 import { resolveEnvironment } from './utils/deployment-target.js';
 import { ClusterTargetError, kubectlBaseArgs, resolveClusterTarget, stackSelector } from './utils/cluster-target.js';
 import { summarizeDeploymentHealth, type DeploymentHealth, type PodHealth, type RawPod } from './utils/pod-health.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 const CANCEL_POLL_INTERVAL_MS = 2000;
@@ -110,8 +111,7 @@ program
         console.log(chalk.dim('  (no changes needed)'));
       }
     } catch (error) {
-      console.error(chalk.red(String(error)));
-      process.exit(1);
+      printCliError(error);
     }
   });
 
@@ -124,7 +124,7 @@ program
   .option('--no-wait', "don't poll for terminal status; exit after cancel is accepted")
   .option(
     '--force',
-    'bypass worker cooperation; mark deployment Cancelled immediately. Pulumi state may diverge — run `pulumi refresh` manually after.',
+    'bypass worker cooperation; mark deployment Cancelled immediately. The deployment record may be left out of sync — run `appliance deployment refresh <project> <env>` after to reconcile.',
     false
   )
   .action(async (idOrProject: string, environmentName: string | undefined, opts: { wait: boolean; force: boolean }) => {
@@ -135,7 +135,7 @@ program
       try {
         deploymentId = await resolveInFlightDeployment(client, idOrProject, environmentName);
       } catch (err) {
-        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        printCliError(err);
         process.exit(1);
       }
       console.log(chalk.dim(`Resolved ${idOrProject}/${environmentName} → ${deploymentId}`));
@@ -146,8 +146,8 @@ program
     if (opts.force) {
       console.warn(
         chalk.yellow(
-          '⚠  --force bypasses the worker. Pulumi state may diverge from reality; ' +
-            'run `pulumi refresh` manually after the worker is reaped.'
+          '⚠  --force bypasses the worker, so the deployment record may end up out of sync with what is actually running; ' +
+            'run `appliance deployment refresh <project> <env>` afterwards to reconcile.'
         )
       );
     }
@@ -216,7 +216,7 @@ program
 // --- appliance deployment refresh <project> <environment> ---
 program
   .command('refresh')
-  .description('reconcile Pulumi state with cloud reality (runs `pulumi refresh` on the env stack)')
+  .description('reconcile the stored deployment state with what is actually running in the cloud')
   .argument('<project>', 'project name')
   .argument('<environment>', 'environment name')
   .option('--no-wait', "don't poll for terminal status; exit after refresh is dispatched")
@@ -227,7 +227,7 @@ program
     try {
       environmentId = await resolveEnvironmentId(client, projectName, environmentName);
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+      printCliError(err);
       process.exit(1);
     }
 
@@ -305,7 +305,7 @@ program
         const env = await resolveEnvironment(client, projectName, environmentName);
         stackName = env.stackName;
       } catch (err) {
-        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        printCliError(err);
         process.exit(1);
       }
 

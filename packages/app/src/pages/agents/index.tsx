@@ -296,13 +296,14 @@ function RuntimeLauncher({
   });
   const status = statusQuery.data;
 
+  const needsWorkspace = Boolean(status?.running) && !status?.devMount;
   const disabledReason = !status
     ? 'Checking the Dev Machine…'
     : !status.running
       ? 'Start the Dev Machine to run agents'
       : status.devMount
         ? null
-        : 'The VM has no shared workspace — start it as a dev environment (Machine → dev environment) to run agents';
+        : "This machine doesn't have a shared workspace folder yet. Agents work in that folder, so set one up first.";
 
   return (
     <div className="space-y-2">
@@ -321,6 +322,15 @@ function RuntimeLauncher({
         onAgentTypeChange={onAgentTypeChange}
         disabledReason={disabledReason}
       />
+      {/* The fix lives on the Machine page (restart as a dev environment) —
+          give it a button rather than describing the path in prose. */}
+      {needsWorkspace ? (
+        <Button asChild variant="outline" size="sm">
+          <Link to="/machine">
+            <Server className="h-3.5 w-3.5" /> Set it up on the Machine page
+          </Link>
+        </Button>
+      ) : null}
     </div>
   );
 }

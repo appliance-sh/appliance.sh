@@ -9,6 +9,7 @@ import { readLink, readSandboxLink } from './utils/link.js';
 import { vmShell } from './utils/sandbox.js';
 import { resolveEnvironment } from './utils/deployment-target.js';
 import { ClusterTargetError, kubectlBaseArgs, resolveClusterTarget, stackSelector } from './utils/cluster-target.js';
+import { printCliError } from './utils/errors.js';
 
 // `appliance logs <project> <environment>` — stream container logs for
 // the active deployment's pods on the local microVM engine.
@@ -125,7 +126,7 @@ program
       const env = await resolveEnvironment(client, projectName, environmentName);
       stackName = env.stackName;
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+      printCliError(err, { apiUrl: credentials.apiUrl });
       process.exit(1);
     }
 

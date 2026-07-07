@@ -121,7 +121,8 @@ program
       stackName = loaded.stack.name;
       apps = resolveStackApps(loaded, environmentArg);
     } catch (err) {
-      exitWith(err instanceof Error ? err.message : String(err));
+      printCliError(err);
+      process.exit(1);
     }
 
     console.log(
@@ -155,7 +156,8 @@ program
       stackName = loaded.stack.name;
       apps = resolveStackApps(loaded, environmentArg);
     } catch (err) {
-      exitWith(err instanceof Error ? err.message : String(err));
+      printCliError(err);
+      process.exit(1);
     }
 
     const projectsResult = await client.listProjects();
@@ -235,7 +237,8 @@ program
       stackName = loaded.stack.name;
       apps = resolveStackApps(loaded, environmentArg);
     } catch (err) {
-      exitWith(err instanceof Error ? err.message : String(err));
+      printCliError(err);
+      process.exit(1);
     }
 
     // Resolve every target up front so the confirmation lists exactly
@@ -245,7 +248,8 @@ program
       try {
         targets.push({ app, projectName: await withDir(app.dir, () => resolveProjectName(app)) });
       } catch (err) {
-        exitWith(err instanceof Error ? err.message : String(err));
+        printCliError(err);
+        process.exit(1);
       }
     }
 

@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
+import { FriendlyError } from '@/components/friendly-error';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -404,6 +405,7 @@ export function DeployPage() {
       {phase === 'configure' ? (
         <ConfigureStep
           manifest={manifest!}
+          isCloudTarget={!isMicroVmTarget}
           projectName={projectName}
           setProjectName={setProjectName}
           envName={envName}
@@ -600,7 +602,9 @@ function TargetStep({
             <Play className={cn('h-3.5 w-3.5', starting && 'animate-pulse')} />
             {starting ? 'Starting…' : 'Start the Dev Machine'}
           </Button>
-          {startError ? <p className="font-mono text-[10px] text-red-300">{startError}</p> : null}
+          {startError ? (
+            <FriendlyError error={startError} fallbackHeadline="The local machine couldn't start" className="text-xs" />
+          ) : null}
           {starting || startLog.length > 0 ? (
             <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/40 p-2 font-mono text-[10px] leading-relaxed">
               {startLog.join('\n') || 'Starting…'}
@@ -828,6 +832,7 @@ function PickStep({
 
 function ConfigureStep({
   manifest,
+  isCloudTarget,
   projectName,
   setProjectName,
   envName,
@@ -845,6 +850,9 @@ function ConfigureStep({
   canNext,
 }: {
   manifest: LocalApplianceManifest;
+  /** The memory/timeout/storage overrides only do anything on cloud
+   *  installations — hide them entirely for a local (Dev Machine) target. */
+  isCloudTarget: boolean;
   projectName: string;
   setProjectName: (v: string) => void;
   envName: string;
@@ -915,24 +923,27 @@ function ConfigureStep({
         )}
       </div>
 
-      <details className="rounded-md border border-[var(--color-border)] p-3">
-        <summary className="cursor-pointer text-xs font-medium">Runtime overrides (optional)</summary>
-        <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
-          Cloud-only knobs for parity with the cloud Console. Locally they&rsquo;re recorded on the deployment but have
-          no effect on the running container.
-        </p>
-        <div className="mt-2 grid grid-cols-3 gap-3">
-          <Field label="Memory (MB)" hint="cloud-only">
-            <TextInput value={memory} onChange={setMemory} placeholder="1024" mono />
-          </Field>
-          <Field label="Timeout (s)" hint="cloud-only">
-            <TextInput value={timeout} onChange={setTimeout} placeholder="30" mono />
-          </Field>
-          <Field label="Storage (MB)" hint="cloud-only">
-            <TextInput value={storage} onChange={setStorage} placeholder="512" mono />
-          </Field>
-        </div>
-      </details>
+      {/* Cloud-only knobs — hidden entirely for a local (Dev Machine)
+          target, where they'd be recorded but have no effect. */}
+      {isCloudTarget ? (
+        <details className="rounded-md border border-[var(--color-border)] p-3">
+          <summary className="cursor-pointer text-xs font-medium">Cloud options (optional)</summary>
+          <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
+            Runtime limits applied by the cloud installation this app deploys into.
+          </p>
+          <div className="mt-2 grid grid-cols-3 gap-3">
+            <Field label="Memory (MB)">
+              <TextInput value={memory} onChange={setMemory} placeholder="1024" mono />
+            </Field>
+            <Field label="Timeout (s)">
+              <TextInput value={timeout} onChange={setTimeout} placeholder="30" mono />
+            </Field>
+            <Field label="Storage (MB)">
+              <TextInput value={storage} onChange={setStorage} placeholder="512" mono />
+            </Field>
+          </div>
+        </details>
+      ) : null}
 
       <div className="flex justify-between">
         <Button variant="outline" onClick={onBack}>
@@ -988,9 +999,7 @@ function RunStep({
         )}
       </pre>
 
-      {error ? (
-        <div className="rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">{error}</div>
-      ) : null}
+      {error ? <FriendlyError error={error} fallbackHeadline="The deploy didn't finish" /> : null}
 
       {resultUrl ? (
         <div className="rounded-md border border-green-500/40 bg-green-500/10 p-3 text-xs text-green-300">

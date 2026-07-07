@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { createApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
@@ -78,6 +79,9 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
   const [busy, setBusy] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   const [log, setLog] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
+  // Which lifecycle action produced `error` — picks the plain-language
+  // headline ("couldn't start" vs "couldn't be installed" …).
+  const [errorAction, setErrorAction] = React.useState<'install' | 'up' | 'stop' | 'delete' | null>(null);
   // Whether the next Start should provision a dev environment. Forced on
   // once the VM is already a dev VM (the engine flag is one-way).
   const [devMode, setDevMode] = React.useState(false);
@@ -97,11 +101,13 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
   const run = async (kind: 'install' | 'up' | 'stop' | 'delete', action: () => Promise<void>) => {
     setBusy(kind);
     setError(null);
+    setErrorAction(null);
     if (kind === 'up') setLog([]);
     try {
       await action();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setErrorAction(kind);
     } finally {
       setBusy(null);
       refresh();
@@ -390,9 +396,18 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
           )}
 
           {error ? (
-            <div className="whitespace-pre-wrap rounded-md border border-red-500/40 bg-red-500/10 p-3 font-mono text-xs text-red-300">
-              {error}
-            </div>
+            <FriendlyError
+              error={error}
+              fallbackHeadline={
+                errorAction === 'install'
+                  ? "The local runtime couldn't be installed"
+                  : errorAction === 'stop'
+                    ? "The machine couldn't be stopped"
+                    : errorAction === 'delete'
+                      ? "The machine couldn't be deleted"
+                      : "The local machine couldn't start"
+              }
+            />
           ) : null}
 
           {busy === 'up' || log.length > 0 ? (
@@ -514,8 +529,10 @@ function RuntimeDiagnostics({ defaultOpen }: { defaultOpen: boolean }) {
   );
 }
 
-// Compact at-a-glance facts for a running VM — Kubernetes URL, profile
-// id, and its allocated host ports.
+// Facts for a running VM. The plain-language summary (what this machine
+// is, where it shows up) leads; the raw technical facts — Kubernetes URL,
+// profile id, port numbers — live behind a collapsed "Technical details"
+// disclosure rather than top-level.
 function MicroVmFacts({
   apiServerUrl,
   clusterId,
@@ -539,13 +556,23 @@ function MicroVmFacts({
     ]);
   }
   return (
-    <dl className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 rounded-md border border-[var(--color-border)] px-3 py-2">
-      {facts.map(([label, value]) => (
-        <React.Fragment key={label}>
-          <dt className="text-[11px] text-[var(--color-muted-foreground)]">{label}</dt>
-          <dd className="min-w-0 truncate text-[11px]">{value}</dd>
-        </React.Fragment>
-      ))}
-    </dl>
+    <div className="space-y-2 rounded-md border border-[var(--color-border)] px-3 py-2">
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        An isolated virtual machine running on this computer. It shows up as a deploy target in the target switcher.
+      </p>
+      <details>
+        <summary className="cursor-pointer select-none text-xs font-medium text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]">
+          Technical details
+        </summary>
+        <dl className="mt-2 grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1">
+          {facts.map(([label, value]) => (
+            <React.Fragment key={label}>
+              <dt className="text-[11px] text-[var(--color-muted-foreground)]">{label}</dt>
+              <dd className="min-w-0 truncate text-[11px]">{value}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+      </details>
+    </div>
   );
 }

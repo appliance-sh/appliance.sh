@@ -5,6 +5,7 @@ import { loadCredentials, getActiveProfileOverride } from './utils/credentials.j
 import { attachProfileOption } from './utils/profile-flag.js';
 import { readLink, writeLink } from './utils/link.js';
 import { urlsByEnvironment } from './utils/deploy-poll.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 // Fetch the URL map for a single project — one round-trip via
@@ -153,8 +154,7 @@ program
       console.log(chalk.dim(`Linked ${projectName} → ${environmentName} (${linkPath})`));
       console.log(chalk.dim(`Run ${chalk.bold('appliance deploy')} to deploy.`));
     } catch (error) {
-      console.error(chalk.red(String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl });
     }
   });
 
@@ -164,7 +164,7 @@ program
   .description('show application status')
   .argument('[project]', 'application name (defaults to the linked project)')
   .action(async (projectArg: string | undefined) => {
-    const { client } = requireClient();
+    const { client, apiUrl } = requireClient();
 
     // No arg → fall back to the cwd link, so `appliance status` works
     // out of the box from a linked project directory.
@@ -231,8 +231,7 @@ program
         }
       }
     } catch (error) {
-      console.error(chalk.red(String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl });
     }
   });
 
@@ -241,7 +240,7 @@ program
   .command('list')
   .description('list applications and environments')
   .action(async () => {
-    const { client } = requireClient();
+    const { client, apiUrl } = requireClient();
 
     try {
       const projectsResult = await client.listProjects();
@@ -288,8 +287,7 @@ program
         console.log();
       }
     } catch (error) {
-      console.error(chalk.red(String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl });
     }
   });
 

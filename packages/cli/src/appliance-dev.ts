@@ -204,7 +204,9 @@ attachProfileOption(program);
 
 program
   .name('appliance dev')
-  .description('dev loop: deploy, stream logs, and rebuild on save (Ctrl+C leaves apps running)')
+  .description(
+    'run your app locally with live rebuild + logs: deploy, stream logs, rebuild on save (Ctrl+C leaves apps running)'
+  )
   .argument('[environment]', "environment for every app (default 'dev')")
   .option('-f, --file <path>', `stack file (default: ./${STACK_FILENAME}; falls back to the current app)`)
   .option('--runtime <runtime>', 'removed — the control plane always runs inside the microVM')

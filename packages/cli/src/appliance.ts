@@ -34,6 +34,9 @@ ensureLocalhostFetch();
 interface SubcommandDef {
   description: string;
   aliases?: string[];
+  /** Dispatchable but omitted from `appliance --help` (deprecated shims
+   *  and lower-level duplicates keep working without inviting new use). */
+  hidden?: boolean;
   load: () => Promise<unknown>;
 }
 
@@ -78,7 +81,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-destroy.js'),
   },
   dev: {
-    description: 'dev loop: deploy this app/stack, stream merged logs, rebuild on save (Ctrl+C leaves apps running)',
+    description: 'run your app locally with live rebuild + logs (Ctrl+C leaves apps running)',
     load: () => import('./appliance-dev.js'),
   },
   doctor: {
@@ -123,10 +126,12 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
   },
   profile: {
     description: '(use `appliance cluster`) the lower-level credential-profile store',
+    hidden: true,
     load: () => import('./appliance-profile.js'),
   },
   server: {
     description: '(deprecated) the control plane runs inside the microVM — use `appliance dev` / `appliance vm`',
+    hidden: true,
     load: () => import('./appliance-server.js'),
   },
   stack: {
@@ -191,49 +196,30 @@ const ALIAS_MAP: Record<string, string> = (() => {
   return m;
 })();
 
-// Help groups the commands by journey instead of alphabetically: the
-// three things people come here to do (build & run locally, ship the
-// same thing to the cloud, operate the machine & team) beat a flat
-// A–Z wall. Names must exist in SUBCOMMANDS; anything unlisted lands
-// in "Other" so a newly-registered command is never silently hidden.
+// Help groups the commands by audience instead of alphabetically: the
+// everyday loop first, then configuration, then the advanced cloud &
+// machine surface — so the common path is obvious before the long
+// tail. Names must exist in SUBCOMMANDS (or SHORTCUTS, rendered as an
+// alias line); anything unlisted lands in "Other" so a newly-registered
+// command is never silently hidden.
 const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
   {
-    title: 'Build & run locally (one managed VM — no Docker anywhere)',
-    names: [
-      'dev',
-      'init',
-      'deploy',
-      'up',
-      'down',
-      'shell',
-      'logs',
-      'agent',
-      'open',
-      'app',
-      'build',
-      'configure',
-      'stack',
-      'manifest',
-      'env',
-      'deployment',
-      'destroy',
-      'link',
-      'unlink',
-    ],
+    title: 'Getting started & everyday',
+    names: ['init', 'dev', 'deploy', 'logs', 'open', 'status', 'agent', 'up', 'shell', 'down'],
   },
   {
-    title: 'Ship to the cloud (same commands, same artifacts — switch with --profile)',
-    names: ['bootstrap', 'teardown', 'login'],
+    title: 'Configuration (profiles, environments, project links)',
+    names: ['configure', 'env', 'link', 'unlink', 'stack', 'app', 'cluster', 'login', 'whoami'],
   },
   {
-    title: 'Machine, credentials & diagnostics',
-    names: ['vm', 'doctor', 'whoami', 'cluster', 'keys', 'test', 'profile', 'server'],
+    title: 'Advanced (cloud installs, machine & diagnostics)',
+    names: ['bootstrap', 'teardown', 'vm', 'deployment', 'keys', 'doctor', 'test', 'manifest', 'build', 'destroy'],
   },
 ];
 
 function showHelp(): void {
   console.log('Usage: appliance <command> [options]');
-  const allNames = Object.keys(SUBCOMMANDS);
+  const allNames = Object.keys(SUBCOMMANDS).filter((n) => !SUBCOMMANDS[n].hidden);
   const width = Math.max(...allNames.map((n) => n.length));
   const grouped = new Set(COMMAND_GROUPS.flatMap((g) => g.names));
   const leftovers = allNames.filter((n) => !grouped.has(n)).sort();
@@ -243,7 +229,13 @@ function showHelp(): void {
     console.log(`${group.title}:`);
     for (const name of group.names) {
       const def = SUBCOMMANDS[name];
-      if (!def) continue;
+      if (!def) {
+        // A shortcut listed in a group (e.g. `status`) renders as its
+        // alias line here instead of in the Shortcuts section below.
+        const sc = SHORTCUTS[name];
+        if (sc) console.log(`  ${name.padEnd(width)}  alias for \`appliance ${sc.target} ${sc.prefix.join(' ')}\``);
+        continue;
+      }
       const aliasTail = def.aliases && def.aliases.length > 0 ? ` (alias: ${def.aliases.join(', ')})` : '';
       console.log(`  ${name.padEnd(width)}  ${def.description}${aliasTail}`);
     }
@@ -251,6 +243,7 @@ function showHelp(): void {
   console.log();
   console.log('Shortcuts:');
   for (const [name, sc] of Object.entries(SHORTCUTS)) {
+    if (grouped.has(name)) continue;
     console.log(`  ${name.padEnd(width)}  alias for \`appliance ${sc.target} ${sc.prefix.join(' ')}\``);
   }
   console.log(`  ${'cloud'.padEnd(width)}  umbrella: \`appliance cloud bootstrap|teardown\``);

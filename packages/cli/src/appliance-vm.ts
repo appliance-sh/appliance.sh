@@ -395,7 +395,9 @@ const DEV_SHELL_LOGIN =
 
 const dev = program
   .command('dev')
-  .description('run the microVM as a development environment (provisioned host + persistent workspace)');
+  .description(
+    'manage the shared dev environment VM used by the desktop app and coding agents (for the local app dev loop, use `appliance dev`)'
+  );
 
 dev
   .command('up')

@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { cn } from '@/lib/utils';
 import { NETSTACK_BAKED_ALLOWLIST } from '@/lib/host';
@@ -281,12 +282,12 @@ export function EgressPanel({
         </div>
       ) : policyError ? (
         // Don't spin on "Loading policy…" forever when egress.get() rejects.
-        <p className="mt-2 text-xs text-red-300">Failed to load egress policy: {errMessage(policyError)}</p>
+        <FriendlyError error={policyError} headline="Couldn't load the egress policy" className="mt-2 text-xs" />
       ) : (
         <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading policy…</p>
       )}
 
-      {err ? <p className="mt-2 text-xs text-red-300">{err}</p> : null}
+      {err ? <FriendlyError error={err} headline="That change didn't apply" className="mt-2 text-xs" /> : null}
     </details>
   );
 }

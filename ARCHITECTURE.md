@@ -4,15 +4,16 @@ Technical reference for Appliance internals, API, and infrastructure.
 
 ## Packages
 
-Appliance is a TypeScript monorepo (pnpm workspaces + Nx) with 5 packages:
+Appliance is a TypeScript monorepo (pnpm workspaces + Nx). Core packages:
 
-| Package                       | Description                                               |
-| ----------------------------- | --------------------------------------------------------- |
-| **@appliance.sh/sdk**         | Core SDK — Zod models, API client, storage abstraction    |
-| **@appliance.sh/cli**         | CLI built on Commander.js + Inquirer                      |
-| **@appliance.sh/api-server**  | Express REST API server (control plane)                   |
-| **@appliance.sh/infra**       | Pulumi infrastructure-as-code for AWS                     |
-| **@appliance.sh/install-aws** | AWS CDK stack for bootstrapping Appliance on your account |
+| Package                       | Description                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| **@appliance.sh/sdk**         | Core SDK — Zod models, API client, storage abstraction                           |
+| **@appliance.sh/cli**         | CLI built on Commander.js + Inquirer                                             |
+| **@appliance.sh/api-server**  | Express REST API server (control plane)                                          |
+| **@appliance.sh/infra**       | Pulumi infrastructure-as-code for AWS                                            |
+| **@appliance.sh/bootstrap**   | Provisions Appliance installations on AWS (Pulumi; drives `appliance bootstrap`) |
+| **@appliance.sh/install-aws** | Placeholder CDK stack (state bucket only) — not the install path                 |
 
 ### Dependencies
 
@@ -263,7 +264,9 @@ bring-up is `runUp` in `packages/cli/src/utils/microvm-up.ts`.
 
 ### Installing Appliance on AWS
 
-The `install-aws` package provides an AWS CDK construct (`ApplianceInstaller`) that bootstraps the required S3 bucket and IAM roles. It outputs a CloudFormation template at `dist/appliance-install-aws.yml`.
+`appliance bootstrap` (alias `appliance cloud bootstrap`) is the install path. It drives `@appliance.sh/bootstrap`, which runs three Pulumi phases: base infrastructure → hoist the api-server/worker onto it → promote installer state to S3. It needs AWS credentials (`~/.aws`; SSO profiles work — pass `--aws-profile`), a domain for the installation, and the Pulumi CLI on PATH.
+
+The `install-aws` package is a placeholder: its CDK construct (`ApplianceInstaller`) currently provisions only an encrypted S3 state bucket. Don't build new install logic there — it lives in `@appliance.sh/bootstrap` + `@appliance.sh/infra`.
 
 ## Environment Variables
 

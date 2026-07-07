@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueries, useQueryClient } from '@tanstack/rea
 import { Plus, Search, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
+import { FriendlyError } from '@/components/friendly-error';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { LiveUrl } from '@/components/ui/live-url';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -217,10 +218,10 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
         </form>
       ) : null}
 
-      {mutationError || error ? (
-        <div className="rounded-md border border-red-500/50 bg-red-500/5 p-3 text-xs text-red-400">
-          {mutationError ?? (error instanceof Error ? error.message : String(error))}
-        </div>
+      {mutationError ? (
+        <FriendlyError error={mutationError} fallbackHeadline="That change didn't go through" />
+      ) : error ? (
+        <FriendlyError error={error} fallbackHeadline="Couldn't load your apps" />
       ) : null}
 
       {loading ? (

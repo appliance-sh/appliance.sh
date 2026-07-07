@@ -1,12 +1,19 @@
 import { useQuery } from '@tanstack/react-query';
+import { isAuthShapedError } from '@/components/friendly-error';
+import { reportAuthFailure } from '@/lib/auth-signal';
 import { useApplianceClient } from './use-appliance-client';
 import { useSelectedCluster } from './use-selected-cluster';
 
 export type KeyRole = 'admin' | 'member';
 
+/** The resolved role, or 'unknown' when whoami FAILED (expired key,
+ *  unreachable server). 'unknown' fails closed: operator surfaces hide,
+ *  but Apps + Settings stay so the app never blanks. */
+export type ResolvedKeyRole = KeyRole | 'unknown';
+
 interface UseKeyRoleResult {
-  /** The calling key's role on the selected cluster. */
-  role: KeyRole;
+  /** The calling key's role on the selected cluster ('unknown' on failure). */
+  role: ResolvedKeyRole;
   /** True until the role has actually been resolved (or defaulted). */
   isLoading: boolean;
 }
@@ -26,6 +33,11 @@ interface UseKeyRoleResult {
  *     tools blink out and back. The API enforces the boundary either
  *     way — a member key gets 403s on admin routes regardless of what
  *     the UI shows.
+ *   - whoami FAILED (401/403, network) → 'unknown', NOT 'admin': a
+ *     rejected or unreachable key must not unlock the operator nav.
+ *     Consumers treat 'unknown' as non-admin (fail closed); Apps and
+ *     Settings stay visible so the shell never blanks. Auth-shaped
+ *     failures also raise the global auth-expiry banner.
  */
 export function useKeyRole(): UseKeyRoleResult {
   const client = useApplianceClient();
@@ -35,11 +47,14 @@ export function useKeyRole(): UseKeyRoleResult {
     queryKey: ['keys', 'self', cluster?.id],
     enabled: Boolean(client),
     staleTime: 60_000,
-    queryFn: async (): Promise<KeyRole> => {
+    queryFn: async (): Promise<ResolvedKeyRole> => {
       const result = await client!.whoami();
       if (!result.success) {
-        // 404/older server (or transient failure): legacy = full access.
-        return 'admin';
+        // 404/older server: legacy = full access (roles didn't exist).
+        if (/(^|[^0-9])404([^0-9]|$)/.test(result.error.message)) return 'admin';
+        // Anything else (rejected key, unreachable server): fail closed.
+        if (isAuthShapedError(result.error)) reportAuthFailure();
+        return 'unknown';
       }
       return result.data.role === 'member' ? 'member' : 'admin';
     },

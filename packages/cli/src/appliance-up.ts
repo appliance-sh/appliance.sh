@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import * as path from 'node:path';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
+import { printCliError } from './utils/errors.js';
 import { writeSandboxLink } from './utils/link.js';
 import type { SandboxLink } from './utils/link.js';
 import {
@@ -43,14 +44,11 @@ program
   .option('--vm <name>', 'sandbox VM to run in', DEFAULT_SANDBOX_VM)
   .option('--port <port>', 'container port to publish (overrides EXPOSE)', parsePort)
   .option('--host-port <port>', 'host port to publish on (overrides the deterministic default)', parsePort)
-  .option('--detach', 'do not stream container logs after starting (default: start + print URL)', false)
-  .option('--no-open', 'do not attempt to open the URL (accepted for forward-compat; v1 never auto-opens)')
-  .action(async (opts: { vm: string; port?: number; hostPort?: number; detach: boolean }) => {
+  .action(async (opts: { vm: string; port?: number; hostPort?: number }) => {
     try {
       await runUp(opts);
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
     }
   });
 
@@ -62,7 +60,7 @@ function parsePort(value: string): number {
   return n;
 }
 
-async function runUp(opts: { vm: string; port?: number; hostPort?: number; detach: boolean }): Promise<void> {
+async function runUp(opts: { vm: string; port?: number; hostPort?: number }): Promise<void> {
   const cwd = process.cwd();
   const type = detectProjectType(cwd);
 
@@ -139,8 +137,7 @@ async function runUp(opts: { vm: string; port?: number; hostPort?: number; detac
   }
   console.log(chalk.dim(`  Logs: appliance logs -f      Stop: appliance down`));
   console.log(chalk.dim(`  Linked: ${linkPath}`));
-  // The container runs detached and we return after printing the URL.
-  // `--detach` is accepted for forward-compat (no behavioral effect yet);
+  // The container runs detached and we return after printing the URL;
   // a foreground log stream is a follow-up — use `appliance logs -f`.
 }
 

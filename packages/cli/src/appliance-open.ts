@@ -5,6 +5,7 @@ import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { readLink } from './utils/link.js';
 import { extractDeploymentUrl } from './utils/deploy-poll.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 // Open a URL in the OS default browser. Picks the right shell tool
@@ -116,8 +117,7 @@ program
       console.log(chalk.dim(`Opening ${url}`));
       openInBrowser(url);
     } catch (error) {
-      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl: credentials.apiUrl });
     }
   });
 

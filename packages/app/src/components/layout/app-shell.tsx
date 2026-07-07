@@ -1,10 +1,11 @@
 import * as React from 'react';
-import { NavLink, Outlet } from 'react-router';
-import { Wand, Server, Laptop, Cloud, Folder, Bot, Cog } from 'lucide-react';
+import { Link, NavLink, Outlet } from 'react-router';
+import { Wand, Server, Laptop, Cloud, Folder, Bot, Cog, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useKeyRole } from '@/hooks/use-key-role';
+import { useAuthExpired, clearAuthFailure } from '@/lib/auth-signal';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 import { TerminalDock } from './terminal-dock';
@@ -103,6 +104,7 @@ export function AppShell() {
       </header>
 
       <main className="col-start-2 min-h-0 overflow-auto p-6">
+        <AuthExpiredBanner />
         <Outlet />
       </main>
 
@@ -117,6 +119,40 @@ export function AppShell() {
           never unmounts the active shell. Its sessions live in
           `TerminalSessionsProvider`; this only shows/hides the view. */}
       {isOperator ? <TerminalLayer /> : null}
+    </div>
+  );
+}
+
+// Dismissible auth-expiry banner. The query cache's error handler raises
+// the signal when any query fails with an auth-shaped error (401/403,
+// invalid signature) — one banner at the top instead of scattered raw
+// errors, with a Reconnect CTA into the connect page.
+function AuthExpiredBanner() {
+  const expired = useAuthExpired();
+  if (!expired) return null;
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2"
+    >
+      <span className="text-sm text-amber-200">Your connection to the server expired.</span>
+      <span className="flex shrink-0 items-center gap-1">
+        <Link
+          to="/setup/connect"
+          onClick={() => clearAuthFailure()}
+          className="rounded-md border border-amber-500/40 px-2.5 py-1 text-xs font-medium text-amber-100 hover:bg-amber-500/10"
+        >
+          Reconnect
+        </Link>
+        <button
+          type="button"
+          aria-label="Dismiss"
+          onClick={() => clearAuthFailure()}
+          className="rounded p-1 text-amber-200/70 hover:text-amber-100"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </span>
     </div>
   );
 }

@@ -147,8 +147,12 @@ export async function checkHelperBinaries(): Promise<CheckResult[]> {
       return pass(`bin:${provider.name}`, label, check.version);
     }
     const remediation = provider.autoInstallable
-      ? `Install ${provider.name} under ${helperBinDir()} or via your package manager; the microVM runtime fetches it automatically on \`appliance vm up\` when missing.`
-      : provider.manualInstall({ binDir: helperBinDir(), platform: 'darwin', arch: 'arm64' }).instructions;
+      ? `Install ${provider.name} under ${helperBinDir()} or via your package manager (\`appliance doctor --fix\` installs it for you); the microVM runtime also fetches it on \`appliance vm up\` when missing.`
+      : provider.manualInstall({
+          binDir: helperBinDir(),
+          platform: process.platform as 'darwin' | 'linux' | 'win32',
+          arch: process.arch as 'x64' | 'arm64',
+        }).instructions;
     const detail = check.error ?? 'not installed';
     return provider.required
       ? fail(`bin:${provider.name}`, label, detail, remediation)

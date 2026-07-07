@@ -2,6 +2,7 @@ import * as React from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import type { MicroVmInstanceHost } from '@/lib/host';
 
 // Per-host credential capture/injection (apiKeyHelper): the proxy can
@@ -190,7 +191,7 @@ export function CredentialsPanel({ vm, name, mitmOn }: { vm: MicroVmInstanceHost
         ) : null}
       </div>
 
-      {err ? <p className="mt-2 text-xs text-red-300">{err}</p> : null}
+      {err ? <FriendlyError error={err} headline="That change didn't apply" className="mt-2 text-xs" /> : null}
     </details>
   );
 }

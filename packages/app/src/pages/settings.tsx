@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { RefreshCw, Download, ArrowUpCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import { useToast } from '@/components/ui/toast';
 import { useHost } from '@/providers/host-provider';
 import { resetOnboarding } from '@/lib/local-runtime';
@@ -75,11 +76,14 @@ function UpdatesSection() {
   const [update, setUpdate] = React.useState<AvailableUpdate | null>(null);
   const [progress, setProgress] = React.useState<UpdateProgress | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  // Which step failed — picks the plain-language headline.
+  const [errorStep, setErrorStep] = React.useState<'check' | 'install' | 'relaunch' | null>(null);
 
   const onCheck = async () => {
     if (!host.updater) return;
     setPhase('checking');
     setError(null);
+    setErrorStep(null);
     setProgress(null);
     try {
       const found = await host.updater.check();
@@ -93,6 +97,7 @@ function UpdatesSection() {
     } catch (err) {
       setPhase('failed');
       setError(err instanceof Error ? err.message : String(err));
+      setErrorStep('check');
     }
   };
 
@@ -100,6 +105,7 @@ function UpdatesSection() {
     if (!host.updater) return;
     setPhase('downloading');
     setError(null);
+    setErrorStep(null);
     setProgress({ downloaded: 0 });
     try {
       await host.updater.downloadAndInstall((p) => setProgress(p));
@@ -108,6 +114,7 @@ function UpdatesSection() {
     } catch (err) {
       setPhase('failed');
       setError(err instanceof Error ? err.message : String(err));
+      setErrorStep('install');
     }
   };
 
@@ -120,6 +127,7 @@ function UpdatesSection() {
       // and will apply on the next manual restart. Surface it but keep
       // the "ready" state so the user can retry or quit themselves.
       setError(err instanceof Error ? err.message : String(err));
+      setErrorStep('relaunch');
       toast('Could not restart automatically — quit and reopen to finish updating', { variant: 'error' });
     }
   };
@@ -202,9 +210,16 @@ function UpdatesSection() {
         </div>
 
         {error ? (
-          <div className="rounded-md border border-[var(--color-border)] bg-black/30 px-3 py-2 font-mono text-xs whitespace-pre-wrap text-red-400">
-            {error}
-          </div>
+          <FriendlyError
+            error={error}
+            fallbackHeadline={
+              errorStep === 'relaunch'
+                ? "The app couldn't restart itself — quit and reopen to finish updating"
+                : errorStep === 'check'
+                  ? "Couldn't check for updates"
+                  : "The update couldn't be installed"
+            }
+          />
         ) : null}
       </div>
     </Section>

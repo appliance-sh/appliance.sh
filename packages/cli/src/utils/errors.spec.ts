@@ -33,7 +33,7 @@ describe('remediationHint', () => {
     // Must win over the docker/daemon catch-all below it — a VM-runtime
     // user should never be told to open Docker Desktop.
     const hint = remediationHint('buildctl: failed to dial tcp://127.0.0.1:5054');
-    expect(hint).toMatch(/appliance server start/);
+    expect(hint).toMatch(/appliance vm up/);
     expect(hint).not.toMatch(/Docker Desktop/);
   });
 

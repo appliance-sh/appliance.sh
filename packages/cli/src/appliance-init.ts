@@ -12,6 +12,7 @@ import { DEFAULT_PROFILE_NAME } from './utils/profile-store.js';
 import { runFixes, runPreflight } from './utils/preflight.js';
 import type { CheckResult, FixOutcome, PreflightReport } from './utils/preflight.js';
 import { DEFAULT_VM_NAME, profileForVm, resolveVmBinary, runUp } from './utils/microvm-up.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 // `appliance init` — one command from nothing to a reachable runtime.
@@ -129,7 +130,7 @@ async function runLocalInit(opts: LocalInitOptions): Promise<void> {
   try {
     await runUp(opts.name, undefined, opts.timeout, {}, { showDeployHint: false });
   } catch (err) {
-    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    printCliError(err);
     process.exit(1);
   }
 
@@ -251,8 +252,10 @@ function detectTargetName(cwd: string): string {
 }
 
 async function handOff(ctx: { name: string; deploy: boolean; yes: boolean; isTTY: boolean }): Promise<void> {
+  // runUp already made the VM's profile active, so the suggested
+  // command doesn't need a --profile flag.
   const profile = profileForVm(ctx.name);
-  const deployCmd = `appliance deploy --profile ${profile}`;
+  const deployCmd = 'appliance deploy';
   const deployable = isDeployableDir(process.cwd());
 
   console.log();
@@ -301,7 +304,7 @@ function spawnDeploy(profile: string): number {
     const r = spawnSync(process.execPath, [entry, ...args], { stdio: 'inherit' });
     return r.status ?? 1;
   } catch {
-    console.error(chalk.red(`Could not launch deploy — run \`appliance deploy --profile ${profile}\` yourself.`));
+    console.error(chalk.red('Could not launch deploy — run `appliance deploy` yourself.'));
     return 1;
   }
 }

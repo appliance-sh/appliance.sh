@@ -1,9 +1,11 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createBrowserRouter } from 'react-router';
 import { HostProvider } from '@/providers/host-provider';
 import { TerminalSessionsProvider } from '@/providers/terminal-sessions-provider';
 import { ToastProvider } from '@/components/ui/toast';
 import { ConfirmProvider } from '@/components/ui/confirm-dialog';
+import { isAuthShapedError } from '@/components/friendly-error';
+import { reportAuthFailure } from '@/lib/auth-signal';
 import { routes } from '@/router/routes';
 import type { ConsoleHost } from '@/lib/host';
 import '@fontsource-variable/geist';
@@ -11,6 +13,14 @@ import '@fontsource-variable/geist-mono';
 import '@/styles.css';
 
 const queryClient = new QueryClient({
+  // Any query failing with an auth-shaped error (401/403, bad signature,
+  // expired key) raises the global auth-expiry signal — the AppShell shows
+  // a single dismissible "connection expired" banner with a Reconnect CTA.
+  queryCache: new QueryCache({
+    onError: (error) => {
+      if (isAuthShapedError(error)) reportAuthFailure();
+    },
+  }),
   defaultOptions: {
     queries: { staleTime: 5_000, refetchOnWindowFocus: false },
   },

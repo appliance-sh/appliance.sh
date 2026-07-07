@@ -277,7 +277,9 @@ function ClaudeLogin({
   const saveOauth = () => {
     const token = extractOauthToken(paste);
     if (!token) {
-      setErr('Could not find an sk-ant-oat01- token in what you pasted. Copy the token shown by `claude setup-token`.');
+      setErr(
+        'That doesn’t look like the token — copy the sk-ant-oat01-… value the terminal shows after you approve in your browser.'
+      );
       return;
     }
     void store('oauth', token, () => setPaste(''));
@@ -325,13 +327,16 @@ function ClaudeLogin({
 
       {mode === 'oauth' ? (
         hasClaude === false ? (
+          // Claude Code missing on the host. A one-click install here needs a
+          // host-side install/exec capability the bridge doesn't expose yet
+          // (agentAuth only offers status/login/logout/hasHostClaude/
+          // runSetupToken) — until it does, offer the copyable command.
           <div className="space-y-2 rounded-md border border-dashed border-[var(--color-border)] p-3 text-[var(--color-muted-foreground)]">
             <p>
-              Claude Code isn&rsquo;t installed on this machine, so &ldquo;Sign in with Claude&rdquo; can&rsquo;t run.
-              Install it with{' '}
-              <code className="font-mono text-[var(--color-foreground)]">npm install -g @anthropic-ai/claude-code</code>
-              , or use an API key instead.
+              Signing in with a Claude subscription needs the Claude Code app, which isn&rsquo;t on this computer yet.
+              Copy this command and run it in a terminal to install it — or use an API key instead.
             </p>
+            <CommandSnippet command="npm install -g @anthropic-ai/claude-code" />
             <Button variant="outline" size="sm" onClick={() => setMode('api-key')}>
               <KeyRound className="h-3.5 w-3.5" /> Use an API key
             </Button>
@@ -339,9 +344,8 @@ function ClaudeLogin({
         ) : (
           <div className="space-y-2">
             <p className="text-[var(--color-muted-foreground)]">
-              Sign in with your Claude Pro/Max/Team subscription. This runs{' '}
-              <code className="font-mono">claude setup-token</code> in a terminal; a browser opens, then the terminal
-              shows a one-year token to paste back here.
+              Sign in with your Claude Pro/Max/Team subscription — no API key needed. A terminal window starts the
+              sign-in, your browser opens to approve it, and the terminal then shows a token to paste below.
             </p>
             <div className="flex items-center gap-2">
               <Button
@@ -351,15 +355,19 @@ function ClaudeLogin({
                 disabled={busy || hasClaude === null}
               >
                 <TerminalSquare className="h-3.5 w-3.5" />
-                {terminalLaunched ? 'Terminal opened — run again?' : 'Open terminal & run it'}
+                {terminalLaunched ? 'Terminal opened — start again?' : 'Start sign-in'}
               </Button>
               {hasClaude === null ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--color-muted-foreground)]" />
               ) : null}
             </div>
+            {/* Auto-open only exists on macOS today (the host's runSetupToken
+                resolves false elsewhere) — surface the manual command instead
+                of a silent no-op. */}
             {terminalAutoOpenFailed ? (
               <p className="text-[var(--color-muted-foreground)]">
-                Couldn&rsquo;t open a terminal automatically — copy the command below and run it yourself.
+                A terminal couldn&rsquo;t be opened automatically on this computer — copy the command below and run it
+                in any terminal instead.
               </p>
             ) : null}
             <div className="space-y-1">
@@ -369,7 +377,9 @@ function ClaudeLogin({
               <CommandSnippet command={SETUP_TOKEN_CMD} />
             </div>
             <label className="block space-y-1">
-              <span className="text-[var(--color-muted-foreground)]">Paste the token (sk-ant-oat01-…)</span>
+              <span className="font-medium text-[var(--color-foreground)]">
+                Paste the token that appears after you approve in your browser
+              </span>
               <input
                 type="password"
                 autoComplete="off"
@@ -383,6 +393,10 @@ function ClaudeLogin({
                 disabled={busy}
                 className="w-full rounded-md border border-[var(--color-border)] bg-transparent px-2 py-1.5 font-mono disabled:opacity-50"
               />
+              <span className="block text-[10px] text-[var(--color-muted-foreground)]">
+                It starts with <code className="font-mono">sk-ant-oat01-</code>. Pasting the whole line the terminal
+                printed works too.
+              </span>
             </label>
             <Button size="sm" onClick={saveOauth} disabled={busy || !paste.trim()}>
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Save token

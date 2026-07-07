@@ -4,6 +4,8 @@ A platform for building, running, and shipping applications — locally and on t
 
 Everything local runs inside **one managed microVM**: a Kubernetes runtime, an image builder, the Appliance control plane (the same api-server that powers cloud installations, running as a plain binary in the guest), and the dev/agent sandbox. Your machine needs the `appliance` CLI and nothing else.
 
+**Supported platforms:** macOS (Virtualization.framework) and Windows (needs WSL2 — run `wsl --install` once and reboot if you don't have it). Linux support is coming soon.
+
 ## The three journeys
 
 ### 1. Build & run your app locally
@@ -11,8 +13,11 @@ Everything local runs inside **one managed microVM**: a Kubernetes runtime, an i
 ```bash
 pnpm add --global appliance.sh
 cd your-app        # or a folder of apps with an appliance.stack.json
-appliance dev      # boots the VM, deploys, streams logs, rebuilds on save
+appliance init     # one-time: checks your machine, boots the VM, guides your first deploy
+appliance dev      # day-to-day: deploys, streams logs, rebuilds on save
 ```
+
+`appliance init` is the front door on a fresh machine: it preflights your system (auto-fixing what's safe), boots the managed VM, saves the `local` profile, and offers to run your first deploy. After that, one command is the whole loop:
 
 `appliance dev` is the whole dev loop: it brings the managed VM (and the control plane inside it) up, deploys the current app — or **every member of a multi-service stack** — streams merged, color-prefixed logs, and rebuilds on save. Builds happen server-side against the in-VM BuildKit, so a save-to-rollout loop is a few seconds and an unchanged rebuild is a no-op. Ctrl+C ends the session; the apps keep running.
 
@@ -63,6 +68,10 @@ appliance deploy --profile <cloud>       # the same source artifact, the same co
 
 The cloud api-server is the **same server** that runs inside your VM, deployed as cloud compute — same API, same packaging (a source zip built server-side), same commands. A stack file that runs locally spins up an identical set in the cloud with `appliance deploy --profile <cloud>`. The server URL printed by bootstrap **is** the web console URL — no separate hosting or CORS setup. Tear it all down with `appliance cloud teardown`.
 
+Bootstrap needs an AWS account (credentials from `~/.aws`, SSO profiles work — pass `--aws-profile <name>`) and a domain for the installation; it walks you through both interactively.
+
+> **Coming soon:** server-side **container-image builds on the cloud base**. Until the cloud builder lands, cloud deploys of `container`-type apps need a pre-built image: `appliance deploy --image-uri ghcr.io/org/app:tag`. Local deploys of every type, and cloud deploys of zip-packaged framework apps, build server-side today.
+
 ## How deploys work (every target, one pipeline)
 
 1. `appliance deploy` packages your **source** into `appliance.zip` (no images, no Docker) and uploads it.
@@ -86,8 +95,8 @@ Optional fields: `scripts` (lifecycle hooks: `prebuild`, `build`, `postbuild`, `
 
 | Command                              | Description                                                                          |
 | ------------------------------------ | ------------------------------------------------------------------------------------ |
-| `appliance dev [env]`                | Dev loop: deploy this app/stack, stream merged logs, rebuild on save                 |
 | `appliance init`                     | First-time setup: boot the managed VM and guide your first deploy                    |
+| `appliance dev [env]`                | Dev loop: deploy this app/stack, stream merged logs, rebuild on save                 |
 | `appliance deploy [project] [env]`   | Deploy the linked target — or the whole stack in a stack folder                      |
 | `appliance destroy [project] [env]`  | Destroy an environment; defaults to the linked target                                |
 | `appliance up` / `down` / `shell`    | Build + run this repo (Dockerfile/compose/devcontainer) in the VM / stop / enter it  |
@@ -114,7 +123,7 @@ Local deploys use the `local` profile, saved automatically when the VM first boo
 
 ## The managed VM
 
-`appliance vm up` (run implicitly by `dev`, `up`, and `agent`) boots an isolated microVM — Virtualization.framework on macOS, WSL2 on Windows; Linux waits on the KVM backend — containing:
+`appliance vm up` (run implicitly by `init`, `dev`, `up`, and `agent`) boots an isolated microVM — Virtualization.framework on macOS, WSL2 on Windows; Linux (KVM) is coming soon — containing:
 
 - **k3s** (Kubernetes) with hostname-routed ingress: `http://<app>-<env>.appliance.localhost:8081`
 - **BuildKit** + an in-VM image registry: server-side builds with a persistent cache
