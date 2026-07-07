@@ -28,8 +28,9 @@ Code references:
 
 The two surfaces deliberately do **not** fight over the same entries:
 
-- **CLI-managed profiles** (`managed: "cli"`, e.g. the `microvm` profile
-  written by `appliance vm up`): `profiles.json` is authoritative. The
+- **CLI-managed profiles** (`managed: "cli"`, e.g. the `local` profile
+  written by `appliance vm up` for the default VM): `profiles.json` is
+  authoritative. The
   desktop only ever _reads_ these — `mirror_to_shared_profiles` skips any
   entry whose `managed != "desktop"`, and `sync_microvm_cluster` copies
   the CLI's `keyId`/`secret` _into_ the Keychain, never the other way.

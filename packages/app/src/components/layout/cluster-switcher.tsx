@@ -5,21 +5,23 @@ import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
-import { isMicroVmClusterId } from '@/lib/host';
+import { devMachineLabel, isMicroVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import type { Cluster } from '@/lib/host';
 
-/** Tag a microVM-backed cluster so it's tellable apart from cloud
- *  clusters at a glance. Mirrors the management page's EngineTag
- *  wording — the local runtime is sandboxed in a virtual machine. */
-function engineLabel(clusterId: string): string | null {
-  if (isMicroVmClusterId(clusterId)) return 'sandboxed';
-  return null;
+/** Display name for a deploy target: the local VM shows as the Dev
+ *  Machine (whatever name the host registered it under); cloud
+ *  installations keep their given name. */
+function targetName(cluster: Cluster): string {
+  const vm = microVmNameFromClusterId(cluster.id);
+  return vm ? devMachineLabel(vm) : cluster.name;
 }
 
 function EngineBadge({ clusterId }: { clusterId: string }) {
-  const label = engineLabel(clusterId);
-  if (!label) return null;
+  if (!isMicroVmClusterId(clusterId)) return null;
   return (
-    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{label}</span>
+    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+      this computer
+    </span>
   );
 }
 
@@ -59,7 +61,7 @@ export function ClusterSwitcher() {
       // per-cluster ids and just refetch, so stay put instead of
       // yanking the user off the page they were reading.
       const segments = window.location.pathname.split('/').filter(Boolean);
-      const stayable = ['projects', 'clusters', 'settings', 'agents', 'environments', 'deployments'];
+      const stayable = ['projects', 'machine', 'cloud', 'settings', 'agents', 'deployments'];
       if (segments.length !== 1 || !stayable.includes(segments[0])) {
         navigate('/');
       }
@@ -68,9 +70,7 @@ export function ClusterSwitcher() {
   });
 
   if (clusters.length === 0) {
-    return (
-      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">No cluster connected</div>
-    );
+    return <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">Not connected</div>;
   }
 
   return (
@@ -83,7 +83,7 @@ export function ClusterSwitcher() {
           open && 'bg-[var(--color-muted)]'
         )}
       >
-        <span className="font-medium">{cluster?.name ?? 'Select cluster'}</span>
+        <span className="font-medium">{cluster ? targetName(cluster) : 'Select target'}</span>
         {cluster ? <EngineBadge clusterId={cluster.id} /> : null}
         <ChevronDown className="h-3.5 w-3.5 text-[var(--color-muted-foreground)]" />
       </button>
@@ -111,7 +111,7 @@ export function ClusterSwitcher() {
                     </div>
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5 font-medium">
-                        {c.name} <EngineBadge clusterId={c.id} />
+                        {targetName(c)} <EngineBadge clusterId={c.id} />
                       </div>
                       <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
                         {c.apiServerUrl}
@@ -124,14 +124,14 @@ export function ClusterSwitcher() {
           </ul>
           <div className="border-t border-[var(--color-border)] p-1">
             <Link
-              // Canonical add-cluster surface (§5.2 dedup / Devon nit) —
+              // Canonical add-cloud surface (§5.2 dedup / Devon nit) —
               // the onboarding Connect form, not the old bare /connect.
               to="/setup/connect"
               onClick={() => setOpen(false)}
               className="flex items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-[var(--color-muted)]"
             >
               <Plus className="h-4 w-4" />
-              Add cluster
+              Add cloud
             </Link>
           </div>
         </div>

@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { NavLink, Outlet } from 'react-router';
-import { Wand, Server, Boxes, Folder, Bot, Cog } from 'lucide-react';
+import { Wand, Server, Laptop, Cloud, Folder, Bot, Cog } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
@@ -27,31 +27,29 @@ export function AppShell() {
   const { cluster, isLoading } = useSelectedCluster();
   const configured = Boolean(cluster);
 
-  // ④ Agents is desktop-only — it launches coding agents into a local
-  // runtime (host.vm). The web shell hides it, mirroring today's Runtimes
-  // gate; the `/agents` route itself renders a "desktop app only" message.
+  // Agents and Machine are desktop-only — both need the local VM engine
+  // (host.vm). The web shell hides them; the routes themselves render a
+  // "desktop app only" message for direct links.
   const host = useHost();
-  const showAgents = Boolean(host.vm);
+  const hasVm = Boolean(host.vm);
 
   // Member keys (invite-onboarded teammates) get the task surface only:
-  // their apps and Settings. Clusters / Agents / Setup are operator
+  // their apps and Settings. Machine / Cloud / Agents / Setup are operator
   // tools — the API 403s a member on them anyway, so showing the nav
   // items would only manufacture dead ends.
   const { role } = useKeyRole();
   const isOperator = role === 'admin';
 
-  // Five-area IA (§2): Setup (adaptive) / Clusters / Projects / Agents /
-  // Settings — canonical labels only (no Dashboard/Overview/Runtimes drift).
-  // Clusters stays always-visible for operators — its desktop-only bits are
-  // host-gated inside the page, not hidden from the rail; Agents is gated OFF
-  // the rail on web since the whole area is desktop-only. Clusters uses
-  // `Boxes` (a distinct icon, not the brand mark's `Server`) so the nav item
-  // doesn't read as a second logo (Devon); Agents uses `Bot`.
+  // Nav: Setup (only while unconfigured) / Apps / Agents / Machine /
+  // Cloud / Settings — canonical labels only. Members see Apps + Settings;
+  // admin desktop sees everything; admin web (no host.vm) drops Agents +
+  // Machine and keeps Cloud.
   const nav: NavItem[] = [
     ...(isOperator && !isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
-    ...(isOperator ? [{ to: '/clusters', label: 'Clusters', icon: Boxes }] : []),
     { to: '/projects', label: 'Apps', icon: Folder },
-    ...(isOperator && showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    ...(isOperator && hasVm ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    ...(isOperator && hasVm ? [{ to: '/machine', label: 'Machine', icon: Laptop }] : []),
+    ...(isOperator ? [{ to: '/cloud', label: 'Cloud', icon: Cloud }] : []),
     { to: '/settings', label: 'Settings', icon: Cog },
   ];
 

@@ -422,14 +422,6 @@ export function createMockHost(): ConsoleHost {
         }
         return ref;
       },
-
-      async bootstrapInClusterApiServer() {
-        await sleep(1_200);
-        return {
-          apiServerUrl: 'http://api.appliance.localhost:8081',
-          apiKey: { id: 'apikey_mock-bootstrap', secret: 'sk_mock-secret' },
-        };
-      },
     },
 
     vm: {

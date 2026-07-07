@@ -43,7 +43,7 @@ export function BootstrapProgressPage() {
   if (!values || values.mode === 'aws') {
     return <AwsProgress values={values} />;
   }
-  return <Navigate to="/bootstrap" replace />;
+  return <Navigate to="/cloud/bootstrap" replace />;
 }
 
 function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
@@ -222,7 +222,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
   }, [result, host, queryClient, values?.name]);
 
   if (!values) {
-    return <Navigate to="/bootstrap" replace />;
+    return <Navigate to="/cloud/bootstrap" replace />;
   }
 
   return (
@@ -318,11 +318,11 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
           </dl>
           {handoff === 'failed' && handoffError ? (
             <div className="rounded-md border border-red-500/50 bg-red-500/5 p-2 text-xs text-red-400">
-              {handoffError} — connect manually under Clusters → Add cluster.
+              {handoffError} — connect manually under Cloud → Add cloud.
             </div>
           ) : null}
-          <Button onClick={() => navigate('/')} disabled={handoff === 'saving'}>
-            {handoff === 'saving' ? 'Saving…' : 'Open dashboard'}
+          <Button onClick={() => navigate('/projects')} disabled={handoff === 'saving'}>
+            {handoff === 'saving' ? 'Saving…' : 'Open Apps'}
           </Button>
         </div>
       ) : null}
@@ -337,7 +337,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
                 {retrying ? 'Retrying…' : `Retry ${failedPhase}`}
               </Button>
             ) : null}
-            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
+            <Button variant="outline" onClick={() => navigate('/cloud/bootstrap')} disabled={retrying}>
               Start over
             </Button>
           </div>
@@ -348,19 +348,21 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
 }
 
 // ============================================================
-// Local Runtime (microVM) bootstrap
+// Dev Machine (microVM) bootstrap
 //
-// One "Get started" press lands here and boots the default VM. The
-// engine already publishes structured bring-up phases
-// (media → booting → network → cluster → ready / failed, mirrored by
-// MicroVmStatus.phase), so instead of a single opaque node we render a
+// One "Get started" press lands here and boots the default VM — DEV-
+// CAPABLE (devUp) when the host supports it, so the freshly-booted
+// machine can run agents and dev shells without a second detour through
+// the Machine page. The engine already publishes structured bring-up
+// phases (media → booting → network → cluster → ready / failed, mirrored
+// by MicroVmStatus.phase), so instead of a single opaque node we render a
 // five-rung ladder driven by polled status().phase: each rung goes
 // pending → running (spinner) → completed (check). The streamed boot
 // lines live underneath as a collapsible detail, and a `failed` phase
 // fails fast — the in-flight rung turns red and the error is surfaced
-// with a Retry. Lands on a clean "ready" state whose primary CTA leads
-// straight into the first deploy ("Deploy your first app" →
-// /projects/deploy), with "Open dashboard" as the secondary action.
+// with a Retry. Lands on a clean "ready" state with ONE primary CTA into
+// the first deploy ("Deploy your first app" → /projects/deploy) and a
+// secondary "Run an agent" → /agents.
 // ============================================================
 
 // The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
@@ -384,9 +386,9 @@ const MICROVM_LADDER: {
   },
   {
     phase: 'ready',
-    label: 'Cluster ready',
-    runningLabel: 'Registering cluster',
-    detail: 'Delivering the api-server and registering the cluster.',
+    label: 'Ready',
+    runningLabel: 'Registering with the console',
+    detail: 'Delivering the api-server and registering the machine as a deploy target.',
   },
 ];
 
@@ -434,7 +436,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
 
   const start = React.useCallback(async () => {
     if (!vmHost) {
-      setError('The microVM engine is only available in the desktop app.');
+      setError('The Dev Machine is only available in the desktop app.');
       setOutcome('failed');
       return;
     }
@@ -473,11 +475,21 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     void poll();
 
     try {
-      appendLog('info', `Booting microVM "${name}" and bootstrapping its api-server…`);
-      // up() streams the same lines the CLI prints, installs the engine
-      // binary if missing, and registers the VM as a cluster on success.
-      await instance.up((e) => appendLog('info', e.message));
-      appendLog('info', `microVM "${name}" is up and registered as a cluster.`);
+      appendLog('info', `Booting the "${name}" VM and bootstrapping its api-server…`);
+      // The express boot provisions the VM DEV-CAPABLE (devUp: dev
+      // toolchain + persistent workspace) so agents and dev shells work
+      // right after onboarding — no second detour through the Machine
+      // page. Falls back to a plain up() on hosts without devUp.
+      const onLog = (e: { message: string }) => appendLog('info', e.message);
+      // Streams the same lines the CLI prints, installs the engine
+      // binary if missing, and registers the VM as a deploy target on
+      // success.
+      if (typeof instance.devUp === 'function') {
+        await instance.devUp(onLog);
+      } else {
+        await instance.up(onLog);
+      }
+      appendLog('info', `The "${name}" VM is up and registered as a deploy target.`);
       setReached(MICROVM_LADDER.length - 1);
       setOutcome('ready');
       // Collapse the bring-up log once we're green — the ladder tells the
@@ -516,7 +528,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   );
 
   if (!vmHost) {
-    return <Navigate to="/bootstrap" replace />;
+    return <Navigate to="/cloud/bootstrap" replace />;
   }
 
   // The rung currently in focus: the high-water mark, defaulting to the
@@ -539,12 +551,12 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // A single spoken sentence for the visually-hidden live region, so screen
   // readers hear the ladder advance / settle without parsing the rungs.
   const announce = (() => {
-    if (outcome === 'ready') return 'Local runtime ready.';
+    if (outcome === 'ready') return 'Dev Machine ready.';
     if (outcome === 'failed') {
       // Mirror the visible header: don't name a stage we never reached.
       return reached < 0 ? 'Start failed.' : `Start failed at the ${MICROVM_LADDER[cur].label} step.`;
     }
-    if (reached < 0) return 'Starting local runtime…';
+    if (reached < 0) return 'Starting the Dev Machine…';
     const rung = MICROVM_LADDER[cur];
     return `${rung.runningLabel ?? rung.label} in progress…`;
   })();
@@ -552,9 +564,9 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold">Starting local runtime</h1>
+        <h1 className="text-2xl font-semibold">Starting your Dev Machine</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Sandboxed in a virtual machine · {name} · registers as{' '}
+          Isolated virtual machine · {name} · registers as{' '}
           <code className="font-mono text-xs">{microVmClusterId(name)}</code>
         </p>
       </div>
@@ -619,30 +631,28 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
       {outcome === 'ready' ? (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
           <div className="flex items-center gap-2 text-sm font-medium text-green-400">
-            <Check className="h-4 w-4" /> Local runtime ready
+            <Check className="h-4 w-4" /> Dev Machine ready
           </div>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt className="text-[var(--color-muted-foreground)]">Sandbox</dt>
-            <dd>virtual machine ({name})</dd>
-            <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
+            <dt className="text-[var(--color-muted-foreground)]">Virtual machine</dt>
+            <dd>{name}</dd>
+            <dt className="text-[var(--color-muted-foreground)]">Profile</dt>
             <dd className="font-mono">{microVmClusterId(name)}</dd>
           </dl>
-          {/* The runtime being up is the middle, not the end — lead straight
-              into the first deploy. The wizard find-or-creates the project +
+          {/* The machine being up is the middle, not the end — lead straight
+              into the first deploy. The wizard find-or-creates the app +
               environment and writes the link itself, so there's no separate
-              "project setup" step to discover first. "Open dashboard" stays
-              as the secondary escape hatch. */}
+              setup step to discover first. ONE primary CTA; "Run an agent"
+              is the secondary path (the express boot is dev-capable, so
+              agents work right away). */}
           <p className="text-xs text-[var(--color-muted-foreground)]">
-            Next, deploy your first app. The wizard creates the project and environment for you — no separate setup step
+            Next, deploy your first app. The wizard creates the app and environment for you — no separate setup step
             needed.
           </p>
           <div className="flex gap-2">
             <Button onClick={() => navigate('/projects/deploy')}>Deploy your first app</Button>
-            <Button variant="outline" onClick={() => navigate('/')}>
-              Open dashboard
-            </Button>
-            <Button variant="outline" onClick={() => navigate('/clusters')}>
-              Manage runtimes
+            <Button variant="outline" onClick={() => navigate('/agents')}>
+              Run an agent
             </Button>
           </div>
         </div>
@@ -661,7 +671,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
             <Button onClick={() => void start()} disabled={retrying}>
               {retrying ? 'Retrying…' : 'Retry'}
             </Button>
-            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
+            <Button variant="outline" onClick={() => navigate('/setup')} disabled={retrying}>
               Start over
             </Button>
           </div>

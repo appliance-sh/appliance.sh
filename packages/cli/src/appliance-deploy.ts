@@ -1,4 +1,6 @@
 import { Command } from 'commander';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { createApplianceClient, DeploymentStatus } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
@@ -8,14 +10,45 @@ import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 // Thin commander wrapper around the shared deploy engine in
-// utils/deploy-core.ts (also driven by `appliance stack deploy`).
+// utils/deploy-core.ts. In a stack folder (appliance.stack.json) a
+// bare `appliance deploy` fans out over every member — one deploy
+// command for single apps and multi-service applications alike.
 
 const program = new Command();
 
 attachProfileOption(program);
 
+/** Bare `appliance deploy` in a stack folder deploys the whole stack.
+ *  Any explicit target/build flag opts back into single-app mode. */
+async function maybeDeployStack(opts: {
+  cliProject?: string;
+  build: string;
+  imageUri?: string;
+  envFile?: string;
+  file?: string;
+}): Promise<boolean> {
+  const { STACK_FILENAME, loadStack, resolveStackApps } = await import('./utils/stack.js');
+  // `file` carries the manifest default ('appliance.json') — only an
+  // explicit override opts out of stack detection.
+  if (opts.cliProject || opts.imageUri || opts.envFile || (opts.file && opts.file !== 'appliance.json')) return false;
+  if (opts.build !== DEFAULT_BUILD_OUTPUT) return false;
+  if (!fs.existsSync(path.join(process.cwd(), STACK_FILENAME))) return false;
+
+  const { deployStackApps, printSummary, requireClient } = await import('./utils/stack-deploy.js');
+  const loaded = loadStack(undefined);
+  const apps = resolveStackApps(loaded, undefined);
+  console.log(
+    chalk.dim(`${STACK_FILENAME} found — deploying the whole stack (${apps.length} apps). `) +
+      chalk.dim('Target one app by running deploy from its folder.')
+  );
+  const { client, apiUrl } = requireClient();
+  const result = await deployStackApps({ client, apiUrl, apps });
+  printSummary(result.rows);
+  process.exit(result.failed ? 1 : 0);
+}
+
 registerManifestOptions(program)
-  .description('deploy the linked (or named) project/environment')
+  .description('deploy the linked (or named) project/environment — or the whole stack in a stack folder')
   .argument('[project]', 'project name (defaults to the linked project, then to the manifest `name`)')
   .argument('[environment]', 'environment name (defaults to the linked environment)')
   .option('-a, --build <path>', 'appliance.zip build to deploy', DEFAULT_BUILD_OUTPUT)
@@ -40,6 +73,14 @@ registerManifestOptions(program)
       console.error(chalk.red('Provide either --image-uri or --build, not both.'));
       process.exit(1);
     }
+
+    await maybeDeployStack({
+      cliProject,
+      build: opts.build,
+      imageUri: opts.imageUri,
+      envFile: opts.envFile,
+      file: opts.file,
+    });
 
     const credentials = loadCredentials();
     if (!credentials) {

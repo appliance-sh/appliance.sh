@@ -1,9 +1,9 @@
 import type { ConsoleHost } from './host';
 
-// Shared helpers for the single "Local Runtime" concept the shell
-// presents. It's backed by the microVM engine (host.vm) — an isolated
-// VM Appliance boots itself, the sole local runtime now that bare k3d
-// is gone. The UI frames it as "sandboxed in a virtual machine".
+// Shared helpers for the local "Dev Machine" concept the shell presents.
+// It's backed by the microVM engine (host.vm) — an isolated VM Appliance
+// boots itself, the sole local engine now that bare k3d is gone. The UI
+// labels it "Dev Machine" (see devMachineLabel in lib/host.ts).
 
 const ONBOARDING_KEY = 'appliance.onboarding.localRuntime.dismissed';
 

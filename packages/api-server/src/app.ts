@@ -6,6 +6,7 @@ import { projectRoutes } from './routes/projects';
 import { environmentRoutes } from './routes/environments';
 import { deploymentRoutes } from './routes/deployments';
 import { buildRoutes } from './routes/builds';
+import { buildContentRoutes } from './routes/builds/content';
 import { bootstrapRoutes } from './routes/bootstrap';
 import { keyRoutes } from './routes/keys';
 import { inviteRoutes } from './routes/invites';
@@ -72,6 +73,11 @@ export function createApp(mode: ApplianceMode = getMode()): Express {
     app.use('/api/v1/deployments', signatureAuth, deploymentRoutes);
     app.use('/api/v1/keys', signatureAuth, keyRoutes);
     app.use('/api/v1/invites', signatureAuth, inviteRoutes);
+    // Content PUTs authenticate with the one-time token minted at
+    // build creation (the self-hosted analogue of a presigned S3 URL),
+    // so they mount ahead of the signed router; anything the content
+    // router doesn't match falls through to the signed routes below.
+    app.use('/api/v1/builds', buildContentRoutes);
     app.use('/api/v1/builds', signatureAuth, buildRoutes);
     app.use('/api/v1/cluster-info', signatureAuth, clusterInfoRoutes);
     // Runtime workloads + container logs (container-runtime bases only;

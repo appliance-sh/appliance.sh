@@ -44,7 +44,7 @@ export function AgentsPage() {
       <div className="max-w-2xl space-y-4">
         <h1 className="text-xl font-semibold">Agents</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Coding agents run inside a local runtime — only available in the desktop app.
+          Coding agents run inside the Dev Machine — only available in the desktop app.
         </p>
       </div>
     );
@@ -63,7 +63,7 @@ export function AgentsPage() {
       <header>
         <h1 className="text-xl font-semibold">Agents</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Sign in to a coding agent, launch it into a local runtime&rsquo;s shared workspace, and observe it in the
+          Sign in to a coding agent, launch it into the Dev Machine&rsquo;s shared workspace, and observe it in the
           terminal dock. Credentials are brokered host-side and never enter the VM.
         </p>
       </header>
@@ -97,8 +97,8 @@ function NoSignedInAgentBanner() {
     <div className="rounded-md border border-cyan-500/40 bg-cyan-500/5 px-4 py-3">
       <h2 className="text-sm font-semibold text-cyan-200">Sign in to get started</h2>
       <p className="mt-1 text-xs text-cyan-100/80">
-        No coding agent is signed in yet. Pick an agent below and store its credential, then launch it into a running
-        local runtime. The credential stays on this machine — it never enters the VM.
+        No coding agent is signed in yet. Pick an agent below and store its credential, then launch it into the running
+        Dev Machine. The credential stays on this computer — it never enters the VM.
       </p>
     </div>
   );
@@ -126,8 +126,8 @@ function AgentSignIn({
       <div>
         <h2 className="text-sm font-semibold">Agent sign-in</h2>
         <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-          Sign in so coding agents can reach their providers. Each agent stores its own credential on this machine,
-          brokered into the sandbox at request time; it never enters the VM.
+          Sign in so coding agents can reach their providers. Each agent stores its own credential on this computer,
+          brokered in at request time; it never enters the VM.
         </p>
       </div>
       <div role="group" aria-label="Agent type" className="flex flex-wrap gap-1">
@@ -209,16 +209,16 @@ function LauncherSection({
     <section className="space-y-3">
       <h2 className="text-sm font-semibold text-[var(--color-muted-foreground)]">Launch</h2>
       {vmListQuery.isLoading && runningVms.length === 0 ? (
-        <p className="text-xs text-[var(--color-muted-foreground)]">Loading runtimes…</p>
+        <p className="text-xs text-[var(--color-muted-foreground)]">Checking the Dev Machine…</p>
       ) : runningVms.length === 0 ? (
         <EmptyState
           icon={Server}
-          title="No running runtime"
-          description="Start a local runtime as a dev environment to launch coding agents into its shared workspace."
+          title="Dev Machine not running"
+          description="Start the Dev Machine as a dev environment to launch coding agents into its shared workspace."
           action={
             <Button asChild>
-              <Link to="/clusters">
-                <Server className="h-4 w-4" /> Go to Clusters
+              <Link to="/machine">
+                <Server className="h-4 w-4" /> Go to Machine
               </Link>
             </Button>
           }
@@ -297,12 +297,12 @@ function RuntimeLauncher({
   const status = statusQuery.data;
 
   const disabledReason = !status
-    ? 'Checking the runtime…'
+    ? 'Checking the Dev Machine…'
     : !status.running
-      ? 'Start this runtime to run agents'
+      ? 'Start the Dev Machine to run agents'
       : status.devMount
         ? null
-        : 'VM has no shared workspace — start it as a dev environment to run agents';
+        : 'The VM has no shared workspace — start it as a dev environment (Machine → dev environment) to run agents';
 
   return (
     <div className="space-y-2">
@@ -406,7 +406,7 @@ function NoRunsState({ hasRuntime }: { hasRuntime: boolean }) {
       description={
         hasRuntime
           ? 'Launch a coding agent above and it appears here with its live status; its observe tab opens in the terminal dock.'
-          : 'Start a local runtime, then launch a coding agent — runs show up here with their live status.'
+          : 'Start the Dev Machine, then launch a coding agent — runs show up here with their live status.'
       }
     />
   );

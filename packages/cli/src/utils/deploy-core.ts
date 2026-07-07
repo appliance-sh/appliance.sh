@@ -2,19 +2,11 @@ import { Command } from 'commander';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { input } from '@inquirer/prompts';
-import {
-  ApplianceType,
-  createApplianceClient,
-  DeploymentStatus,
-  isDockerBase,
-  isKubernetesBase,
-} from '@appliance.sh/sdk';
-import type { ApplianceBaseConfig, Project, Environment, Deployment } from '@appliance.sh/sdk';
+import { createApplianceClient, DeploymentStatus, isDockerBase, isKubernetesBase } from '@appliance.sh/sdk';
+import type { Project, Environment, Deployment } from '@appliance.sh/sdk';
 import { getActiveProfileOverride } from './credentials.js';
-import { extractApplianceFile, resolveApplianceDir } from './common.js';
+import { extractApplianceFile } from './common.js';
 import { buildApplianceZip } from './build-package.js';
-import { buildLocalApplianceImage, publishLocalApplianceImage } from './local-image.js';
-import { buildkitAvailable, ensureBuildctl, publishViaBuildkit } from './buildkit-image.js';
 import { readLink, writeLink } from './link.js';
 import { pollDeploymentUntilDone, extractDeploymentUrl } from './deploy-poll.js';
 import { startProgressLine, BRAND } from './progress.js';
@@ -236,25 +228,22 @@ async function resolveTarget(
   return { projectName, environmentName, source };
 }
 
-// Resolve which build to deploy. Five mutually-exclusive paths:
+// Resolve which build to deploy. Three mutually-exclusive paths:
 //   --image-uri <uri>    : register an external image build (no upload)
-//   <docker base>        : build the image into the local docker daemon
-//                          and register its image ID — the server runs
-//                          containers on the same daemon, so there is
-//                          no push at all
-//   <kubernetes base>    : build the image host-side, push/import it
-//                          into the cluster, register a remote-image
-//                          build (upload-flow builds aren't supported
-//                          by k8s-driven api-servers)
 //   <existing zip path>  : upload the existing zip
 //   <no zip + default>   : auto-build the manifest into appliance.zip,
 //                          then upload it
+//
+// Uploaded zips are SOURCE — the api-server builds the image
+// server-side (BuildKit against the base's builder) on every base, so
+// there is no client-side docker/buildctl path anymore. The only
+// base-type sensitivity left is packaging: Lambda zips carry
+// pre-installed deps + run.sh, container-runtime zips are plain source.
 async function resolveBuildId(
   client: ReturnType<typeof createApplianceClient>,
   program: Command,
   opts: { imageUri?: string; build: string },
-  kubernetesBase: ApplianceBaseConfig | null,
-  dockerBase: ApplianceBaseConfig | null
+  lambdaPrep: boolean
 ): Promise<string> {
   if (opts.imageUri) {
     console.log(chalk.dim(`Using image: ${opts.imageUri}`));
@@ -262,14 +251,6 @@ async function resolveBuildId(
     if (!createResult.success) throw new Error(`Failed to create external build: ${createResult.error.message}`);
     console.log(chalk.dim(`External build created: ${createResult.data.buildId}`));
     return createResult.data.buildId;
-  }
-
-  if (dockerBase) {
-    return resolveDockerBuildId(client, program);
-  }
-
-  if (kubernetesBase) {
-    return resolveKubernetesBuildId(client, program, kubernetesBase);
   }
 
   const buildPath = path.resolve(opts.build);
@@ -293,7 +274,7 @@ async function resolveBuildId(
         `Cannot auto-build: ${manifest.error.message}. Run \`appliance build\` first, or pass --image-uri / --build <path>.`
       );
     }
-    const built = await buildApplianceZip({ appliance: manifest.data, outputPath: buildPath });
+    const built = await buildApplianceZip({ appliance: manifest.data, outputPath: buildPath, lambdaPrep });
     const sizeMb = (built.sizeBytes / 1024 / 1024).toFixed(1);
     console.log(chalk.green(`Built: ${built.outputPath} (${sizeMb} MB)`));
   }
@@ -305,144 +286,6 @@ async function resolveBuildId(
   if (!uploadResult.success) throw new Error(`Upload failed: ${uploadResult.error.message}`);
   console.log(chalk.dim(`Build uploaded: ${uploadResult.data.buildId}`));
   return uploadResult.data.buildId;
-}
-
-// Docker-base build (the local daemon runtime): build the image into
-// the SAME docker daemon the server deploys from and register its
-// immutable image ID. No registry, no push, no delivery — the fastest
-// local loop there is.
-async function resolveDockerBuildId(
-  client: ReturnType<typeof createApplianceClient>,
-  program: Command
-): Promise<string> {
-  const manifest = await extractApplianceFile(program);
-  if (!manifest.success) {
-    throw new Error(
-      `This environment deploys container images, and no manifest was found to build one from: ${manifest.error.message}. ` +
-        'Pass --image-uri <ref> to deploy a pre-built image.'
-    );
-  }
-  const appliance = manifest.data;
-  if (appliance.type !== ApplianceType.container) {
-    throw new Error(
-      `This environment runs on the local Docker runtime, which deploys container images. ` +
-        `"${appliance.type}" appliances can't be built into an image by the CLI yet — ` +
-        'add a Dockerfile and switch to `"type": "container"`, or pass --image-uri <ref>.'
-    );
-  }
-
-  // The containers run on this machine's daemon — pin the build to the
-  // host arch like the microVM path does, so a manifest that targets a
-  // cloud platform doesn't produce an emulated (or unrunnable) image.
-  const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  if (!appliance.scripts?.build && appliance.platform && !appliance.platform.endsWith(hostArch)) {
-    console.log(
-      chalk.yellow(
-        `Manifest platform "${appliance.platform}" targets a different architecture — building linux/${hostArch} for the local daemon instead.`
-      )
-    );
-  }
-  const imageId = await buildLocalApplianceImage({
-    name: appliance.name,
-    platform: appliance.scripts?.build ? undefined : `linux/${hostArch}`,
-    buildScript: appliance.scripts?.build,
-    context: resolveApplianceDir(program),
-  });
-
-  const createResult = await client.createBuild({ uploadUrl: imageId, port: appliance.port });
-  if (!createResult.success) throw new Error(`Failed to create image build: ${createResult.error.message}`);
-  console.log(chalk.dim(`Image build created: ${createResult.data.buildId} (${imageId.slice(0, 19)}…)`));
-  return createResult.data.buildId;
-}
-
-// Kubernetes-base build: produce a container image on the host and
-// hand the api-server an image reference. The in-cluster api-server
-// has no docker daemon, so it rejects zip uploads — image production
-// is the CLI's job here, exactly like the desktop's deploy wizard.
-async function resolveKubernetesBuildId(
-  client: ReturnType<typeof createApplianceClient>,
-  program: Command,
-  baseConfig: ApplianceBaseConfig
-): Promise<string> {
-  const manifest = await extractApplianceFile(program);
-  if (!manifest.success) {
-    throw new Error(
-      `This environment deploys container images, and no manifest was found to build one from: ${manifest.error.message}. ` +
-        'Pass --image-uri <ref> to deploy a pre-built image.'
-    );
-  }
-  const appliance = manifest.data;
-  if (appliance.type !== ApplianceType.container) {
-    throw new Error(
-      `This environment runs on a Kubernetes base, which deploys container images. ` +
-        `"${appliance.type}" appliances can't be built into an image by the CLI yet — ` +
-        'add a Dockerfile and switch to `"type": "container"`, or pass --image-uri <ref>.'
-    );
-  }
-
-  // Loopback registries mean the cluster runs on this machine, and it
-  // can't emulate — the microVM has no binfmt. A cross-arch image just
-  // crashloops with `exec format error` after an opaque rollout timeout,
-  // so pin the build to
-  // the host arch for local targets regardless of the manifest's
-  // `platform` (which typically targets a cloud runtime). The override
-  // doesn't touch a user `scripts.build` — that script owns its arch.
-  const registryUrl = baseConfig.kubernetes?.registry?.url ?? null;
-  const hostArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  const isLocalTarget = registryUrl?.startsWith('localhost') ?? false;
-  // Widen to string: a local override produces a plain `linux/<arch>`
-  // ref, and publishLocalApplianceImage takes a string platform.
-  let platform: string | undefined = appliance.platform;
-  if (isLocalTarget) {
-    if (!appliance.scripts?.build && appliance.platform && !appliance.platform.endsWith(hostArch)) {
-      console.log(
-        chalk.yellow(
-          `Manifest platform "${appliance.platform}" can't run on this local cluster (linux/${hostArch}) — ` +
-            `building linux/${hostArch} instead.`
-        )
-      );
-    }
-    platform = `linux/${hostArch}`;
-  }
-  // Prefer the runtime's BuildKit builder when the base advertises one
-  // (the microVM forwards its in-guest buildkitd): the whole build +
-  // push happens with no docker daemon anywhere. A user `scripts.build`
-  // is a docker contract (`docker tag <name>`), so it stays on the
-  // docker path; an unreachable buildkitd (still installing on a first
-  // boot, or a parked VM) falls back to docker with a notice.
-  const buildkitAddr = baseConfig.kubernetes?.buildkit?.addr;
-  let imageRef: string | null = null;
-  if (buildkitAddr && registryUrl && !appliance.scripts?.build) {
-    const buildctl = await ensureBuildctl();
-    if (buildctl && buildkitAvailable(buildctl, buildkitAddr)) {
-      console.log(chalk.dim(`Building with BuildKit (${buildkitAddr}) — no Docker needed`));
-      imageRef = await publishViaBuildkit(buildctl, {
-        name: appliance.name,
-        platform,
-        registryUrl,
-        buildkitAddr,
-        context: resolveApplianceDir(program),
-      });
-    } else {
-      console.log(chalk.dim('BuildKit builder not reachable yet — falling back to docker build + push.'));
-    }
-  }
-  if (!imageRef) {
-    imageRef = await publishLocalApplianceImage({
-      name: appliance.name,
-      platform,
-      buildScript: appliance.scripts?.build,
-      registryUrl,
-      // Build the appliance's own directory (honors -d/-f), not whatever
-      // cwd the deploy was invoked from.
-      context: resolveApplianceDir(program),
-    });
-  }
-
-  const createResult = await client.createBuild({ uploadUrl: imageRef, port: appliance.port });
-  if (!createResult.success) throw new Error(`Failed to create image build: ${createResult.error.message}`);
-  console.log(chalk.dim(`Image build created: ${createResult.data.buildId}`));
-  return createResult.data.buildId;
 }
 
 function formatStatus(d: Deployment): string {
@@ -513,22 +356,24 @@ export async function runDeploy(params: RunDeployParams): Promise<DeployOutcome>
   const project = await findOrCreateProject(client, projectName);
   const environment = await findOrCreateEnvironment(client, project.id, projectName, environmentName);
 
-  // Container-runtime bases deploy images, not uploaded zips — probe
-  // the server's base type once so the build step can pick the right
-  // pipeline. Treat probe failures as "cloud-shaped": older
-  // api-servers without /cluster-info predate the container runtimes.
+  // Every base consumes the same source-zip artifact; the only
+  // base-type sensitivity left is packaging (Lambda zips carry
+  // pre-installed deps + run.sh for the zip runtime; container
+  // runtimes build an image from plain source server-side). Probe the
+  // base type once for that decision — probe failures are treated as
+  // "cloud-shaped" since older api-servers without /cluster-info
+  // predate the container runtimes.
   const clusterInfo = await client.getClusterInfo();
   const baseConfig = clusterInfo.success ? clusterInfo.data.baseConfig : null;
-  const kubernetesBase = baseConfig && isKubernetesBase(baseConfig) ? baseConfig : null;
-  const dockerBase = baseConfig && isDockerBase(baseConfig) ? baseConfig : null;
+  if (baseConfig && isDockerBase(baseConfig) && !opts.imageUri) {
+    throw new Error(
+      'This environment targets the removed local Docker runtime. Deploy to the microVM runtime instead ' +
+        '(`appliance dev`), or pass --image-uri <ref> to reference a pre-built image.'
+    );
+  }
+  const lambdaPrep = !(baseConfig && isKubernetesBase(baseConfig));
 
-  const buildId = await resolveBuildId(
-    client,
-    program,
-    { imageUri: opts.imageUri, build: opts.build },
-    kubernetesBase,
-    dockerBase
-  );
+  const buildId = await resolveBuildId(client, program, { imageUri: opts.imageUri, build: opts.build }, lambdaPrep);
 
   const manifestRuntime = await renderRuntimeConfig(program, projectName, environmentName);
   const envFileVars = loadEnvFile(opts.envFile, environmentName);

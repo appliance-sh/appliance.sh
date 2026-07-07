@@ -48,7 +48,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-app.js'),
   },
   bootstrap: {
-    description: 'provision a new Appliance installation on AWS',
+    description: 'provision a new Appliance installation on AWS (alias: `appliance cloud bootstrap`)',
     load: () => import('./appliance-bootstrap.js'),
   },
   build: {
@@ -90,8 +90,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-env.js'),
   },
   init: {
-    description:
-      'one-tap local onboarding: boot the microVM runtime and guide your first deploy (--remote <url> for cloud creds)',
+    description: 'first-time setup: boot the managed VM and guide your first deploy (after that, `appliance dev`)',
     load: () => import('./appliance-init.js'),
   },
   keys: {
@@ -102,16 +101,12 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'link this folder to a project/environment',
     load: () => import('./appliance-link.js'),
   },
-  local: {
-    description: '(removed) the local k3d runtime — use `appliance vm` / `appliance up`',
-    load: () => import('./appliance-local.js'),
-  },
   logs: {
     description: "stream a deployment's container logs (local engines)",
     load: () => import('./appliance-logs.js'),
   },
   vm: {
-    description: 'manage the microVM runtimes (deploy VM `appliance`; `up`/`agent` use sandbox VM `appliance-sbx`)',
+    description: 'manage the microVM (the one `appliance` VM runs deploys, dev sessions, and agents)',
     load: () => import('./appliance-vm.js'),
   },
   login: {
@@ -127,20 +122,19 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-open.js'),
   },
   profile: {
-    description: 'manage credential profiles (the lower-level store behind `appliance cluster`)',
+    description: '(use `appliance cluster`) the lower-level credential-profile store',
     load: () => import('./appliance-profile.js'),
   },
   server: {
-    description:
-      'run the control plane as a lightweight local daemon — deploys into the microVM (--runtime docker for the host daemon)',
+    description: '(deprecated) the control plane runs inside the microVM — use `appliance dev` / `appliance vm`',
     load: () => import('./appliance-server.js'),
   },
   stack: {
-    description: 'deploy, inspect, and destroy a collection of appliances as a unit (appliance.stack.json)',
+    description: 'scaffold/inspect/destroy a multi-app stack (`appliance deploy` in a stack folder deploys it)',
     load: () => import('./appliance-stack.js'),
   },
   teardown: {
-    description: 'destroy a bootstrap installation (reverses `appliance bootstrap`)',
+    description: 'destroy a cloud installation (alias: `appliance cloud teardown`)',
     load: () => import('./appliance-teardown.js'),
   },
   test: {
@@ -152,7 +146,7 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-unlink.js'),
   },
   up: {
-    description: 'build + run this project (Dockerfile, compose, or devcontainer) in the shared sandbox microVM',
+    description: 'build + run this project (Dockerfile, compose, or devcontainer) in the managed microVM',
     load: () => import('./appliance-up.js'),
   },
   down: {
@@ -178,6 +172,14 @@ const SHORTCUTS: Record<string, { target: string; prefix: string[] }> = {
   status: { target: 'app', prefix: ['status'] },
 };
 
+// `appliance cloud <verb>` — the umbrella for cloud-installation
+// lifecycle. Routes to the existing command modules so `cloud
+// bootstrap` and `bootstrap` can never drift.
+const CLOUD_VERBS: Record<string, string> = {
+  bootstrap: 'bootstrap',
+  teardown: 'teardown',
+};
+
 // Resolve aliases (e.g. `application` -> `app`) to their canonical
 // subcommand name. Filled once at module load.
 const ALIAS_MAP: Record<string, string> = (() => {
@@ -189,27 +191,28 @@ const ALIAS_MAP: Record<string, string> = (() => {
   return m;
 })();
 
-// Help groups the commands by workflow instead of alphabetically: the
-// three things people come here to do (run this repo in the sandbox,
-// deploy appliances, operate runtimes/servers) beat a flat A–Z wall.
-// Names must exist in SUBCOMMANDS; anything unlisted lands in "Other"
-// so a newly-registered command is never silently hidden.
+// Help groups the commands by journey instead of alphabetically: the
+// three things people come here to do (build & run locally, ship the
+// same thing to the cloud, operate the machine & team) beat a flat
+// A–Z wall. Names must exist in SUBCOMMANDS; anything unlisted lands
+// in "Other" so a newly-registered command is never silently hidden.
 const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
   {
-    title: 'Run this repo locally (shared sandbox microVM)',
-    names: ['up', 'down', 'shell', 'logs', 'agent'],
-  },
-  {
-    title: 'Deploy appliances (local microVM or cloud — same commands, switch with --profile)',
+    title: 'Build & run locally (one managed VM — no Docker anywhere)',
     names: [
       'dev',
       'init',
       'deploy',
-      'stack',
+      'up',
+      'down',
+      'shell',
+      'logs',
+      'agent',
       'open',
       'app',
       'build',
       'configure',
+      'stack',
       'manifest',
       'env',
       'deployment',
@@ -219,21 +222,12 @@ const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
     ],
   },
   {
-    title: 'Runtimes, servers & credentials',
-    names: [
-      'server',
-      'vm',
-      'doctor',
-      'login',
-      'whoami',
-      'profile',
-      'cluster',
-      'keys',
-      'test',
-      'bootstrap',
-      'teardown',
-      'local',
-    ],
+    title: 'Ship to the cloud (same commands, same artifacts — switch with --profile)',
+    names: ['bootstrap', 'teardown', 'login'],
+  },
+  {
+    title: 'Machine, credentials & diagnostics',
+    names: ['vm', 'doctor', 'whoami', 'cluster', 'keys', 'test', 'profile', 'server'],
   },
 ];
 
@@ -259,15 +253,13 @@ function showHelp(): void {
   for (const [name, sc] of Object.entries(SHORTCUTS)) {
     console.log(`  ${name.padEnd(width)}  alias for \`appliance ${sc.target} ${sc.prefix.join(' ')}\``);
   }
+  console.log(`  ${'cloud'.padEnd(width)}  umbrella: \`appliance cloud bootstrap|teardown\``);
   console.log();
-  console.log('Getting started:');
-  console.log('  Iterate locally, no Docker: appliance dev           (deploy + logs + rebuild on save)');
-  console.log('  Fastest local deploys:      appliance server start  →  appliance deploy  →  appliance open');
-  console.log('  Isolated local runtime:     appliance init  →  appliance deploy   (microVM + k3s)');
-  console.log('  Run this repo, no manifest: appliance up          (Dockerfile / compose / devcontainer)');
-  console.log('  Run a coding agent:         appliance agent login  →  appliance agent start');
-  console.log('  A collection of apps:       appliance stack init  →  appliance stack deploy');
-  console.log('  Cloud on AWS:               appliance bootstrap  →  appliance login  →  appliance deploy');
+  console.log('The three journeys:');
+  console.log('  1. Build & run your app(s):   appliance dev            (deploy + logs + rebuild on save;');
+  console.log('                                multi-service via appliance.stack.json — same command)');
+  console.log('  2. Dev environment + agents:  appliance up  →  appliance agent login  →  appliance agent start');
+  console.log('  3. Ship the same app to AWS:  appliance cloud bootstrap  →  appliance deploy --profile <cloud>');
   console.log();
   console.log('Environment variables:');
   console.log('  APPLIANCE_PROFILE               credential profile to use (overrides the active profile)');
@@ -313,6 +305,21 @@ async function main(): Promise<void> {
   if (shortcut) {
     process.argv = [process.argv[0], `appliance-${shortcut.target}`, ...shortcut.prefix, ...args.slice(1)];
     await SUBCOMMANDS[shortcut.target].load();
+    return;
+  }
+
+  // `appliance cloud <verb>` — route to the underlying command module.
+  if (sub === 'cloud') {
+    const verb = args[1];
+    const target = verb ? CLOUD_VERBS[verb] : undefined;
+    if (!target) {
+      console.error(`Usage: appliance cloud <${Object.keys(CLOUD_VERBS).join('|')}> [options]`);
+      console.error('  bootstrap  provision a new Appliance installation on AWS');
+      console.error('  teardown   destroy a cloud installation');
+      process.exit(verb ? 1 : 0);
+    }
+    process.argv = [process.argv[0], `appliance-${target}`, ...args.slice(2)];
+    await SUBCOMMANDS[target].load();
     return;
   }
 

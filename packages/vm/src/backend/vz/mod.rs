@@ -86,6 +86,7 @@ impl VmBackend for VzBackend {
             spec.docker,
             spec.egress_port,
             spec.agent_only,
+            spec.host_port,
         )?;
 
         // The prebuilt agent image (Node ≥22 + the pinned CLIs) attaches as a

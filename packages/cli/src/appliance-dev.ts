@@ -21,7 +21,7 @@ import {
   requireClient,
   type StackDeployResult,
 } from './utils/stack-deploy.js';
-import { ensureServerRunning, SERVER_PROFILE, type ServerRuntime } from './utils/local-server.js';
+import { ensureLocalRuntime, LOCAL_PROFILE } from './utils/microvm-up.js';
 import { createRebuildQueue, watchMember } from './utils/dev-watch.js';
 import { LogMux } from './utils/log-mux.js';
 import { BRAND } from './utils/progress.js';
@@ -29,12 +29,13 @@ import { isPrintedError } from './utils/deploy-core.js';
 import { printCliError } from './utils/errors.js';
 
 // `appliance dev` — the local dev loop, docker-compose-up feel with no
-// Docker: bring the local server (and its microVM runtime) up, deploy
-// the current app or stack, stream every member's logs merged and
-// color-prefixed, and rebuild + redeploy a member when its files
-// change. BuildKit's persistent cache makes a save-to-rollout loop a
-// few seconds; an unchanged rebuild short-circuits as a no-op.
-// Ctrl+C ends the session but leaves the apps running.
+// Docker anywhere: bring the ONE managed VM (and its guest api-server)
+// up, deploy the current app or stack, stream every member's logs
+// merged and color-prefixed, and rebuild + redeploy a member when its
+// files change. Images build server-side against the in-VM BuildKit,
+// whose persistent cache makes a save-to-rollout loop a few seconds;
+// an unchanged rebuild short-circuits as a no-op. Ctrl+C ends the
+// session but leaves the apps running.
 
 function exitWith(message: string): never {
   console.error(chalk.red(message));
@@ -47,14 +48,6 @@ interface DevOptions {
   /** commander --no-logs / --no-watch land as logs/watch = false. */
   logs: boolean;
   watch: boolean;
-}
-
-function parseRuntime(value: string | undefined): ServerRuntime | undefined {
-  if (value === undefined) return undefined;
-  if (value !== 'vm' && value !== 'docker') {
-    exitWith(`Invalid --runtime: ${value} (expected 'vm' or 'docker')`);
-  }
-  return value;
 }
 
 /** The stack members to run: the stack file when present, else the
@@ -102,23 +95,27 @@ async function runDev(environmentArg: string | undefined, opts: DevOptions): Pro
   if (environmentArg !== undefined && !dnsName.safeParse(environmentArg).success) {
     exitWith(`Invalid environment name "${environmentArg}" — lowercase alphanumeric with hyphens, DNS-safe.`);
   }
-  const runtime = parseRuntime(opts.runtime);
+  if (opts.runtime) {
+    console.log(
+      chalk.yellow(
+        '--runtime is gone: the control plane always runs inside the microVM now (the host Docker runtime was removed).'
+      )
+    );
+  }
   const { name, apps, isStack } = await resolveDevApps(environmentArg, opts.file);
 
   console.log(
     `${chalk.cyan(BRAND)} ${chalk.bold('appliance dev')} — ${name} (${apps.length} app${apps.length === 1 ? '' : 's'})`
   );
 
-  // Profile: `dev` owns the local server unless the caller pinned a
-  // different profile — dev against the microvm or a cloud profile is
-  // legitimate (any k8s base streams logs the same way); the server
-  // auto-start only applies to the `local` one.
+  // Profile: `dev` owns the local runtime unless the caller pinned a
+  // different profile — dev against a cloud profile is legitimate (any
+  // k8s base streams logs the same way); the VM auto-start only applies
+  // to the `local` one.
   const pinnedProfile = getActiveProfileOverride() ?? process.env.APPLIANCE_PROFILE;
-  if (!pinnedProfile || pinnedProfile === SERVER_PROFILE) {
-    await ensureServerRunning({ runtime, quiet: true });
-    setActiveProfileOverride(SERVER_PROFILE);
-  } else if (runtime) {
-    console.log(chalk.dim(`--runtime is ignored with --profile ${pinnedProfile} (no local server to manage).`));
+  if (!pinnedProfile || pinnedProfile === LOCAL_PROFILE) {
+    await ensureLocalRuntime();
+    setActiveProfileOverride(LOCAL_PROFILE);
   }
   const { client, apiUrl } = requireClient();
 
@@ -210,7 +207,7 @@ program
   .description('dev loop: deploy, stream logs, and rebuild on save (Ctrl+C leaves apps running)')
   .argument('[environment]', "environment for every app (default 'dev')")
   .option('-f, --file <path>', `stack file (default: ./${STACK_FILENAME}; falls back to the current app)`)
-  .option('--runtime <runtime>', "local server runtime: 'vm' (microVM + BuildKit, no Docker; default) or 'docker'")
+  .option('--runtime <runtime>', 'removed — the control plane always runs inside the microVM')
   .option('--no-logs', 'skip merged log streaming')
   .option('--no-watch', 'skip file watching / rebuild on save')
   .action(runDev);

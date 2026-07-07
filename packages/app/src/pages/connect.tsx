@@ -190,12 +190,12 @@ export function ConnectPage() {
 
       {canBootstrap ? (
         <div className="rounded-md border border-[var(--color-border)] p-4">
-          <div className="text-sm">No cluster yet?</div>
+          <div className="text-sm">Nothing to connect to yet?</div>
           <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-            Provision one from this machine — uses your current AWS credentials.
+            Provision a new installation from this machine — uses your current AWS credentials.
           </p>
           <Button asChild variant="outline" className="mt-3">
-            <Link to="/bootstrap">Bootstrap new installation</Link>
+            <Link to="/cloud/bootstrap">Bootstrap new installation</Link>
           </Button>
         </div>
       ) : null}

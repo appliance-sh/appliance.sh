@@ -321,9 +321,7 @@ all-root and throwaway.
 false` propagates exit `1` (sentinel intact); guest clock is corrected.
 - **E2.3 — docker/devcontainer as the user.** Add `addgroup appliance docker`
   to `DOCKER_PROVISION`; confirm `NPM_CONFIG_PREFIX` lets
-  `npm i -g @devcontainers/cli` run unprivileged (§4). **Accept:** on a warm
-  sandbox VM, `appliance up` (Dockerfile / compose / devcontainer) builds + runs
+  `npm i -g @devcontainers/cli` run unprivileged (§4). **Accept:** on the warm
+  managed VM, `appliance up` (Dockerfile / compose / devcontainer) builds + runs
   end-to-end as `appliance`; `appliance shell` lands in the devcontainer; k3s
   still reaches `Ready`.
-  </content>
-  </invoke>

@@ -417,6 +417,15 @@ export function isMicroVmClusterId(clusterId: string): boolean {
   return microVmNameFromClusterId(clusterId) !== null;
 }
 
+/** Canonical user-facing name for a local VM: the default VM is THE
+ *  "Dev Machine"; extra VMs are qualified by name. Used wherever a
+ *  microVM-backed target is shown (switcher, machine page, wizard rows)
+ *  so the local target never drifts back to "local runtime" /
+ *  "sandboxed" / "MicroVM Runtime" wording. */
+export function devMachineLabel(vmName: string): string {
+  return vmName === DEFAULT_MICROVM_NAME ? 'Dev Machine' : `Dev Machine (${vmName})`;
+}
+
 /** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
  *  Ordered: media → booting → network → cluster → ready (terminal), or
  *  failed (terminal). */
@@ -848,38 +857,6 @@ export interface LocalRuntimeHost {
    *  onEvent. Resolves with the registry-qualified image ref on
    *  success. */
   buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
-  /** Apply the in-cluster api-server manifest to the local cluster
-   *  (Deployment + Service + Ingress + RBAC + PVC), wait for it to
-   *  become reachable at `api.appliance.localhost`, mint a first
-   *  API key via the bootstrap token. The api-server image must
-   *  already live in the cluster-attached registry (pushed via
-   *  `buildAndImportImage` with the appliance-api-server context).
-   *  Returns the resulting URL + key. Idempotent — safe to call
-   *  again to reconcile drift. */
-  bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult>;
-}
-
-export interface BootstrapInClusterInput {
-  /** Override the runtime input used to resolve cluster name / data
-   *  dir / namespace. Defaults to the baked-in runtime-config
-   *  defaults. */
-  runtime?: LocalRuntimeInput;
-  /** Override the api-server image reference. Defaults to
-   *  `ghcr.io/appliance-sh/api-server:latest` (pulled from ghcr on
-   *  first deploy). For local dev iteration, push a built image to
-   *  `<registryUrl>/appliance-api-server:<tag>` and pass that ref
-   *  through here. */
-  image?: string;
-}
-
-export interface BootstrapInClusterResult {
-  /** URL at which the in-cluster api-server is reachable
-   *  (`http://api.appliance.localhost[:port]`). */
-  apiServerUrl: string;
-  /** API key minted via the bootstrap token — caller persists it
-   *  alongside the cluster registration. Shape matches what
-   *  api-server's POST /bootstrap/create-key returns. */
-  apiKey: { id: string; secret: string };
 }
 
 export type {

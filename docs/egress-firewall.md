@@ -335,8 +335,8 @@ stream)` / `serve_http(name, host, stream)` from
 - **Cloud deployment / promotion** (`docs/cloud-promotion-contract.md`,
   `control-plane.md`) — a different runtime entirely; the egress firewall
   is a local-`VzBackend`-only concern and must not touch it.
-- The k3d runtime and the in-guest cooperative egress ConfigMap remain as
-  they are (the latter demoted to defense-in-depth, §5).
+- The in-guest cooperative egress ConfigMap remains as it is (demoted to
+  defense-in-depth, §5).
 
 **Risk list:**
 
@@ -613,7 +613,7 @@ effective-JSON write-back anywhere.
 **Graceful degradation.** The egress panel only mounts for a running,
 cluster-ready VM; the web/mock shell (`packages/desktop/src/mock-host.ts`)
 exercises both a Netstack (enforced) and a NAT (cooperative) VM with seeded
-deny records, so the surface is QA-able in a browser with no `microvm` host.
+deny records, so the surface is QA-able in a browser with no microVM host.
 
 **OWED-LIVE.** The real denied→allow loop in the GUI against a live
 `net_link=Netstack` VM under default-deny (block a host, watch it appear in

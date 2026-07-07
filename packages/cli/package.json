@@ -35,7 +35,6 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@appliance.sh/api-server": "workspace:*",
     "@appliance.sh/bootstrap": "workspace:*",
     "@appliance.sh/helper": "workspace:*",
     "@appliance.sh/sdk": "workspace:*",

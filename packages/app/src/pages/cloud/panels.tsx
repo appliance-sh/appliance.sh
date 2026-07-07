@@ -11,10 +11,14 @@ import { useApplianceClient } from '@/hooks/use-appliance-client';
 import type { BootstrapEvent, Cluster, ConsoleHost } from '@/lib/host';
 import { cn } from '@/lib/utils';
 
-// ② Cluster detail — CLOUD cluster (docs/desktop-ia.md §3 / move-map 4b).
-// The lifecycle ops that used to hang off each Settings cluster row:
-// update baseline, update api-server/worker, detach/reattach installer
-// state, and destroy. Moved out of `settings.tsx` wholesale.
+// Cloud installation detail — the lifecycle ops for one bootstrapped AWS
+// installation: update baseline, update api-server/worker, detach/reattach
+// installer state, and destroy. Rendered by /cloud/:id.
+//
+// The four update/migration panels are deep Pulumi/AWS surface most
+// operators never touch, so they sit COLLAPSED under an "Advanced"
+// disclosure; Destroy stays visible (it's the one op people come here
+// for) but last.
 //
 // These all read cluster metadata from the api-server's `/cluster-info`
 // endpoint, which needs an authenticated SDK client — and we only hold a
@@ -69,14 +73,27 @@ export function CloudClusterDetail({ cluster }: { cluster: Cluster }) {
 
   return (
     <div className="space-y-3">
-      <UpdateBaselinePanel cluster={cluster} />
-      <UpdateApiServerPanel cluster={cluster} />
-      <StateMigrationPanel cluster={cluster} direction="promote" />
-      <StateMigrationPanel cluster={cluster} direction="demote" />
+      {/* The heavyweight installer panels, collapsed by default — deep
+          Pulumi/AWS territory that most visits don't need. */}
+      <details className="rounded-md border border-[var(--color-border)]">
+        <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+          Advanced
+          <span className="ml-2 text-xs font-normal text-[var(--color-muted-foreground)]">
+            baseline / api-server updates · installer-state migration
+          </span>
+        </summary>
+        <div className="space-y-3 border-t border-[var(--color-border)] p-3">
+          <UpdateBaselinePanel cluster={cluster} />
+          <UpdateApiServerPanel cluster={cluster} />
+          <StateMigrationPanel cluster={cluster} direction="promote" />
+          <StateMigrationPanel cluster={cluster} direction="demote" />
+        </div>
+      </details>
       {/* Teardown reads installer state from this device's ~/.appliance
           cache, so it's only meaningful for clusters bootstrapped here
           (lastBootstrapInput is the signal). A Connect-added cluster has
-          no local state to destroy. */}
+          no local state to destroy. Kept visible (not under Advanced) but
+          last. */}
       {canTeardown && cluster.lastBootstrapInput ? <DestroyClusterPanel cluster={cluster} /> : null}
     </div>
   );
@@ -228,8 +245,8 @@ function UpdateBaselinePanel({ cluster }: { cluster: Cluster }) {
       {!cluster.lastBootstrapInput ? (
         <div className="rounded-md border border-dashed border-[var(--color-border)] p-2 text-xs text-[var(--color-muted-foreground)]">
           No cached bootstrap input on this cluster — needed to preserve dns / vpc choices when re-running phase 1.
-          Re-run <code className="font-mono">/setup/bootstrap</code> from this device to cache it, or operate via the
-          CLI.
+          Re-run the bootstrap wizard (<code className="font-mono">/cloud/bootstrap</code>) from this device to cache
+          it, or operate via the CLI.
         </div>
       ) : null}
 

@@ -1,12 +1,7 @@
-import {
-  applianceBaseConfig,
-  isDockerBase,
-  isKubernetesBase,
-  EnvironmentHealth,
-  EnvironmentHealthStatus,
-} from '@appliance.sh/sdk';
-import { DockerDeploymentService, LocalContainerDeploymentService, type DeploymentHealth } from '@appliance.sh/infra';
+import { EnvironmentHealth, EnvironmentHealthStatus } from '@appliance.sh/sdk';
+import type { DeploymentHealth } from '@appliance.sh/infra';
 import { environmentService } from './environment.service';
+import { readBaseConfig, resolveContainerBackend, RemovedDockerBaseError } from './deployment-backend';
 import { logger } from '../logger';
 
 /**
@@ -31,28 +26,28 @@ export class EnvironmentHealthService {
     const environment = await environmentService.get(environmentId);
     if (!environment) return null;
 
-    const baseConfig = this.readBaseConfig();
+    const baseConfig = readBaseConfig();
     if (!baseConfig) {
       return this.unknown(environmentId, 'Cluster base config is unavailable on the api-server.');
     }
 
-    // AWS/Lambda bases have no pod/restart state to read — surface
-    // "unknown" rather than pretending. Kubernetes-driven and
-    // plain-Docker bases both carry container health.
-    if (!isKubernetesBase(baseConfig) && !isDockerBase(baseConfig)) {
-      return this.unknown(
-        environmentId,
-        `Health metrics are only available for container-runtime bases (got '${baseConfig.type}').`
-      );
-    }
-
     try {
-      const service = isDockerBase(baseConfig)
-        ? new DockerDeploymentService(baseConfig)
-        : new LocalContainerDeploymentService(baseConfig);
+      // The single base fork (deployment-backend.ts): a container
+      // backend reads pod health; cloud bases have no pod/restart
+      // state to read — surface "unknown" rather than pretending.
+      const service = resolveContainerBackend(baseConfig);
+      if (!service) {
+        return this.unknown(
+          environmentId,
+          `Health metrics are only available for container-runtime bases (got '${baseConfig.type}').`
+        );
+      }
       const health = await service.getDeploymentHealth(environment.stackName);
       return this.fromDeploymentHealth(environmentId, health);
     } catch (error) {
+      if (error instanceof RemovedDockerBaseError) {
+        return this.unknown(environmentId, error.message);
+      }
       // Cluster unreachable / API error — don't fail the request, the
       // console treats unknown as "no data".
       logger.warn('environment health lookup failed', {
@@ -61,17 +56,6 @@ export class EnvironmentHealthService {
         error: String(error),
       });
       return this.unknown(environmentId, 'Unable to reach the cluster to read workload health.');
-    }
-  }
-
-  private readBaseConfig() {
-    const raw = process.env.APPLIANCE_BASE_CONFIG;
-    if (!raw) return undefined;
-    try {
-      return applianceBaseConfig.parse(JSON.parse(raw));
-    } catch (error) {
-      logger.warn('failed to parse APPLIANCE_BASE_CONFIG for health lookup', { error: String(error) });
-      return undefined;
     }
   }
 

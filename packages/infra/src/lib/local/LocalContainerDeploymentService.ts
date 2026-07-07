@@ -681,19 +681,23 @@ export const LocalContainerDeploymentService = KubernetesDeploymentService;
 export type LocalContainerDeploymentService = KubernetesDeploymentService;
 
 /**
- * Build a KubeConfig from the base config. Four supported modes,
+ * Build a KubeConfig from the base config. Five supported modes,
  * in priority order:
  *   1. `appliance-base-kubernetes` with inline `kubeconfig` — parsed
  *      verbatim. Covers BYO clusters where the operator already has
  *      a working kubeconfig.
- *   2. `appliance-base-kubernetes` with `server` + `token` — built
+ *   2. `appliance-base-kubernetes` with `kubeconfigPath` — read from
+ *      disk lazily at deploy time. The guest api-server binary points
+ *      this at its local k3s (`/etc/rancher/k3s/k3s.yaml`), which may
+ *      not exist yet when the server process starts.
+ *   3. `appliance-base-kubernetes` with `server` + `token` — built
  *      programmatically. The common path for in-cluster API tokens
  *      and ServiceAccount-issued credentials supplied out of band.
- *   3. `appliance-base-kubernetes` with none of the above — falls
+ *   4. `appliance-base-kubernetes` with none of the above — falls
  *      back to `loadFromCluster()`, which reads the pod's mounted
  *      ServiceAccount token + CA. The expected path when api-server
  *      itself runs inside the cluster it manages.
- *   4. `appliance-base-local` — loads the host's default kubeconfig
+ *   5. `appliance-base-local` — loads the host's default kubeconfig
  *      (preserves prior behaviour for k3d-on-laptop dev).
  */
 function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
@@ -705,6 +709,10 @@ function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
     }
     if (cfg.kubeconfig) {
       kc.loadFromString(cfg.kubeconfig);
+      return kc;
+    }
+    if (cfg.kubeconfigPath) {
+      kc.loadFromFile(cfg.kubeconfigPath);
       return kc;
     }
     if (cfg.server && cfg.token) {

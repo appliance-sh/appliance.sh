@@ -123,10 +123,24 @@ impl VmBackend for WslBackend {
         } else {
             None
         };
+        // CLI-staged api-server artifacts + the VM's bootstrap token
+        // (generated once, persisted host-side for the CLI to mint keys).
+        let apiserver = if spec.agent_only {
+            None
+        } else {
+            crate::guest::apiserver_assets()
+        };
+        let bootstrap_token = if apiserver.is_some() {
+            crate::guest::ensure_bootstrap_token(&paths.dir)?
+        } else {
+            String::new()
+        };
         let script = build_bootstrap(
             spec,
             k3s.as_ref().map(|(p, sha)| (p.as_path(), *sha)),
             egress_ca.as_deref(),
+            apiserver.as_ref(),
+            &bootstrap_token,
         );
         push_bootstrap(&distro, &script)?;
 
@@ -407,7 +421,7 @@ REPOS
 mkdir -p /persist/apk-cache /etc/apk
 ln -sfn /persist/apk-cache /etc/apk/cache
 apk update --no-progress >/dev/null 2>&1 || true
-apk add --no-progress ca-certificates busybox-extras sudo tmux \
+apk add --no-progress ca-certificates busybox-extras sudo tmux libstdc++ libgcc unzip \
   || echo "WARNING: base package install failed (offline?)"
 
 # --- egress CA trust (node-side) --------------------------------------
@@ -432,6 +446,8 @@ __DOCKER_PROVISION__
 __BUILDKIT_PROVISION__
 # --- k3s / agent-runtime handoff -----------------------------------------
 __K3S_PROVISION__
+# --- appliance api-server (control plane as a guest binary) ---------------
+__APISERVER_PROVISION__
 # Keep the boot session resident: the host process owns this child, and
 # `appliance-vm stop` terminates the whole distro.
 while :; do sleep 3600; done
@@ -457,6 +473,37 @@ if ! echo '__K3S_SHA256__  /usr/local/bin/k3s' | sha256sum -c -s 2>/dev/null; th
   echo "FATAL: k3s binary failed its sha256 check after copy"
   exit 1
 fi
+"#;
+
+/// WSL replacement for `guest::APISERVER_MEDIA_COPY`: the CLI-staged
+/// api-server binary (and optional console bundle) live in the host's
+/// asset cache, reached over the drvfs automount, and the bootstrap
+/// token is embedded in this root-only script (the same trust level as
+/// the vz apkovl). Prepended to the shared `guest::APISERVER_COMMON`.
+const WSL_APISERVER_COPY: &str = r#"# --- appliance api-server ---------------------------------------------
+# The control plane runs as a plain guest binary — no image delivery,
+# no docker anywhere. Copy it (and the console bundle) over drvfs.
+mkdir -p /persist/appliance /usr/local/bin /etc/appliance
+APISERVER_SRC=$(wslpath -u '__APISERVER_WIN_PATH__')
+if [ -f "$APISERVER_SRC" ]; then
+  cp "$APISERVER_SRC" /usr/local/bin/appliance-api-server
+  chmod +x /usr/local/bin/appliance-api-server
+else
+  echo "appliance-api-server: staged binary not reachable at $APISERVER_SRC"
+fi
+CONSOLE_SRC=$(wslpath -u '__CONSOLE_WIN_PATH__')
+if [ -n '__CONSOLE_WIN_PATH__' ] && [ -f "$CONSOLE_SRC" ]; then
+  rm -rf /persist/appliance/console.new
+  mkdir -p /persist/appliance/console.new
+  if tar -xzf "$CONSOLE_SRC" -C /persist/appliance/console.new 2>/dev/null; then
+    rm -rf /persist/appliance/console
+    mv /persist/appliance/console.new /persist/appliance/console
+  else
+    echo "appliance-api-server: console bundle extraction failed (API still serves)"
+  fi
+fi
+printf '%s' '__APISERVER_TOKEN__' > /etc/appliance/bootstrap-token
+chmod 600 /etc/appliance/bootstrap-token
 "#;
 
 /// The agent-runtime handoff for an agent-only VM on WSL. There is no
@@ -519,6 +566,10 @@ fn build_bootstrap(
     spec: &VmSpec,
     k3s: Option<(&Path, &'static str)>,
     egress_ca_pem: Option<&str>,
+    // CLI-staged api-server artifacts + the VM's bootstrap token.
+    // `None` for agent-only VMs or when nothing was staged.
+    apiserver: Option<&crate::guest::ApiServerAssets>,
+    bootstrap_token: &str,
 ) -> String {
     let dev = spec.dev;
     let mount = spec.dev_mount.as_deref().map(strip_verbatim);
@@ -535,6 +586,26 @@ fn build_bootstrap(
             .replace("__K3S_WIN_PATH__", &shell_squote(strip_verbatim(&path.to_string_lossy())))
             .replace("__K3S_SHA256__", sha),
     };
+    // The api-server guest binary rides k3s VMs whose assets were
+    // staged. Same substitution rules as the k3s block: injected before
+    // the port markers so its nested markers expand too.
+    let apiserver_block = match (spec.agent_only, apiserver) {
+        (false, Some(assets)) => format!("{WSL_APISERVER_COPY}{}", crate::guest::APISERVER_COMMON)
+            .replace(
+                "__APISERVER_WIN_PATH__",
+                &shell_squote(strip_verbatim(&assets.binary.to_string_lossy())),
+            )
+            .replace(
+                "__CONSOLE_WIN_PATH__",
+                &assets
+                    .console
+                    .as_ref()
+                    .map(|c| shell_squote(strip_verbatim(&c.to_string_lossy())))
+                    .unwrap_or_default(),
+            )
+            .replace("__APISERVER_TOKEN__", &shell_squote(bootstrap_token)),
+        _ => String::new(),
+    };
     let ca_block = egress_ca_pem
         .map(|pem| {
             let pem = if pem.ends_with('\n') { pem.to_string() } else { format!("{pem}\n") };
@@ -549,6 +620,7 @@ fn build_bootstrap(
     WSL_BOOTSTRAP
         // Blocks first (they carry nested markers), then the markers.
         .replace("__K3S_PROVISION__", &k3s_block)
+        .replace("__APISERVER_PROVISION__", &apiserver_block)
         .replace(
             "__AGENT_DOCKER_STUB__",
             if spec.agent_only && !spec.docker {
@@ -594,6 +666,8 @@ fn build_bootstrap(
         .replace("__REGISTRY_NODEPORT__", &crate::guest::REGISTRY_NODEPORT.to_string())
         .replace("__REGISTRY_HOST_PORT__", &spec.registry_port.to_string())
         .replace("__BUILDKITD_GUEST_PORT__", &crate::guest::BUILDKITD_GUEST_PORT.to_string())
+        .replace("__APISERVER_GUEST_PORT__", &crate::guest::API_SERVER_GUEST_PORT.to_string())
+        .replace("__HOST_PORT__", &spec.host_port.to_string())
         .replace("__EGRESS_PORT__", &spec.egress_port.to_string())
         // No prebuilt agent squashfs on WSL — nothing to put PATH-first.
         .replace("__AGENT_BIN_PATH__", "")
@@ -758,10 +832,18 @@ mod tests {
         s.dev = true;
         s.docker = true;
         s.dev_mount = Some(r"\\?\C:\Users\dev\proj".to_string());
+        let assets = crate::guest::ApiServerAssets {
+            binary: PathBuf::from(r"C:\Users\dev\.appliance\vm\images\guest-assets\appliance-api-server"),
+            console: Some(PathBuf::from(
+                r"C:\Users\dev\.appliance\vm\images\guest-assets\appliance-console.tar.gz",
+            )),
+        };
         let script = build_bootstrap(
             &s,
             Some((Path::new(r"C:\Users\dev\.appliance\vm\images\guest-assets\k3s"), "abc123")),
             Some("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"),
+            Some(&assets),
+            "tok3n",
         );
         for marker in [
             "__K3S_PROVISION__",
@@ -779,6 +861,12 @@ mod tests {
             "__DOCKER_PROVISION__",
             "__BUILDKIT_PROVISION__",
             "__BUILDKITD_GUEST_PORT__",
+            "__APISERVER_PROVISION__",
+            "__APISERVER_WIN_PATH__",
+            "__CONSOLE_WIN_PATH__",
+            "__APISERVER_TOKEN__",
+            "__APISERVER_GUEST_PORT__",
+            "__HOST_PORT__",
             "__EGRESS_PORT__",
             "__EGRESS_CA__",
             "__AGENT_BIN_PATH__",
@@ -813,6 +901,18 @@ mod tests {
         )));
         assert!(script.contains("appliance-egress.crt"));
         assert!(script.contains("-----BEGIN CERTIFICATE-----"));
+        // The api-server guest binary: drvfs copy, token, launch env,
+        // ingress manifest, and the traefik route for the profile URL.
+        assert!(script.contains(r"wslpath -u 'C:\Users\dev\.appliance\vm\images\guest-assets\appliance-api-server'"));
+        assert!(script.contains(r"wslpath -u 'C:\Users\dev\.appliance\vm\images\guest-assets\appliance-console.tar.gz'"));
+        assert!(script.contains("printf '%s' 'tok3n' > /etc/appliance/bootstrap-token"));
+        assert!(script.contains(&format!(
+            "PORT={} HOST=0.0.0.0",
+            crate::guest::API_SERVER_GUEST_PORT
+        )));
+        assert!(script.contains("host: api.appliance.localhost"));
+        assert!(script.contains(&format!("\"hostPort\": {}", s.host_port)));
+        assert!(script.contains("/persist/.apiserver-ready"));
         // The user is pinned to the conventional 1000/1000 on WSL.
         assert!(script.contains("APP_UID=1000"));
         assert!(script.contains("APP_GID=1000"));
@@ -825,7 +925,7 @@ mod tests {
     #[test]
     fn plain_vm_omits_dev_docker_and_mount_blocks() {
         let s = spec("x");
-        let script = build_bootstrap(&s, Some((Path::new(r"C:\k3s"), "sha")), None);
+        let script = build_bootstrap(&s, Some((Path::new(r"C:\k3s"), "sha")), None, None, "");
         assert!(!script.contains("appliance-dev: provisioning"));
         assert!(!script.contains("appliance-docker: provisioning"));
         assert!(!script.contains("mount --bind"));
@@ -842,7 +942,7 @@ mod tests {
         let mut s = spec("sbx");
         s.agent_only = true;
         s.dev = true;
-        let script = build_bootstrap(&s, None, None);
+        let script = build_bootstrap(&s, None, None, None, "");
         assert!(!script.contains("k3s server"), "agent-only provisions NO k3s");
         assert!(!script.contains("buildkitd"), "agent-only provisions no buildkit either");
         assert!(script.contains("while [ ! -f /persist/.dev-ready ]"));
@@ -854,7 +954,7 @@ mod tests {
         s.agent_only = true;
         s.dev = true;
         s.docker = true;
-        let script = build_bootstrap(&s, None, None);
+        let script = build_bootstrap(&s, None, None, None, "");
         assert!(!script.contains("docker is not provisioned in this agent sandbox."));
         assert!(script.contains("apk add --no-progress docker docker-cli-compose"));
     }
@@ -865,14 +965,14 @@ mod tests {
         s.dev = true;
         s.agent_only = true;
         s.dev_mount = Some(r"C:\Users\dev\proj".to_string());
-        let script = build_bootstrap(&s, None, None);
+        let script = build_bootstrap(&s, None, None, None, "");
         assert!(script.contains("rm -rf /persist/npm-global"));
         assert!(!script.contains("APPLIANCE_PROJECT=''"), "a mount must stamp a project id");
         // No mount ⇒ empty identity ⇒ the guard is inert.
         let mut s = spec("x");
         s.dev = true;
         s.agent_only = true;
-        let script = build_bootstrap(&s, None, None);
+        let script = build_bootstrap(&s, None, None, None, "");
         assert!(script.contains("APPLIANCE_PROJECT=''"));
     }
 
@@ -890,12 +990,12 @@ mod tests {
         s.dev_mount = Some(r"C:\proj".to_string());
         for script in [
             build_bootstrap(&s, Some((Path::new(r"C:\k3s"), "sha"))
-                , Some("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n")),
+                , Some("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"), None, ""),
             {
                 let mut a = spec("sbx");
                 a.agent_only = true;
                 a.dev = true;
-                build_bootstrap(&a, None, None)
+                build_bootstrap(&a, None, None, None, "")
             },
         ] {
             let lines: Vec<&str> = script.lines().collect();

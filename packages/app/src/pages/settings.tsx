@@ -26,9 +26,10 @@ export function SettingsPage() {
       <div>
         <h1 className="text-xl font-semibold">Settings</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Shell info, updates, and app preferences. Manage clusters under{' '}
-          <span className="font-medium text-[var(--color-foreground)]">Clusters</span>, and sign in to coding agents
-          under <span className="font-medium text-[var(--color-foreground)]">Agents</span>.
+          Shell info, updates, and app preferences. Manage the Dev Machine under{' '}
+          <span className="font-medium text-[var(--color-foreground)]">Machine</span>, cloud installations under{' '}
+          <span className="font-medium text-[var(--color-foreground)]">Cloud</span>, and sign in to coding agents under{' '}
+          <span className="font-medium text-[var(--color-foreground)]">Agents</span>.
         </p>
       </div>
 
@@ -220,7 +221,7 @@ function PreferencesSection() {
   const { toast } = useToast();
   const onReplay = () => {
     resetOnboarding();
-    toast('First-run setup will show again the next time no cluster is connected');
+    toast('First-run setup will show again the next time nothing is connected');
   };
   return (
     <Section title="Preferences" description="App-level preferences for this shell.">
@@ -228,7 +229,7 @@ function PreferencesSection() {
         <div>
           <div className="text-sm">Replay first-run setup</div>
           <p className="mt-0.5 text-xs text-[var(--color-muted-foreground)]">
-            Re-show the welcome + get-started prompt the next time this shell has no cluster connected.
+            Re-show the welcome + get-started prompt the next time this shell has nothing connected.
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={onReplay}>

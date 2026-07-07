@@ -14,10 +14,14 @@ buildRoutes.post('/', async (req, res) => {
       return;
     }
 
+    // Kubernetes bases mint a self-URL for the content PUT — derive
+    // the origin from the request so the URL is reachable wherever
+    // the caller reached us (host-forwarded port, ingress hostname…).
+    const requestOrigin = `${req.protocol}://${req.get('host')}`;
     const result =
       parsed.data.type === BuildType.RemoteImage
         ? await buildUploadService.createRemoteImage(parsed.data.uploadUrl, parsed.data.port)
-        : await buildUploadService.createUpload();
+        : await buildUploadService.createUpload(requestOrigin);
 
     logger.info('build created', {
       requestId: req.requestId,

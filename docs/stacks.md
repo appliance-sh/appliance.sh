@@ -1,6 +1,8 @@
 # Stacks: collections of appliances
 
-**Status:** Implemented (`appliance stack init|deploy|status|destroy`).
+**Status:** Implemented (`appliance stack init|deploy|status|destroy`; a bare
+`appliance deploy` in a folder containing `appliance.stack.json` fans out to
+the whole stack).
 
 ## Premise
 
@@ -51,9 +53,12 @@ contract; loading/resolution in `packages/cli/src/utils/stack.ts`).
 - **deploy** runs members **sequentially in file order** (later members
   may depend on earlier ones), driving the same engine as `appliance
 deploy` (`utils/deploy-core.ts` `runDeploy`) with cwd switched into
-  each member — manifest detection, `.env.<env>` lookup, docker build
-  context, and `link.json` writes behave exactly as a hand-run deploy
-  in that folder. Fail-fast: the first failure stops the run; the
+  each member — manifest detection, `.env.<env>` lookup, source
+  packaging (each member uploads its source zip and the api-server
+  builds the image server-side), and `link.json` writes behave exactly
+  as a hand-run deploy in that folder. Running `appliance deploy` from
+  the stack folder itself is equivalent to `appliance stack deploy`.
+  Fail-fast: the first failure stops the run; the
   summary table shows what deployed, what failed, and what was never
   attempted. Non-interactive by construction (targets are fully
   resolved up front), so it's CI-safe.
@@ -80,9 +85,7 @@ whose values reference sibling members by `dir`:
 
 - `{{service:<dir>}}` → `http://<project>-<environment>:<port>`, the
   member's in-network address. Deterministic (no deploy-order
-  dependency): the docker base serves it via a shared-network DNS alias
-  (`DockerDeploymentService`), Kubernetes bases via the Service name —
-  the same value works on both.
+  dependency): Kubernetes bases serve it via the Service name.
 - `{{url:<dir>}}` → the member's host-facing URL from its deploy this
   run; requires the member to appear **earlier in `apps`** (members
   deploy in file order). For values that end up in a browser.

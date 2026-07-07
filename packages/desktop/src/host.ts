@@ -22,8 +22,6 @@ import type {
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
-  BootstrapInClusterInput,
-  BootstrapInClusterResult,
   BootstrapResult,
   Cluster,
   ConsoleHost,
@@ -204,9 +202,6 @@ export const tauriHost: ConsoleHost = {
       const channel = new Channel<LocalLogEvent>();
       channel.onmessage = onEvent;
       return invoke<string>('build_and_import_image', { input, onEvent: channel });
-    },
-    async bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult> {
-      return invoke<BootstrapInClusterResult>('bootstrap_in_cluster_api_server', { input: input ?? {} });
     },
   },
 

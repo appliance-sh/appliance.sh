@@ -17,10 +17,14 @@ export enum ApplianceBaseType {
   // server + token). The microVM local runtime uses this variant. The
   // sole Kubernetes-driven base going forward.
   ApplianceKubernetes = 'appliance-base-kubernetes',
-  // Plain-Docker base: the api-server orchestrates containers on a
-  // Docker daemon directly — no cluster, no registry, no manifests.
-  // This is the single-binary local daemon runtime (`appliance server
-  // start`): state in a filesystem dataDir, deploys as `docker run`.
+  /**
+   * @deprecated The plain-Docker runtime (the host daemon's
+   * `--runtime docker`) has been removed — the microVM local runtime
+   * is the sole local base. The enum value & schema are retained for
+   * back-compat: existing configs still parse, and the api-server's
+   * base fork (deployment-backend.ts) maps them to a clear
+   * "runtime removed" error with migration guidance.
+   */
   ApplianceDocker = 'appliance-base-docker',
 }
 
@@ -126,6 +130,11 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
     token: z.string().optional(),
     // Inline kubeconfig YAML. Mutex with `server`/`token`.
     kubeconfig: z.string().optional(),
+    // Path to a kubeconfig file, read lazily at deploy time. The guest
+    // api-server binary uses this to point at its local k3s
+    // (`/etc/rancher/k3s/k3s.yaml`) without inlining a file that may
+    // not exist yet when the server starts.
+    kubeconfigPath: z.string().optional(),
     // Namespace appliances deploy into. Defaults to `appliance`.
     namespace: z.string().optional(),
     // DNS suffix appended to per-appliance Ingress hostnames
@@ -253,6 +262,17 @@ export const applianceBaseConfig = z.object({
           worker: z.string(),
         })
         .optional(),
+      // Optional buildkitd gRPC address reachable from the api-server /
+      // worker (e.g. a small BuildKit instance provisioned next to the
+      // base). When set, container-type uploads are built server-side
+      // from source and pushed to ECR — the same mechanism as the
+      // Kubernetes bases' in-VM buildkitd. When absent, container
+      // deploys must pass --image-uri (or ship a legacy image.tar zip).
+      buildkit: z
+        .object({
+          addr: z.string(),
+        })
+        .optional(),
     })
     .optional(),
   // Deprecated local container runtime config. Present only for legacy
@@ -300,6 +320,9 @@ export const applianceBaseConfig = z.object({
       ca: z.string().optional(),
       token: z.string().optional(),
       kubeconfig: z.string().optional(),
+      // Kubeconfig file path, read lazily at deploy time (the guest
+      // api-server points this at its local k3s).
+      kubeconfigPath: z.string().optional(),
       namespace: z.string().optional(),
       hostnameSuffix: z.string().optional(),
       ingressClassName: z.string().optional(),

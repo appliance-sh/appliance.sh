@@ -4,12 +4,13 @@ import {
   applianceBaseConfig,
   BuildType,
   generateId,
-  isDockerBase,
   isKubernetesBase,
   type ApplianceBaseConfig,
   type Build,
 } from '@appliance.sh/sdk';
+import { randomBytes } from 'node:crypto';
 import { getStorageService } from './storage.service';
+import { assertSupportedBase } from './deployment-backend';
 
 const COLLECTION = 'builds';
 
@@ -21,8 +22,10 @@ export interface BuildUploadResult {
 
 /**
  * Create a Build record. Two paths:
- *   - `createUpload()` (no args) → upload flow. Presigned S3 URL
- *     returned for the caller to PUT their zip to.
+ *   - `createUpload()` (no args) → upload flow. A PUT URL is returned
+ *     for the caller to send their zip to: a presigned S3 URL on
+ *     cloud bases, or this server's own `/api/v1/builds/:id/content`
+ *     endpoint (secured by a one-time token) on Kubernetes bases.
  *   - `createExternal(uploadUrl)` → external reference. The caller's
  *     URL is recorded as the build source; no upload.
  *
@@ -31,21 +34,39 @@ export interface BuildUploadResult {
  * with no body preserves the upload-flow behavior.
  */
 export class BuildUploadService {
-  async createUpload(): Promise<BuildUploadResult> {
+  async createUpload(requestOrigin?: string): Promise<BuildUploadResult> {
     const config = getBaseConfig();
+    // The single base fork (deployment-backend.ts) rejects the
+    // removed docker base with migration guidance.
+    assertSupportedBase(config);
     const buildId = generateId('build');
 
-    // Kubernetes-driven and Docker bases have no presigned-URL story —
-    // the upload pipeline is the cloud path's reason for existing.
-    // Callers running against these bases should be using
-    // `createRemoteImage` with an image reference instead (pushed to a
-    // registry the cluster can reach, or already present in the local
-    // daemon for docker bases). Fail loud rather than silently
-    // returning a useless empty uploadUrl.
-    if (isKubernetesBase(config) || isDockerBase(config)) {
-      throw new Error(
-        `Upload-flow builds are not supported on ${config.type} bases. Use a remote-image build referencing a container image.`
-      );
+    // Kubernetes bases receive content directly: the server builds
+    // the image itself (in-guest buildkitd → in-VM registry), so the
+    // upload lands on the base's filesystem dataDir via a self-URL.
+    // Requires a builder — bases without one (BYO clusters that
+    // didn't advertise buildkit) keep the remote-image-only contract.
+    if (isKubernetesBase(config)) {
+      const buildkitAddr = config.kubernetes?.buildkit?.addr;
+      if (!buildkitAddr) {
+        throw new Error(
+          'Upload-flow builds need a builder, and this base has none configured (kubernetes.buildkit.addr). ' +
+            'Use a remote-image build referencing a container image instead.'
+        );
+      }
+      if (!requestOrigin) {
+        throw new Error('Upload-flow builds need the request origin to mint an upload URL');
+      }
+      const uploadToken = randomBytes(32).toString('hex');
+      await this.persist({
+        id: buildId,
+        type: BuildType.Upload,
+        source: `builds/${buildId}.zip`,
+        uploadToken,
+        createdAt: new Date().toISOString(),
+      });
+      const uploadUrl = `${requestOrigin}/api/v1/builds/${buildId}/content?token=${uploadToken}`;
+      return { buildId, uploadUrl };
     }
 
     if (!config.aws?.dataBucketName) {
@@ -82,6 +103,17 @@ export class BuildUploadService {
     return { buildId };
   }
 
+  /** Flip an upload build to received: stamp uploadedAt, burn the token. */
+  async markUploaded(buildId: string): Promise<void> {
+    const build = await this.get(buildId);
+    if (!build) throw new Error(`Build not found: ${buildId}`);
+    await this.persist({
+      ...build,
+      uploadToken: undefined,
+      uploadedAt: new Date().toISOString(),
+    });
+  }
+
   async get(buildId: string): Promise<Build | null> {
     const storage = getStorageService();
     return storage.get<Build>(COLLECTION, buildId);
@@ -93,7 +125,7 @@ export class BuildUploadService {
   }
 }
 
-function getBaseConfig(): ApplianceBaseConfig {
+export function getBaseConfig(): ApplianceBaseConfig {
   const raw = process.env.APPLIANCE_BASE_CONFIG;
   if (!raw) throw new Error('APPLIANCE_BASE_CONFIG not set');
   return applianceBaseConfig.parse(JSON.parse(raw));

@@ -19,26 +19,26 @@ import { useConfirm } from '@/components/ui/confirm-dialog';
 import { useHost } from '@/providers/host-provider';
 import { useTerminalSessions } from '@/providers/terminal-sessions-provider';
 import { cn } from '@/lib/utils';
+import { devMachineLabel } from '@/lib/host';
 import type { MicroVmStatus, MicroVmSummary } from '@/lib/host';
 import { DoctorPanel } from '@/pages/setup/doctor';
 // PARKER CONTINUITY: workloads moved to ③ env-detail in I3, but the
-// runtime-scoped "what's running on THIS engine, across all projects" view
-// stays reachable here as the ② cluster-detail Workloads tab — it imports the
-// same panel from its new home rather than being stranded or duplicated.
+// machine-scoped "what's running on THIS VM, across all apps" view stays
+// reachable here as the Workloads tab — it imports the same panel from its
+// new home rather than being stranded or duplicated.
 import { WorkloadsPanel } from '@/pages/environments/workloads-panel';
 import { EgressPanel } from './egress-panel';
 import { CredentialsPanel } from './credentials-panel';
 
 type RuntimeTab = 'lifecycle' | 'egress' | 'credentials' | 'facts' | 'workloads';
 
-// ② Cluster detail — LOCAL RUNTIME (microVM). The per-VM management that
-// used to be the monolithic `MicroVmPanel` card on `/local-runtime`, now a
-// proper detail page rendered as TABS (Parker) — Lifecycle · Egress ·
-// Credentials · Facts — so the decomposition isn't undone in one long
-// scroll at the leaf. Workloads is the runtime-scoped 5th tab (its panel now
-// lives in ③ env-detail; this is the deep-link to "what's running on THIS
-// engine"). The agent launcher moved to ④ Agents in I4 — Lifecycle now keeps
-// only a thin "Run agent →" deep-link (preselecting this runtime).
+// The Dev Machine detail — per-VM management rendered as TABS (Parker) —
+// Lifecycle · Egress · Credentials · Facts — so the decomposition isn't
+// undone in one long scroll at the leaf. Workloads is the machine-scoped
+// 5th tab (its panel lives in ③ env-detail; this is the deep-link to
+// "what's running on THIS VM"). The agent launcher lives in ④ Agents —
+// Lifecycle keeps a thin "Run agent →" deep-link (preselecting this VM).
+// Rendered by /machine (pages/machine/index.tsx) for the selected local VM.
 //
 // THE EGRESS DOUBLE-FETCH FIX (docs/desktop-ia.md §5.5): the single
 // `['microvm', name, 'egress']` policy poll lives HERE and is passed down —
@@ -131,9 +131,9 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
 
   const onDelete = async () => {
     const ok = await confirm({
-      title: `Delete the "${name}" microVM?`,
-      description: 'In-VM state (projects, images, deployments) is destroyed.',
-      confirmLabel: 'Delete microVM',
+      title: `Delete the "${name}" VM?`,
+      description: 'Everything inside the VM (apps, images, deployments) is destroyed.',
+      confirmLabel: 'Delete VM',
     });
     if (!ok) return;
     void run('delete', () => vm.remove());
@@ -240,7 +240,9 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
       <div className="flex items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <code className="font-mono text-sm font-semibold">{name}</code>
-          <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">sandboxed</span>
+          <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+            isolated VM
+          </span>
           {isDefault ? (
             <span className="rounded bg-[var(--color-muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-muted-foreground)]">
               default
@@ -253,7 +255,7 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
       {/* Tab strip */}
       <div
         role="tablist"
-        aria-label="Runtime detail"
+        aria-label="Dev Machine detail"
         className="flex flex-wrap gap-1 border-b border-[var(--color-border)]"
       >
         {tabs.map((t) => {
@@ -266,7 +268,7 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
               aria-selected={active}
               disabled={!t.enabled}
               onClick={() => setTab(t.id)}
-              title={t.enabled ? undefined : 'Start the runtime to use this tab'}
+              title={t.enabled ? undefined : 'Start the Dev Machine to use this tab'}
               className={cn(
                 '-mb-px border-b-2 px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-40',
                 active
@@ -405,8 +407,8 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
           {status?.running && status.kubeconfigReady ? (
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="text-xs text-[var(--color-muted-foreground)]">
-                Registered as the{' '}
-                <span className="font-medium text-[var(--color-foreground)]">{microVmClusterLabel(name)}</span> cluster
+                Available as <span className="font-medium text-[var(--color-foreground)]">{devMachineLabel(name)}</span>{' '}
+                in the target switcher
               </p>
               <div className="flex items-center gap-2">
                 {host.terminal ? (
@@ -432,7 +434,7 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
                   </Button>
                 ) : null}
                 {/* The launcher itself lives in ④ Agents (I4). Keep a thin
-                    deep-link here, preselecting this runtime via `?runtime=`,
+                    deep-link here, preselecting this VM via `?runtime=`,
                     so "run an agent on this VM" stays one click from detail. */}
                 {host.terminal && host.vm ? (
                   <Button asChild variant="outline" size="sm">
@@ -445,7 +447,7 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
                   </Button>
                 ) : null}
                 <Button variant="outline" size="sm" onClick={() => void deployHere()} disabled={busy !== null}>
-                  <Rocket className="h-4 w-4" /> Deploy application
+                  <Rocket className="h-4 w-4" /> Deploy app
                 </Button>
               </div>
             </div>
@@ -469,14 +471,14 @@ export function RuntimeDetail({ name, clusterId }: { name: string; clusterId: st
         <MicroVmFacts apiServerUrl={status.apiServerUrl} clusterId={clusterId} summary={summary} />
       ) : null}
 
-      {/* Runtime-scoped Workloads — the same panel ③ env-detail renders,
-          here filtered to this engine (Parker continuity). */}
+      {/* Machine-scoped Workloads — the same panel ③ env-detail renders,
+          here scoped to this VM (Parker continuity). */}
       {activeTab === 'workloads' ? <WorkloadsPanel clusterId={clusterId} vmName={name} /> : null}
     </div>
   );
 }
 
-// Q4: the prerequisite Doctor, reachable from the runtime detail. Reuses the
+// Q4: the prerequisite Doctor, reachable from the machine detail. Reuses the
 // SAME DoctorPanel as ① /setup/doctor — one PreflightPanel, two entry points.
 function RuntimeDiagnostics({ defaultOpen }: { defaultOpen: boolean }) {
   const [open, setOpen] = React.useState(defaultOpen);
@@ -512,8 +514,8 @@ function RuntimeDiagnostics({ defaultOpen }: { defaultOpen: boolean }) {
   );
 }
 
-// Compact at-a-glance facts for a running microVM — Kubernetes URL,
-// cluster id, and its allocated host ports.
+// Compact at-a-glance facts for a running VM — Kubernetes URL, profile
+// id, and its allocated host ports.
 function MicroVmFacts({
   apiServerUrl,
   clusterId,
@@ -525,7 +527,7 @@ function MicroVmFacts({
 }) {
   const facts: Array<[string, React.ReactNode]> = [
     ['Kubernetes', <code className="font-mono">{apiServerUrl}</code>],
-    ['Cluster id', <code className="font-mono">{clusterId}</code>],
+    ['Profile', <code className="font-mono">{clusterId}</code>],
   ];
   if (summary) {
     facts.push([
@@ -546,10 +548,4 @@ function MicroVmFacts({
       ))}
     </dl>
   );
-}
-
-/** Human label for a VM's registered cluster — mirrors
- *  microvm_cluster_label in the desktop's lib.rs. */
-export function microVmClusterLabel(name: string): string {
-  return name === 'appliance' ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`;
 }

@@ -15,37 +15,45 @@ import {
   History,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CommandSnippet } from '@/components/ui/command-snippet';
 import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { cn } from '@/lib/utils';
-import { isMicroVmClusterId, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { devMachineLabel, isMicroVmClusterId, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
 import type { Cluster, LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
-// Docker Desktop-style deploy wizard, the canonical ③ /projects/deploy
-// (I3). It deploys into the *selected* cluster — each microVM registers
-// as a regular cluster — gating readiness on that VM and routing the
+// Docker Desktop-style deploy wizard, the canonical ③ /projects/deploy.
+// It deploys into the *selected* target — the Dev Machine registers as a
+// regular deploy target — gating readiness on that VM and routing the
 // image to its in-VM registry. Four steps:
-//   0. TARGET (Q5) — choose the target cluster. When the chosen local
-//      runtime isn't serving yet, start it inline (one click brings the
-//      microVM up, installing the engine if needed) rather than dead-ending
+//   0. TARGET (Q5) — choose the deploy target. When the chosen Dev
+//      Machine isn't serving yet, start it inline (one click brings the
+//      VM up, installing the engine if needed) rather than dead-ending
 //      the wizard. The deploy intent (?project=&environment=) is captured
 //      on mount and survives the bring-up, so the user never loses it.
 //   1. Pick a folder containing an appliance.{json,ts,js} manifest
 //      + a Dockerfile. Programmatic .ts/.js manifests run in the
 //      CLI's QuickJS sandbox (sidecar invocation).
-//   2. Configure the deploy — project / environment names, env vars,
+//   2. Configure the deploy — app / environment names, env vars,
 //      optional runtime overrides (memory / timeout / storage).
-//   3. Run — streams docker build + registry push logs from the
-//      shell, then drives the api-server via the existing SDK for
+//   3. Run — streams the docker build + registry push from this
+//      computer, then drives the api-server via the existing SDK for
 //      build registration + deploy + status polling.
+//
+// NOTE (server-side builds): `appliance deploy` from a terminal now
+// uploads the source and builds ON the server (BuildKit inside the VM /
+// cloud). This wizard keeps the desktop's host-docker path — the host
+// bridge has no zip/upload capability yet — so the copy makes the
+// "built locally with Docker" nature explicit and points terminal users
+// at the server-side builder. Do not remove the docker path until the
+// sidecar-CLI rework lands.
 //
 // The wizard never talks to the api-server directly; it uses the
 // SDK client wired up by useApplianceClient(), which already holds
-// the selected cluster's signed credentials. That keeps the new
-// Rust-side surface small (just shell-outs to docker / kubectl).
+// the selected target's signed credentials.
 
 type Phase = 'target' | 'pick' | 'configure' | 'run';
 
@@ -56,7 +64,7 @@ interface EnvEntry {
   value: string;
 }
 
-export function LocalRuntimeDeployPage() {
+export function DeployPage() {
   const host = useHost();
   const client = useApplianceClient();
   const queryClient = useQueryClient();
@@ -192,7 +200,7 @@ export function LocalRuntimeDeployPage() {
     if (!client) {
       setRunStatus('failed');
       setRunError(
-        'No cluster is selected, so there are no credentials to deploy with. Start a local engine (it registers its cluster automatically), then retry.'
+        'No deploy target is selected, so there are no credentials to deploy with. Start the Dev Machine (it registers itself automatically), then retry.'
       );
       return;
     }
@@ -200,8 +208,8 @@ export function LocalRuntimeDeployPage() {
       setRunStatus('failed');
       setRunError(
         isMicroVmTarget
-          ? 'The microVM engine is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
-          : 'The local runtime is not running. Go back to the Target step to start it (or start it in the Clusters area), then retry.'
+          ? 'The Dev Machine is not running. Go back to the Target step to start it (or start it from the Machine page), then retry.'
+          : 'The deploy target is not reachable. Go back to the Target step to pick another, then retry.'
       );
       return;
     }
@@ -213,8 +221,8 @@ export function LocalRuntimeDeployPage() {
     const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
 
     try {
-      // 1. Resolve the registry from the *selected cluster's* own
-      //    /cluster-info — the microVM advertises its forwarded in-VM
+      // 1. Resolve the registry from the *selected target's* own
+      //    /cluster-info — the Dev Machine advertises its forwarded in-VM
       //    registry (localhost:5052). Without it there's nowhere to
       //    push the built image, so fail with an actionable hint.
       let registryUrl: string | undefined;
@@ -230,7 +238,7 @@ export function LocalRuntimeDeployPage() {
 
       // 2. docker build + registry push — streams onto our log box.
       const imageTag = `${manifest.name}:latest`;
-      append({ stream: 'meta', message: `==> building image ${imageTag} from ${folderPath}` });
+      append({ stream: 'meta', message: `==> building image ${imageTag} locally (Docker) from ${folderPath}` });
       const resolvedImageRef = await local.buildAndImportImage(
         {
           path: folderPath,
@@ -241,10 +249,10 @@ export function LocalRuntimeDeployPage() {
         (event: LocalLogEvent) => append({ stream: event.stream, message: event.message })
       );
 
-      // 3. SDK path: find-or-create project + environment, register
-      //    the external-image build, dispatch the deploy, poll until
-      //    a terminal state arrives.
-      append({ stream: 'meta', message: `==> registering project "${projectName}" / env "${envName}"` });
+      // 3. SDK path: find-or-create app + environment, register the
+      //    external-image build, dispatch the deploy, poll until a
+      //    terminal state arrives.
+      append({ stream: 'meta', message: `==> registering app "${projectName}" / env "${envName}"` });
       const project = await findOrCreateProject(client, projectName);
       const env = await findOrCreateEnvironment(client, project.id, projectName, envName);
 
@@ -309,10 +317,12 @@ export function LocalRuntimeDeployPage() {
   if (!local?.buildAndImportImage) {
     return (
       <div className="max-w-2xl space-y-4">
-        <h1 className="text-xl font-semibold">Deploy Application</h1>
+        <h1 className="text-xl font-semibold">Deploy an app</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          The build & deploy wizard is only available in the desktop app.
+          The visual deploy wizard is only available in the desktop app. From a terminal, run this in your app folder —
+          it uploads the source and builds on the server:
         </p>
+        <CommandSnippet command="appliance deploy" />
       </div>
     );
   }
@@ -324,33 +334,36 @@ export function LocalRuntimeDeployPage() {
     <div className="max-w-3xl space-y-6">
       <div>
         <Button asChild variant="ghost" size="sm" className="-ml-2">
-          <Link to="/clusters">
-            <ChevronLeft className="h-4 w-4" /> Clusters
+          <Link to="/projects">
+            <ChevronLeft className="h-4 w-4" /> Apps
           </Link>
         </Button>
       </div>
 
       <header>
-        <h1 className="text-xl font-semibold">Deploy Application</h1>
+        <h1 className="text-xl font-semibold">Deploy an app</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
           Pick a folder with an <code>appliance.json</code>, <code>.ts</code>, or <code>.js</code> manifest, configure
-          overrides, then build and deploy directly to the target cluster.
+          overrides, then build (locally, with Docker) and deploy to the selected target.
         </p>
         {selectedCluster ? (
           <p className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]">
             Target:
             <span className="inline-flex items-center rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-medium text-[var(--color-foreground)]">
-              {selectedCluster.name}
+              {isMicroVmTarget ? devMachineLabel(vmName!) : selectedCluster.name}
             </span>
-            {isMicroVmTarget ? (
-              <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
-                microVM engine
-              </span>
-            ) : null}
-            <span>· switch with the cluster menu in the top bar</span>
+            <span>· switch with the target menu in the top bar</span>
           </p>
         ) : null}
       </header>
+
+      {/* Server-side builder pointer: the terminal path uploads the source
+          and builds on the server — no local Docker needed. This wizard
+          still builds with the host's Docker (see file header note). */}
+      <p className="rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 px-3 py-2 text-xs text-[var(--color-muted-foreground)]">
+        Prefer the terminal? <code className="font-mono">appliance deploy</code> uploads your source and builds it on
+        the server — no local Docker needed. This wizard builds on this computer with Docker.
+      </p>
 
       {/* Once past the target step, if the runtime fell out of ready (e.g. it
           was stopped mid-flow), nudge back to the target step where it can be
@@ -359,7 +372,7 @@ export function LocalRuntimeDeployPage() {
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
-            The {isMicroVmTarget ? 'sandboxed ' : ''}target cluster isn&apos;t serving — builds deploy into it, so the
+            The {isMicroVmTarget ? 'Dev Machine' : 'deploy target'} isn&apos;t serving — builds deploy into it, so the
             final step needs it up.{' '}
             <button type="button" className="underline" onClick={() => setPhase('target')}>
               Back to choose / start a target
@@ -448,13 +461,13 @@ export function LocalRuntimeDeployPage() {
 
 // ----- step UIs ------------------------------------------------------
 
-// Q5 — TARGET step. Choose where this app deploys (cloud cluster or local
-// runtime), and when the chosen runtime isn't serving yet, START IT INLINE
-// instead of bouncing the operator to ② Clusters. Selecting a target makes
-// it the active cluster (the SDK client binds to the selection), so by the
-// time the wizard reaches "Build & deploy" the credentials + registry are
-// the target's. The page captures `?project=&environment=` on mount, so the
-// intent survives the bring-up here.
+// Q5 — TARGET step. Choose where this app deploys (a cloud installation or
+// the Dev Machine), and when the chosen machine isn't serving yet, START IT
+// INLINE instead of bouncing the operator to the Machine page. Selecting a
+// target makes it the active one (the SDK client binds to the selection),
+// so by the time the wizard reaches "Build & deploy" the credentials +
+// registry are the target's. The page captures `?project=&environment=` on
+// mount, so the intent survives the bring-up here.
 function TargetStep({
   selectedCluster,
   vmName,
@@ -547,9 +560,9 @@ function TargetStep({
   return (
     <section className="space-y-4 rounded-md border border-[var(--color-border)] p-4">
       <div>
-        <h2 className="text-sm font-semibold">Choose a target cluster</h2>
+        <h2 className="text-sm font-semibold">Choose a deploy target</h2>
         <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-          Builds deploy into the selected cluster. Pick where this app should run — you can also switch from the cluster
+          Builds deploy into the selected target. Pick where this app should run — you can also switch from the target
           menu in the top bar.
         </p>
       </div>
@@ -584,7 +597,7 @@ function TargetStep({
                   key={id}
                   name={name}
                   sub={id}
-                  kind="local runtime"
+                  kind="dev machine"
                   selected={selectedCluster?.id === id}
                   stateLabel={state}
                   onSelect={() => void selectTarget(id)}
@@ -599,12 +612,12 @@ function TargetStep({
         <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
           <p className="text-xs text-amber-200">
             {targetLoading
-              ? 'Checking the selected runtime…'
-              : `The ${startTargetName === vmName ? 'selected' : 'default'} local runtime (${startTargetName}) isn’t serving yet — start it to finish the deploy. Your project / environment selection is kept.`}
+              ? 'Checking the Dev Machine…'
+              : `The Dev Machine (${startTargetName}) isn’t serving yet — start it to finish the deploy. Your app / environment selection is kept.`}
           </p>
           <Button size="sm" onClick={() => void startRuntime()} disabled={starting || targetLoading}>
             <Play className={cn('h-3.5 w-3.5', starting && 'animate-pulse')} />
-            {starting ? 'Starting…' : 'Start the local runtime'}
+            {starting ? 'Starting…' : 'Start the Dev Machine'}
           </Button>
           {startError ? <p className="font-mono text-[10px] text-red-300">{startError}</p> : null}
           {starting || startLog.length > 0 ? (
@@ -620,16 +633,23 @@ function TargetStep({
           {selectedCluster ? (
             readyToDeploy ? (
               <>
-                Target <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span> is
-                ready.
+                Target{' '}
+                <span className="font-medium text-[var(--color-foreground)]">
+                  {vmName ? devMachineLabel(vmName) : selectedCluster.name}
+                </span>{' '}
+                is ready.
               </>
             ) : (
               <>
-                Selected <span className="font-medium text-[var(--color-foreground)]">{selectedCluster.name}</span>.
+                Selected{' '}
+                <span className="font-medium text-[var(--color-foreground)]">
+                  {vmName ? devMachineLabel(vmName) : selectedCluster.name}
+                </span>
+                .
               </>
             )
           ) : (
-            'No cluster selected yet.'
+            'No deploy target selected yet.'
           )}
         </p>
         <Button onClick={onNext} disabled={!readyToDeploy}>
@@ -650,7 +670,7 @@ function TargetRow({
 }: {
   name: string;
   sub: string;
-  kind: 'cloud' | 'local runtime';
+  kind: 'cloud' | 'dev machine';
   selected: boolean;
   stateLabel: string;
   onSelect: () => void;
@@ -660,16 +680,16 @@ function TargetRow({
       <div className="w-4 shrink-0">{selected ? <Check className="h-4 w-4 text-[var(--color-accent)]" /> : null}</div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className={cn('truncate text-sm font-medium', kind === 'local runtime' && 'font-mono')}>{name}</span>
+          <span className={cn('truncate text-sm font-medium', kind === 'dev machine' && 'font-mono')}>{name}</span>
           <span
             className={cn(
               'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
-              kind === 'local runtime'
+              kind === 'dev machine'
                 ? 'bg-cyan-500/15 text-cyan-300'
                 : 'bg-[var(--color-muted)] text-[var(--color-muted-foreground)]'
             )}
           >
-            {kind}
+            {kind === 'dev machine' ? 'Dev Machine' : 'cloud'}
           </span>
         </div>
         <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">{sub}</div>
@@ -792,6 +812,19 @@ function PickStep({
         <div className="rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">{pickError}</div>
       ) : null}
 
+      {/* Multi-service stacks (appliance.stack.json): the manifest reader
+          rejects them — the wizard deploys ONE app. Point at the CLI's
+          stack-aware flow instead of leaving a bare parse error. */}
+      {pickError && /stack/i.test(pickError) ? (
+        <div className="space-y-2 rounded-md border border-cyan-500/40 bg-cyan-500/5 p-3 text-xs text-cyan-200">
+          <p>
+            This folder looks like a multi-service stack. The wizard deploys a single app — for stacks, run this from a
+            terminal in that folder instead:
+          </p>
+          <CommandSnippet command="appliance dev" />
+        </div>
+      ) : null}
+
       {manifest ? (
         <dl className="grid grid-cols-[7rem_1fr] gap-y-1 rounded-md border border-[var(--color-border)] p-3 text-sm">
           <Row label="Name" value={<code className="font-mono text-xs">{manifest.name}</code>} />
@@ -856,7 +889,7 @@ function ConfigureStep({
       <h2 className="text-sm font-semibold">Configure deploy</h2>
 
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Project name" hint={`Default from manifest: ${manifest.name}`}>
+        <Field label="App name" hint={`Default from manifest: ${manifest.name}`}>
           <TextInput value={projectName} onChange={setProjectName} placeholder={manifest.name} />
         </Field>
         <Field label="Environment name" hint="Created if absent.">

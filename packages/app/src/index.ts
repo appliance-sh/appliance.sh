@@ -15,8 +15,6 @@ export type {
   BootstrapPhase,
   BootstrapPriorOutputs,
   BootstrapResult,
-  BootstrapInClusterInput,
-  BootstrapInClusterResult,
   StateDemotionInput,
   StateDemotionOptions,
   StatePromotionInput,

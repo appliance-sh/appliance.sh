@@ -1,18 +1,8 @@
-import {
-  applianceBaseConfig,
-  isDockerBase,
-  isKubernetesBase,
-  type ApplianceBaseConfig,
-  type Workloads,
-} from '@appliance.sh/sdk';
-import {
-  DockerDeploymentService,
-  LocalContainerDeploymentService,
-  type ContainerDeploymentBackend,
-} from '@appliance.sh/infra';
+import type { Workloads } from '@appliance.sh/sdk';
+import type { ContainerDeploymentBackend } from '@appliance.sh/infra';
 import { Writable } from 'node:stream';
 import { environmentService } from './environment.service';
-import { logger } from '../logger';
+import { readBaseConfig, resolveContainerBackend, RemovedDockerBaseError } from './deployment-backend';
 
 /**
  * Raised when a workloads/pod-logs read is attempted on a base that
@@ -39,35 +29,29 @@ export class NonKubernetesBaseError extends Error {
  */
 export class WorkloadsService {
   /**
-   * Parse + validate the api-server's base config, requiring a
-   * container-runtime base. Throws NonKubernetesBaseError otherwise so
-   * the route can answer 409 before touching the response.
+   * Resolve the container backend for this base via the single fork
+   * point (deployment-backend.ts), requiring a container-runtime base.
+   * Throws NonKubernetesBaseError otherwise so the route can answer
+   * 409 before touching the response.
    */
-  private containerBaseOrThrow(): ApplianceBaseConfig {
-    const raw = process.env.APPLIANCE_BASE_CONFIG;
-    if (!raw) {
+  private cluster(): ContainerDeploymentBackend {
+    const baseConfig = readBaseConfig();
+    if (!baseConfig) {
       throw new NonKubernetesBaseError('Cluster base config is unavailable on the api-server.');
     }
-    let baseConfig: ApplianceBaseConfig;
+    let backend: ContainerDeploymentBackend | null;
     try {
-      baseConfig = applianceBaseConfig.parse(JSON.parse(raw));
+      backend = resolveContainerBackend(baseConfig);
     } catch (error) {
-      logger.warn('failed to parse APPLIANCE_BASE_CONFIG for workloads lookup', { error: String(error) });
-      throw new NonKubernetesBaseError('Cluster base config could not be parsed on the api-server.');
+      if (error instanceof RemovedDockerBaseError) throw new NonKubernetesBaseError(error.message);
+      throw error;
     }
-    if (!isKubernetesBase(baseConfig) && !isDockerBase(baseConfig)) {
+    if (!backend) {
       throw new NonKubernetesBaseError(
         `Workloads and pod logs are only available for container-runtime bases (got '${baseConfig.type}').`
       );
     }
-    return baseConfig;
-  }
-
-  private cluster(): ContainerDeploymentBackend {
-    const baseConfig = this.containerBaseOrThrow();
-    return isDockerBase(baseConfig)
-      ? new DockerDeploymentService(baseConfig)
-      : new LocalContainerDeploymentService(baseConfig);
+    return backend;
   }
 
   /**
@@ -76,7 +60,7 @@ export class WorkloadsService {
    * before it sets any response headers, so the 409 body is still JSON.
    */
   ensureKubernetesBase(): void {
-    this.containerBaseOrThrow();
+    this.cluster();
   }
 
   /** Namespace-scoped workloads. Undefined namespace → the infra client
