@@ -33,7 +33,7 @@ export function EnvironmentDetailPage() {
   const queryClient = useQueryClient();
   const host = useHost();
   const confirm = useConfirm();
-  const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
+  const canRunDeployWizard = Boolean(host.local?.packageAndUploadBuild);
   // ③ env-detail absorbs the runtime Workloads surface (move-map 4a). It
   // reads through the selected cluster's in-VM api-server, so it's only
   // meaningful when the env's cluster is a local microVM runtime this shell

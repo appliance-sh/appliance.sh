@@ -32,7 +32,7 @@ export type {
   LocalPodInfo,
   LocalServiceInfo,
   LocalApplianceManifest,
-  LocalBuildAndImportInput,
+  LocalPackageUploadInput,
   LocalLogEvent,
   MicroVmHost,
   MicroVmInstanceHost,

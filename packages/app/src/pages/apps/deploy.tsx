@@ -27,33 +27,31 @@ import { extractDeploymentUrl } from '@/lib/deployment';
 
 // Docker Desktop-style deploy wizard, the canonical ③ /projects/deploy.
 // It deploys into the *selected* target — the Dev Machine registers as a
-// regular deploy target — gating readiness on that VM and routing the
-// image to its in-VM registry. Four steps:
+// regular deploy target — gating readiness on that VM and uploading the
+// app source to its api-server. Four steps:
 //   0. TARGET (Q5) — choose the deploy target. When the chosen Dev
 //      Machine isn't serving yet, start it inline (one click brings the
 //      VM up, installing the engine if needed) rather than dead-ending
 //      the wizard. The deploy intent (?project=&environment=) is captured
 //      on mount and survives the bring-up, so the user never loses it.
-//   1. Pick a folder containing an appliance.{json,ts,js} manifest
-//      + a Dockerfile. Programmatic .ts/.js manifests run in the
-//      CLI's QuickJS sandbox (sidecar invocation).
+//   1. Pick a folder containing an appliance.{json,ts,js} manifest.
+//      Programmatic .ts/.js manifests run in the CLI's QuickJS
+//      sandbox (sidecar invocation).
 //   2. Configure the deploy — app / environment names, env vars,
 //      optional runtime overrides (memory / timeout / storage).
-//   3. Run — streams the docker build + registry push from this
-//      computer, then drives the api-server via the existing SDK for
-//      build registration + deploy + status polling.
+//   3. Run — mints a build via the SDK, packages + uploads the source
+//      through the host bridge (the bundled CLI zips exactly like
+//      `appliance deploy` does), then the api-server builds the image
+//      next to where it runs (in-VM BuildKit locally, the
+//      installation's builder on cloud) while the wizard polls the
+//      deploy to a terminal state. No Docker on this machine — the
+//      desktop and the terminal share one server-side pipeline.
 //
-// NOTE (server-side builds): `appliance deploy` from a terminal now
-// uploads the source and builds ON the server (BuildKit inside the VM /
-// cloud). This wizard keeps the desktop's host-docker path — the host
-// bridge has no zip/upload capability yet — so the copy makes the
-// "built locally with Docker" nature explicit and points terminal users
-// at the server-side builder. Do not remove the docker path until the
-// sidecar-CLI rework lands.
-//
-// The wizard never talks to the api-server directly; it uses the
-// SDK client wired up by useApplianceClient(), which already holds
-// the selected target's signed credentials.
+// The wizard talks to the api-server through the SDK client wired up
+// by useApplianceClient(), which already holds the selected target's
+// signed credentials. The only host-bridge step is
+// packageAndUploadBuild — its upload URL is minted by createBuild()
+// and carries its own one-time authorization.
 
 type Phase = 'target' | 'pick' | 'configure' | 'run';
 
@@ -191,10 +189,10 @@ export function DeployPage() {
   };
 
   // ============================================================
-  // Step 3 — build + import + deploy + poll.
+  // Step 3 — package + upload source, deploy, poll.
   // ============================================================
   const runDeploy = async () => {
-    if (!folderPath || !manifest || !local?.buildAndImportImage) return;
+    if (!folderPath || !manifest || !local?.packageAndUploadBuild) return;
     // Defense in depth behind the banner/disabled button: a silent
     // return here used to leave step 3 stuck on "Starting…" forever.
     if (!client) {
@@ -221,56 +219,47 @@ export function DeployPage() {
     const append = (line: LogLine) => setLogs((prev) => [...prev, line]);
 
     try {
-      // 1. Resolve the registry from the *selected target's* own
-      //    /cluster-info — the Dev Machine advertises its forwarded in-VM
-      //    registry (localhost:5052). Without it there's nowhere to
-      //    push the built image, so fail with an actionable hint.
-      let registryUrl: string | undefined;
-      const info = await client.getClusterInfo();
-      if (info.success) {
-        registryUrl = info.data.baseConfig.kubernetes?.registry?.url ?? undefined;
-      }
-      if (!registryUrl) {
-        throw new Error(
-          'the api-server did not advertise its registry (/cluster-info) — run "appliance vm up" to reconcile it, then retry'
-        );
+      // 1. Decide packaging for the target: Kubernetes bases (the Dev
+      //    Machine, BYO clusters) build a container image from the
+      //    uploaded source server-side, so the zip skips the Lambda
+      //    zip-runtime prep; cloud/Lambda bases consume the prepped
+      //    zip. Mirrors the CLI deploy pipeline's lambdaPrep decision.
+      let noLambdaPrep = isMicroVmTarget;
+      if (!noLambdaPrep) {
+        const info = await client.getClusterInfo();
+        noLambdaPrep = info.success && Boolean(info.data.baseConfig.kubernetes);
       }
 
-      // 2. docker build + registry push — streams onto our log box.
-      const imageTag = `${manifest.name}:latest`;
-      append({ stream: 'meta', message: `==> building image ${imageTag} locally (Docker) from ${folderPath}` });
-      const resolvedImageRef = await local.buildAndImportImage(
-        {
-          path: folderPath,
-          imageTag,
-          platform: manifest.platform,
-          registryUrl,
-        },
-        (event: LocalLogEvent) => append({ stream: event.stream, message: event.message })
+      // 2. Mint the build record + one-time upload URL, then package +
+      //    upload the source through the host bridge (bundled CLI —
+      //    same zip a terminal `appliance deploy` ships). The image is
+      //    built server-side, next to where it runs.
+      append({ stream: 'meta', message: `==> packaging ${manifest.name} and uploading source from ${folderPath}` });
+      const build = await client.createBuild();
+      if (!build.success) throw new Error(`createBuild: ${build.error.message}`);
+      const { buildId, uploadUrl } = build.data;
+      if (!uploadUrl) {
+        throw new Error('the api-server did not return an upload URL for this build — is its builder configured?');
+      }
+      await local.packageAndUploadBuild({ path: folderPath, uploadUrl, noLambdaPrep }, (event: LocalLogEvent) =>
+        append({ stream: event.stream, message: event.message })
       );
 
-      // 3. SDK path: find-or-create app + environment, register the
-      //    external-image build, dispatch the deploy, poll until a
-      //    terminal state arrives.
+      // 3. SDK path: find-or-create app + environment, dispatch the
+      //    deploy with the uploaded build, poll until a terminal
+      //    state arrives.
       append({ stream: 'meta', message: `==> registering app "${projectName}" / env "${envName}"` });
       const project = await findOrCreateProject(client, projectName);
       const env = await findOrCreateEnvironment(client, project.id, projectName, envName);
-
-      append({ stream: 'meta', message: `==> creating external build for ${resolvedImageRef}` });
-      // `port` rides on the build record so the api-server's Service
-      // wiring targets the app's real port (remote images carry no
-      // manifest to read it from).
-      const build = await client.createBuild({ uploadUrl: resolvedImageRef, port: manifest.port });
-      if (!build.success) throw new Error(`createBuild: ${build.error.message}`);
 
       const envVars: Record<string, string> = {};
       for (const { key, value } of envEntries) {
         if (key.trim()) envVars[key.trim()] = value;
       }
 
-      append({ stream: 'meta', message: `==> dispatching deploy` });
+      append({ stream: 'meta', message: `==> dispatching deploy (build ${buildId})` });
       const deploy = await client.deploy(env.id, {
-        buildId: build.data.buildId,
+        buildId,
         environment: Object.keys(envVars).length ? envVars : undefined,
         memory: memory ? Number(memory) : undefined,
         timeout: timeout ? Number(timeout) : undefined,
@@ -314,7 +303,7 @@ export function DeployPage() {
   // ============================================================
   // Render
   // ============================================================
-  if (!local?.buildAndImportImage) {
+  if (!local?.packageAndUploadBuild) {
     return (
       <div className="max-w-2xl space-y-4">
         <h1 className="text-xl font-semibold">Deploy an app</h1>
@@ -344,7 +333,7 @@ export function DeployPage() {
         <h1 className="text-xl font-semibold">Deploy an app</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
           Pick a folder with an <code>appliance.json</code>, <code>.ts</code>, or <code>.js</code> manifest, configure
-          overrides, then build (locally, with Docker) and deploy to the selected target.
+          overrides, then upload the source — it builds and deploys on the selected target.
         </p>
         {selectedCluster ? (
           <p className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]">
@@ -356,14 +345,6 @@ export function DeployPage() {
           </p>
         ) : null}
       </header>
-
-      {/* Server-side builder pointer: the terminal path uploads the source
-          and builds on the server — no local Docker needed. This wizard
-          still builds with the host's Docker (see file header note). */}
-      <p className="rounded-md border border-[var(--color-border)] bg-[var(--color-muted)]/30 px-3 py-2 text-xs text-[var(--color-muted-foreground)]">
-        Prefer the terminal? <code className="font-mono">appliance deploy</code> uploads your source and builds it on
-        the server — no local Docker needed. This wizard builds on this computer with Docker.
-      </p>
 
       {/* Once past the target step, if the runtime fell out of ready (e.g. it
           was stopped mid-flow), nudge back to the target step where it can be
@@ -763,9 +744,10 @@ function PickStep({
     <section className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
       <h2 className="text-sm font-semibold">Source folder</h2>
       <p className="text-xs text-[var(--color-muted-foreground)]">
-        The folder must contain a <code>Dockerfile</code> plus an <code>appliance.json</code>, <code>appliance.ts</code>
-        , or <code>appliance.js</code> manifest. Programmatic manifests run inside a QuickJS sandbox — no host
-        filesystem, process, or network access; only <code>@appliance.sh/sdk</code> imports resolve.
+        The folder must contain an <code>appliance.json</code>, <code>appliance.ts</code>, or <code>appliance.js</code>{' '}
+        manifest (container apps also ship their <code>Dockerfile</code>; framework apps need none — the server
+        generates one). Programmatic manifests run inside a QuickJS sandbox — no host filesystem, process, or network
+        access; only <code>@appliance.sh/sdk</code> imports resolve.
       </p>
       <div className="flex items-center gap-2">
         <Button onClick={onPick} disabled={pickBusy}>

@@ -728,20 +728,18 @@ export interface LocalApplianceManifest {
   manifestPath: string;
 }
 
-export interface LocalBuildAndImportInput {
-  /** Build-context folder (parent of the Dockerfile + manifest). */
+export interface LocalPackageUploadInput {
+  /** App folder (manifest + source — the folder the picker returned). */
   path: string;
-  /** Image tag, e.g. "demo-node-container:latest". */
-  imageTag: string;
-  /** Optional docker --platform override (e.g. "linux/amd64"). */
-  platform?: string;
-  /** Host-side registry URL the cluster pulls through (e.g. the
-   *  microVM's forwarded in-VM registry `localhost:5052`). The image
-   *  is tagged `<registryUrl>/<imageTag>` and pushed via `docker
-   *  push`; the resolved Promise resolves with the registry-qualified
-   *  ref so callers can hand it straight to api-server. Resolved from
-   *  the selected cluster's `/cluster-info`. */
-  registryUrl?: string;
+  /** One-time upload URL minted by `client.createBuild()` (presigned
+   *  S3 on cloud bases, token self-URL on Kubernetes bases). The URL
+   *  itself carries the authorization, so the host bridge needs no
+   *  api-server credentials. */
+  uploadUrl: string;
+  /** Skip Lambda zip-runtime prep for framework apps — pass true when
+   *  the target base builds container images from source (mirrors the
+   *  CLI deploy pipeline's `lambdaPrep` decision). */
+  noLambdaPrep?: boolean;
 }
 
 /** Streaming log event emitted while a child process runs. */
@@ -853,10 +851,13 @@ export interface LocalRuntimeHost {
    *  `.cjs`) are evaluated through the CLI's QuickJS sandbox via the
    *  sidecar. Errors if no manifest is found or the sandbox rejects. */
   readApplianceManifest(path: string): Promise<LocalApplianceManifest>;
-  /** docker build → registry push, streaming each command's output to
-   *  onEvent. Resolves with the registry-qualified image ref on
-   *  success. */
-  buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
+  /** Package the app folder as a source zip and PUT it to the one-time
+   *  upload URL minted by `client.createBuild()` — the desktop drives
+   *  the bundled CLI (`appliance build --upload-url …`) so the wizard
+   *  ships byte-identical artifacts to a terminal `appliance deploy`.
+   *  The image is then built server-side; no Docker on this machine.
+   *  Streams packaging/upload progress to onEvent. */
+  packageAndUploadBuild(input: LocalPackageUploadInput, onEvent: (event: LocalLogEvent) => void): Promise<void>;
 }
 
 export type {

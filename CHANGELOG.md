@@ -8,6 +8,12 @@
 - **Profiles:** the local profile is now `local` (owned by the VM); the legacy `microvm` name is dual-written for one release.
 - **Removed/deprecated commands:** `appliance local` (deleted), `server --runtime docker` and `dev --runtime` (removed — the host-Docker runtime `appliance-base-docker` is deprecated and deploys against it error with migration guidance), `profile` (use `cluster`). New: `appliance cloud bootstrap|teardown` umbrella; bare `appliance deploy` in a stack folder deploys the whole stack.
 - **Helper binaries:** docker/crane/buildctl providers removed (kubectl remains); `doctor` no longer checks Docker.
+- **The desktop deploy wizard builds server-side too.** It now mints a build, packages + uploads the source through the bundled CLI (`appliance build --upload-url`, byte-identical to a terminal `appliance deploy`), and lets the api-server build the image — the host-Docker build/push path (`build_and_import_image`, crane fallback) is removed. Framework apps deploy from the wizard with no Dockerfile.
+- **Desktop registers the local VM cluster as "Dev Machine"** (was "MicroVM Runtime"); previously persisted entries are relabeled in place.
+
+### Bug Fixes
+
+- **cli(windows):** the compiled binary parsed its own embedded entry (`B:/~BUN/...`) as the command — every invocation failed with "Unknown command"; and `.localhost` URLs (the VM's api-server + app ingress) could not connect because Bun's resolver only tries `::1` while the VM forwards listen on `127.0.0.1`. Both fixed; `ensureLocalhostFetch()` now covers the Bun runtime.
 
 ## 1.51.2 (2026-07-04)
 

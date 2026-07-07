@@ -321,7 +321,7 @@ export async function runUp(
     console.log(chalk.cyan('» waiting for the in-VM api-server'));
     await waitForApiServerUrl(apiServerUrl, 600_000);
     const token = readVmBootstrapToken(name);
-    const keyName = name === DEFAULT_VM_NAME ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`;
+    const keyName = name === DEFAULT_VM_NAME ? 'Dev Machine' : `Dev Machine (${name})`;
     const apiKey = await mintApiKey(apiServerUrl, token, keyName);
     persistVmCredentials(name, profile, { apiUrl: apiServerUrl, keyId: apiKey.id, secret: apiKey.secret });
     console.log(`${chalk.green('✓')} api-server ready; credentials saved to profile ${chalk.bold(profile)}`);

@@ -1403,7 +1403,10 @@ const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
 // flag and the shared profiles.json key. Survives as the id the
 // pre-Phase-4 URL migration rewrites in place.
 const LOCAL_RUNTIME_CLUSTER_ID: &str = "local-runtime";
-const MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
+const MICROVM_CLUSTER_NAME: &str = "Dev Machine";
+// Pre-rename cluster label; sync_microvm_cluster migrates persisted
+// entries carrying it (bare or "(name)"-qualified) to the current one.
+const LEGACY_MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
 // Mirrors MICROVM_PROFILE in packages/cli/src/appliance-vm.ts — the
 // CLI's `vm up` writes this profile; the desktop adopts it as a
 // cluster with the same stable id.
@@ -1429,7 +1432,7 @@ struct PrereqTool {
 const LOCAL_PREREQS: &[PrereqTool] = &[
     PrereqTool {
         name: "docker",
-        purpose: "Container runtime Appliance shells out to for `docker build` / `docker save`.",
+        purpose: "Container runtime for the deprecated host-Docker local runtime. App deploys no longer need it — images build server-side.",
         version_args: &["--version"],
         // Container runtimes are an OS-level install (kernel
         // features, privileged daemon, GUI on macOS); we can't ship
@@ -2445,10 +2448,10 @@ async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, S
 /// Apply the in-cluster api-server manifests to the running
 /// cluster, wait for the deployment to become reachable, and mint
 /// the first API key. The api-server image must already be present
-/// in the cluster-attached registry (push via the desktop's
-/// build_and_import_image with `image_tag: appliance-api-server:latest`,
-/// or pre-pull from a remote registry). Idempotent: applying twice
-/// reconciles the manifest in place and mints a fresh key.
+/// in the cluster-attached registry (pushed by `appliance vm up`'s
+/// provisioning, or pre-pulled from a remote registry). Idempotent:
+/// applying twice reconciles the manifest in place and mints a
+/// fresh key.
 #[tauri::command]
 async fn bootstrap_in_cluster_api_server(
     app: AppHandle,
@@ -2691,8 +2694,9 @@ fn sync_microvm_cluster(app: &AppHandle, name: &str) -> Result<(), HostError> {
                 changed = true;
             }
             // A bare ingest from profiles.json labels the cluster with
-            // its slug; upgrade it to the human name.
-            if cluster.name == cluster_id {
+            // its slug; upgrade it to the human name. Entries persisted
+            // before the "Dev Machine" rename migrate the same way.
+            if cluster.name == cluster_id || cluster.name.starts_with(LEGACY_MICROVM_CLUSTER_NAME) {
                 cluster.name = cluster_label.clone();
                 changed = true;
             }
@@ -4669,8 +4673,10 @@ fn manifest_info_from_value(
 /// Spawn the bundled `appliance` CLI sidecar with the `manifest read`
 /// subcommand. The CLI emits exactly one JSON line on stdout:
 ///
-///     {ok: true, path, manifest}                       (success)
-///     {ok: false, kind: 'runtime' | 'validation', error, path?}  (failure)
+/// ```text
+/// {ok: true, path, manifest}                       (success)
+/// {ok: false, kind: 'runtime' | 'validation', error, path?}  (failure)
+/// ```
 ///
 /// We surface the failure as a plain string so the wizard can display
 /// it next to the folder picker without any further unwrapping.
@@ -4760,214 +4766,137 @@ async fn evaluate_manifest_via_sidecar(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BuildAndImportInput {
-    /// Absolute path of the build context (the folder containing the Dockerfile).
+struct PackageAndUploadInput {
+    /// Absolute path of the app folder (manifest + source — the same
+    /// folder the wizard's folder picker returned).
     path: String,
-    /// Image tag to build with, e.g. "demo-node-container:latest".
-    image_tag: String,
-    /// Requested `--platform` (e.g. "linux/amd64"). Overridden to the
-    /// host arch for these local-cluster builds — the cluster can't run
-    /// anything else — so a cross-arch manifest value never crashloops.
+    /// One-time upload URL minted by the api-server's `POST
+    /// /api/v1/builds` (presigned S3 on cloud bases, token self-URL on
+    /// Kubernetes bases). Authorization travels in the URL, so this
+    /// command needs no api-server credentials of its own.
+    upload_url: String,
+    /// Skip Lambda zip-runtime prep for framework apps. The wizard
+    /// passes true when the target base builds container images from
+    /// source (mirrors the `lambdaPrep` decision in the CLI's
+    /// deploy-core).
     #[serde(default)]
-    platform: Option<String>,
-    /// Host-side registry URL to push to (e.g. the microVM's forwarded
-    /// in-VM registry `localhost:5052`). The image is tagged
-    /// `<registry_url>/<image_tag>` and pushed via `docker push` (with
-    /// a host-side `docker save` + `crane push` fallback). The returned
-    /// image URI references the registry path so the cluster pulls
-    /// through the mirror. Required — local image delivery is
-    /// registry-only.
-    #[serde(default)]
-    registry_url: Option<String>,
+    no_lambda_prep: bool,
 }
 
-/// Stream stdout+stderr from a child process onto the channel as
-/// `{type:"log", stream:"stdout"|"stderr", message: <line>}` events.
-async fn stream_child_to_channel(
-    program: &str,
-    args: &[String],
-    on_event: &Channel<serde_json::Value>,
-) -> Result<(), String> {
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": format!("$ {} {}", program, args.join(" ")),
-    }));
-
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", program))?;
-
-    let stdout = child.stdout.take().ok_or("stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("stderr unavailable")?;
-
-    let ch_out = on_event.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = ch_out.send(serde_json::json!({
-                "type": "log",
-                "stream": "stdout",
-                "message": line,
-            }));
-        }
-    });
-    let ch_err = on_event.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = ch_err.send(serde_json::json!({
-                "type": "log",
-                "stream": "stderr",
-                "message": line,
-            }));
-        }
-    });
-
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    if !status.success() {
-        return Err(format!("{} exited with status {}", program, status));
-    }
-    Ok(())
-}
-
-/// Build the image with docker, then push it to the cluster's
-/// host-side registry. Streams raw command output to the frontend so
-/// the wizard can show a live terminal-style log pane.
+/// Package the picked app folder as a source zip and upload it to the
+/// api-server, by driving the bundled `appliance` CLI sidecar
+/// (`appliance build --json --upload-url …`). The CLI owns packaging
+/// (resolved manifest + project tree, .dockerignore honored), so the
+/// wizard ships byte-identical artifacts to a terminal `appliance
+/// deploy`; the upload itself is a raw PUT because the URL carries a
+/// one-time token / S3 presignature. NDJSON progress is forwarded to
+/// the frontend channel; the final `result` line resolves the call.
 ///
-/// Returns the registry-qualified image reference
-/// (`<registry_url>/<image_tag>`) the cluster pulls through its mirror,
-/// which the caller (the deploy wizard) hands straight to api-server's
-/// build resolver. Local image delivery is registry-only.
+/// APPLIANCE_TRUST_MANIFEST=1: programmatic (.ts/.js) manifests
+/// normally require an interactive trust prompt. In the wizard the
+/// user explicitly picked this folder in a native dialog and clicked
+/// Deploy after reviewing the evaluated manifest — that is the trust
+/// gesture, and the sidecar has no TTY to re-ask on.
 #[tauri::command]
-async fn build_and_import_image(
-    input: BuildAndImportInput,
+async fn package_and_upload_build(
+    app: AppHandle,
+    input: PackageAndUploadInput,
     on_event: Channel<serde_json::Value>,
-) -> Result<String, String> {
-    // Local image delivery is registry-only now that bare k3d (and its
-    // `k3d image import` path) is gone. The deploy wizard resolves the
-    // registry from the cluster's /cluster-info before calling here.
-    let registry_url = input.registry_url.as_deref().ok_or(
-        "no registry configured for this cluster — local image delivery is registry-only \
-         (run \"appliance vm up\" to reconcile the in-VM registry)",
-    )?;
-    // Tag the build with the registry-qualified ref up front so the
-    // single `docker build` produces an image already named the way
-    // we'll push it. Avoids a separate `docker tag` step.
-    let pushable = format!("{}/{}", registry_url, input.image_tag);
-
-    // This command only ever targets a local cluster, which runs this
-    // machine's architecture and can't emulate (the microVM has no
-    // binfmt). Build for the host arch regardless of any requested
-    // platform — a cross-arch image would just crashloop with `exec
-    // format error` after an opaque rollout timeout.
-    let host_platform = format!(
-        "linux/{}",
-        if std::env::consts::ARCH == "aarch64" {
-            "arm64"
-        } else {
-            "amd64"
-        }
-    );
-    if let Some(p) = input.platform.as_deref() {
-        if p != host_platform.as_str() {
-            let _ = on_event.send(serde_json::json!({
-                "type": "log",
-                "stream": "meta",
-                "message": format!(
-                    "requested platform {p} can't run on this local cluster ({host_platform}) — building {host_platform} instead"
-                ),
-            }));
-        }
+) -> Result<serde_json::Value, String> {
+    let dir = PathBuf::from(&input.path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
     }
-    let build_args: Vec<String> = vec![
+
+    let mut args: Vec<String> = vec![
         "build".into(),
-        "-t".into(),
-        pushable.clone(),
-        "--platform".into(),
-        host_platform,
-        input.path.clone(),
+        "--json".into(),
+        "--upload-url".into(),
+        input.upload_url.clone(),
     ];
-    stream_child_to_channel("docker", &build_args, &on_event).await?;
-
-    // Push, then return the registry-qualified reference so the cluster
-    // pulls through its mirror. A plain `docker push` executes inside
-    // the docker provider's VM (colima/Docker Desktop), where
-    // host-loopback registries (the microVM's forwarded 5052) don't
-    // exist — fall back to a host-side `docker save` + `crane push` in
-    // that case, exactly like the CLI deploy pipeline.
-    let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
-    if stream_child_to_channel("docker", &push_args, &on_event)
-        .await
-        .is_ok()
-    {
-        return Ok(pushable);
+    if input.no_lambda_prep {
+        args.push("--no-lambda-prep".into());
     }
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": "docker push failed — retrying host-side with crane",
-    }));
-    crane_push_fallback(&pushable, &on_event).await
-}
 
-/// Host-side image delivery for registries the docker daemon cannot
-/// reach: `docker save` to a temp tarball, then `crane push
-/// --insecure` from this process. Returns the digest-qualified ref so
-/// redeploys roll even under a reused tag. crane comes from the
-/// helper-managed bin dir (`appliance local install crane`) or PATH.
-async fn crane_push_fallback(
-    image_ref: &str,
-    on_event: &Channel<serde_json::Value>,
-) -> Result<String, String> {
-    let crane = helper_bin_dir()
-        .map(|d| d.join("crane"))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "crane".to_string());
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| {
+            format!(
+                "Bundled appliance CLI is unavailable: {e}. Rebuild with `pnpm --filter @appliance.sh/desktop build` so the CLI binary lands in src-tauri/binaries/."
+            )
+        })?
+        .args(&args)
+        .current_dir(dir)
+        .env("APPLIANCE_TRUST_MANIFEST", "1");
 
-    let tar_path = std::env::temp_dir().join(format!("appliance-image-{}.tar", std::process::id()));
-    let tar_str = tar_path.to_string_lossy().to_string();
-    let save_args: Vec<String> = vec![
-        "save".into(),
-        "-o".into(),
-        tar_str.clone(),
-        image_ref.into(),
-    ];
-    stream_child_to_channel("docker", &save_args, on_event).await?;
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
 
-    let result = run_status_command(&[&crane, "push", "--insecure", &tar_str, image_ref]).await;
-    let _ = std::fs::remove_file(&tar_path);
-    let (ok, stdout, stderr) = result?;
-    if !ok {
-        return Err(format!(
-            "crane push failed: {} (install crane with `appliance local install crane`)",
-            stderr.trim()
-        ));
+    let mut final_result: Option<serde_json::Value> = None;
+    let mut error: Option<String> = None;
+    let mut exit_code: Option<i32> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                let line = String::from_utf8_lossy(&bytes);
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(parsed) => match parsed.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        "result" => final_result = parsed.get("result").cloned(),
+                        "error" => {
+                            error = parsed
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        _ => {
+                            let _ = on_event.send(parsed);
+                        }
+                    },
+                    // A user `scripts.build` runs with inherited stdio,
+                    // so its output isn't NDJSON — forward it as a log
+                    // line instead of dropping it.
+                    Err(_) => {
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "log",
+                            "stream": "stdout",
+                            "message": trimmed,
+                        }));
+                    }
+                }
+            }
+            CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                if !line.is_empty() {
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "log",
+                        "stream": "stderr",
+                        "message": line,
+                    }));
+                }
+            }
+            CommandEvent::Error(msg) => error = Some(msg),
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
+        }
     }
-    // crane prints the digest-qualified reference as its final line.
-    let digest_ref = stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .unwrap_or(image_ref)
-        .to_string();
-    if !digest_ref.contains("@sha256:") {
-        return Ok(image_ref.to_string());
+
+    if let Some(msg) = error {
+        return Err(msg);
     }
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": format!("pushed {digest_ref}"),
-    }));
-    Ok(digest_ref)
+    match final_result {
+        Some(result) => Ok(result),
+        None => Err(format!(
+            "appliance build exited with code {} before reporting a result",
+            exit_code.map_or_else(|| "?".to_string(), |c| c.to_string())
+        )),
+    }
 }
 
 /// Resolve the helper-managed bin dir (`~/.appliance/bin` on POSIX,
@@ -5166,7 +5095,7 @@ pub fn run() {
             local_preflight,
             start_container_runtime,
             read_appliance_manifest,
-            build_and_import_image,
+            package_and_upload_build,
             bootstrap_in_cluster_api_server,
             microvm_list,
             microvm_status,

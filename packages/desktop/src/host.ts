@@ -28,7 +28,7 @@ import type {
   HostConfig,
   LatestGhcrTagInput,
   LocalApplianceManifest,
-  LocalBuildAndImportInput,
+  LocalPackageUploadInput,
   LocalHelperInstallResult,
   LocalLogEvent,
   LocalPreflightCheck,
@@ -195,13 +195,18 @@ export const tauriHost: ConsoleHost = {
     async readApplianceManifest(path: string): Promise<LocalApplianceManifest> {
       return invoke<LocalApplianceManifest>('read_appliance_manifest', { path });
     },
-    async buildAndImportImage(
-      input: LocalBuildAndImportInput,
+    async packageAndUploadBuild(
+      input: LocalPackageUploadInput,
       onEvent: (event: LocalLogEvent) => void
-    ): Promise<string> {
-      const channel = new Channel<LocalLogEvent>();
-      channel.onmessage = onEvent;
-      return invoke<string>('build_and_import_image', { input, onEvent: channel });
+    ): Promise<void> {
+      // The sidecar CLI emits `{type:'log', level, message}` lines
+      // without a stream tag — normalize to the LocalLogEvent shape so
+      // the wizard's log pane renders them like any other progress.
+      const channel = new Channel<LocalLogEvent & { stream?: LocalLogEvent['stream'] }>();
+      channel.onmessage = (event) => {
+        if (event?.message) onEvent({ type: 'log', stream: event.stream ?? 'meta', message: event.message });
+      };
+      await invoke('package_and_upload_build', { input, onEvent: channel });
     },
   },
 

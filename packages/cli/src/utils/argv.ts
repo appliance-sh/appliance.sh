@@ -30,8 +30,9 @@ export function userArgs(argv: string[] = process.argv, resolve: (p: string) => 
   if (!first) return argv.slice(1);
 
   // Bun standalone executable: argv[1] is the embedded entry under Bun's
-  // virtual filesystem (POSIX `/$bunfs/`, Windows `B:\~BUN\`).
-  if (first.startsWith('/$bunfs/') || first.startsWith('B:\\~BUN\\')) return argv.slice(2);
+  // virtual filesystem (POSIX `/$bunfs/`, Windows `B:\~BUN\` — reported
+  // with either slash direction depending on the Bun release).
+  if (first.startsWith('/$bunfs/') || /^B:[\\/]~BUN[\\/]/.test(first)) return argv.slice(2);
 
   // Newer Bun standalone executables repeat the binary path in argv[1]
   // instead of a `/$bunfs/` entry — it duplicates argv[0].

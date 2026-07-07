@@ -26,6 +26,17 @@ describe('userArgs', () => {
     expect(userArgs(['/bin/appliance', '/$bunfs/root/appliance', 'status'], resolve)).toEqual(['status']);
   });
 
+  // Regression: on Windows, Bun reports the embedded entry with forward
+  // slashes ("B:/~BUN/root/appliance"), so a backslash-only test missed it
+  // and every command failed with "Unknown command: B:/~BUN/root/appliance".
+  it('handles the Windows Bun virtual-filesystem entry in either slash direction', () => {
+    expect(userArgs(['C:\\bin\\appliance.exe', 'B:/~BUN/root/appliance', 'vm', 'list'], resolve)).toEqual([
+      'vm',
+      'list',
+    ]);
+    expect(userArgs(['C:\\bin\\appliance.exe', 'B:\\~BUN\\root\\appliance', 'status'], resolve)).toEqual(['status']);
+  });
+
   it('handles a newer Bun-compiled binary that repeats the binary path', () => {
     expect(userArgs(['/bin/appliance', '/bin/appliance', 'status'], resolve)).toEqual(['status']);
   });

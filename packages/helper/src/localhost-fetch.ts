@@ -46,15 +46,53 @@ const localhostLookup = function lookup(
 
 /**
  * Install a `.localhost`-aware global fetch. Idempotent. No-op outside
- * Windows (other supported resolvers implement RFC 6761) and outside
- * Node (the bun-compiled binary ships Bun's own fetch — if Bun's
- * resolver proves to have the same gap, that needs a Bun-side fix).
+ * Windows (other supported resolvers implement RFC 6761).
+ *
+ * Two runtimes, two mechanisms:
+ *   - Node: route fetch through an undici Agent whose connect-time
+ *     lookup answers loopback for `.localhost` names.
+ *   - Bun (the compiled CLI): Bun ships its own fetch and remaps the
+ *     `undici` package onto it, so the dispatcher swap can't help. Its
+ *     `.localhost` special-case connects to ::1 only, but the microVM's
+ *     host forwards listen on 127.0.0.1 — so rewrite the socket target
+ *     to 127.0.0.1 and pin the original authority in the Host header
+ *     (Bun honors an explicit Host). Ingress routing and request
+ *     signatures still see the real hostname either way.
  */
 export function ensureLocalhostFetch(): void {
   if (process.platform !== 'win32') return;
-  if (!process.versions?.node || process.versions?.bun) return;
   const marked = globalThis as { __applianceLocalhostFetch?: boolean };
   if (marked.__applianceLocalhostFetch) return;
+
+  if (process.versions?.bun) {
+    const original = globalThis.fetch.bind(globalThis);
+    const wrapped = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+      let url: URL;
+      try {
+        url = new URL(raw);
+      } catch {
+        return original(input as RequestInfo, init);
+      }
+      const host = url.hostname;
+      if (host !== 'localhost' && !host.endsWith('.localhost')) {
+        return original(input as RequestInfo, init);
+      }
+      const authority = url.host; // host[:port] — the HTTP authority the server routes on
+      url.hostname = '127.0.0.1';
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      if (!headers.has('host')) headers.set('host', authority);
+      if (input instanceof Request) {
+        return original(new Request(url, input), { ...init, headers });
+      }
+      return original(url.toString(), { ...init, headers });
+    }) as typeof globalThis.fetch;
+    globalThis.fetch = wrapped;
+    marked.__applianceLocalhostFetch = true;
+    return;
+  }
+
+  if (!process.versions?.node) return;
   setGlobalDispatcher(new Agent({ connect: { lookup: localhostLookup } }));
   // Node's built-in fetch uses its internal undici copy, which ignores
   // the npm copy's global dispatcher — swap in the npm copy's fetch so
