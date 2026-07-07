@@ -3688,7 +3688,13 @@ async fn microvm_host_shell_argv(
             .join("vm")
             .join(vm)
             .join("shell.sock");
-        if sock.exists() {
+        // The relay socket is a unix-only artifact (vsock backend). On
+        // Windows the WSL backend's `appliance-vm shell` drives wsl.exe
+        // directly — no socket ever exists, so gate on the engine binary
+        // alone there (it reports "is it running?" itself when the VM is
+        // down, which beats falling through to a kubectl the host may
+        // not have).
+        if cfg!(windows) || sock.exists() {
             let mut argv = vec![
                 bin.to_string_lossy().into_owned(),
                 "shell".to_string(),
@@ -4225,6 +4231,9 @@ async fn microvm_agent_stop(
 // with utils/agent.ts — a drift fails the broker CLOSED.
 // ============================================================
 
+// Only the macOS `security`-backed store paths reference the service
+// name; off-macOS the per-provider 0600 cred files carry the envelope.
+#[cfg(target_os = "macos")]
 const AGENT_KEYCHAIN_SERVICE: &str = "sh.appliance.agent";
 
 /// Map an agent `--type` to its per-provider host cred-store key, mirroring the

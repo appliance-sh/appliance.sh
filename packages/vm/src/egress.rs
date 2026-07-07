@@ -658,11 +658,23 @@ fn guest_subnet_v3(name: &str) -> [u8; 3] {
 }
 
 /// The proxy URL a guest workload should point `HTTPS_PROXY` at,
-/// derived from the VM's subnet gateway (the `.1` of the guest's /24,
-/// where the host sits on the vz NAT) and the egress port. Falls back
-/// to the vz default subnet when the guest IP isn't known yet.
+/// derived from the VM's subnet gateway and the egress port.
+///
+/// A backend-recorded `gateway-ip` (the guest's real default gateway)
+/// wins: the WSL NAT hands out a /20 whose gateway is NOT the `.1` of
+/// the guest's /24, so deriving it from the guest IP points at nothing
+/// there. Without the file (vz), fall back to the `.1` of the guest's
+/// /24 — where the host sits on the vz NAT — and to the vz default
+/// subnet when the guest IP isn't known yet.
 pub fn guest_proxy_url(name: &str, port: u16) -> String {
-    let gw = std::fs::read_to_string(VmPaths::for_name(name).guest_ip())
+    let paths = VmPaths::for_name(name);
+    if let Some(gw) = std::fs::read_to_string(paths.gateway_ip())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<std::net::Ipv4Addr>().ok())
+    {
+        return format!("http://{gw}:{port}");
+    }
+    let gw = std::fs::read_to_string(paths.guest_ip())
         .ok()
         .and_then(|raw| raw.trim().parse::<std::net::Ipv4Addr>().ok())
         .map(|ip| {
@@ -883,6 +895,24 @@ mod tests {
         assert!(peer_allowed("127.0.0.1".parse().unwrap(), name)); // loopback always
         assert!(!peer_allowed("192.168.64.8".parse().unwrap(), name)); // sibling VM
         assert!(!peer_allowed("192.168.64.1".parse().unwrap(), name)); // the gateway/host
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_url_prefers_the_recorded_gateway() {
+        // WSL's NAT is a /20 — the real gateway (recorded by the backend
+        // at boot) must win over the vz-style ".1 of the guest's /24"
+        // derivation, which points at nothing there.
+        let name = "egress-gateway-test";
+        let dir = VmPaths::for_name(name).dir;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(VmPaths::for_name(name).guest_ip(), "172.25.66.42\n").unwrap();
+        // No recorded gateway → the /24 fallback.
+        assert_eq!(guest_proxy_url(name, 5053), "http://172.25.66.1:5053");
+        // Recorded gateway → used verbatim.
+        std::fs::write(VmPaths::for_name(name).gateway_ip(), "172.25.64.1\n").unwrap();
+        assert_eq!(guest_proxy_url(name, 5053), "http://172.25.64.1:5053");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -125,6 +125,9 @@ api-server binary rode the boot media.
 
 ## 2. Desktop "Get started" — structured bring-up phases
 
+> Screenshots and a page-by-page tour of the desktop app live in
+> [desktop.md](desktop.md).
+
 First launch with no cluster on a shell that can sandbox shows
 `FirstRunWelcome` with a single **"Set up local runtime"** button that
 navigates straight to the bring-up run — no picker, no form.

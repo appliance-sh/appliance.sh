@@ -70,6 +70,15 @@ pub fn open(
     // A sensible TERM so curses apps and color work; the host env is
     // otherwise inherited (PATH already carries the helper bin dir).
     cmd.env("TERM", "xterm-256color");
+    // On Windows portable-pty rebuilds the child env from the registry
+    // (system + user Environment keys), which silently discards this
+    // process's PATH — including the helper bin dir prepended at startup
+    // (ensure_helper_bin_on_path), so `kubectl` would not resolve.
+    // Re-assert the live process PATH; a no-op on unix where the base
+    // env already is the process env.
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
 
     let child = pair
         .slave

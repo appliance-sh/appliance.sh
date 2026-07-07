@@ -364,6 +364,13 @@ impl VmPaths {
     pub fn guest_ip(&self) -> PathBuf {
         self.dir.join("guest-ip")
     }
+    /// The guest's default-gateway address (where the host answers on the
+    /// VM NAT), recorded at boot by backends whose NAT prefix isn't the
+    /// vz /24 (WSL uses a /20 and the gateway is NOT `<guest>/24`.1).
+    /// `egress::guest_proxy_url` prefers this over its /24 derivation.
+    pub fn gateway_ip(&self) -> PathBuf {
+        self.dir.join("gateway-ip")
+    }
     pub fn host_log(&self) -> PathBuf {
         self.dir.join("host.log")
     }

@@ -8,6 +8,31 @@ Tauri 2 shell for the Appliance desktop app. Frontend is `@appliance.sh/app`; th
 - Rust toolchain (`rustup` + stable `cargo`)
 - Platform build deps per https://v2.tauri.app/start/prerequisites/
 
+## Windows notes
+
+The Windows build is fully supported (WSL2 backend). Platform specifics worth
+knowing when touching the Rust shell:
+
+- **Guest shells ride `wsl.exe`, not a socket.** The vsock relay socket
+  (`~/.appliance/vm/<vm>/shell.sock`) is a unix-only artifact; on Windows
+  `appliance-vm shell` drives `wsl.exe -d <distro>` directly, so any "is the
+  fast shell available?" check must be `cfg!(windows) || sock.exists()` —
+  never the socket check alone (`microvm_host_shell_argv` in `lib.rs`).
+  Sessions land in the same in-guest tmux sockets, so reattach semantics
+  match macOS.
+- **PTY spawns don't inherit the process PATH.** portable-pty on Windows
+  rebuilds the child environment from the registry (system + user
+  `Environment` keys), which discards the helper bin dir this process
+  prepends to PATH at startup. `terminal.rs` re-asserts the live process
+  PATH on every `CommandBuilder` — keep that when adding spawn sites, or
+  `kubectl` silently stops resolving in terminals while working everywhere
+  else.
+- **Two managed bin dirs.** The microVM engine installs to
+  `~/.appliance/bin/appliance-vm.exe` (shared with the CLI); helper-installed
+  tools (kubectl, crane, buildctl) live in `%LOCALAPPDATA%\Appliance\bin`
+  (mirrors `helperBinDir()` in `@appliance.sh/helper`). Both are put on the
+  desktop's PATH at startup.
+
 ## Icons
 
 The full platform icon set (PNGs + `icon.icns` + `icon.ico`) is checked in under `src-tauri/icons/`, generated from a programmatic brand mark. To regenerate (e.g. after tweaking the mark in `scripts/generate-icon.mjs`):

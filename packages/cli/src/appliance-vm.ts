@@ -277,7 +277,11 @@ function shellSock(name: string): string {
  *  path; it has no equivalent on the kubectl fallback, so it's dropped
  *  there. */
 function runInteractiveShell(name: string, fallback: string[], root = false, session?: string): number {
-  if (fs.existsSync(shellSock(name))) {
+  // The relay socket is a unix-only artifact (vsock backend). On Windows
+  // the WSL backend's `appliance-vm shell` drives wsl.exe directly — no
+  // socket ever exists — so always prefer the engine there (it reports
+  // "is it running?" itself when the VM is down).
+  if (process.platform === 'win32' || fs.existsSync(shellSock(name))) {
     // The vsock agent drops to the non-root `appliance` user by default;
     // `--root` lands a root shell via the agent's escape hatch.
     // `--session` rides the agent's tmux attach-or-create path.

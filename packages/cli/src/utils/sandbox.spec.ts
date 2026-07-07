@@ -1,5 +1,24 @@
 import { describe, it, expect } from 'vitest';
-import { parseDevcontainerUp, parseDockerPort } from './sandbox.js';
+import { parseDevcontainerUp, parseDockerPort, sameMountPath } from './sandbox.js';
+
+describe('sameMountPath', () => {
+  it('matches the engine-persisted extended-length form against the plain path on win32', () => {
+    // The engine canonicalizes devMount, which on Windows persists the
+    // `\\?\C:\…` form; a naive equality would force a VM restart per run.
+    expect(sameMountPath('\\\\?\\C:\\Users\\Jo\\proj', 'C:\\Users\\Jo\\proj', 'win32')).toBe(true);
+  });
+
+  it('is case-insensitive on win32 only', () => {
+    expect(sameMountPath('C:\\Users\\Jo\\Proj', 'c:\\users\\jo\\proj', 'win32')).toBe(true);
+    expect(sameMountPath('/home/jo/Proj', '/home/jo/proj', 'linux')).toBe(false);
+  });
+
+  it('differs on genuinely different folders and handles nulls', () => {
+    expect(sameMountPath('\\\\?\\C:\\a', 'C:\\b', 'win32')).toBe(false);
+    expect(sameMountPath(null, 'C:\\a', 'win32')).toBe(false);
+    expect(sameMountPath(null, null, 'win32')).toBe(true);
+  });
+});
 
 describe('parseDevcontainerUp', () => {
   it('parses a success result with a container id', () => {

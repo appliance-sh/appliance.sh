@@ -6,20 +6,29 @@ Everything local runs inside **one managed microVM**: a Kubernetes runtime, an i
 
 **Supported platforms:** macOS (Virtualization.framework) and Windows (needs WSL2 — run `wsl --install` once and reboot if you don't have it). Linux support is coming soon.
 
+![The Appliance desktop app — Apps page](docs/images/desktop-apps.png)
+
+## Quickstart
+
+```bash
+pnpm add --global appliance.sh
+cd your-app
+appliance init     # checks your machine, boots the VM, offers your first deploy
+appliance dev      # deploys, streams logs, rebuilds on save
+```
+
+Your app is live at `http://<app>-dev.appliance.localhost:8081`. That's the
+whole loop — no Dockerfile required (framework apps get their image generated
+server-side), no Docker daemon, no registry setup. Prefer clicking to typing?
+The [desktop app](docs/desktop.md) does all of the above with buttons.
+
 ## The three journeys
 
 ### 1. Build & run your app locally
 
-```bash
-pnpm add --global appliance.sh
-cd your-app        # or a folder of apps with an appliance.stack.json
-appliance init     # one-time: checks your machine, boots the VM, guides your first deploy
-appliance dev      # day-to-day: deploys, streams logs, rebuilds on save
-```
+The two commands from the quickstart are the whole journey. `appliance init` is the front door on a fresh machine: it preflights your system (auto-fixing what's safe), boots the managed VM, saves the `local` profile, and offers to run your first deploy. After that, one command is the loop:
 
-`appliance init` is the front door on a fresh machine: it preflights your system (auto-fixing what's safe), boots the managed VM, saves the `local` profile, and offers to run your first deploy. After that, one command is the whole loop:
-
-`appliance dev` is the whole dev loop: it brings the managed VM (and the control plane inside it) up, deploys the current app — or **every member of a multi-service stack** — streams merged, color-prefixed logs, and rebuilds on save. Builds happen server-side against the in-VM BuildKit, so a save-to-rollout loop is a few seconds and an unchanged rebuild is a no-op. Ctrl+C ends the session; the apps keep running.
+`appliance dev` brings the managed VM (and the control plane inside it) up, deploys the current app — or **every member of a multi-service stack** — streams merged, color-prefixed logs, and rebuilds on save. Builds happen server-side against the in-VM BuildKit, so a save-to-rollout loop is a few seconds and an unchanged rebuild is a no-op. Ctrl+C ends the session; the apps keep running.
 
 Every app needs an `appliance.json` (scaffold one with `appliance configure`):
 
@@ -44,7 +53,9 @@ In a stack folder, plain `appliance deploy` (and `appliance dev`) deploys every 
 
 ### 2. A development environment + coding agents (zero terminal for teammates)
 
-Non-technical teammates use the **desktop app**: first run boots the managed VM as a ready dev environment, and the Agents page runs coding agents (Claude Code, GitHub Copilot, OpenAI Codex) inside it — credentials stay host-side and are injected per-request by the egress broker, never written into the VM.
+Non-technical teammates use the **[desktop app](docs/desktop.md)**: first run boots the managed VM as a ready dev environment, and the Agents page runs coding agents (Claude Code, GitHub Copilot, OpenAI Codex) inside it — credentials stay host-side and are injected per-request by the egress broker, never written into the VM.
+
+![Agents in the desktop app](docs/images/desktop-agents.png)
 
 To onboard a teammate onto a shared installation, open the console → **Settings → Team** → **Create invite link**, and send them the link. Opening it signs them in with their own credential — no server URL or secret to paste. Invited teammates get a **member** key: they see and manage apps but not the operator surfaces.
 
@@ -131,6 +142,10 @@ Local deploys use the `local` profile, saved automatically when the VM first boo
 - **The dev/agent sandbox** — your working tree shared over VirtioFS, agents confined by the VM's egress policy (`appliance vm egress …`)
 
 The VM parks with `appliance vm stop` (state persists) and everything — cluster, registry cache, deployed apps — survives a reboot. The CLI stages the api-server guest binary automatically (from the repo build or the release download); no image pulls, no registries, no Docker.
+
+`appliance vm shell` (or **Open shell** in the desktop) drops you into the guest; shells are tmux-backed and reattachable across disconnects — the desktop even reattaches them after an app restart:
+
+![A reattached shell into the managed VM](docs/images/desktop-terminal.png)
 
 ## Examples
 

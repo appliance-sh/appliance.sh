@@ -483,6 +483,27 @@ export function deterministicHostPort(project: string): number {
   return 8100 + (h % 900);
 }
 
+/**
+ * Whether two resolved mount paths point at the same folder. The engine
+ * persists devMount canonicalized, which on Windows means the extended-length
+ * `\\?\C:\…` form — path.resolve keeps that prefix, so a naive equality
+ * against the plain `C:\…` projectDir NEVER matches and every `agent start`
+ * forces a pointless VM restart. Strip the prefix and case-fold (Windows
+ * paths are case-insensitive) before comparing.
+ */
+export function sameMountPath(
+  a: string | null,
+  b: string | null,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (a === null || b === null) return a === b;
+  const norm = (p: string) => {
+    const stripped = p.replace(/^\\\\\?\\/, '');
+    return platform === 'win32' ? stripped.toLowerCase() : stripped;
+  };
+  return norm(a) === norm(b);
+}
+
 // ---- VM bring-up + docker readiness ------------------------------------
 
 /** Options for {@link ensureSandboxVm}. */
@@ -530,7 +551,7 @@ export async function ensureSandboxVm(vm: string, projectDir: string, opts: Ensu
   // on its next boot. Restart it when the share points elsewhere, or when
   // --docker is newly requested (the lazy re-up), so the change takes
   // effect this run.
-  const needsRemount = running && currentMount !== desiredMount;
+  const needsRemount = running && !sameMountPath(currentMount, desiredMount);
   const needsDocker = running && docker && !currentDocker;
   if (needsRemount || needsDocker) {
     const why = needsRemount ? `mounted elsewhere (${currentMount ?? 'none'})` : 'docker newly requested (--docker)';

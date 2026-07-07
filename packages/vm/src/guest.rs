@@ -453,6 +453,9 @@ if [ -n "$APPLIANCE_PROJECT" ] && [ "$(cat /persist/.npm-global-project 2>/dev/n
   mkdir -p /persist/npm-global
   printf '%s' "$APPLIANCE_PROJECT" > /persist/.npm-global-project
 fi
+# This block runs as root; the npm self-heal runs as the appliance user —
+# hand the prefix over or the unprivileged install EACCESes.
+chown appliance /persist/npm-global 2>/dev/null || true
 mkdir -p /srv/handoff
 (
   # Wait for the dev toolchain (nodejs/npm) — the grippable .dev-ready
@@ -548,6 +551,14 @@ chmod 0755 "$APP_HOME" 2>/dev/null || true
 mkdir -p /etc/sudoers.d
 printf '%s\n' "$APP_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appliance
 chmod 0440 /etc/sudoers.d/appliance
+
+# npm's global prefix (NPM_CONFIG_PREFIX below) lives on the root-owned
+# /persist disk — create it HERE, owned by the unprivileged user, or the
+# first `npm install -g` self-heal EACCESes. The agent-only handoff blocks
+# also (re)create it around the project-switch wipe; this covers the
+# merged k3s+dev VM, which has no handoff block.
+mkdir -p /persist/npm-global
+chown "$APP_UID:$APP_GID" /persist/npm-global 2>/dev/null || true
 
 # Login env for the appliance user: npm global prefix under HOME so
 # global installs (appliance up) succeed unprivileged. /etc/profile.d/*.sh

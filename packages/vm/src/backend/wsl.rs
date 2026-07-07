@@ -151,6 +151,7 @@ impl VmBackend for WslBackend {
         let _ = std::fs::remove_file(paths.kubeconfig());
         let _ = std::fs::remove_file(paths.agent_ready());
         let _ = std::fs::remove_file(paths.guest_ip());
+        let _ = std::fs::remove_file(paths.gateway_ip());
         let _ = std::fs::remove_file(paths.stop_request());
 
         let log = std::fs::OpenOptions::new()
@@ -465,11 +466,15 @@ if [ ! -f "$K3S_SRC" ]; then
   exit 1
 fi
 mkdir -p /usr/local/bin
-if ! echo '__K3S_SHA256__  /usr/local/bin/k3s' | sha256sum -c -s 2>/dev/null; then
+# Plain `-c` with output redirected, NOT `-c -s`: `-s` is a busybox-only
+# spelling, and once provisioning installs GNU coreutils into the
+# persisted distro its sha256sum shadows busybox, rejects `-s`, and
+# fails this check (and every subsequent boot) unconditionally.
+if ! echo '__K3S_SHA256__  /usr/local/bin/k3s' | sha256sum -c >/dev/null 2>&1; then
   cp "$K3S_SRC" /usr/local/bin/k3s
   chmod +x /usr/local/bin/k3s
 fi
-if ! echo '__K3S_SHA256__  /usr/local/bin/k3s' | sha256sum -c -s 2>/dev/null; then
+if ! echo '__K3S_SHA256__  /usr/local/bin/k3s' | sha256sum -c >/dev/null 2>&1; then
   echo "FATAL: k3s binary failed its sha256 check after copy"
   exit 1
 fi
@@ -527,6 +532,9 @@ if [ -n "$APPLIANCE_PROJECT" ] && [ "$(cat /persist/.npm-global-project 2>/dev/n
   mkdir -p /persist/npm-global
   printf '%s' "$APPLIANCE_PROJECT" > /persist/.npm-global-project
 fi
+# This block runs as root; the npm self-heal runs as the appliance user —
+# hand the prefix over or the unprivileged install EACCESes.
+chown appliance /persist/npm-global 2>/dev/null || true
 mkdir -p /srv/handoff
 (
   while [ ! -f /persist/.dev-ready ]; do sleep 1; done
@@ -684,6 +692,17 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
     let guest_ip = discover_guest_ip(distro, Duration::from_secs(120))?;
     eprintln!("guest address: {guest_ip}");
     std::fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
+    // The guest reaches host-side services (the egress proxy) at its
+    // default gateway. The WSL NAT prefix is a /20 — NOT the vz /24 —
+    // so record the real gateway for egress::guest_proxy_url instead of
+    // letting it guess `<guest>/24`.1 (which points at nothing here).
+    match discover_gateway_ip(distro) {
+        Some(gw) => {
+            eprintln!("guest gateway: {gw}");
+            std::fs::write(vm_dir.join("gateway-ip"), gw.to_string())?;
+        }
+        None => eprintln!("guest gateway: not found (egress proxy URL falls back to the /24 gateway)"),
+    }
     crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
     let bind_hint = |port: u16, what: &str| {
@@ -768,6 +787,34 @@ fn discover_guest_ip(distro: &str, timeout: Duration) -> Result<IpAddr> {
     }
 }
 
+/// The distro's default-gateway IPv4 — where the Windows host answers on
+/// the WSL NAT (`ip route show default` → `default via <gw> dev eth0`).
+fn discover_gateway_ip(distro: &str) -> Option<IpAddr> {
+    let out = wsl_cmd()
+        .args(["-d", distro, "-u", "root", "--", "ip", "route", "show", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_via(&decode_wsl(&out.stdout))
+}
+
+/// Pull the `via <addr>` gateway out of `ip route show default` output.
+fn parse_default_via(raw: &str) -> Option<IpAddr> {
+    let mut tokens = raw.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "via" {
+            if let Some(addr) = tokens.next() {
+                if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                    return Some(IpAddr::V4(ip));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// First non-loopback IPv4 `inet` address off `ip addr` output.
 fn parse_inet(raw: &str) -> Option<IpAddr> {
     for line in raw.lines() {
@@ -809,6 +856,18 @@ mod tests {
         assert_eq!(decode_wsl(&utf16), "Ubuntu\r\n");
         // Guest command output passes through as UTF-8.
         assert_eq!(decode_wsl(b"inet 172.20.240.2/20"), "inet 172.20.240.2/20");
+    }
+
+    #[test]
+    fn parses_the_default_gateway() {
+        // The WSL NAT is a /20 — the gateway is NOT the .1 of the
+        // guest's /24, so it must come from the route table verbatim.
+        assert_eq!(
+            parse_default_via("default via 172.25.64.1 dev eth0 \n"),
+            Some("172.25.64.1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(parse_default_via(""), None);
+        assert_eq!(parse_default_via("default dev eth0 scope link"), None);
     }
 
     #[test]
