@@ -415,7 +415,8 @@ fn run() -> Result<()> {
             // Allocate a non-colliding port block so this VM can run
             // alongside others (the default VM keeps the canonical
             // 8081/6443/5052/5053; an existing VM keeps its ports).
-            let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(&name);
+            let (host_port, api_port, registry_port, egress_port, buildkit_port) =
+                VmSpec::allocate_ports(&name);
             let spec = VmSpec {
                 cpus,
                 memory_mib: memory,
@@ -424,6 +425,7 @@ fn run() -> Result<()> {
                 api_port,
                 registry_port,
                 egress_port,
+                buildkit_port,
                 dev,
                 dev_mount,
                 docker,
@@ -437,7 +439,7 @@ fn run() -> Result<()> {
                 "created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk{})",
                 if dev { ", dev environment" } else { "" }
             );
-            println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}");
+            println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}  buildkit :{buildkit_port}");
             Ok(())
         }
 
@@ -718,6 +720,7 @@ fn run() -> Result<()> {
                 api_port: spec.as_ref().map(|s| s.api_port),
                 registry_port: spec.as_ref().map(|s| s.registry_port),
                 egress_port: spec.as_ref().map(|s| s.egress_port),
+                buildkit_port: spec.as_ref().map(|s| s.buildkit_port),
                 dev: spec.as_ref().map(|s| s.dev).unwrap_or(false),
             };
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -1073,12 +1076,13 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
     }
     // A VM started without an explicit `create` still needs a
     // non-colliding port block so it can run beside existing VMs.
-    let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(name);
+    let (host_port, api_port, registry_port, egress_port, buildkit_port) = VmSpec::allocate_ports(name);
     let spec = VmSpec {
         host_port,
         api_port,
         registry_port,
         egress_port,
+        buildkit_port,
         ..VmSpec::defaults(name)
     };
     store::save_spec(&spec)?;

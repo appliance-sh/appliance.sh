@@ -51,6 +51,12 @@ pub const KUBECONFIG_PORT: u16 = 9991;
 /// range k3s allows by default).
 pub const REGISTRY_NODEPORT: u16 = 30500;
 
+/// Guest TCP port buildkitd's gRPC listener binds. The host forwards
+/// 127.0.0.1:<buildkitPort> (5054 by default) here so `buildctl` on the
+/// host builds images inside the VM with no Docker anywhere. Clear of
+/// the kubeconfig handoff (9991) and the NodePort window (30000+).
+pub const BUILDKITD_GUEST_PORT: u16 = 8372;
+
 /// VirtioFS tag the host-folder share is presented under. The VZ
 /// backend tags the device with this; the guest bootstrap mounts the
 /// same tag at /persist/workspace. Keep both sides in sync (a guest
@@ -197,6 +203,11 @@ __DEV_PROVISION__
 # otherwise. Backgrounded and fully decoupled from the bring-up phases:
 # k3s readiness below is what `vm up` waits on, never dockerd.
 __DOCKER_PROVISION__
+# --- buildkit (docker-free image builds) ------------------------------
+# Substituted with the provisioning block below on every k3s VM, empty
+# for agent-only VMs (no registry to push to). Backgrounded like the
+# docker engine: k3s readiness never waits on buildkitd.
+__BUILDKIT_PROVISION__
 # --- k3s / agent-runtime handoff -------------------------------------
 # Substituted with the k3s control-plane block (normal VM) or the
 # agent-runtime handoff (agent-only VM). Quinn gap #1: this block carries
@@ -677,6 +688,78 @@ fi
 ) &
 "#;
 
+/// In-guest BuildKit provisioning, substituted into `APPLIANCE_START`
+/// (the `__BUILDKIT_PROVISION__` marker) on every k3s VM (agent-only
+/// VMs get an empty block — they have no registry to push to). The
+/// docker-free image build path: the host's `buildctl` dials the
+/// forwarded gRPC port, buildkitd builds from the streamed context and
+/// pushes straight to the in-VM registry.
+///
+/// Mirrors `DOCKER_PROVISION`'s shape:
+///
+///   • the apk install is backgrounded with the same DB-lock retry
+///     loop — k3s readiness (what `vm up` waits on) never waits on
+///     buildkitd; first boot installs from the network, later boots hit
+///     the persistent /persist/apk-cache.
+///   • the layer/cache root lives at /persist/buildkit, so rebuild
+///     caching survives vm stop/up.
+///   • pushes target `localhost:__REGISTRY_HOST_PORT__/<name>` — the
+///     SAME ref pods pull through the containerd registries.yaml
+///     mirror. Nothing in the guest listens on that port (host-side
+///     forward only), so a guest-loopback socat alias bridges it to the
+///     registry NodePort; one ref then works from the host CLI, from
+///     buildkitd, and from the kubelet.
+///   • a `/persist/.buildkit-ready` marker records completion.
+pub(crate) const BUILDKIT_PROVISION: &str = r#"
+echo "appliance-buildkit: provisioning in-guest BuildKit"
+mkdir -p /persist/buildkit /persist/apk-cache /etc/buildkit /run/buildkit
+# Shared persistent apk cache (same symlink DEV/DOCKER provisioning
+# makes; idempotent in any order).
+ln -sfn /persist/apk-cache /etc/apk/cache
+cat > /etc/buildkit/buildkitd.toml <<BKTOML
+root = "/persist/buildkit"
+[registry."localhost:__REGISTRY_HOST_PORT__"]
+  http = true
+[registry."127.0.0.1:__REGISTRY_NODEPORT__"]
+  http = true
+BKTOML
+# Install + launch in the background: never blocks the k3s readiness
+# gate. Same apk DB-lock retry loop as the docker provision. socat is
+# installed explicitly — the vz base world carries it (vsock shell
+# agent) but the WSL bootstrap's base package set does not.
+(
+  rm -f /persist/.buildkit-ready
+  apk update --no-progress >/dev/null 2>&1 || true
+  i=0
+  while :; do
+    if apk add --no-progress buildkit runc socat; then
+      # Guest-loopback alias for the registry ref: pushes address
+      # localhost:__REGISTRY_HOST_PORT__ (the host-forwarded port,
+      # which has no guest listener) and land on the registry
+      # NodePort. Forks per connection, so starting before the
+      # registry itself is up is fine.
+      socat TCP-LISTEN:__REGISTRY_HOST_PORT__,bind=127.0.0.1,reuseaddr,fork \
+        TCP:127.0.0.1:__REGISTRY_NODEPORT__ \
+        >/var/log/appliance-registry-alias.log 2>&1 &
+      buildkitd \
+        --config /etc/buildkit/buildkitd.toml \
+        --addr unix:///run/buildkit/buildkitd.sock \
+        --addr tcp://0.0.0.0:__BUILDKITD_GUEST_PORT__ \
+        >/var/log/appliance-buildkit.log 2>&1 &
+      : > /persist/.buildkit-ready
+      echo "appliance-buildkit: buildkitd listening on :__BUILDKITD_GUEST_PORT__"
+      break
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      echo "appliance-buildkit: buildkit install failed after retries (will retry on next boot)"
+      break
+    fi
+    sleep 5
+  done
+) &
+"#;
+
 /// Per-connection shell run by the vsock agent (socat EXEC target). The
 /// host `appliance-vm shell` client sends an initial "rows R cols C"
 /// line; we apply it as the PTY size (echo off so it isn't painted into
@@ -878,9 +961,20 @@ fn build_apkovl(
                 "__AGENT_DOCKER_STUB__",
                 if agent_only && !docker { AGENT_DOCKER_STUB } else { "" },
             )
+            // BuildKit rides every k3s VM (agent-only VMs have no
+            // registry to push to). Injected before the port
+            // substitutions below — it carries nested
+            // __REGISTRY_HOST_PORT__/__REGISTRY_NODEPORT__/
+            // __BUILDKITD_GUEST_PORT__ markers (Quinn gap #1, same as
+            // the k3s branch).
+            .replace(
+                "__BUILDKIT_PROVISION__",
+                if agent_only { "" } else { BUILDKIT_PROVISION },
+            )
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
+            .replace("__BUILDKITD_GUEST_PORT__", &BUILDKITD_GUEST_PORT.to_string())
             .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
             .replace("__APP_USER_PROVISION__", &app_user_provision)
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
@@ -1122,6 +1216,8 @@ pub fn host_services(
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
                 crate::net::spawn_proxy_netstack(spec.registry_port, REGISTRY_NODEPORT, ns.clone())
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                crate::net::spawn_proxy_netstack(spec.buildkit_port, BUILDKITD_GUEST_PORT, ns.clone())
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.buildkit_port, "buildkit")))?;
                 for port in 30000..=30050u16 {
                     let _ = crate::net::spawn_proxy_netstack(port, port, ns.clone());
                 }
@@ -1145,6 +1241,8 @@ pub fn host_services(
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
                 crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                crate::net::spawn_proxy(spec.buildkit_port, SocketAddr::new(guest_ip, BUILDKITD_GUEST_PORT))
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.buildkit_port, "buildkit")))?;
                 // The deterministic-NodePort window KubernetesDeploymentService
                 // assigns from — forwarded so the "direct" URLs in deploy
                 // results work exactly as they do on k3d.
@@ -1185,8 +1283,8 @@ pub fn host_services(
     }
 
     eprintln!(
-        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
-        spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT
+        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
+        spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
     );
 
     // The guest serves its kubeconfig only after k3s has written it —
@@ -1268,9 +1366,10 @@ mod tests {
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         // The base user block references /persist/workspace on every VM,
-        // so assert on dev-only wiring instead.
+        // and buildkit's own apk install rides every k3s VM — so assert
+        // on dev-only wiring (the toolchain package set) instead.
         assert!(!start.contains("appliance-dev: provisioning"));
-        assert!(!start.contains("apk add"));
+        assert!(!start.contains("bash bash-completion git"));
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
@@ -1280,7 +1379,7 @@ mod tests {
         assert!(start.contains("mkdir -p /persist/workspace"));
         assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
         assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
-        assert!(start.contains("apk add"));
+        assert!(start.contains("bash bash-completion git"));
         assert!(start.contains("/persist/.dev-ready"));
     }
 
@@ -1528,6 +1627,52 @@ mod tests {
     }
 
     #[test]
+    fn buildkit_provisioned_on_k3s_vms_but_not_agent_only() {
+        // Normal (k3s) VM: buildkitd is provisioned unconditionally —
+        // marker substituted, apk install + tcp listener + persistent
+        // cache root + registry alias + readiness marker all present.
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__BUILDKIT_PROVISION__"), "marker must be substituted");
+        // socat rides the same install: present in the vz world file
+        // but NOT in the WSL bootstrap's base packages.
+        assert!(start.contains("apk add --no-progress buildkit runc socat"));
+        assert!(start.contains("root = \"/persist/buildkit\""));
+        assert!(start.contains(&format!("--addr tcp://0.0.0.0:{BUILDKITD_GUEST_PORT}")));
+        assert!(start.contains("/persist/.buildkit-ready"));
+        // The guest-loopback registry alias bridges the host-forwarded
+        // ref (localhost:<registryPort>) to the registry NodePort so
+        // buildkitd pushes the SAME ref pods pull.
+        assert!(start.contains("socat TCP-LISTEN:5052,bind=127.0.0.1,reuseaddr,fork"));
+        assert!(start.contains(&format!("TCP:127.0.0.1:{REGISTRY_NODEPORT}")));
+        // Insecure (plain-HTTP) push for both spellings of the registry.
+        assert!(start.contains("[registry.\"localhost:5052\"]"));
+        assert!(start.contains(&format!("[registry.\"127.0.0.1:{REGISTRY_NODEPORT}\"]")));
+        // No literal port markers survive.
+        assert!(!start.contains("__BUILDKITD_GUEST_PORT__"));
+        assert!(!start.contains("__REGISTRY_HOST_PORT__"));
+
+        // Agent-only VM: no k3s, no registry — no buildkit either. (The
+        // section-header comment legitimately names buildkitd even when
+        // off, so assert on strings only the provision block emits.)
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__BUILDKIT_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("apk add --no-progress buildkit runc socat"), "agent-only VMs provision no buildkit");
+        assert!(!start.contains("/persist/.buildkit-ready"));
+    }
+
+    #[test]
+    fn buildkit_heredoc_terminates() {
+        // The BKTOML heredoc must close: an unterminated heredoc would
+        // swallow the rest of the bootstrap silently.
+        let opens = BUILDKIT_PROVISION.matches("<<BKTOML").count();
+        let closes = BUILDKIT_PROVISION.lines().filter(|l| l.trim() == "BKTOML").count();
+        assert_eq!(opens, 1);
+        assert_eq!(closes, 1, "the BKTOML heredoc must terminate at column 0");
+    }
+
+    #[test]
     fn k3s_provisioned_only_for_non_agent_only_vms() {
         // Normal VM: the k3s block is present and the marker is gone.
         let k3s = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
@@ -1566,6 +1711,8 @@ mod tests {
             "__REGISTRY_NODEPORT__",
             "__REGISTRY_HOST_PORT__",
             "__AGENT_DOCKER_STUB__",
+            "__BUILDKIT_PROVISION__",
+            "__BUILDKITD_GUEST_PORT__",
         ] {
             assert!(!start.contains(marker), "literal marker {marker} leaked into agent-only bootstrap");
         }

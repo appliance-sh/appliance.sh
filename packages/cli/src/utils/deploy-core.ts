@@ -14,6 +14,7 @@ import { getActiveProfileOverride } from './credentials.js';
 import { extractApplianceFile, resolveApplianceDir } from './common.js';
 import { buildApplianceZip } from './build-package.js';
 import { buildLocalApplianceImage, publishLocalApplianceImage } from './local-image.js';
+import { buildkitAvailable, ensureBuildctl, publishViaBuildkit } from './buildkit-image.js';
 import { readLink, writeLink } from './link.js';
 import { pollDeploymentUntilDone, extractDeploymentUrl } from './deploy-poll.js';
 import { startProgressLine, BRAND } from './progress.js';
@@ -55,6 +56,10 @@ export interface DeployOutcome {
   deployment: Deployment;
   projectName: string;
   environmentName: string;
+  /** Ids of the resolved target — orchestrators (stack deploy,
+   *  `appliance dev` log streaming) key follow-up API calls on these. */
+  projectId: string;
+  environmentId: string;
   url?: string;
 }
 
@@ -399,15 +404,40 @@ async function resolveKubernetesBuildId(
     }
     platform = `linux/${hostArch}`;
   }
-  const imageRef = await publishLocalApplianceImage({
-    name: appliance.name,
-    platform,
-    buildScript: appliance.scripts?.build,
-    registryUrl,
-    // Build the appliance's own directory (honors -d/-f), not whatever
-    // cwd the deploy was invoked from.
-    context: resolveApplianceDir(program),
-  });
+  // Prefer the runtime's BuildKit builder when the base advertises one
+  // (the microVM forwards its in-guest buildkitd): the whole build +
+  // push happens with no docker daemon anywhere. A user `scripts.build`
+  // is a docker contract (`docker tag <name>`), so it stays on the
+  // docker path; an unreachable buildkitd (still installing on a first
+  // boot, or a parked VM) falls back to docker with a notice.
+  const buildkitAddr = baseConfig.kubernetes?.buildkit?.addr;
+  let imageRef: string | null = null;
+  if (buildkitAddr && registryUrl && !appliance.scripts?.build) {
+    const buildctl = await ensureBuildctl();
+    if (buildctl && buildkitAvailable(buildctl, buildkitAddr)) {
+      console.log(chalk.dim(`Building with BuildKit (${buildkitAddr}) — no Docker needed`));
+      imageRef = await publishViaBuildkit(buildctl, {
+        name: appliance.name,
+        platform,
+        registryUrl,
+        buildkitAddr,
+        context: resolveApplianceDir(program),
+      });
+    } else {
+      console.log(chalk.dim('BuildKit builder not reachable yet — falling back to docker build + push.'));
+    }
+  }
+  if (!imageRef) {
+    imageRef = await publishLocalApplianceImage({
+      name: appliance.name,
+      platform,
+      buildScript: appliance.scripts?.build,
+      registryUrl,
+      // Build the appliance's own directory (honors -d/-f), not whatever
+      // cwd the deploy was invoked from.
+      context: resolveApplianceDir(program),
+    });
+  }
 
   const createResult = await client.createBuild({ uploadUrl: imageRef, port: appliance.port });
   if (!createResult.success) throw new Error(`Failed to create image build: ${createResult.error.message}`);
@@ -555,6 +585,8 @@ export async function runDeploy(params: RunDeployParams): Promise<DeployOutcome>
     deployment: finalDeployment,
     projectName,
     environmentName,
+    projectId: project.id,
+    environmentId: environment.id,
     url: extractDeploymentUrl(finalDeployment.message) ?? undefined,
   };
 }

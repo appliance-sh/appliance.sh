@@ -139,11 +139,11 @@ routing needs zero new machinery — only the port forward.
 ### Multiple VMs
 
 Several VMs run concurrently — one for interactive development, another
-for traffic testing. Each VM persists its own four host ports (ingress /
-kubernetes / registry / egress) in its `vm.json` and gets a
+for traffic testing. Each VM persists its own five host ports (ingress /
+kubernetes / registry / egress / buildkit) in its `vm.json` and gets a
 non-colliding block at create: the default `appliance` VM keeps the
-canonical `8081/6443/5052/5053`; any other VM is allocated the lowest
-free contiguous block of four from `8100` upward (`VmSpec::allocate_ports`).
+canonical `8081/6443/5052/5053/5054`; any other VM is allocated the lowest
+free contiguous block of five from `8100` upward (`VmSpec::allocate_ports`).
 Each registers as its own desktop cluster (`microvm` / `microvm-<name>`,
 the same string as its CLI credentials profile), so the deploy wizard,
 cluster switcher, and kubectl reads target the right VM. `appliance vm
@@ -248,6 +248,15 @@ verbatim. The vsock channel above already gives it a clean way in.
    app-image builds to the host arch for local targets regardless of
    the manifest's `platform` — so a Lambda-targeted amd64 manifest
    still runs on Apple Silicon instead of crashlooping.
+   **Docker-free builds** _(done)_: every k3s VM also provisions
+   **buildkitd** in-guest (Alpine `buildkit` package, cache under
+   `/persist/buildkit`, gRPC on guest `:8372` forwarded to host
+   `127.0.0.1:5054`), with a guest-loopback socat alias bridging
+   `localhost:5052 → :30500` so buildkitd pushes the same ref pods
+   pull. The host daemon runtime (`appliance server start`, see
+   docs/local-server.md) builds through it with a managed `buildctl` —
+   no host Docker anywhere in that loop; the in-VM api-server flow
+   above still uses the docker-save path for its own image delivery.
 4. **KVM backend**, then **WSL backend**; the desktop presents the two
    engines as one **Local runtime** with a "sandbox with a virtual
    machine" toggle (default on) rather than an engine selector _(done)_;

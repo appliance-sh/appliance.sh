@@ -20,7 +20,19 @@ bases, so the same stack file works on both. `{{url:<dir>}}` resolves
 to a member's host-facing URL (it must appear earlier in `apps`), for
 values that end up in a browser.
 
-Run it:
+Run it — the dev loop (recommended; no Docker needed):
+
+```bash
+cd examples/demo-stack-3tier
+appliance dev
+# boots the local server (+ microVM) if needed, deploys all three
+# members via the in-VM BuildKit, prints their URLs, then streams
+# merged color-prefixed logs and rebuilds a member when you save.
+# Try editing frontend/server.js — the rollout takes seconds.
+# Ctrl+C ends the session; the apps keep running.
+```
+
+Or the one-shot deploy:
 
 ```bash
 appliance server start           # or: appliance vm up

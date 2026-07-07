@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   bootstrapInClusterApiServer,
   ensureDockerRunning,
@@ -38,7 +39,26 @@ export const DEFAULT_VM_NAME = 'appliance';
 // Mirrors VmSpec defaults in packages/vm/src/spec.rs — keep in sync.
 // These are the *default* VM's canonical ports; additional VMs get an
 // allocated block, read per-VM from their persisted spec (vmPorts).
-const DEFAULT_VM_PORTS = { hostPort: 8081, apiPort: 6443, registryPort: 5052, egressPort: 5053 } as const;
+const DEFAULT_VM_PORTS = {
+  hostPort: 8081,
+  apiPort: 6443,
+  registryPort: 5052,
+  egressPort: 5053,
+  buildkitPort: 5054,
+} as const;
+
+/** A VM's forwarded host ports. */
+export type VmPorts = { -readonly [K in keyof typeof DEFAULT_VM_PORTS]: number };
+
+/** What `ensureVmRuntime` hands back: enough for a host-side control
+ *  plane to drive the VM's cluster (kubeconfig + forwarded ports). */
+export interface VmRuntimeInfo {
+  name: string;
+  /** Host path of the VM's admin kubeconfig, already rewritten to the
+   *  forwarded 127.0.0.1:<apiPort> server address by the engine. */
+  kubeconfigPath: string;
+  ports: VmPorts;
+}
 
 // The microVM runs the host's CPU architecture — Virtualization.framework
 // doesn't emulate — so the api-server image we push must carry a matching
@@ -59,13 +79,8 @@ export function vmDir(name: string): string {
 
 /** Read a VM's forwarded host ports from its persisted spec, falling
  *  back to the canonical defaults when the spec isn't written yet.
- *  Module-private: only `runUp` below consumes it. */
-function vmPorts(name: string): {
-  hostPort: number;
-  apiPort: number;
-  registryPort: number;
-  egressPort: number;
-} {
+ *  Module-private: only `ensureVmRuntime` below consumes it. */
+function vmPorts(name: string): VmPorts {
   try {
     const raw = fs.readFileSync(path.join(vmDir(name), 'vm.json'), 'utf8');
     const spec = JSON.parse(raw) as Partial<typeof DEFAULT_VM_PORTS>;
@@ -74,9 +89,28 @@ function vmPorts(name: string): {
       apiPort: spec.apiPort ?? DEFAULT_VM_PORTS.apiPort,
       registryPort: spec.registryPort ?? DEFAULT_VM_PORTS.registryPort,
       egressPort: spec.egressPort ?? DEFAULT_VM_PORTS.egressPort,
+      buildkitPort: spec.buildkitPort ?? DEFAULT_VM_PORTS.buildkitPort,
     };
   } catch {
     return { ...DEFAULT_VM_PORTS };
+  }
+}
+
+/** Repo-checkout builds of the engine binary, resolved relative to
+ *  this module's emitted file (dist/utils → the repo's packages dir) —
+ *  so `appliance dev`/`server start` find it from ANY working
+ *  directory, not just the repo root. Empty under the bun single
+ *  binary, whose import.meta.url is not a real file. */
+function repoVmBinaryCandidates(): string[] {
+  if (process.versions.bun) return [];
+  try {
+    const packagesDir = fileURLToPath(new URL('../../..', import.meta.url));
+    return [
+      path.join(packagesDir, 'vm', 'target', 'release', 'appliance-vm'),
+      path.join(packagesDir, 'vm', 'target', 'debug', 'appliance-vm'),
+    ];
+  } catch {
+    return [];
   }
 }
 
@@ -92,7 +126,9 @@ export function resolveVmBinary(): string | null {
     process.env.APPLIANCE_VM,
     path.join(os.homedir(), '.appliance', 'bin', 'appliance-vm'),
     'appliance-vm',
-    // Repo-checkout fallbacks, resolved from the working directory.
+    // Repo-checkout fallbacks: relative to this module first (works
+    // from any cwd), then the working directory (legacy behavior).
+    ...repoVmBinaryCandidates(),
     path.resolve('packages/vm/target/release/appliance-vm'),
     path.resolve('packages/vm/target/debug/appliance-vm'),
   ].filter((c): c is string => Boolean(c));
@@ -118,6 +154,23 @@ export function runVm(args: string[]): number {
   const bin = vmBinary();
   const r = spawnSync(bin, args, { stdio: 'inherit' });
   return r.status ?? 1;
+}
+
+/** Best-effort engine invocation with output suppressed — for calls
+ *  that are allowed to fail quietly (e.g. `egress sync` before the
+ *  cluster namespace exists). Returns the exit code; never exits. */
+export function runVmQuiet(args: string[]): number {
+  const bin = resolveVmBinary();
+  if (!bin) return 1;
+  const r = spawnSync(bin, args, { stdio: 'ignore' });
+  return r.status ?? 1;
+}
+
+/** A VM's forwarded host ports, read from its persisted spec. Exported
+ *  for status displays; boot flows get the same data via
+ *  `ensureVmRuntime`. */
+export function readVmPorts(name: string = DEFAULT_VM_NAME): VmPorts {
+  return vmPorts(name);
 }
 
 // Deleting a microVM is not a plain engine passthrough. The Rust engine
@@ -150,6 +203,65 @@ const printProgress = (event: ProgressEvent) => {
   console.log(`${prefix} ${chalk.dim(event.tool)} ${event.message}`);
 };
 
+/**
+ * Boot (or reuse) the microVM and wait until its cluster endpoint and
+ * in-VM registry answer. Does NOT deliver or bootstrap the in-cluster
+ * api-server — callers that run the control plane host-side
+ * (`appliance server start`, `appliance dev`) stop here; `runUp`
+ * continues on to the in-VM api-server.
+ *
+ * Throws (instead of exiting) on failure so programmatic callers can
+ * catch and render their own remediation.
+ */
+export async function ensureVmRuntime(
+  name: string = DEFAULT_VM_NAME,
+  opts: {
+    timeout?: number;
+    resources?: { cpus?: number; memory?: number; dev?: boolean; mount?: string };
+  } = {}
+): Promise<VmRuntimeInfo> {
+  const timeout = opts.timeout ?? 600;
+  const resources = opts.resources ?? {};
+  // Boot the VM + wait for its kubernetes endpoint. Per-VM resource
+  // overrides are persisted into the spec by the engine, so they
+  // survive restarts; omitting them keeps the VM's current sizing.
+  // `--dev` provisions the VM as a development environment (persisted
+  // one-way, so a later plain `up` keeps it a dev VM).
+  const upArgs = ['up', name, '--timeout', String(timeout)];
+  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
+  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
+  if (resources.dev) upArgs.push('--dev');
+  // Resolve --mount to an absolute path so it's unambiguous to the
+  // engine regardless of its working directory (it canonicalizes too).
+  if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
+  const status = runVm(upArgs);
+  if (status !== 0) {
+    throw new Error(
+      `microVM '${name}' failed to come up (appliance-vm exited ${status}). ` +
+        'Inspect the boot log with `appliance vm console`, or run `appliance doctor`.'
+    );
+  }
+  // Read ports AFTER `vm up`: it creates the spec (with allocated
+  // ports) when it didn't exist, so an earlier read may be stale.
+  const ports = vmPorts(name);
+  const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
+  const kubeconfigDeadline = Date.now() + 30_000;
+  while (!fs.existsSync(kubeconfigPath)) {
+    if (Date.now() >= kubeconfigDeadline) {
+      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vm up`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+
+  // Wait for the in-VM registry forward — image delivery for the
+  // in-cluster api-server and every `appliance deploy` rides this.
+  // First boot includes the registry:2 image pull.
+  console.log(chalk.cyan('» waiting for the in-VM registry'));
+  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
+
+  return { name, kubeconfigPath, ports };
+}
+
 export async function runUp(
   name: string,
   imageOverride: string | undefined,
@@ -161,45 +273,21 @@ export async function runUp(
   opts: { showDeployHint?: boolean } = {}
 ): Promise<void> {
   const profile = profileForVm(name);
-  const ports = vmPorts(name);
-  // 1. Boot the VM + wait for its kubernetes endpoint. Per-VM resource
-  //    overrides are persisted into the spec by the engine, so they
-  //    survive restarts; omitting them keeps the VM's current sizing.
-  //    `--dev` provisions the VM as a development environment (persisted
-  //    one-way, so a later plain `up` keeps it a dev VM).
-  const upArgs = ['up', name, '--timeout', String(timeout)];
-  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
-  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
-  if (resources.dev) upArgs.push('--dev');
-  // Resolve --mount to an absolute path so it's unambiguous to the
-  // engine regardless of its working directory (it canonicalizes too).
-  if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
-  const status = runVm(upArgs);
-  if (status !== 0) {
+  // 1-2. Boot + wait for the cluster and registry.
+  let vm: VmRuntimeInfo;
+  try {
+    vm = await ensureVmRuntime(name, { timeout, resources });
+  } catch (err) {
+    console.error(chalk.red((err as Error).message));
     console.error(
       chalk.dim(
-        'Tip: for local deploys without a VM, `appliance server start` runs the control plane as a host daemon (needs only Docker).'
+        'Tip: `appliance server start --runtime docker` runs the control plane as a host daemon against a local Docker daemon, no VM needed.'
       )
     );
-    process.exit(status);
+    process.exit(1);
   }
-  // Re-read ports: `vm up` creates the spec (with allocated ports) if
-  // it didn't exist, so the canonical-fallback above may be stale now.
-  Object.assign(ports, vmPorts(name));
-  const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
-  const kubeconfigDeadline = Date.now() + 30_000;
-  while (!fs.existsSync(kubeconfigPath)) {
-    if (Date.now() >= kubeconfigDeadline) {
-      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vm up`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-  }
-
-  // 2. Wait for the in-VM registry forward — image delivery for both
-  //    the api-server below and every later `appliance deploy` rides
-  //    this. First boot includes the registry:2 image pull.
-  console.log(chalk.cyan('» waiting for the in-VM registry'));
-  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
+  const ports = vm.ports;
+  const kubeconfigPath = vm.kubeconfigPath;
 
   // 3. Deliver the api-server image into the VM's registry. The image
   //    must be present in the local docker daemon (built via
@@ -312,8 +400,7 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
       throw new Error(
         `in-VM registry not reachable at ${url} after ${Math.round(timeoutMs / 1000)}s.\n` +
           'The VM booted but its registry forward never came up. Inspect the boot log with `appliance vm console`, ' +
-          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.\n' +
-          'Or skip the VM entirely: `appliance server start` runs the control plane as a lightweight host daemon.'
+          'and run `appliance doctor` to confirm the host prerequisites (free ports, virtualization) are healthy.'
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));

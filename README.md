@@ -56,10 +56,11 @@ appliance setup       # Link this folder to a project/environment (one-time)
 appliance deploy      # Build, upload, and deploy
 ```
 
-No server yet? Two local-first paths, no login or setup needed:
+No server yet? Local-first paths, no login or setup needed:
 
-- **`appliance server start`** — the fastest: runs the control plane as a lightweight daemon on your machine (ready in ~1 s, needs only Docker) and saves the `local` profile. Deploys become containers on your Docker daemon.
-- **`appliance init`** — the isolated path: boots the microVM runtime (its own VM + Kubernetes), saves the `microvm` profile, and hands you straight into the first deploy.
+- **`appliance dev`** — the dev loop: brings the local server (and its microVM runtime) up, deploys the current app or stack, streams merged logs, and rebuilds on save. **No Docker required.**
+- **`appliance server start`** — runs the control plane as a lightweight daemon on your machine and saves the `local` profile. Deploys land in the microVM's Kubernetes by default (images build via the in-VM BuildKit — no Docker); `--runtime docker` targets your Docker daemon instead.
+- **`appliance init`** — the isolated path: boots the microVM runtime and deploys the api-server _into_ its cluster, saves the `microvm` profile, and hands you straight into the first deploy.
 
 `appliance setup` writes a `.appliance/link.json` recording which project and environment this folder targets. After linking, `appliance deploy` (with no arguments) builds the manifest, uploads it, and rolls the linked environment forward — re-deploys are a single command.
 
@@ -120,8 +121,9 @@ Optional fields available on all types:
 | `appliance deployment status <id>`  | Check a specific deployment's status                                                |
 | `appliance deployment cancel`       | Cancel an in-flight deployment                                                      |
 | `appliance deployment refresh`      | Reconcile Pulumi state with cloud reality                                           |
-| `appliance server start`            | Run the control plane as a lightweight local daemon (no VM/k3s; profile `local`)    |
-| `appliance server stop` / `status`  | Stop the local daemon (containers keep running) / show its state and URL            |
+| `appliance dev [env]`               | Dev loop: deploy this app/stack, stream merged logs, rebuild on save (no Docker)    |
+| `appliance server start`            | Run the control plane as a local daemon (deploys into the microVM; profile `local`) |
+| `appliance server stop` / `status`  | Stop the local daemon (deployed apps keep running) / show its state and URL         |
 | `appliance server logs`             | Print (or `-f` follow) the local daemon's log                                       |
 | `appliance vm up`                   | Boot the isolated microVM local runtime (no docker provider needed for the cluster) |
 | `appliance vm stop` / `delete`      | Stop (state preserved) or delete the microVM                                        |
@@ -134,15 +136,17 @@ Top-level commands like `setup`, `status`, and `list` are shortcuts for `applian
 
 Two ways to run Appliance on your machine, both ordinary credential profiles (switch with `--profile` / `APPLIANCE_PROFILE`):
 
-**The local server (fastest).** `appliance server start` embeds the same api-server that powers cloud installations directly in the CLI binary and runs it as a host daemon — no VM, no Kubernetes, no registry. It's ready in about a second, stores state under `~/.appliance/server/data`, and deploys become containers on your local Docker daemon with stable `http://localhost:<port>` URLs. Deploys build straight into the daemon (no push step at all), making it the tightest build→deploy loop available:
+**The local server (default: no Docker).** `appliance server start` embeds the same api-server that powers cloud installations directly in the CLI binary and runs it as a host daemon. By default it drives the microVM's Kubernetes as its workload runtime: images build inside the VM via BuildKit (a managed `buildctl` streams your build context over a forwarded port), push to the in-VM registry, and roll out with hostname-routed URLs — **no Docker anywhere**. `--runtime docker` keeps the original mode: containers on your local Docker daemon with `http://localhost:<port>` URLs, built straight into the daemon with no push step.
 
 ```bash
+appliance dev                                  # deploy + logs + rebuild-on-save, in one command
+# or, piecewise:
 appliance server start
 appliance deploy my-app dev --profile local
-# → http://localhost:8342
+# → http://my-app-dev.appliance.localhost:8081
 ```
 
-See [`docs/local-server.md`](docs/local-server.md) for the full contract and how it compares with the microVM.
+See [`docs/local-server.md`](docs/local-server.md) for the full contract and how the runtimes compare.
 
 **The microVM runtime (isolated).** `appliance vm up` (or `appliance init`) boots an isolated microVM (Virtualization.framework on macOS) running a Kubernetes cluster with an in-VM image registry, deploys the Appliance api-server _into_ the cluster, and logs you in under the `microvm` profile. Deploys honor `replicas`, get hostname-routed URLs like the cloud, and are confined by the desktop's egress policy:
 
@@ -154,7 +158,7 @@ APPLIANCE_PROFILE=microvm appliance deploy my-app dev
 
 The same API and SDK drive every target — local-server deploys build into the host daemon, microVM deploys push to the in-VM registry, and cloud deploys upload a build for server-side processing.
 
-> The host-side k3d runtime (`appliance local`) has been removed. The microVM supports macOS (Virtualization.framework) and Windows (WSL2) today — Linux waits on the KVM backend; the local server runs anywhere Node + Docker do.
+> The host-side k3d runtime (`appliance local`) has been removed. The microVM supports macOS (Virtualization.framework) and Windows (WSL2) today — Linux waits on the KVM backend; the local server's `--runtime docker` mode runs anywhere Node + Docker do.
 
 ### The link file
 
@@ -255,10 +259,12 @@ APPLIANCE_PROFILE=microvm appliance deploy my-app dev
 appliance destroy my-app dev
 ```
 
-If you don't need VM isolation or k8s parity, `appliance server start`
-is the lighter alternative: the same api-server as a host daemon,
-deploying containers straight to your Docker daemon
-(`appliance-base-docker`, `DockerDeploymentService`). See
+If you don't need the api-server inside the cluster, `appliance
+server start` is the lighter alternative: the same api-server as a
+host daemon driving the microVM's cluster (default — builds via the
+in-VM BuildKit, no Docker), or your Docker daemon with
+`--runtime docker` (`appliance-base-docker`,
+`DockerDeploymentService`). See
 [`docs/local-server.md`](docs/local-server.md).
 
 ### Migrating from `appliance local` (k3d)

@@ -428,6 +428,8 @@ TMUXCONF
 __DEV_PROVISION__
 # --- docker engine (appliance vm ... --docker) ---------------------------
 __DOCKER_PROVISION__
+# --- buildkit (docker-free image builds) ----------------------------------
+__BUILDKIT_PROVISION__
 # --- k3s / agent-runtime handoff -----------------------------------------
 __K3S_PROVISION__
 # Keep the boot session resident: the host process owns this child, and
@@ -579,11 +581,19 @@ fn build_bootstrap(
             "__DOCKER_PROVISION__",
             if spec.docker { crate::guest::DOCKER_PROVISION } else { "" },
         )
+        // BuildKit rides every k3s VM, exactly as on the vz backend —
+        // injected before the port markers below so its nested
+        // __REGISTRY_*__/__BUILDKITD_GUEST_PORT__ markers expand too.
+        .replace(
+            "__BUILDKIT_PROVISION__",
+            if spec.agent_only { "" } else { crate::guest::BUILDKIT_PROVISION },
+        )
         .replace("__EGRESS_CA__", &ca_block)
         .replace("__TMUX_CONF__\n", crate::guest::TMUX_CONF)
         .replace("__KUBECONFIG_PORT__", &crate::guest::KUBECONFIG_PORT.to_string())
         .replace("__REGISTRY_NODEPORT__", &crate::guest::REGISTRY_NODEPORT.to_string())
         .replace("__REGISTRY_HOST_PORT__", &spec.registry_port.to_string())
+        .replace("__BUILDKITD_GUEST_PORT__", &crate::guest::BUILDKITD_GUEST_PORT.to_string())
         .replace("__EGRESS_PORT__", &spec.egress_port.to_string())
         // No prebuilt agent squashfs on WSL — nothing to put PATH-first.
         .replace("__AGENT_BIN_PATH__", "")
@@ -618,16 +628,23 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
             SocketAddr::new(guest_ip, crate::guest::REGISTRY_NODEPORT),
         )
         .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+        crate::net::spawn_proxy(
+            spec.buildkit_port,
+            SocketAddr::new(guest_ip, crate::guest::BUILDKITD_GUEST_PORT),
+        )
+        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.buildkit_port, "buildkit")))?;
         // The deterministic-NodePort window, same as the vz backend.
         for port in 30000..=30050u16 {
             let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
         }
         eprintln!(
-            "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
+            "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
             spec.api_port,
             spec.host_port,
             spec.registry_port,
-            crate::guest::REGISTRY_NODEPORT
+            crate::guest::REGISTRY_NODEPORT,
+            spec.buildkit_port,
+            crate::guest::BUILDKITD_GUEST_PORT
         );
     }
 
@@ -760,6 +777,8 @@ mod tests {
             "__DEV_MOUNT__",
             "__MOUNT_WIN_PATH__",
             "__DOCKER_PROVISION__",
+            "__BUILDKIT_PROVISION__",
+            "__BUILDKITD_GUEST_PORT__",
             "__EGRESS_PORT__",
             "__EGRESS_CA__",
             "__AGENT_BIN_PATH__",
@@ -784,9 +803,14 @@ mod tests {
         // The verbatim prefix is stripped for wslpath.
         assert!(script.contains(r"wslpath -u 'C:\Users\dev\proj'"));
         assert!(!script.contains(r"\\?\"));
-        // Dev + docker + CA blocks are present.
+        // Dev + docker + buildkit + CA blocks are present.
         assert!(script.contains("appliance-dev: provisioning development environment"));
         assert!(script.contains("appliance-docker: provisioning in-guest Docker engine"));
+        assert!(script.contains("appliance-buildkit: provisioning in-guest BuildKit"));
+        assert!(script.contains(&format!(
+            "--addr tcp://0.0.0.0:{}",
+            crate::guest::BUILDKITD_GUEST_PORT
+        )));
         assert!(script.contains("appliance-egress.crt"));
         assert!(script.contains("-----BEGIN CERTIFICATE-----"));
         // The user is pinned to the conventional 1000/1000 on WSL.
@@ -820,6 +844,7 @@ mod tests {
         s.dev = true;
         let script = build_bootstrap(&s, None, None);
         assert!(!script.contains("k3s server"), "agent-only provisions NO k3s");
+        assert!(!script.contains("buildkitd"), "agent-only provisions no buildkit either");
         assert!(script.contains("while [ ! -f /persist/.dev-ready ]"));
         assert!(script.contains("echo agent-ready > /srv/handoff/agent-ready"));
         // The honest-failure docker stub is present without --docker…

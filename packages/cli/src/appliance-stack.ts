@@ -2,21 +2,20 @@ import { Command } from 'commander';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { confirm } from '@inquirer/prompts';
-import { createApplianceClient, DeploymentStatus, dnsName } from '@appliance.sh/sdk';
+import { DeploymentStatus, dnsName } from '@appliance.sh/sdk';
 import type { Deployment } from '@appliance.sh/sdk';
 import chalk from 'chalk';
-import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
-import { extractApplianceFile, MANIFEST_FILENAMES, registerManifestOptions } from './utils/common.js';
-import { DEFAULT_BUILD_OUTPUT, isPrintedError, runDeploy } from './utils/deploy-core.js';
+import { MANIFEST_FILENAMES } from './utils/common.js';
+import { loadStack, resolveStackApps, STACK_FILENAME, type ResolvedStackApp } from './utils/stack.js';
 import {
-  loadStack,
-  resolveStackApps,
-  resolveStackAppEnv,
-  STACK_FILENAME,
-  type ResolvedStackApp,
-  type StackMemberInfo,
-} from './utils/stack.js';
+  deployStackApps,
+  printSummary,
+  requireClient,
+  resolveProjectName,
+  withDir,
+  type StackRow,
+} from './utils/stack-deploy.js';
 import { pollDeploymentUntilDone, urlsByEnvironment } from './utils/deploy-poll.js';
 import { startProgressLine, BRAND } from './utils/progress.js';
 import { printCliError } from './utils/errors.js';
@@ -27,65 +26,9 @@ import { printCliError } from './utils/errors.js';
 // environment on whichever api-server the active profile points at,
 // so the same stack file drives the local microVM runtime and a cloud
 // installation (switch with --profile / APPLIANCE_PROFILE).
-
-function requireClient() {
-  const credentials = loadCredentials();
-  if (!credentials) {
-    console.error(chalk.red('Not logged in — no credentials for the active profile.'));
-    console.error(
-      chalk.dim('Run `appliance login`, or start the local runtime with `appliance init` (which saves a profile).')
-    );
-    process.exit(1);
-  }
-  return {
-    client: createApplianceClient({
-      baseUrl: credentials.apiUrl,
-      credentials: { keyId: credentials.keyId, secret: credentials.secret },
-    }),
-    apiUrl: credentials.apiUrl,
-  };
-}
-
-// A fresh Command carrying only the -f/-d/--variant manifest options at
-// their defaults, so per-app manifest resolution behaves exactly as if
-// `appliance deploy` had been run inside the member directory.
-function manifestCommand(): Command {
-  const cmd = new Command();
-  registerManifestOptions(cmd);
-  return cmd;
-}
-
-// Resolve a member's project name: the stack entry's `project` pin,
-// else the member manifest's `name`. Must run with cwd inside the
-// member directory (see withDir) so manifest detection and any
-// programmatic-manifest evaluation see the right folder.
-async function resolveProjectName(app: ResolvedStackApp): Promise<string> {
-  if (app.project) return app.project;
-  const manifest = await extractApplianceFile(manifestCommand());
-  if (!manifest.success) {
-    throw new Error(
-      `Cannot resolve a project name for "${app.relDir}": ${manifest.error.message} ` +
-        `Set "project" on the stack entry, or add a manifest with a \`name\`.`
-    );
-  }
-  return manifest.data.name;
-}
-
-// Run fn with cwd temporarily switched to the member directory. The
-// deploy engine (manifest detection, link.json, .env.<env> lookup,
-// docker build context) is cwd-relative by design — switching cwd makes
-// a stack member behave identically to a hand-run `appliance deploy`
-// in that folder. Members run sequentially, so the global cwd swap is
-// safe.
-async function withDir<T>(dir: string, fn: () => Promise<T>): Promise<T> {
-  const prev = process.cwd();
-  process.chdir(dir);
-  try {
-    return await fn();
-  } finally {
-    process.chdir(prev);
-  }
-}
+//
+// The deploy engine (member loop, env wiring, summary rows) lives in
+// utils/stack-deploy.ts, shared with `appliance dev`.
 
 function exitWith(message: string): never {
   console.error(chalk.red(message));
@@ -95,30 +38,6 @@ function exitWith(message: string): never {
 function validateEnvironmentArg(env: string | undefined): void {
   if (env !== undefined && !dnsName.safeParse(env).success) {
     exitWith(`Invalid environment name "${env}" — lowercase alphanumeric with hyphens, DNS-safe.`);
-  }
-}
-
-interface StackRow {
-  app: string;
-  target: string;
-  status: string;
-  url?: string;
-  /** true → green check, false → red cross, null → neutral dot. */
-  ok: boolean | null;
-}
-
-function printSummary(rows: StackRow[]): void {
-  if (rows.length === 0) return;
-  const appW = Math.max(...rows.map((r) => r.app.length), 3);
-  const targetW = Math.max(...rows.map((r) => r.target.length), 6);
-  const statusW = Math.max(...rows.map((r) => r.status.length), 6);
-  console.log();
-  for (const r of rows) {
-    const glyph = r.ok === true ? chalk.green('✓') : r.ok === false ? chalk.red('✗') : chalk.yellow('•');
-    const url = r.url ? `  ${chalk.cyan(r.url)}` : '';
-    console.log(
-      `  ${glyph} ${r.app.padEnd(appW)}  ${chalk.dim(r.target.padEnd(targetW))}  ${r.status.padEnd(statusW)}${url}`
-    );
   }
 }
 
@@ -209,72 +128,14 @@ program
       `${chalk.cyan(BRAND)} ${chalk.bold(stackName)} — deploying ${apps.length} app${apps.length === 1 ? '' : 's'}`
     );
 
-    // Env wiring: when any entry declares `env`, gather what the
-    // placeholders can reference — each member's project name and port
-    // from its manifest. Skipped entirely otherwise, so stacks without
-    // wiring don't pay an extra manifest evaluation per member.
-    const memberInfo = new Map<string, StackMemberInfo>();
-    if (apps.some((a) => a.env && Object.keys(a.env).length > 0)) {
-      for (const app of apps) {
-        const manifest = await withDir(app.dir, () => extractApplianceFile(manifestCommand()));
-        memberInfo.set(app.relDir, {
-          projectName: app.project ?? (manifest.success ? manifest.data.name : undefined),
-          environment: app.environment,
-          port: (manifest.success && 'port' in manifest.data && manifest.data.port) || 8080,
-        });
-      }
-    }
+    const result = await deployStackApps({ client, apiUrl, apps });
 
-    const rows: StackRow[] = [];
-    const deployedUrls = new Map<string, string>();
-    let failed = false;
-
-    for (const [i, app] of apps.entries()) {
-      console.log();
-      console.log(chalk.bold(`[${i + 1}/${apps.length}] ${app.relDir}`) + chalk.dim(` → ${app.environment}`));
-      try {
-        const extraEnv = resolveStackAppEnv(app, memberInfo, deployedUrls);
-        if (extraEnv) {
-          console.log(chalk.dim(`Stack env: ${Object.keys(extraEnv).join(', ')}`));
-        }
-        const outcome = await withDir(app.dir, async () => {
-          const projectName = await resolveProjectName(app);
-          return runDeploy({
-            client,
-            apiUrl,
-            program: manifestCommand(),
-            cliProject: projectName,
-            cliEnvironment: app.environment,
-            opts: { build: DEFAULT_BUILD_OUTPUT, yes: true, extraEnv },
-          });
-        });
-        if (outcome.url) deployedUrls.set(app.relDir, outcome.url);
-        const ok = outcome.deployment.status === DeploymentStatus.Succeeded;
-        rows.push({
-          app: app.relDir,
-          target: `${outcome.projectName}/${outcome.environmentName}`,
-          status: outcome.deployment.status,
-          url: outcome.url,
-          ok,
-        });
-        if (!ok) {
-          failed = true;
-          break; // Fail fast: later members may depend on this one.
-        }
-      } catch (error) {
-        if (!isPrintedError(error)) printCliError(error, { apiUrl });
-        rows.push({ app: app.relDir, target: `${app.project ?? '?'}/${app.environment}`, status: 'error', ok: false });
-        failed = true;
-        break;
-      }
-    }
-
-    printSummary(rows);
-    const remaining = apps.length - rows.length;
+    printSummary(result.rows);
+    const remaining = apps.length - result.rows.length;
     if (remaining > 0) {
       console.log(chalk.dim(`  (${remaining} app${remaining === 1 ? '' : 's'} not attempted after the failure)`));
     }
-    process.exit(failed ? 1 : 0);
+    process.exit(result.failed ? 1 : 0);
   });
 
 // --- appliance stack status ---

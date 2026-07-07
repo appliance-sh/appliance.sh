@@ -153,6 +153,15 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
         insecure: z.boolean().optional(),
       })
       .optional(),
+    // Optional buildkitd gRPC address reachable from the operator's
+    // machine (e.g. `tcp://127.0.0.1:5054`, the microVM's forwarded
+    // in-guest buildkitd). When set the CLI builds images with
+    // buildctl instead of a local Docker daemon. BYO clusters omit it.
+    buildkit: z
+      .object({
+        addr: z.string(),
+      })
+      .optional(),
   }),
 });
 
@@ -302,6 +311,13 @@ export const applianceBaseConfig = z.object({
         .object({
           url: z.string(),
           insecure: z.boolean().optional(),
+        })
+        .optional(),
+      // buildkitd gRPC address for host-side docker-free builds. See
+      // the input schema's field of the same name.
+      buildkit: z
+        .object({
+          addr: z.string(),
         })
         .optional(),
     })

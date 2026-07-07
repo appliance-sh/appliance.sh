@@ -77,6 +77,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     aliases: ['remove'],
     load: () => import('./appliance-destroy.js'),
   },
+  dev: {
+    description: 'dev loop: deploy this app/stack, stream merged logs, rebuild on save (Ctrl+C leaves apps running)',
+    load: () => import('./appliance-dev.js'),
+  },
   doctor: {
     description: 'run first-run preflight checks (use --fix to auto-resolve the safe ones)',
     load: () => import('./appliance-doctor.js'),
@@ -127,7 +131,8 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     load: () => import('./appliance-profile.js'),
   },
   server: {
-    description: 'run the control plane as a lightweight local daemon — deploys to your Docker daemon, no VM/k3s',
+    description:
+      'run the control plane as a lightweight local daemon — deploys into the microVM (--runtime docker for the host daemon)',
     load: () => import('./appliance-server.js'),
   },
   stack: {
@@ -197,6 +202,7 @@ const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
   {
     title: 'Deploy appliances (local microVM or cloud — same commands, switch with --profile)',
     names: [
+      'dev',
       'init',
       'deploy',
       'stack',
@@ -255,6 +261,7 @@ function showHelp(): void {
   }
   console.log();
   console.log('Getting started:');
+  console.log('  Iterate locally, no Docker: appliance dev           (deploy + logs + rebuild on save)');
   console.log('  Fastest local deploys:      appliance server start  →  appliance deploy  →  appliance open');
   console.log('  Isolated local runtime:     appliance init  →  appliance deploy   (microVM + k3s)');
   console.log('  Run this repo, no manifest: appliance up          (Dockerfile / compose / devcontainer)');

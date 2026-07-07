@@ -26,6 +26,9 @@ export function remediationHint(message: string, apiUrl?: string): string | null
   if (/no such (host|cluster)|cluster .*not (found|exist|running)|does not exist/i.test(message)) {
     return 'The local runtime is not running — start it with `appliance vm up` (`appliance vm status` shows what is missing).';
   }
+  if (/buildkit|buildctl/i.test(message)) {
+    return 'The BuildKit builder is not reachable — is the microVM up? `appliance server start` (or `appliance vm up`) brings it back; `--runtime docker` builds with Docker instead.';
+  }
   if (/docker|container runtime|daemon|colima/i.test(message)) {
     return 'The container runtime is not reachable — start it (`colima start`, or open Docker Desktop), then re-run (`appliance doctor` checks the host prerequisites).';
   }

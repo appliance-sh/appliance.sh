@@ -42,6 +42,40 @@ describe('appliance-base-kubernetes schema', () => {
     expect(parsed.kubernetes.kubeconfig).toContain('apiVersion: v1');
   });
 
+  it('round-trips the optional buildkit address on both input and resolved schemas', () => {
+    const input = applianceBaseConfigInput.parse({
+      type: ApplianceBaseType.ApplianceKubernetes,
+      name: 'local',
+      kubernetes: {
+        kubeconfig: 'apiVersion: v1\nkind: Config\n',
+        dataDir: '/data',
+        registry: { url: 'localhost:5052', insecure: true },
+        buildkit: { addr: 'tcp://127.0.0.1:5054' },
+      },
+    });
+    if (input.type !== ApplianceBaseType.ApplianceKubernetes) throw new Error('narrow failed');
+    expect(input.kubernetes.buildkit?.addr).toBe('tcp://127.0.0.1:5054');
+
+    const resolved = applianceBaseConfig.parse({
+      type: ApplianceBaseType.ApplianceKubernetes,
+      name: 'local',
+      kubernetes: {
+        kubeconfig: 'apiVersion: v1\nkind: Config\n',
+        dataDir: '/data',
+        buildkit: { addr: 'tcp://127.0.0.1:5054' },
+      },
+    });
+    expect(resolved.kubernetes?.buildkit?.addr).toBe('tcp://127.0.0.1:5054');
+
+    // buildkit stays optional: a config without it still parses.
+    const bare = applianceBaseConfig.parse({
+      type: ApplianceBaseType.ApplianceKubernetes,
+      name: 'byo',
+      kubernetes: { dataDir: '/data' },
+    });
+    expect(bare.kubernetes?.buildkit).toBeUndefined();
+  });
+
   it('requires dataDir on the kubernetes variant', () => {
     expect(() =>
       applianceBaseConfigInput.parse({

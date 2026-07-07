@@ -29,6 +29,14 @@ describe('remediationHint', () => {
     expect(remediationHint('Cannot connect to the Docker daemon')).toMatch(/colima start|Docker Desktop/);
   });
 
+  it('points buildkit failures at the microVM, not at Docker', () => {
+    // Must win over the docker/daemon catch-all below it — a VM-runtime
+    // user should never be told to open Docker Desktop.
+    const hint = remediationHint('buildctl: failed to dial tcp://127.0.0.1:5054');
+    expect(hint).toMatch(/appliance server start/);
+    expect(hint).not.toMatch(/Docker Desktop/);
+  });
+
   it('treats 5xx as a transient server error worth a retry', () => {
     const hint = remediationHint('api returned 503 Service Unavailable', 'http://localhost:8081');
     expect(hint).toMatch(/server error/i);
