@@ -63,6 +63,22 @@ jobs:
       - name: Compile per-platform binaries
         run: pnpm --filter @appliance.sh/cli run compile:all
 
+      # The installed CLI (a bun single-binary) can't build the guest
+      # control-plane locally, so it downloads these from the release —
+      # see packages/cli/src/utils/api-server-artifact.ts stageFromRelease.
+      # Build the api-server + console workspaces (the guest compile
+      # bundles their dist), cross-compile both linux guest binaries, and
+      # tar the web console the same way the repo path does (dist contents
+      # at the archive root, matching tarGzDirectory).
+      - name: Build guest prerequisites
+        run: pnpm exec nx run-many -t build -p @appliance.sh/api-server @appliance.sh/console
+
+      - name: Compile api-server guest binaries
+        run: pnpm --filter @appliance.sh/api-server run compile:guest
+
+      - name: Package web console bundle
+        run: tar -czf packages/api-server/dist/guest/appliance-console.tar.gz -C packages/console/dist .
+
       - name: Resolve release tag
         id: tag
         env:
@@ -113,3 +129,19 @@ jobs:
           # this workflow (e.g. fixing a build issue) updates the
           # release in place instead of failing on a duplicate name.
           gh release upload "${TAG}" --clobber "${ASSETS[@]}"
+
+      # Guest control-plane assets live under the api-server dist, not the
+      # CLI dist — upload them in a second pass. Names must match exactly
+      # what stageFromRelease() fetches: appliance-api-server-linux-<arch>
+      # and appliance-console.tar.gz.
+      - name: Upload guest api-server binaries + console bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: packages/api-server/dist/guest
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" --clobber \
+            appliance-api-server-linux-x64 \
+            appliance-api-server-linux-arm64 \
+            appliance-console.tar.gz
