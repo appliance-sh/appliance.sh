@@ -933,9 +933,10 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  # NOT `appliance-api-server`: the legacy in-cluster deployment used
-  # that name with a different (immutable) roleRef, which would block
-  # this apply forever on upgraded VMs.
+  # NOT the bare name: the legacy in-cluster deployment used that name
+  # with a different (immutable) roleRef, which would block this apply
+  # forever on upgraded VMs. (No backticks here — this is an unquoted
+  # heredoc, where a backtick pair runs the api-server as a command.)
   name: appliance-api-server-admin
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -2054,6 +2055,26 @@ mod tests {
             assert_eq!(opens, 1, "{tag} must open once");
             assert_eq!(closes, 1, "the {tag} heredoc must terminate at column 0");
         }
+    }
+
+    #[test]
+    fn apiserver_manifest_heredoc_has_no_command_substitution() {
+        // The APIMANIFEST heredoc is unquoted (it must expand $GUEST_IP at
+        // runtime), so a backtick pair anywhere in its body runs as a
+        // command during expansion. A stray `appliance-api-server` in a
+        // comment once did exactly that — launching the server binary
+        // mid-heredoc, which never exits, so the `cat` hung and the manifest
+        // was written empty (no Service/Endpoints/token Secret → the guest
+        // control plane never became reachable). Guard the body.
+        let body = APISERVER_COMMON
+            .split_once("<<APIMANIFEST")
+            .and_then(|(_, rest)| rest.split_once("\nAPIMANIFEST"))
+            .map(|(body, _)| body)
+            .expect("APIMANIFEST heredoc present");
+        assert!(
+            !body.contains('`'),
+            "the unquoted APIMANIFEST heredoc must not contain backticks (they run as commands)"
+        );
     }
 
     #[test]
