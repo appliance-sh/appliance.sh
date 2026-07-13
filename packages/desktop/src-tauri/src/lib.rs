@@ -2416,15 +2416,16 @@ async fn wait_for_api_server_url(url: &str, max_wait: Duration) -> Result<(), St
     }
 }
 
-/// Mint an initial api key against the in-cluster api-server. Mirrors
+/// Mint an api key against an api-server's bootstrap route. Mirrors
 /// the host-side `mint_api_key` but takes the full URL instead of a
 /// loopback port — same `/bootstrap/create-key` route, same payload.
-async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, String> {
+/// `key_name` is the human label stored with the key.
+async fn mint_api_key_url(api_server_url: &str, token: &str, key_name: &str) -> Result<ApiKey, String> {
     let url = format!(
         "{}/bootstrap/create-key",
         api_server_url.trim_end_matches('/')
     );
-    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
+    let body = serde_json::json!({ "name": key_name }).to_string();
     let (ok, stdout, stderr) = run_status_command(&[
         "curl",
         "-fsS",
@@ -2490,7 +2491,7 @@ async fn bootstrap_in_cluster_api_server(
         )
     };
     wait_for_api_server_url(&api_server_url, Duration::from_secs(60)).await?;
-    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token).await?;
+    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token, "Local Runtime").await?;
     Ok(BootstrapInClusterResult {
         api_server_url,
         api_key,
@@ -3025,6 +3026,262 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             .get("message")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+    }
+}
+
+// ============================================================
+// MicroVM credential self-heal
+//
+// A microVM's api-server keeps its key store on the VM's data disk, so
+// recreating the VM silently invalidates every credential a client
+// holds — the desktop would 401 forever with no recovery path (the
+// CLI's `vm up` re-mints, but only when it runs). This command is the
+// desktop's counterpart: when the frontend sees an auth-shaped error
+// from a microVM cluster, it asks the host to verify-and-re-mint using
+// the VM's on-disk bootstrap token (~/.appliance/vm/<name>/bootstrap-token
+// — its presence proves this host owns the VM). The fresh key is
+// written to profiles.json (the CLI-shared store) and propagated to
+// the keychain + cluster registry via the existing sync path.
+// ============================================================
+
+/// Minimum spacing between mint attempts per VM. One heal per window;
+/// if the freshly minted key still fails, the banner fallback shows
+/// instead of minting in a loop.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(60);
+/// If the key WE minted is the one being rejected, the failure isn't
+/// credential-shaped (clock skew, digest mismatch, server bug) —
+/// refuse to mint again for this long so heal can't mask a real bug
+/// behind an ever-growing key store.
+const HEAL_REMINT_GUARD: Duration = Duration::from_secs(600);
+
+/// CLI-canonical profile the default VM owns. Mirrors LOCAL_PROFILE /
+/// profileForVm in packages/cli/src/utils/microvm-up.ts.
+const LOCAL_CLI_PROFILE: &str = "local";
+
+#[derive(Default, Clone)]
+struct HealRecord {
+    /// A mint is currently running for this VM.
+    in_flight: bool,
+    /// When the last mint attempt finished (success or failure).
+    last_attempt: Option<std::time::Instant>,
+    /// Key id of the last successful mint.
+    last_minted_key: Option<String>,
+}
+
+fn heal_state() -> &'static std::sync::Mutex<BTreeMap<String, HealRecord>> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, HealRecord>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[derive(Debug, PartialEq)]
+enum HealDecision {
+    /// Mint a fresh key via the bootstrap token.
+    Proceed,
+    /// The shared profile already carries a different key than the one
+    /// that failed (the CLI re-keyed) — sync it instead of minting.
+    AlreadyRekeyed,
+    /// Do nothing; the caller falls back to the auth-expired banner.
+    Skip(&'static str),
+}
+
+/// Decide whether a heal request should mint. Pure: all clock/store
+/// reads are resolved by the caller and passed in.
+fn decide_heal(
+    record: &HealRecord,
+    now: std::time::Instant,
+    failed_key_id: Option<&str>,
+    stored_key_id: Option<&str>,
+) -> HealDecision {
+    if record.in_flight {
+        return HealDecision::Skip("heal already in flight");
+    }
+    // Someone (CLI `vm up`, another window) already replaced the key
+    // the caller failed with — adopt it rather than minting yet
+    // another. Checked before the cooldown so a stale caller converges
+    // on the fresh key immediately.
+    if let (Some(failed), Some(stored)) = (failed_key_id, stored_key_id) {
+        if failed != stored {
+            return HealDecision::AlreadyRekeyed;
+        }
+    }
+    if let (Some(failed), Some(minted)) = (failed_key_id, record.last_minted_key.as_deref()) {
+        if failed == minted
+            && record
+                .last_attempt
+                .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
+        {
+            return HealDecision::Skip("freshly minted key still rejected — not credential-shaped");
+        }
+    }
+    if record
+        .last_attempt
+        .is_some_and(|at| now.duration_since(at) < HEAL_COOLDOWN)
+    {
+        return HealDecision::Skip("cooldown");
+    }
+    HealDecision::Proceed
+}
+
+/// Resolve the VM's api-server URL: the engine's reported ingress port
+/// is authoritative (ports can be reallocated across recreates), the
+/// registered cluster record is the fallback, the default-VM port the
+/// last resort.
+async fn microvm_api_url(app: &AppHandle, name: &str, cluster_id: &str) -> String {
+    if let Some(bin) = vm_binary() {
+        let bin = bin.to_string_lossy().to_string();
+        if let Ok((true, stdout, _stderr)) = run_status_command(&[&bin, "status", name]).await {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+            if let Some(port) = parsed.get("hostPort").and_then(|v| v.as_u64()) {
+                return format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, port);
+            }
+        }
+    }
+    read_persisted_config(app)
+        .ok()
+        .and_then(|cfg| {
+            cfg.clusters
+                .into_iter()
+                .find(|c| c.id == cluster_id)
+                .map(|c| c.api_server_url)
+        })
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT
+            )
+        })
+}
+
+/// Write a freshly minted VM credential into profiles.json. The
+/// default VM dual-writes the CLI-canonical `local` profile and the
+/// legacy `microvm` id the desktop's cluster registry reads — mirrors
+/// persistVmCredentials in packages/cli/src/utils/microvm-up.ts.
+/// Non-secret metadata on an existing entry is carried forward.
+fn persist_vm_profile_entry(
+    name: &str,
+    cluster_id: &str,
+    api_url: &str,
+    key: &ApiKey,
+) -> Result<(), HostError> {
+    let _guard = config_lock();
+    let mut file = read_shared_profiles().unwrap_or_default();
+    let ids: Vec<&str> = if name == MICROVM_NAME {
+        vec![LOCAL_CLI_PROFILE, MICROVM_CLUSTER_ID]
+    } else {
+        vec![cluster_id]
+    };
+    for id in ids {
+        let prev = file.profiles.get(id).cloned().unwrap_or_default();
+        file.profiles.insert(
+            id.to_string(),
+            SharedProfileEntry {
+                api_url: api_url.to_string(),
+                key_id: key.id.clone(),
+                secret: key.secret.clone(),
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+                state_backend_url: prev.state_backend_url,
+                last_bootstrap_input: prev.last_bootstrap_input,
+                managed: prev.managed.or_else(|| Some("desktop".to_string())),
+                name: prev.name,
+            },
+        );
+    }
+    write_shared_profiles(&file)
+}
+
+/// Mint + persist + propagate. Returns the new key id.
+async fn heal_mint(
+    app: &AppHandle,
+    name: &str,
+    cluster_id: &str,
+    token: &str,
+) -> Result<String, String> {
+    let api_url = microvm_api_url(app, name, cluster_id).await;
+    let key = mint_api_key_url(&api_url, token, &microvm_cluster_label(name)).await?;
+    persist_vm_profile_entry(name, cluster_id, &api_url, &key)
+        .map_err(|e| format!("persist healed credentials: {e}"))?;
+    sync_microvm_cluster(app, name).map_err(|e| format!("sync healed cluster: {e}"))?;
+    Ok(key.id)
+}
+
+/// Recover from a rejected microVM credential: re-mint via the VM's
+/// on-disk bootstrap token and persist everywhere the old key lived.
+/// Returns `true` when fresh credentials are in place (retry now),
+/// `false` when there is nothing to heal with or an attempt was made
+/// too recently (show the normal auth-expired UI).
+#[tauri::command]
+async fn microvm_heal_credentials(
+    app: AppHandle,
+    name: Option<String>,
+    failed_key_id: Option<String>,
+) -> Result<bool, String> {
+    let name = vm_name(name);
+    let cluster_id = microvm_cluster_id(&name);
+
+    // The bootstrap token is the heal credential; no token, no heal.
+    let token = home_dir()
+        .map(|h| {
+            h.join(SHARED_PROFILES_DIR)
+                .join("vm")
+                .join(&name)
+                .join("bootstrap-token")
+        })
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        return Ok(false);
+    };
+
+    let stored_key_id = read_shared_profiles()
+        .and_then(|f| f.profiles.get(&cluster_id).map(|e| e.key_id.clone()))
+        .filter(|k| !k.is_empty());
+
+    let decision = {
+        let mut st = heal_state().lock().unwrap();
+        let record = st.entry(name.clone()).or_default();
+        let decision = decide_heal(
+            record,
+            std::time::Instant::now(),
+            failed_key_id.as_deref(),
+            stored_key_id.as_deref(),
+        );
+        if decision == HealDecision::Proceed {
+            record.in_flight = true;
+        }
+        decision
+    };
+    match decision {
+        HealDecision::Skip(reason) => {
+            eprintln!("microvm heal skipped for '{name}': {reason}");
+            return Ok(false);
+        }
+        HealDecision::AlreadyRekeyed => {
+            sync_microvm_cluster(&app, &name).map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        HealDecision::Proceed => {}
+    }
+
+    let result = heal_mint(&app, &name, &cluster_id, &token).await;
+
+    {
+        let mut st = heal_state().lock().unwrap();
+        let record = st.entry(name.clone()).or_default();
+        record.in_flight = false;
+        record.last_attempt = Some(std::time::Instant::now());
+        if let Ok(key_id) = &result {
+            record.last_minted_key = Some(key_id.clone());
+        }
+    }
+    match result {
+        Ok(key_id) => {
+            eprintln!("microvm heal minted fresh credentials for '{name}' ({key_id})");
+            Ok(true)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -5099,6 +5356,7 @@ pub fn run() {
             bootstrap_in_cluster_api_server,
             microvm_list,
             microvm_status,
+            microvm_heal_credentials,
             microvm_install,
             microvm_up,
             microvm_dev_up,
@@ -5294,6 +5552,107 @@ mod tests {
         assert_eq!(
             decide_seed(&cluster, Some(&no_id), None),
             SeedDecision::NothingToSeed
+        );
+    }
+
+    // ---- microVM credential self-heal (decide_heal) --------------
+
+    use std::time::Instant;
+
+    #[test]
+    fn heal_proceeds_on_first_failure() {
+        // The core case: a dead key (matches the stored one), no prior
+        // attempt — mint.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-dead"), Some("key-dead")),
+            HealDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn heal_proceeds_without_a_stored_key() {
+        // Empty/absent profile entry (the VM-recreate case) — nothing
+        // to compare, mint.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-dead"), None),
+            HealDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn heal_adopts_an_existing_rekey_instead_of_minting() {
+        // The CLI already re-minted (stored ≠ failed): sync, don't
+        // mint — even while the cooldown from our own last mint is
+        // still running.
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(Instant::now()),
+            last_minted_key: Some("key-new".into()),
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-old"), Some("key-new")),
+            HealDecision::AlreadyRekeyed
+        );
+    }
+
+    #[test]
+    fn heal_skips_while_in_flight() {
+        let record = HealRecord {
+            in_flight: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("k"), Some("k")),
+            HealDecision::Skip("heal already in flight")
+        );
+    }
+
+    #[test]
+    fn heal_skips_during_cooldown() {
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(Instant::now()),
+            last_minted_key: None,
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("k"), Some("k")),
+            HealDecision::Skip("cooldown")
+        );
+    }
+
+    #[test]
+    fn heal_refuses_when_its_own_minted_key_is_rejected() {
+        // We minted key-new and the server rejected key-new: the 401
+        // isn't credential-shaped (clock skew, digest, server bug) —
+        // don't feed the key store.
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            // Past the 60s cooldown but inside the 10min re-mint guard.
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-new"), Some("key-new")),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn heal_proceeds_again_after_cooldown() {
+        // A later, different dead key after the windows expire (e.g.
+        // the VM was recreated twice) heals again.
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(now - HEAL_REMINT_GUARD),
+            last_minted_key: Some("key-a".into()),
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-a"), Some("key-a")),
+            HealDecision::Proceed
         );
     }
 }
