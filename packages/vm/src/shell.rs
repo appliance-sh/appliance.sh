@@ -113,6 +113,40 @@ pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option
     Ok(0)
 }
 
+/// Run a one-shot command over the shell channel with the output
+/// CAPTURED instead of streamed to stdout — for host-internal callers
+/// (the bring-up credential mint) that need to parse what the guest
+/// said. Same protocol as `run_client`'s one-shot path: handshake,
+/// command + exit-code sentinel, half-close, drain. `root` keeps the
+/// root shell (also the path that works before the appliance user is
+/// fully provisioned). Returns the guest command's exit code and the
+/// raw PTY output (echo included — callers delimit their payload).
+#[cfg(unix)]
+pub fn run_captured(name: &str, command: &str, root: bool) -> Result<(i32, String)> {
+    let mut stream = connect(name)?;
+    writeln!(stream, "rows 24 cols 80{}", if root { " root" } else { "" })?;
+    writeln!(stream, "{}; printf '\\n{}%d__END__\\n' \"$?\"\nexit", command, RC_MARK)?;
+    // Half-close so the guest shell sees EOF on stdin once the command
+    // and `exit` are consumed; then drain its output to the sentinel.
+    stream.shutdown(Shutdown::Write)?;
+    let mut out: Vec<u8> = Vec::new();
+    let code = pump_until_sentinel(&mut stream, &mut out);
+    Ok((code, String::from_utf8_lossy(&out).to_string()))
+}
+
+/// Windows: `wsl.exe` is the channel and propagates the exit code
+/// natively, so capture is a plain piped `sh -lc`.
+#[cfg(windows)]
+pub fn run_captured(name: &str, command: &str, root: bool) -> Result<(i32, String)> {
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args(["--cd", "~", "--", "sh", "-lc", command]);
+    let out = cmd.output().context("run wsl.exe")?;
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(255), text))
+}
+
 /// A reattachable tmux session, as reported by `sessions list`.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SessionInfo {
