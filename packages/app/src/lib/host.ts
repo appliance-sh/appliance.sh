@@ -426,6 +426,43 @@ export function devMachineLabel(vmName: string): string {
   return vmName === DEFAULT_MICROVM_NAME ? 'Dev Machine' : `Dev Machine (${vmName})`;
 }
 
+/** Hostname shapes that resolve to this computer — bare localhost /
+ *  loopback IPs, plus any `*.localhost` name (the VM's forwarded
+ *  api-server is reached at `api.appliance.localhost`, which resolves
+ *  to 127.0.0.1). */
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname.endsWith('.localhost')
+  );
+}
+
+/** The local VM whose forwarded api-server endpoint `apiServerUrl`
+ *  points at, or null. Detects profile-derived DUPLICATES of a microVM:
+ *  the CLI writes its own profiles (e.g. `local`) whose URL is the same
+ *  `http://api.appliance.localhost:<hostPort>` endpoint the VM itself
+ *  registers under a `microvm*` cluster id, and a bare profile ingest
+ *  surfaces both as separate clusters — one machine reading as two
+ *  targets, the duplicate mislabeled "cloud". Two entries are the same
+ *  machine when the cluster URL's host resolves to this computer AND
+ *  its port is a VM's forwarded ingress port (`hostPort` — the port the
+ *  api-server is served on). PRESENTATION ONLY: callers relabel or
+ *  collapse rows with this; which cluster object gets selected (and so
+ *  what the SDK client binds to) never changes. */
+export function microVmNameBehindUrl(
+  apiServerUrl: string,
+  vms: ReadonlyArray<Pick<MicroVmSummary, 'name' | 'hostPort'>>
+): string | null {
+  let url: URL;
+  try {
+    url = new URL(apiServerUrl);
+  } catch {
+    return null;
+  }
+  if (!isLoopbackHostname(url.hostname)) return null;
+  const port = url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80;
+  return vms.find((vm) => vm.hostPort === port)?.name ?? null;
+}
+
 /** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
  *  Ordered: media → booting → network → cluster → ready (terminal), or
  *  failed (terminal). */
