@@ -371,6 +371,7 @@ impl VmPaths {
     /// and the resident host process's parking loop acts on it. On Unix
     /// SIGTERM is the primary channel and this file is the fallback; on
     /// Windows (no SIGTERM) it is the only one. Cleared on every boot.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn stop_request(&self) -> PathBuf {
         self.dir.join("stop.request")
     }
