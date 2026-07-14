@@ -16,7 +16,9 @@ import { VERSION } from '@appliance.sh/sdk';
 // executable, delivered as a plain file.
 //
 // Resolution order:
-//   1. APPLIANCE_API_SERVER_BINARY — explicit override, copied as-is.
+//   1. APPLIANCE_API_SERVER_BINARY — explicit override, copied as-is
+//      (plus a sibling appliance-console.tar.gz when one ships next to
+//      it, as the desktop's dev staging does).
 //   2. Repo checkout — a prebuilt dist/guest binary, or a fresh
 //      `bun build --compile` when bun is available.
 //   3. GitHub release download pinned to this CLI's VERSION (the same
@@ -62,7 +64,15 @@ function repoPackagesDir(): string | null {
  */
 export async function ensureApiServerArtifacts(): Promise<void> {
   const force = process.env.APPLIANCE_REBUILD_API_SERVER === '1';
-  const stamp = `${VERSION}:${GUEST_ARCH}`;
+  const override = process.env.APPLIANCE_API_SERVER_BINARY;
+  if (override && !fs.existsSync(override)) {
+    throw new Error(`APPLIANCE_API_SERVER_BINARY points at a missing file: ${override}`);
+  }
+  // Release/repo staging is keyed by the SDK version, but an override
+  // binary changes without a version bump (desktop dev builds), so its
+  // stamp carries the source file's identity instead — a matching
+  // VERSION stamp must not keep an older staged binary in place.
+  const stamp = override ? overrideStamp(override) : `${VERSION}:${GUEST_ARCH}`;
   if (!force && fs.existsSync(stagedBinaryPath())) {
     try {
       if (fs.readFileSync(versionStampPath(), 'utf8').trim() === stamp) return;
@@ -73,13 +83,16 @@ export async function ensureApiServerArtifacts(): Promise<void> {
 
   fs.mkdirSync(guestAssetsDir(), { recursive: true });
 
-  const override = process.env.APPLIANCE_API_SERVER_BINARY;
   if (override) {
-    if (!fs.existsSync(override)) {
-      throw new Error(`APPLIANCE_API_SERVER_BINARY points at a missing file: ${override}`);
-    }
     console.log(chalk.cyan(`» staging api-server guest binary from ${override}`));
     fs.copyFileSync(override, stagedBinaryPath());
+    // Console bundle: best-effort — staged when a tarball ships next to
+    // the override binary; the API serves headless without it.
+    const consoleTar = path.join(path.dirname(override), 'appliance-console.tar.gz');
+    if (fs.existsSync(consoleTar)) {
+      fs.copyFileSync(consoleTar, stagedConsolePath());
+      console.log(chalk.dim('staged web console bundle'));
+    }
     fs.writeFileSync(versionStampPath(), stamp);
     return;
   }
@@ -91,6 +104,13 @@ export async function ensureApiServerArtifacts(): Promise<void> {
     await stageFromRelease();
   }
   fs.writeFileSync(versionStampPath(), stamp);
+}
+
+/** Size+mtime identify an override build, so a changed override
+ *  restages while an unchanged one still short-circuits. */
+function overrideStamp(override: string): string {
+  const st = fs.statSync(override);
+  return `override:${GUEST_ARCH}:${st.size}:${Math.floor(st.mtimeMs)}`;
 }
 
 async function stageFromRepo(packagesDir: string): Promise<void> {
