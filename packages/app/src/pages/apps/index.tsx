@@ -242,6 +242,13 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
             </div>
           ))}
         </div>
+      ) : !client || projectsQuery.isPending ? (
+        // The apps query is DISABLED (no SDK client — e.g. the selected
+        // cluster's signing secret is missing or an alias rebind is still
+        // converging) or hasn't produced data yet. That is NOT "zero
+        // apps": rendering the first-app CTA here misreads a machine we
+        // simply aren't connected to yet as an empty one.
+        <p className="py-16 text-center text-sm text-[var(--color-muted-foreground)]">Connecting to {clusterName}…</p>
       ) : projects.length === 0 ? (
         <EmptyApps />
       ) : (

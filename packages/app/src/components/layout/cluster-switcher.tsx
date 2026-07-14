@@ -5,29 +5,17 @@ import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
-import {
-  devMachineLabel,
-  isMicroVmClusterId,
-  microVmClusterId,
-  microVmNameBehindUrl,
-  microVmNameFromClusterId,
-} from '@/lib/host';
-import type { Cluster, MicroVmSummary } from '@/lib/host';
+import { devMachineLabel, isMicroVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { resolveDevMachineTargets } from '@/lib/dev-machine-targets';
+import type { Cluster } from '@/lib/host';
 
-/** Display name for a deploy target: anything backed by the local VM —
- *  its own `microvm*` cluster, or a CLI profile pointing at the VM's
- *  forwarded api-server port — shows as the Dev Machine; cloud
- *  installations keep their given name. */
-function targetName(cluster: Cluster, vms: MicroVmSummary[]): string {
-  const vm = vmBehindCluster(cluster, vms);
+/** Display name for a deploy target: the local VM's own `microvm*`
+ *  cluster shows as the Dev Machine; everything else keeps its given
+ *  name. Only canonical rows render here — an alias entry that folds
+ *  into a VM (see lib/dev-machine-targets.ts) never reaches this. */
+function targetName(cluster: Cluster): string {
+  const vm = microVmNameFromClusterId(cluster.id);
   return vm ? devMachineLabel(vm) : cluster.name;
-}
-
-/** The local VM a cluster entry represents, whether registered by the
- *  VM itself (`microvm*` id) or ingested from a CLI profile that points
- *  at the VM's forwarded api-server endpoint. Null for real clouds. */
-function vmBehindCluster(cluster: Cluster, vms: MicroVmSummary[]): string | null {
-  return microVmNameFromClusterId(cluster.id) ?? microVmNameBehindUrl(cluster.apiServerUrl, vms);
 }
 
 function EngineBadge({ local }: { local: boolean }) {
@@ -43,7 +31,7 @@ export function ClusterSwitcher() {
   const host = useHost();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { config, cluster } = useSelectedCluster();
+  const { config, cluster, isLoading } = useSelectedCluster();
   const clusters = config?.clusters ?? [];
 
   // Local VM inventory (ports) so profile-derived duplicates of the Dev
@@ -56,25 +44,14 @@ export function ClusterSwitcher() {
   });
   const vms = vmListQuery.data ?? [];
 
-  // Presentation-only dedupe (see microVmNameBehindUrl): a CLI profile
-  // whose URL points at a local VM's forwarded api-server port IS that
-  // VM — one machine must not list as two targets. When both entries are
-  // registered, render one row: the duplicate yields to its `microvm*`
-  // twin unless the duplicate is the current selection (then the twin
-  // yields, so the check mark never vanishes). Clicking the surviving
-  // row still selects exactly the cluster it always did — nothing about
-  // selection or the SDK client's binding changes.
-  const visibleClusters = clusters.filter((c) => {
-    const vm = vmBehindCluster(c, vms);
-    if (!vm) return true;
-    if (isMicroVmClusterId(c.id)) {
-      // The VM's own row: yield only to a selected profile duplicate.
-      return !(cluster && cluster.id !== c.id && vmBehindCluster(cluster, vms) === vm);
-    }
-    // Profile duplicate: hide when the VM's own row is also listed,
-    // unless this duplicate is the current selection.
-    return !clusters.some((t) => t.id === microVmClusterId(vm)) || c.id === cluster?.id;
-  });
+  // Canonical dedupe (see lib/dev-machine-targets.ts): a CLI profile
+  // whose URL points at a running local VM's forwarded api-server port
+  // IS that VM — one machine must not list as two targets. The alias row
+  // never renders when its `microvm*` twin exists; there's no "selected
+  // alias" special case because useSelectedCluster REBINDS an alias
+  // selection to the twin, so the check mark always lands on the
+  // surviving row and clicking it selects the working identity.
+  const { visibleClusters } = resolveDevMachineTargets(clusters, vms);
 
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
@@ -127,8 +104,10 @@ export function ClusterSwitcher() {
           open && 'bg-[var(--color-muted)]'
         )}
       >
-        <span className="font-medium">{cluster ? targetName(cluster, vms) : 'Select target'}</span>
-        {cluster ? <EngineBadge local={vmBehindCluster(cluster, vms) !== null} /> : null}
+        {/* While an alias selection is still resolving against the VM
+            inventory, show a quiet ellipsis — never the alias identity. */}
+        <span className="font-medium">{cluster ? targetName(cluster) : isLoading ? '…' : 'Select target'}</span>
+        {cluster ? <EngineBadge local={isMicroVmClusterId(cluster.id)} /> : null}
         <ChevronDown className="h-3.5 w-3.5 text-[var(--color-muted-foreground)]" />
       </button>
       {open ? (
@@ -155,7 +134,7 @@ export function ClusterSwitcher() {
                     </div>
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5 font-medium">
-                        {targetName(c, vms)} <EngineBadge local={vmBehindCluster(c, vms) !== null} />
+                        {targetName(c)} <EngineBadge local={isMicroVmClusterId(c.id)} />
                       </div>
                       <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
                         {c.apiServerUrl}
