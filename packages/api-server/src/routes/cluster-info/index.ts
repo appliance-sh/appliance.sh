@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { applianceBaseConfig, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getConsoleMode, getExternalConsoleUrl, type ConsoleMode } from '../../console-static';
+import { supportsUploadBuilds } from '../../services/build-upload.service';
 import { logger } from '../../logger';
 
 export interface ClusterInfo {
@@ -23,6 +24,20 @@ export interface ClusterInfo {
    */
   consoleMode?: ConsoleMode;
   consoleUrl?: string;
+  /**
+   * The server's own version, under the name the desktop's capability
+   * probe reads (same value as `version`, which predates it). Absent
+   * on older servers — clients must tolerate omission.
+   */
+  serverVersion: string;
+  /**
+   * What this base can do, so clients can warn up front instead of
+   * discovering it via a failed request. `uploadBuilds`: whether
+   * upload-flow (source zip) builds can run here — mirrors the gates
+   * POST /api/v1/builds enforces (409 when they fail). Absent on
+   * older servers.
+   */
+  capabilities: { uploadBuilds: boolean };
 }
 
 export const clusterInfoRoutes: Router = Router();
@@ -41,6 +56,8 @@ clusterInfoRoutes.get('/', async (req, res) => {
       baseConfig,
       consoleMode: getConsoleMode(),
       ...(externalUrl ? { consoleUrl: externalUrl } : {}),
+      serverVersion: VERSION,
+      capabilities: { uploadBuilds: supportsUploadBuilds(baseConfig) },
     };
     res.json(body);
   } catch (error) {
