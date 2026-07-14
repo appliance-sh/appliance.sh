@@ -521,8 +521,8 @@ function RuntimeDiagnostics({ defaultOpen }: { defaultOpen: boolean }) {
         </Button>
       </div>
       <p className="text-xs text-[var(--color-muted-foreground)]">
-        The same prerequisite checks as <span className="font-medium">Setup → Doctor</span> — Docker / kubectl, the
-        container runtime daemon, and a one-click start.
+        The same prerequisite checks as <span className="font-medium">Setup → Doctor</span> — kubectl for workload views
+        and pod shells, with one-click installs. Docker isn&rsquo;t required — images build server-side.
       </p>
       <DoctorPanel />
     </div>
