@@ -67,6 +67,16 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
   const startedRef = React.useRef(false);
   const handoffStartedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
+  const logBoxRef = React.useRef<HTMLDivElement | null>(null);
+
+  React.useEffect(() => {
+    // Autoscroll to tail as new lines arrive — same pattern as the Dev
+    // Machine bring-up log below.
+    if (logBoxRef.current) {
+      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+    }
+  }, [logs]);
+
   // Captured outputs of phases that have succeeded so far. Seeded
   // back into the engine on retry so phase 2 doesn't have to re-run
   // phase 1, etc.
@@ -263,7 +273,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
         <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
           Event log
         </div>
-        <div className="h-80 overflow-auto font-mono text-xs leading-relaxed">
+        <div ref={logBoxRef} className="h-80 overflow-auto font-mono text-xs leading-relaxed">
           {logs.length === 0 ? (
             <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
           ) : (
