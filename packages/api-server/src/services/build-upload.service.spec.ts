@@ -12,7 +12,8 @@ vi.mock('./storage.service', () => ({
   }),
 }));
 
-import { BuildUploadService } from './build-upload.service';
+import { BuildUploadService, MissingBuilderError, supportsUploadBuilds } from './build-upload.service';
+import { applianceBaseConfig } from '@appliance.sh/sdk';
 
 const K8S_BASE = {
   type: 'appliance-base-kubernetes',
@@ -60,6 +61,8 @@ describe('BuildUploadService.createUpload', () => {
       kubernetes: { dataDir: '/data' },
     });
     const service = new BuildUploadService();
+    // Typed so the builds route can map it to a 409 (vs generic 500).
+    await expect(service.createUpload('http://x')).rejects.toThrow(MissingBuilderError);
     await expect(service.createUpload('http://x')).rejects.toThrow(/builder/);
   });
 
@@ -71,6 +74,32 @@ describe('BuildUploadService.createUpload', () => {
     });
     const service = new BuildUploadService();
     await expect(service.createUpload('http://x')).rejects.toThrow(/removed local Docker runtime/);
+  });
+
+  // Mirrors createUpload's gates — /api/v1/cluster-info reports it as
+  // `capabilities.uploadBuilds` so clients can warn before the 409.
+  describe('supportsUploadBuilds', () => {
+    it('is true on kubernetes bases with a builder, false without', () => {
+      expect(supportsUploadBuilds(applianceBaseConfig.parse(K8S_BASE))).toBe(true);
+      expect(supportsUploadBuilds(applianceBaseConfig.parse({ ...K8S_BASE, kubernetes: { dataDir: '/data' } }))).toBe(
+        false
+      );
+    });
+
+    it('on aws bases requires only the data bucket the presigned PUT targets', () => {
+      const awsBase = (aws: Record<string, unknown>) =>
+        applianceBaseConfig.parse({ type: 'appliance-base-aws-public', name: 'cloud', aws });
+      expect(supportsUploadBuilds(awsBase({ region: 'us-east-1', zoneId: 'Z1', dataBucketName: 'b' }))).toBe(true);
+      expect(supportsUploadBuilds(awsBase({ region: 'us-east-1', zoneId: 'Z1' }))).toBe(false);
+    });
+
+    it('is false for the removed docker base', () => {
+      expect(
+        supportsUploadBuilds(
+          applianceBaseConfig.parse({ type: 'appliance-base-docker', name: 'local', docker: { dataDir: '/data' } })
+        )
+      ).toBe(false);
+    });
   });
 
   it('markUploaded stamps uploadedAt and burns the token', async () => {

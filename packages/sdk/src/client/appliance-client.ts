@@ -645,6 +645,15 @@ export class ApplianceClient {
       consoleMode?: 'full' | 'bootstrap' | 'off';
       /** Canonical console URL when hosted separately from the api-server. */
       consoleUrl?: string;
+      /** The server's own version. Absent on older servers — treat as unknown. */
+      serverVersion?: string;
+      /**
+       * What this base can do. `uploadBuilds`: whether upload-flow
+       * (source zip) builds can run here — POST /api/v1/builds 409s
+       * when they can't. Absent on older servers — treat as unknown
+       * and let the request's error responses decide.
+       */
+      capabilities?: { uploadBuilds: boolean };
     }>
   > {
     return this.request<{
@@ -652,6 +661,8 @@ export class ApplianceClient {
       baseConfig: ApplianceBaseConfig;
       consoleMode?: 'full' | 'bootstrap' | 'off';
       consoleUrl?: string;
+      serverVersion?: string;
+      capabilities?: { uploadBuilds: boolean };
     }>('GET', '/api/v1/cluster-info');
   }
 
