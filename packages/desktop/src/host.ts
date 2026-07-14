@@ -243,6 +243,9 @@ export const tauriHost: ConsoleHost = {
         async cleanupShell() {
           await invoke('microvm_dev_cleanup', { name: vm });
         },
+        healCredentials(failedKeyId?: string) {
+          return invoke<boolean>('microvm_heal_credentials', { name: vm, failedKeyId: failedKeyId ?? null });
+        },
         stop() {
           return invoke('microvm_stop', { name: vm });
         },

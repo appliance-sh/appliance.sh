@@ -656,6 +656,16 @@ export interface MicroVmInstanceHost {
   /** Sweep the debugger pods a dev/host shell leaves behind. Called
    *  when a shell terminal closes; best-effort. */
   cleanupShell(): Promise<void>;
+  /** Recover from a rejected credential: re-mint via the VM's on-disk
+   *  bootstrap token and persist it everywhere the old key lived
+   *  (profiles.json, keychain, cluster registry). `failedKeyId` is the
+   *  key the server just rejected — the host skips minting when the
+   *  store already carries a different (fresher) key. Resolves `true`
+   *  when fresh credentials are in place and the caller should retry;
+   *  `false` when there's nothing to heal with (no bootstrap token,
+   *  attempt too recent). Optional: only hosts that own local VM state
+   *  (the desktop) can heal. */
+  healCredentials?(failedKeyId?: string): Promise<boolean>;
   stop(): Promise<void>;
   /** Delete the VM and its state (stops first if needed). */
   remove(): Promise<void>;
