@@ -2568,29 +2568,49 @@ fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
 /// from unreleased main can be schema-skewed against the released
 /// guest binary.
 fn bundled_api_server_binary(app: &AppHandle) -> Option<PathBuf> {
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
+    let (arch, other_arch) = if cfg!(target_arch = "aarch64") {
+        ("arm64", "x64")
     } else {
-        "x64"
+        ("x64", "arm64")
     };
     let name = format!("appliance-api-server-linux-{arch}");
-    if let Ok(resource) = app.path().resolve(
-        &format!("apiserver-bin/{name}"),
-        tauri::path::BaseDirectory::Resource,
-    ) {
-        if resource.is_file() {
-            return Some(resource);
-        }
+    let other_name = format!("appliance-api-server-linux-{other_arch}");
+
+    let mut staging_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app
+        .path()
+        .resolve("apiserver-bin", tauri::path::BaseDirectory::Resource)
+    {
+        staging_dirs.push(resource_dir);
     }
     // Dev runs can outrace the resource copy tauri-build does at
     // compile time — fall back to the checkout's staging dir.
     #[cfg(debug_assertions)]
-    {
-        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("apiserver-bin")
-            .join(&name);
+    staging_dirs.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("apiserver-bin"));
+
+    for dir in &staging_dirs {
+        let staged = dir.join(&name);
         if staged.is_file() {
             return Some(staged);
+        }
+    }
+    // A wrong-arch staging (e.g. a Rosetta x64 Node staged `-x64` into
+    // an arm64 app) is genuinely unusable: the guest VM runs the host's
+    // arch, so a linux-x64 binary cannot boot in an arm64 VM. Never
+    // export it — warn loudly instead so the developer knows staging
+    // misfired rather than letting the release download silently
+    // resurrect the schema skew this staging exists to prevent.
+    for dir in &staging_dirs {
+        let other = dir.join(&other_name);
+        if other.is_file() {
+            eprintln!(
+                "[appliance] apiserver-bin arch mismatch: staging produced {} but this {arch} build \
+                 needs {} — ignoring it (the CLI falls back to its release download). \
+                 Re-run stage-apiserver.mjs with a {arch}-native toolchain.",
+                other.display(),
+                dir.join(&name).display()
+            );
+            return None;
         }
     }
     None

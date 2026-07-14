@@ -64,9 +64,18 @@ function repoPackagesDir(): string | null {
  */
 export async function ensureApiServerArtifacts(): Promise<void> {
   const force = process.env.APPLIANCE_REBUILD_API_SERVER === '1';
-  const override = process.env.APPLIANCE_API_SERVER_BINARY;
+  let override = process.env.APPLIANCE_API_SERVER_BINARY;
   if (override && !fs.existsSync(override)) {
-    throw new Error(`APPLIANCE_API_SERVER_BINARY points at a missing file: ${override}`);
+    // A stale export in a shell profile must not brick bring-up when
+    // valid staged artifacts (or the repo/release paths) can serve —
+    // warn loudly and proceed as if the override were unset.
+    console.warn(
+      chalk.yellow(
+        `APPLIANCE_API_SERVER_BINARY points at a missing file (${override}) — ignoring the override; ` +
+          'staging falls back to the repo build or the release download.'
+      )
+    );
+    override = undefined;
   }
   // Release/repo staging is keyed by the SDK version, but an override
   // binary changes without a version bump (desktop dev builds), so its
@@ -86,12 +95,18 @@ export async function ensureApiServerArtifacts(): Promise<void> {
   if (override) {
     console.log(chalk.cyan(`» staging api-server guest binary from ${override}`));
     fs.copyFileSync(override, stagedBinaryPath());
-    // Console bundle: best-effort — staged when a tarball ships next to
-    // the override binary; the API serves headless without it.
-    const consoleTar = path.join(path.dirname(override), 'appliance-console.tar.gz');
+    // Console bundle: staged when a tarball ships next to the override
+    // binary; the API serves headless without it. No sibling means the
+    // override build carries no console — keeping a previously staged
+    // tarball would pair an old web console with the new server (the
+    // exact skew this module exists to prevent), so drop it.
+    const consoleTar = overrideConsolePath(override);
     if (fs.existsSync(consoleTar)) {
       fs.copyFileSync(consoleTar, stagedConsolePath());
       console.log(chalk.dim('staged web console bundle'));
+    } else {
+      fs.rmSync(stagedConsolePath(), { force: true });
+      console.log(chalk.dim('no console bundle next to the override binary — the VM serves API only'));
     }
     fs.writeFileSync(versionStampPath(), stamp);
     return;
@@ -106,11 +121,27 @@ export async function ensureApiServerArtifacts(): Promise<void> {
   fs.writeFileSync(versionStampPath(), stamp);
 }
 
+/** The console tarball the desktop's dev staging ships next to the
+ *  override binary. */
+function overrideConsolePath(override: string): string {
+  return path.join(path.dirname(override), 'appliance-console.tar.gz');
+}
+
 /** Size+mtime identify an override build, so a changed override
- *  restages while an unchanged one still short-circuits. */
+ *  restages while an unchanged one still short-circuits. The sibling
+ *  console tarball's identity (or absence) is folded in so a
+ *  console-only rebuild — same binary, new tarball — restages too. */
 function overrideStamp(override: string): string {
   const st = fs.statSync(override);
-  return `override:${GUEST_ARCH}:${st.size}:${Math.floor(st.mtimeMs)}`;
+  let consolePart = 'no-console';
+  try {
+    const ct = fs.statSync(overrideConsolePath(override));
+    consolePart = `${ct.size}:${Math.floor(ct.mtimeMs)}`;
+  } catch {
+    // no sibling tarball — the stamp records its absence, so adding
+    // one later restages
+  }
+  return `override:${GUEST_ARCH}:${st.size}:${Math.floor(st.mtimeMs)}:${consolePart}`;
 }
 
 async function stageFromRepo(packagesDir: string): Promise<void> {

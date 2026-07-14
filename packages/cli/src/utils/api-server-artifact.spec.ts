@@ -21,6 +21,7 @@ describe('ensureApiServerArtifacts with APPLIANCE_API_SERVER_BINARY', () => {
   let work: string;
 
   const staged = () => path.join(guestAssetsDir(), 'appliance-api-server');
+  const stagedConsole = () => path.join(guestAssetsDir(), 'appliance-console.tar.gz');
   const stampFile = () => path.join(guestAssetsDir(), 'appliance-api-server.version');
 
   function overrideBinary(content: string): string {
@@ -34,6 +35,7 @@ describe('ensureApiServerArtifacts with APPLIANCE_API_SERVER_BINARY', () => {
     work = fs.mkdtempSync(path.join(os.tmpdir(), 'api-server-artifact-work-'));
     state.home = home;
     vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -43,9 +45,19 @@ describe('ensureApiServerArtifacts with APPLIANCE_API_SERVER_BINARY', () => {
     vi.restoreAllMocks();
   });
 
-  it('throws when the override points at a missing file', async () => {
+  it('warns and falls back when the override points at a missing file', async () => {
+    // A stale export in a shell profile must not brick bring-up when
+    // valid staged artifacts exist — the override is ignored and the
+    // matching VERSION stamp short-circuits.
+    fs.mkdirSync(guestAssetsDir(), { recursive: true });
+    fs.writeFileSync(staged(), 'previously-staged');
+    fs.writeFileSync(stampFile(), `${VERSION}:${GUEST_ARCH}`);
     process.env.APPLIANCE_API_SERVER_BINARY = path.join(work, 'nope');
-    await expect(ensureApiServerArtifacts()).rejects.toThrow(/missing file/);
+
+    await expect(ensureApiServerArtifacts()).resolves.toBeUndefined();
+
+    expect(fs.readFileSync(staged(), 'utf8')).toBe('previously-staged');
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(path.join(work, 'nope')));
   });
 
   it('restages over a VERSION-stamped staged binary (stamp bypass)', async () => {
@@ -86,6 +98,33 @@ describe('ensureApiServerArtifacts with APPLIANCE_API_SERVER_BINARY', () => {
 
     await ensureApiServerArtifacts();
 
-    expect(fs.readFileSync(path.join(guestAssetsDir(), 'appliance-console.tar.gz'), 'utf8')).toBe('tar-bytes');
+    expect(fs.readFileSync(stagedConsole(), 'utf8')).toBe('tar-bytes');
+  });
+
+  it('drops a previously staged console tarball when the override has no sibling', async () => {
+    // A release download left a console tar behind — keeping it would
+    // pair an old web console with the new override server.
+    fs.mkdirSync(guestAssetsDir(), { recursive: true });
+    fs.writeFileSync(stagedConsole(), 'old-release-console');
+    process.env.APPLIANCE_API_SERVER_BINARY = overrideBinary('bin');
+
+    await ensureApiServerArtifacts();
+
+    expect(fs.existsSync(stagedConsole())).toBe(false);
+  });
+
+  it('restages on a console-only rebuild (unchanged override binary)', async () => {
+    const tar = path.join(work, 'appliance-console.tar.gz');
+    fs.writeFileSync(tar, 'console-one');
+    process.env.APPLIANCE_API_SERVER_BINARY = overrideBinary('bin');
+    await ensureApiServerArtifacts();
+
+    // Only the tarball changes (new size + mtime) — the binary stamp
+    // alone would short-circuit and keep the stale console.
+    fs.writeFileSync(tar, 'console-two!');
+    fs.utimesSync(tar, new Date(), new Date(Date.now() + 5000));
+    await ensureApiServerArtifacts();
+
+    expect(fs.readFileSync(stagedConsole(), 'utf8')).toBe('console-two!');
   });
 });

@@ -30,8 +30,20 @@ const repoRoot = path.resolve(desktopRoot, '..', '..');
 const stagingDir = path.join(desktopRoot, 'src-tauri', 'apiserver-bin');
 
 // The microVM's guest arch follows the host arch — mirrors GUEST_ARCH
-// in api-server-artifact.ts (arm64 on Apple Silicon).
-const guestArch = process.arch === 'arm64' ? 'arm64' : 'x64';
+// in api-server-artifact.ts (arm64 on Apple Silicon). process.arch
+// reports the *Node* binary's arch, which lies under Rosetta: an x64
+// Node on Apple Silicon says 'x64' while the app (and the VM) target
+// arm64, so the Rust lookup would never find the staged file. Ask the
+// hardware directly on macOS; hw.optional.arm64 is '1' on Apple
+// Silicon even under translation, and absent on Intel Macs.
+function hostArch() {
+  if (process.platform === 'darwin') {
+    const r = spawnSync('sysctl', ['-n', 'hw.optional.arm64'], { encoding: 'utf8' });
+    if (!r.error && r.status === 0 && r.stdout.trim() === '1') return 'arm64';
+  }
+  return process.arch === 'arm64' ? 'arm64' : 'x64';
+}
+const guestArch = hostArch();
 const binName = `appliance-api-server-linux-${guestArch}`;
 
 function newestMtimeMs(dir) {
