@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link, Navigate, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueries, useQueryClient } from '@tanstack/react-query';
-import { Plus, Search, Trash2 } from 'lucide-react';
+import { Plus, Rocket, Search, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
 import { FriendlyError } from '@/components/friendly-error';
@@ -165,8 +165,16 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
               className="h-9 w-56 rounded-md border border-[var(--color-border)] bg-transparent pl-8 pr-3 text-sm placeholder:text-[var(--color-muted-foreground)] focus:border-[var(--color-border-strong)] focus:outline-none"
             />
           </div>
+          {/* Deploy is the primary action — the wizard find-or-creates the
+              app + environment and deploys in one flow. "New app" (a bare
+              app record, no deploy) stays as the secondary path. */}
+          <Button asChild>
+            <Link to="/projects/deploy">
+              <Rocket className="h-4 w-4" /> Deploy an app
+            </Link>
+          </Button>
           {!creating ? (
-            <Button onClick={() => setCreating(true)}>
+            <Button variant="outline" onClick={() => setCreating(true)}>
               <Plus className="h-4 w-4" /> New app
             </Button>
           ) : null}

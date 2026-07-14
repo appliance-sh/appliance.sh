@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link, Navigate, useNavigate, useParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, ExternalLink, Trash2 } from 'lucide-react';
+import { ChevronLeft, ExternalLink, Rocket, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -131,6 +131,14 @@ export function ProjectDetailPage() {
               ) : null}
             </div>
             <div className="flex gap-2">
+              {/* Deploy via the wizard with this app preset — same
+                  `?project=<name>` param the environment detail page
+                  sends (the wizard reads it via useSearchParams). */}
+              <Button asChild>
+                <Link to={`/projects/deploy?project=${encodeURIComponent(project.name)}`}>
+                  <Rocket className="h-4 w-4" /> Deploy
+                </Link>
+              </Button>
               <Button variant="destructive" onClick={onDelete} disabled={deleteMutation.isPending}>
                 <Trash2 className="h-4 w-4" />
                 {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
