@@ -41,11 +41,13 @@ buildRoutes.post('/', async (req, res) => {
       return;
     }
     logger.error('create build failed', error, { requestId: req.requestId });
-    // `detail` + `requestId` let a client surface something actionable
-    // (and quotable against the server log) instead of a bare 500.
+    // Unexpected faults stay opaque: raw error messages can carry
+    // internals (paths, bucket names, endpoints) that don't belong in a
+    // response body — `requestId` is the quotable handle into the
+    // server log. Known preconditions get their own status + message
+    // above.
     res.status(500).json({
       error: 'Failed to create build',
-      detail: error instanceof Error ? error.message : String(error),
       requestId: req.requestId,
     });
   }

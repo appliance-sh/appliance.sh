@@ -16,6 +16,7 @@ import type {
 } from '@/lib/host';
 import type { AwsWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
 import { microVmClusterId } from '@/lib/host';
+import { useTailAutoscroll } from '@/hooks/use-tail-autoscroll';
 import { cn } from '@/lib/utils';
 
 type PhaseState = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -67,15 +68,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
   const startedRef = React.useRef(false);
   const handoffStartedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
-  const logBoxRef = React.useRef<HTMLDivElement | null>(null);
-
-  React.useEffect(() => {
-    // Autoscroll to tail as new lines arrive — same pattern as the Dev
-    // Machine bring-up log below.
-    if (logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [logs]);
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLDivElement>([logs]);
 
   // Captured outputs of phases that have succeeded so far. Seeded
   // back into the engine on retry so phase 2 doesn't have to re-run
@@ -273,7 +266,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
         <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
           Event log
         </div>
-        <div ref={logBoxRef} className="h-80 overflow-auto font-mono text-xs leading-relaxed">
+        <div ref={logBoxRef} onScroll={onLogScroll} className="h-80 overflow-auto font-mono text-xs leading-relaxed">
           {logs.length === 0 ? (
             <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
           ) : (
@@ -432,16 +425,10 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // setReached/setOutcome post-unmount.
   const liveRef = React.useRef(false);
   const timerRef = React.useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  const logBoxRef = React.useRef<HTMLDivElement | null>(null);
-
-  React.useEffect(() => {
-    // Autoscroll to tail as new lines arrive — the longest rung streams
-    // for minutes, and a pane pinned to the head shows stale early lines.
-    // `showLog` is a dep so re-expanding the pane also lands on the tail.
-    if (logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [logs, showLog]);
+  // Tail the stream (the longest rung streams for minutes) without
+  // fighting a user who scrolled up to read an earlier line. `showLog`
+  // is a dep so re-expanding the pane also lands on the tail.
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLDivElement>([logs, showLog]);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
     logIdRef.current += 1;
@@ -629,6 +616,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         {showLog ? (
           <div
             ref={logBoxRef}
+            onScroll={onLogScroll}
             className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed"
           >
             {logs.length === 0 ? (

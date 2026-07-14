@@ -69,8 +69,8 @@ describe('POST /api/v1/builds', () => {
     });
   });
 
-  it('500s with detail + requestId on unexpected failures', async () => {
-    mockBuildUploadService.createUpload.mockRejectedValue(new Error('storage exploded'));
+  it('500s with requestId but never the raw error on unexpected failures', async () => {
+    mockBuildUploadService.createUpload.mockRejectedValue(new Error('s3://internal-bucket/path exploded'));
 
     const res = await request(createTestApp())
       .post('/api/v1/builds')
@@ -78,9 +78,10 @@ describe('POST /api/v1/builds', () => {
       .send({ type: BuildType.Upload });
 
     expect(res.status).toBe(500);
+    // Raw messages can leak internals (paths, buckets, endpoints) —
+    // the body must stay opaque; requestId is the log correlation key.
     expect(res.body).toEqual({
       error: 'Failed to create build',
-      detail: 'storage exploded',
       requestId: REQUEST_ID,
     });
   });

@@ -21,6 +21,7 @@ import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
+import { useTailAutoscroll } from '@/hooks/use-tail-autoscroll';
 import { cn } from '@/lib/utils';
 import {
   DEFAULT_MICROVM_NAME,
@@ -208,14 +209,7 @@ export function DeployPage() {
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [runError, setRunError] = React.useState<RunFailure | null>(null);
   const [resultUrl, setResultUrl] = React.useState<string | null>(null);
-  const logBoxRef = React.useRef<HTMLPreElement | null>(null);
-
-  React.useEffect(() => {
-    // Autoscroll to tail as new lines arrive.
-    if (logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [logs]);
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLPreElement>([logs]);
 
   // ============================================================
   // Step 1 — pick a folder, read its manifest.
@@ -536,6 +530,7 @@ export function DeployPage() {
           runStatus={runStatus}
           logs={logs}
           logBoxRef={logBoxRef}
+          onLogScroll={onLogScroll}
           error={runError}
           resultUrl={resultUrl}
           onRetry={runDeploy}
@@ -1072,6 +1067,7 @@ function RunStep({
   runStatus,
   logs,
   logBoxRef,
+  onLogScroll,
   error,
   resultUrl,
   onRetry,
@@ -1080,6 +1076,7 @@ function RunStep({
   runStatus: RunStatus;
   logs: LogLine[];
   logBoxRef: React.RefObject<HTMLPreElement | null>;
+  onLogScroll: (event: React.UIEvent<HTMLPreElement>) => void;
   error: RunFailure | null;
   resultUrl: string | null;
   onRetry: () => void;
@@ -1094,6 +1091,7 @@ function RunStep({
 
       <pre
         ref={logBoxRef}
+        onScroll={onLogScroll}
         className="max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-[var(--color-border)] bg-black/40 p-3 font-mono text-[11px] leading-relaxed"
       >
         {logs.length === 0 ? (
