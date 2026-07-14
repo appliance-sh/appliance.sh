@@ -11,11 +11,13 @@ mod egress;
 mod guest;
 #[cfg_attr(windows, allow(dead_code))]
 mod images;
+mod mint;
 mod mitm;
 #[cfg_attr(windows, allow(dead_code))]
 mod net;
 #[cfg_attr(windows, allow(dead_code))]
 mod netstack;
+mod profiles;
 mod shell;
 mod spec;
 mod store;
@@ -672,6 +674,12 @@ fn run() -> Result<()> {
             if let Err(e) = egress::spawn(&name, egress_addr, false) {
                 eprintln!("warn: egress proxy not started ({e:#}); `appliance vm egress proxy` still works");
             }
+            // The engine owns the FIRST api key: mint one at bring-up
+            // (over the vsock shell, before k3s is even up) whenever the
+            // guest key store or the host profile is missing, so an
+            // engine-only start never strands clients on a dead
+            // credential. No-op when the api-server isn't staged.
+            mint::spawn_bringup_mint(&spec);
             let result = backend.run_foreground(&spec);
             store::clear_pidfile(&name);
             result
