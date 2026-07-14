@@ -422,6 +422,16 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // setReached/setOutcome post-unmount.
   const liveRef = React.useRef(false);
   const timerRef = React.useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const logBoxRef = React.useRef<HTMLDivElement | null>(null);
+
+  React.useEffect(() => {
+    // Autoscroll to tail as new lines arrive — the longest rung streams
+    // for minutes, and a pane pinned to the head shows stale early lines.
+    // `showLog` is a dep so re-expanding the pane also lands on the tail.
+    if (logBoxRef.current) {
+      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+    }
+  }, [logs, showLog]);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
     logIdRef.current += 1;
@@ -607,7 +617,10 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
           <span>{showLog ? 'Hide' : 'Show'}</span>
         </button>
         {showLog ? (
-          <div className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed">
+          <div
+            ref={logBoxRef}
+            className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed"
+          >
             {logs.length === 0 ? (
               <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
             ) : (
