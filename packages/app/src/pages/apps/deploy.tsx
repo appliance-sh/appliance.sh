@@ -23,14 +23,8 @@ import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
 import { useTailAutoscroll } from '@/hooks/use-tail-autoscroll';
 import { cn } from '@/lib/utils';
-import {
-  DEFAULT_MICROVM_NAME,
-  devMachineLabel,
-  isMicroVmClusterId,
-  microVmClusterId,
-  microVmNameBehindUrl,
-  microVmNameFromClusterId,
-} from '@/lib/host';
+import { DEFAULT_MICROVM_NAME, devMachineLabel, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { resolveDevMachineTargets } from '@/lib/dev-machine-targets';
 import type { Cluster, LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
@@ -91,13 +85,16 @@ export function DeployPage() {
   const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
 
   // The wizard deploys into the *selected* cluster (the SDK client is
-  // bound to it). The local runtime is a microVM, so when the selection
-  // is a microVM we gate readiness on that VM being up — surfaced up
-  // front since the wizard is reachable while the VM is down (deep
-  // links, or the user stopped it mid-session). A non-microVM selection
-  // is a cloud / BYO cluster the client already targets. Query keys are
-  // shared with the Clusters area so the two views never disagree.
-  const { cluster: selectedCluster, config } = useSelectedCluster();
+  // bound to it). The selection arrives ALREADY resolved: a CLI-profile
+  // alias of a running local VM reads as the VM's own `microvm*` cluster
+  // (useSelectedCluster rebinds it), so "is this a microVM target?" is
+  // answerable from the cluster id alone. When it is one, readiness is
+  // gated on that VM being up — surfaced up front since the wizard is
+  // reachable while the VM is down (deep links, or the user stopped it
+  // mid-session). A non-microVM selection is a cloud / BYO cluster the
+  // client already targets. Query keys are shared with the Clusters area
+  // so the two views never disagree.
+  const { cluster: selectedCluster, config, isLoading: selectionLoading } = useSelectedCluster();
   const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
   const isMicroVmTarget = vmName !== null;
   const vmQuery = useQuery({
@@ -108,14 +105,13 @@ export function DeployPage() {
   });
   const vmUp = Boolean(vmQuery.data?.running && vmQuery.data?.kubeconfigReady);
   const targetUp = isMicroVmTarget ? vmUp : Boolean(client);
-  const targetLoading = isMicroVmTarget ? vmQuery.isLoading : false;
+  const targetLoading = selectionLoading || (isMicroVmTarget ? vmQuery.isLoading : false);
   const readyToDeploy = targetUp && Boolean(client);
 
   // Local VM inventory — same query key TargetStep and the Machine page
-  // poll, so the cache is shared. Needed page-wide for two things:
-  // recognising a profile-derived duplicate of the Dev Machine (the
-  // labels below) and deciding the one-time auto-skip before the target
-  // step ever renders.
+  // poll, so the cache is shared. Needed page-wide to decide the one-time
+  // auto-skip (the canonical target count folds Dev Machine aliases away)
+  // before the target step ever renders.
   const vmListQuery = useQuery({
     queryKey: ['microvm', 'list'],
     enabled: Boolean(host.vm),
@@ -124,14 +120,7 @@ export function DeployPage() {
   });
   const vms = vmListQuery.data ?? [];
 
-  // A non-microVM selection can still BE the Dev Machine: a CLI profile
-  // (e.g. `local`) pointing at the VM's forwarded api-server port is the
-  // same endpoint under another name (see microVmNameBehindUrl). This is
-  // presentation only — readiness gating, packaging, and the SDK client
-  // keep following the selection object exactly as before.
-  const vmAlias = selectedCluster && !isMicroVmTarget ? microVmNameBehindUrl(selectedCluster.apiServerUrl, vms) : null;
-  const presentedVm = vmName ?? vmAlias;
-  const targetLabel = selectedCluster ? (presentedVm ? devMachineLabel(presentedVm) : selectedCluster.name) : null;
+  const targetLabel = selectedCluster ? (vmName ? devMachineLabel(vmName) : selectedCluster.name) : null;
 
   // Q5: the wizard opens on the TARGET step so the first decision is always
   // "where does this deploy?". A user with a ready runtime confirms + clicks
@@ -140,31 +129,30 @@ export function DeployPage() {
 
   // …unless there's nothing to decide: exactly ONE distinct ready target
   // ⇒ start on Pick folder (Back still returns to the target step).
-  // "Distinct" counts real clouds plus local VMs — a profile duplicate
-  // of a VM is the same machine, and counting it would force a first-run
-  // user to choose between two names for the one machine they set up.
-  // Decided ONCE, on the first render where the cluster list, the VM
-  // inventory, and the readiness probe have all answered — never
-  // re-evaluated, so going Back doesn't bounce the user forward again.
-  // Multiple targets, or a single target that isn't ready (a stopped VM
-  // needing the inline start), still land on the target step.
+  // "Distinct" counts canonical targets (lib/dev-machine-targets.ts) —
+  // an alias of a running VM folds into that VM, and counting it would
+  // force a first-run user to choose between two names for the one
+  // machine they set up. Decided ONCE, on the first render where the
+  // cluster list, the VM inventory, the selection resolution, and the
+  // readiness probe have all answered — never re-evaluated, so going
+  // Back doesn't bounce the user forward again. Multiple targets, or a
+  // single target that isn't ready (a stopped VM needing the inline
+  // start), still land on the target step.
   const autoSkipDecided = React.useRef(false);
   React.useEffect(() => {
     if (autoSkipDecided.current) return;
-    if (!config) return;
+    if (!config || selectionLoading) return;
     if (host.vm && !vmListQuery.data) return;
     if (isMicroVmTarget && vmQuery.isLoading) return;
     autoSkipDecided.current = true;
-    const cloudTargets = config.clusters.filter(
-      (c) => !isMicroVmClusterId(c.id) && !microVmNameBehindUrl(c.apiServerUrl, vms)
-    );
+    const { cloudClusters } = resolveDevMachineTargets(config.clusters, vms);
     // Mirrors TargetStep's runtime list: the canonical VM is always
     // offered (even before it's created), plus any the engine reports.
     const runtimeTargets = host.vm ? new Set([DEFAULT_MICROVM_NAME, ...vms.map((v) => v.name)]).size : 0;
-    if (cloudTargets.length + runtimeTargets === 1 && readyToDeploy) {
+    if (cloudClusters.length + runtimeTargets === 1 && readyToDeploy) {
       setPhase('pick');
     }
-  }, [config, host.vm, isMicroVmTarget, readyToDeploy, vmListQuery.data, vmQuery.isLoading, vms]);
+  }, [config, host.vm, isMicroVmTarget, readyToDeploy, selectionLoading, vmListQuery.data, vmQuery.isLoading, vms]);
 
   // Capability preflight: newer api-servers advertise what they can do
   // on GET /api/v1/cluster-info — `capabilities.uploadBuilds: false`
@@ -447,19 +435,35 @@ export function DeployPage() {
       {/* Capability preflight — the selected control plane said it can't
           accept source-build uploads. Rendered only where it bites (the
           configure/run steps); older servers that don't report
-          capabilities are assumed capable and never see this. */}
+          capabilities are assumed capable and never see this. The
+          remediation depends on the target: a Dev Machine's guest binary
+          genuinely updates on restart (banner + hard-disable below), but
+          a BYO kubernetes cluster just has no builder configured — that's
+          an info state with a remote-image alternative, and the button
+          stays enabled (the server's 409 carries the same remediation as
+          the backstop). */}
       {(phase === 'configure' || phase === 'run') && sourceBuildsUnsupported ? (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>
-            The Dev Machine&apos;s control plane doesn&apos;t support source builds — it&apos;s likely older than this
-            app. Restart the Dev Machine from the{' '}
-            <Link to="/machine" className="underline">
-              Machine page
-            </Link>{' '}
-            to update it, then retry here.
-          </span>
-        </div>
+        isMicroVmTarget ? (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              The Dev Machine&apos;s control plane doesn&apos;t support source builds — it&apos;s likely older than this
+              app. Restart the Dev Machine from the{' '}
+              <Link to="/machine" className="underline">
+                Machine page
+              </Link>{' '}
+              to update it, then retry here.
+            </span>
+          </div>
+        ) : (
+          <div className="space-y-2 rounded-md border border-cyan-500/40 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-200">
+            <p>
+              No build system is configured on this target, so it can&apos;t build the uploaded source into an image.
+              You can deploy a prebuilt image from a terminal instead:
+            </p>
+            <CommandSnippet command="appliance deploy --image-uri <registry>/<image>:<tag>" />
+          </div>
+        )
       ) : null}
 
       {presetProject || presetEnvironment ? (
@@ -521,7 +525,9 @@ export function DeployPage() {
             setPhase('run');
             void runDeploy();
           }}
-          canNext={canRun && readyToDeploy && !sourceBuildsUnsupported}
+          // Hard-block only the Dev Machine (restart genuinely fixes it);
+          // a builder-less BYO target keeps the button — see the banner.
+          canNext={canRun && readyToDeploy && !(isMicroVmTarget && sourceBuildsUnsupported)}
         />
       ) : null}
 
@@ -576,22 +582,15 @@ function TargetStep({
   });
   const vms = vmListQuery.data ?? [];
 
-  // Presentation-only dedupe (see microVmNameBehindUrl): a CLI profile
-  // whose URL points at a local VM's forwarded api-server port IS that
-  // VM — one machine must not read as two targets, the duplicate
-  // mislabeled "cloud". The duplicate drops out of the cloud list and
-  // folds into the VM's row, which reads selected when EITHER entry is
-  // the selection. Clicking Select keeps selecting the same ids it
-  // always did — what the SDK client binds to never changes here.
-  const selectedVmAlias =
-    selectedCluster && !isMicroVmClusterId(selectedCluster.id)
-      ? microVmNameBehindUrl(selectedCluster.apiServerUrl, vms)
-      : null;
-  const selectedVm = vmName ?? selectedVmAlias;
-  const selectedLabel = selectedCluster ? (selectedVm ? devMachineLabel(selectedVm) : selectedCluster.name) : null;
-  const cloudClusters = (config?.clusters ?? []).filter(
-    (c) => !isMicroVmClusterId(c.id) && !microVmNameBehindUrl(c.apiServerUrl, vms)
-  );
+  // Canonical dedupe (see lib/dev-machine-targets.ts): a CLI profile
+  // whose URL points at a running local VM's forwarded api-server port
+  // IS that VM — one machine must not read as two targets, the duplicate
+  // mislabeled "cloud". The alias folds out of the cloud list into the
+  // VM's row; and because useSelectedCluster REBINDS an alias selection
+  // to the `microvm*` twin, `selectedCluster.id` is always the canonical
+  // id — the VM row's selected state needs no alias special case.
+  const selectedLabel = selectedCluster ? (vmName ? devMachineLabel(vmName) : selectedCluster.name) : null;
+  const { cloudClusters } = resolveDevMachineTargets(config?.clusters ?? [], vms);
   const runtimeNames = React.useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
@@ -695,7 +694,7 @@ function TargetStep({
                   name={name}
                   sub={id}
                   kind="dev machine"
-                  selected={selectedCluster?.id === id || selectedVmAlias === name}
+                  selected={selectedCluster?.id === id}
                   stateLabel={state}
                   onSelect={() => void selectTarget(id)}
                 />
