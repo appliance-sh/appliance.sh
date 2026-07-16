@@ -5,6 +5,7 @@ import { runFixes, runPreflight } from './utils/preflight.js';
 import type { CheckResult, FixOutcome, PreflightReport } from './utils/preflight.js';
 import { runRuntimeDoctor } from './utils/runtime-doctor.js';
 import type { RuntimeDoctorReport, RuntimeFinding, RuntimeFixOutcome } from './utils/runtime-doctor.js';
+import { writeSupportBundle } from './utils/doctor-bundle.js';
 
 // `appliance doctor` — reliability diagnostics in two sections:
 //
@@ -31,7 +32,11 @@ program
   .option('--fix', 'auto-resolve the checks doctor can safely fix (pull binaries, re-mint a dead key, …)', false)
   .option('--json', 'emit the report as JSON instead of a checklist', false)
   .option('--vm <name>', 'microVM whose runtime to diagnose', 'appliance')
-  .action(async (opts: { fix: boolean; json: boolean; vm: string }) => {
+  .option(
+    '--bundle [path]',
+    'also write a REDACTED support tarball (report + env + VM state + scrubbed log tails; no secrets)'
+  )
+  .action(async (opts: { fix: boolean; json: boolean; vm: string; bundle?: string | boolean }) => {
     let report = await runPreflight();
 
     let fixes: FixOutcome[] = [];
@@ -50,6 +55,25 @@ program
       printJson(report, fixes, runtime);
     } else {
       printChecklist(report, fixes, runtime);
+    }
+
+    if (opts.bundle !== undefined && opts.bundle !== false) {
+      try {
+        const tarball = await writeSupportBundle({
+          vm: opts.vm,
+          report: reportJson(report, fixes, runtime),
+          ...(typeof opts.bundle === 'string' ? { outPath: opts.bundle } : {}),
+        });
+        console.log();
+        console.log(`${chalk.green('✓')} support bundle written to ${chalk.bold(tarball)}`);
+        console.log(
+          chalk.dim(
+            '  redacted: no API secrets, bootstrap tokens, captured credentials, or kubeconfig certs are included'
+          )
+        );
+      } catch (err) {
+        console.error(chalk.red(`support bundle failed: ${err instanceof Error ? err.message : String(err)}`));
+      }
     }
 
     if (!report.ok || !runtime.ok) process.exit(1);
@@ -131,17 +155,15 @@ function printChecklist(report: PreflightReport, fixes: FixOutcome[], runtime: R
   }
 }
 
+function reportJson(report: PreflightReport, fixes: FixOutcome[], runtime: RuntimeDoctorReport): unknown {
+  return {
+    ok: report.ok && runtime.ok,
+    checks: report.results,
+    fixes,
+    runtime,
+  };
+}
+
 function printJson(report: PreflightReport, fixes: FixOutcome[], runtime: RuntimeDoctorReport): void {
-  console.log(
-    JSON.stringify(
-      {
-        ok: report.ok && runtime.ok,
-        checks: report.results,
-        fixes,
-        runtime,
-      },
-      null,
-      2
-    )
-  );
+  console.log(JSON.stringify(reportJson(report, fixes, runtime), null, 2));
 }
