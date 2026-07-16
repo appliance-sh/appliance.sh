@@ -204,6 +204,38 @@ fn spawn_netstack_accept_loop(
     });
 }
 
+/// One short-timeout HTTP probe, returning the body on a 2xx answer and
+/// `None` otherwise. The polling building block for the bring-up
+/// progress handoff (the guest's grippable /progress markers).
+pub fn http_get_text(url: &str) -> Option<String> {
+    ureq::get(url)
+        .timeout(Duration::from_secs(2))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+}
+
+/// Probe an HTTP endpoint through a localhost forward while routing by
+/// NAME: the explicit `Host` header drives traefik's name-based routing
+/// without depending on the host resolver knowing `*.appliance.localhost`.
+pub fn wait_http_host(url: &str, host_header: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ok = ureq::get(url)
+            .set("Host", host_header)
+            .timeout(Duration::from_secs(2))
+            .call()
+            .is_ok();
+        if ok {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("{url} (Host: {host_header}) not answering within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Probe an HTTP endpoint until it answers anything at all.
 pub fn wait_http(url: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;

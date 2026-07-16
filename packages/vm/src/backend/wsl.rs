@@ -735,18 +735,10 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
         return Ok(());
     }
 
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{guest_ip}:{}/k3s.yaml", crate::guest::KUBECONFIG_PORT);
-    crate::net::wait_http(&handoff, Duration::from_secs(600))?;
-    let kubeconfig =
-        crate::net::fetch_kubeconfig(guest_ip, crate::guest::KUBECONFIG_PORT, spec.api_port)?;
-    std::fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    crate::bringup::hostlog(&format!(
-        "kubeconfig written to {}",
-        vm_dir.join("kubeconfig.yaml").display()
-    ));
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
-    Ok(())
+    // Shared with the vz backend: honest cluster sub-phases off the
+    // guest's /progress markers, and `Ready` only once the kubeconfig,
+    // registry, and (when staged) api-server route actually answer.
+    crate::guest::wait_platform_ready(spec, vm_dir, guest_ip, crate::guest::KUBECONFIG_PORT)
 }
 
 /// Poll `ip addr show eth0` inside the distro until the WSL NAT lease

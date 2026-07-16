@@ -314,6 +314,16 @@ chmod +x /usr/local/bin/k3s
 pub(crate) const K3S_COMMON: &str = r#"
 mkdir -p "$PERSIST/k3s" /etc/rancher/k3s
 
+# --- bring-up progress handoff ---------------------------------------
+# Serve /srv/handoff from the START of the k3s block, not once k3s.yaml
+# exists: the host polls /progress to advance honest sub-phases through
+# the long "cluster" window, and later fetches /k3s.yaml off the same
+# httpd. Grippable markers only — the host never scrapes console echo.
+mkdir -p /srv/handoff
+: > /srv/handoff/progress
+httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+echo base-system-ready >> /srv/handoff/progress
+
 # containerd pull-through: image refs pushed from the host as
 # localhost:__REGISTRY_HOST_PORT__/<name> resolve to the in-VM registry's
 # NodePort. Read by k3s at startup.
@@ -386,14 +396,13 @@ RMANIFEST
   >/var/log/k3s.log 2>&1 &
 
 # --- kubeconfig handoff ----------------------------------------------
-# Serve the admin kubeconfig on the shared (host-only reachable) NAT
-# network once k3s writes it. The host rewrites the server address to
-# its forwarded localhost port.
-mkdir -p /srv/handoff
+# Publish the admin kubeconfig into the already-running handoff httpd
+# once k3s writes it, and mark the API up for the progress poller. The
+# host rewrites the server address to its forwarded localhost port.
 (
   while [ ! -s /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
   cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml
-  httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+  echo k3s-api-up >> /srv/handoff/progress
 ) &
 "#;
 
@@ -1616,18 +1625,93 @@ pub fn host_services(
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
     ));
 
-    // The guest serves its kubeconfig only after k3s has written it —
-    // first boot includes apk installs + image pulls, so be generous.
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
-    crate::net::wait_http(&handoff, Duration::from_secs(600))?;
+    wait_platform_ready(spec, vm_dir, handoff_host, handoff_port)
+}
+
+/// Drive the honest cluster sub-phases through the long "cluster" window
+/// and only declare `Ready` once the platform actually answers:
+/// kubeconfig fetched, the in-VM registry's `/v2/` reachable through its
+/// host forward, and — when the media carried the api-server — its
+/// traefik route answering. Backend-neutral (plain HTTP polling of
+/// host-reachable endpoints): the vz and WSL host services both end here.
+pub(crate) fn wait_platform_ready(
+    spec: &crate::spec::VmSpec,
+    vm_dir: &Path,
+    handoff_host: std::net::IpAddr,
+    handoff_port: u16,
+) -> Result<()> {
+    use crate::bringup::{hostlog, set, Phase};
+    use std::time::{Duration, Instant};
+
+    // Publish the coarse phase FIRST: older desktops ignore the unknown
+    // sub-phases below, so `cluster` is what keeps their ladder moving.
+    set(vm_dir, Phase::Cluster, None);
+
+    // Poll the guest's grippable /progress markers to advance sub-phases
+    // while waiting on the k3s API — same 600s cold budget the plain
+    // k3s.yaml wait had (first boot installs packages / imports images).
+    let progress_url = format!("http://{handoff_host}:{handoff_port}/progress");
+    let kubeconfig_url = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut node_seen = false;
+    let mut images_seen = false;
+    loop {
+        if let Some(progress) = crate::net::http_get_text(&progress_url) {
+            if !node_seen && progress.contains("base-system-ready") {
+                set(vm_dir, Phase::ClusterNode, None);
+                hostlog("guest base system up");
+                node_seen = true;
+            }
+            if !images_seen && progress.contains("images-imported") {
+                set(vm_dir, Phase::ClusterImages, Some("airgap tarball staged".into()));
+                hostlog("platform images staged for k3s import");
+                images_seen = true;
+            }
+            if progress.contains("k3s-api-up") {
+                break;
+            }
+        }
+        // Belt and braces: the kubeconfig answering IS the API being up,
+        // marker or no marker (e.g. a guest predating the marker).
+        if crate::net::http_get_text(&kubeconfig_url).is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("guest kubeconfig handoff did not answer within 600s");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    set(vm_dir, Phase::ClusterApi, None);
+    hostlog("kubernetes api up (kubeconfig served)");
+    // The marker can beat a first fetch by a beat — give it patience.
+    crate::net::wait_http(&kubeconfig_url, Duration::from_secs(30))?;
     let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
+
+    // Last mile — what `ready` must actually mean. The registry rides
+    // every k3s VM (first boot may still be pulling registry:2, so keep
+    // the old CLI cold budget); the api-server route only exists when the
+    // media carried the binary, and traefik's own install shares the same
+    // cold window.
+    set(vm_dir, Phase::Ingress, Some("in-VM registry".into()));
+    let registry_url = format!("http://127.0.0.1:{}/v2/", spec.registry_port);
+    crate::net::wait_http(&registry_url, Duration::from_secs(300))?;
+    hostlog("in-VM registry answering");
+    if apiserver_assets().is_some() {
+        set(vm_dir, Phase::Ingress, Some("api-server route".into()));
+        let ingress_url = format!("http://127.0.0.1:{}/bootstrap/status", spec.host_port);
+        crate::net::wait_http_host(&ingress_url, "api.appliance.localhost", Duration::from_secs(600))?;
+        hostlog("api-server ingress answering");
+    }
+
+    // The kubeconfig write is the readiness contract `up` polls on —
+    // deliberately LAST, so its presence now means "actually usable",
+    // not just "k3s elected itself".
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    crate::bringup::hostlog(&format!(
+    hostlog(&format!(
         "kubeconfig written to {}",
         vm_dir.join("kubeconfig.yaml").display()
     ));
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
+    set(vm_dir, Phase::Ready, None);
     Ok(())
 }
 
@@ -2118,6 +2202,31 @@ mod tests {
         // shell agent's console echo.
         assert!(start.contains("while [ ! -f /persist/.dev-ready ]"));
         assert!(start.contains("echo agent-ready > /srv/handoff/agent-ready"));
+    }
+
+    #[test]
+    fn k3s_bringup_serves_grippable_progress_markers() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The handoff httpd starts at the TOP of the k3s block (not gated
+        // on k3s.yaml existing) so the host can poll /progress through the
+        // whole cluster window.
+        let httpd_at = start
+            .find(&format!("httpd -f -p {KUBECONFIG_PORT} -h /srv/handoff"))
+            .unwrap();
+        let k3s_at = start.find("k3s server").unwrap();
+        assert!(httpd_at < k3s_at, "handoff httpd must start before k3s launches");
+        // Grippable markers (never console echo), appended in order:
+        // base system up before k3s, the API marker after it.
+        assert!(start.contains(": > /srv/handoff/progress"));
+        let base_at = start.find("echo base-system-ready >> /srv/handoff/progress").unwrap();
+        let api_at = start.find("echo k3s-api-up >> /srv/handoff/progress").unwrap();
+        assert!(base_at < k3s_at, "base-system-ready precedes the k3s launch");
+        assert!(k3s_at < api_at, "k3s-api-up follows the k3s launch");
+        // The kubeconfig is still published for the host fetch, before the
+        // API marker fires (the marker means "the file is fetchable").
+        let copy_at = start.find("cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml").unwrap();
+        assert!(copy_at < api_at, "k3s.yaml is published before k3s-api-up");
     }
 
     #[test]

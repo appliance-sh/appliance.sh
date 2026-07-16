@@ -79,13 +79,16 @@ enum Cmd {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
-    /// Start the VM and wait until its Kubernetes endpoint is ready:
-    /// kubeconfig fetched and the API answering on the forwarded port.
+    /// Start the VM and wait until its platform is actually ready:
+    /// kubeconfig fetched, the in-VM registry answering, and (when
+    /// staged) the api-server reachable through its ingress route.
     Up {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
-        /// Seconds to wait for readiness before giving up.
-        #[arg(long, default_value_t = 600)]
+        /// Seconds to wait for readiness before giving up. Readiness now
+        /// covers the whole platform (not just the kubernetes endpoint),
+        /// so the budget carries what used to be the CLI's serial waits.
+        #[arg(long, default_value_t = 900)]
         timeout: u64,
         /// Virtual CPUs (persisted; defaults to the VM's current value,
         /// or 2 for a new VM). Takes effect on the next boot.
@@ -754,11 +757,7 @@ fn run() -> Result<()> {
                 _ => paths.kubeconfig(),
             };
             let cluster_ready = pid.is_some() && ready_marker.exists();
-            let phase = if pid.is_some() {
-                bringup::read(&paths.dir).map(|b| b.phase)
-            } else {
-                None
-            };
+            let bringup = if pid.is_some() { bringup::read(&paths.dir) } else { None };
             let status = VmStatus {
                 name: name.clone(),
                 exists: spec.is_some(),
@@ -766,7 +765,8 @@ fn run() -> Result<()> {
                 pid,
                 backend: backend.name(),
                 cluster_ready,
-                phase,
+                phase: bringup.as_ref().map(|b| b.phase),
+                phase_detail: bringup.and_then(|b| b.detail),
                 message: backend.availability().err().map(|e| format!("{e:#}")),
                 host_port: spec.as_ref().map(|s| s.host_port),
                 api_port: spec.as_ref().map(|s| s.api_port),
@@ -791,6 +791,8 @@ fn run() -> Result<()> {
                 #[serde(skip_serializing_if = "Option::is_none")]
                 phase: Option<bringup::Phase>,
                 #[serde(skip_serializing_if = "Option::is_none")]
+                phase_detail: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
                 pid: Option<i32>,
                 host_port: u16,
                 api_port: u16,
@@ -811,15 +813,12 @@ fn run() -> Result<()> {
                         paths.kubeconfig()
                     };
                     let cluster_ready = pid.is_some() && ready_marker.exists();
-                    let phase = if pid.is_some() {
-                        bringup::read(&paths.dir).map(|b| b.phase)
-                    } else {
-                        None
-                    };
+                    let bringup = if pid.is_some() { bringup::read(&paths.dir) } else { None };
                     VmEntry {
                         running: pid.is_some(),
                         cluster_ready,
-                        phase,
+                        phase: bringup.as_ref().map(|b| b.phase),
+                        phase_detail: bringup.and_then(|b| b.detail),
                         pid,
                         host_port: spec.host_port,
                         api_port: spec.api_port,

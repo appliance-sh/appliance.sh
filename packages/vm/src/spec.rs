@@ -402,9 +402,15 @@ pub struct VmStatus {
     /// starting" from "ready".
     pub cluster_ready: bool,
     /// The current bring-up stage while a VM is starting (media, booting,
-    /// network, cluster, ready, failed). `None` when not running.
+    /// network, cluster + its sub-phases, ready, failed). `None` when not
+    /// running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<crate::bringup::Phase>,
+    /// Free-text context for `phase` (guest IP, what ingress is waiting
+    /// on, the failure reason) — the desktop renders it as the live
+    /// detail line under the in-flight rung.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Forwarded host ports (present once the VM is defined).

@@ -32,14 +32,29 @@ pub enum Phase {
     /// Guest network is up and host port-forwards are wired. Waiting on k3s.
     Network,
     /// k3s is coming up — on first boot this installs packages and pulls
-    /// the registry/traefik images, which is the slow part.
+    /// the registry/traefik images, which is the slow part. The honest
+    /// sub-phases below slice this window open; `Cluster` itself is still
+    /// published first so older UIs (which ignore unknown phases) keep
+    /// advancing their ladder.
     Cluster,
+    /// Guest base system is up: persistent disk mounted, packages
+    /// installed, the bring-up progress handoff answering.
+    ClusterNode,
+    /// Platform images staged for k3s's airgap import (the alternative
+    /// to pulling ~300 MB from docker.io on first boot).
+    ClusterImages,
+    /// k3s API up — the kubeconfig is written and served.
+    ClusterApi,
+    /// Wiring the last mile: the in-VM registry and the api-server's
+    /// traefik route must answer before `Ready` is honest.
+    Ingress,
     /// Agent-only VMs: preparing the agent runtime (the Node toolchain +
     /// the vsock shell). Replaces `Cluster` when the spec is agent-only —
     /// there is no k3s control plane to wait on, just the runtime an agent
     /// actually rides.
     Agent,
-    /// kubeconfig fetched and the cluster answers. Terminal success.
+    /// The platform actually answers: kubeconfig fetched, registry and
+    /// (when staged) api-server ingress reachable. Terminal success.
     Ready,
     /// Bring-up failed; `detail` carries the reason. Terminal.
     Failed,
@@ -53,6 +68,10 @@ impl Phase {
             Phase::Booting => "booting guest",
             Phase::Network => "guest network up",
             Phase::Cluster => "starting k3s (first boot pulls images — can take a few minutes)",
+            Phase::ClusterNode => "guest base system up, starting k3s",
+            Phase::ClusterImages => "platform images staged for import",
+            Phase::ClusterApi => "kubernetes api up",
+            Phase::Ingress => "waiting for the registry + ingress routes",
             Phase::Agent => "preparing agent runtime (node + shell)",
             Phase::Ready => "cluster ready",
             Phase::Failed => "bring-up failed",
@@ -317,6 +336,10 @@ mod tests {
     fn phase_serializes_kebab_case_for_the_ui() {
         // The desktop reads these strings off `status` — pin the wire form.
         assert_eq!(serde_json::to_string(&Phase::Cluster).unwrap(), "\"cluster\"");
+        assert_eq!(serde_json::to_string(&Phase::ClusterNode).unwrap(), "\"cluster-node\"");
+        assert_eq!(serde_json::to_string(&Phase::ClusterImages).unwrap(), "\"cluster-images\"");
+        assert_eq!(serde_json::to_string(&Phase::ClusterApi).unwrap(), "\"cluster-api\"");
+        assert_eq!(serde_json::to_string(&Phase::Ingress).unwrap(), "\"ingress\"");
         assert_eq!(serde_json::to_string(&Phase::Agent).unwrap(), "\"agent\"");
         assert_eq!(serde_json::to_string(&Phase::Ready).unwrap(), "\"ready\"");
         assert_eq!(serde_json::to_string(&Phase::Failed).unwrap(), "\"failed\"");
@@ -329,6 +352,10 @@ mod tests {
             Phase::Booting,
             Phase::Network,
             Phase::Cluster,
+            Phase::ClusterNode,
+            Phase::ClusterImages,
+            Phase::ClusterApi,
+            Phase::Ingress,
             Phase::Agent,
             Phase::Ready,
             Phase::Failed,
