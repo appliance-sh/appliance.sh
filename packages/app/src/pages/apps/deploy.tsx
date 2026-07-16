@@ -21,8 +21,10 @@ import { useHost } from '@/providers/host-provider';
 import { useApplianceClient } from '@/hooks/use-appliance-client';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useRecentFolders, type RecentFolder } from '@/hooks/use-recent-folders';
+import { useTailAutoscroll } from '@/hooks/use-tail-autoscroll';
 import { cn } from '@/lib/utils';
-import { devMachineLabel, isMicroVmClusterId, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { DEFAULT_MICROVM_NAME, devMachineLabel, microVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { resolveDevMachineTargets } from '@/lib/dev-machine-targets';
 import type { Cluster, LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
 
@@ -35,6 +37,8 @@ import { extractDeploymentUrl } from '@/lib/deployment';
 //      VM up, installing the engine if needed) rather than dead-ending
 //      the wizard. The deploy intent (?project=&environment=) is captured
 //      on mount and survives the bring-up, so the user never loses it.
+//      Auto-skipped when exactly one distinct ready target exists —
+//      there's no decision to make; Back still returns here.
 //   1. Pick a folder containing an appliance.{json,ts,js} manifest.
 //      Programmatic .ts/.js manifests run in the CLI's QuickJS
 //      sandbox (sidecar invocation).
@@ -81,13 +85,16 @@ export function DeployPage() {
   const presetEnvironment = React.useMemo(() => searchParams.get('environment') ?? null, [searchParams]);
 
   // The wizard deploys into the *selected* cluster (the SDK client is
-  // bound to it). The local runtime is a microVM, so when the selection
-  // is a microVM we gate readiness on that VM being up — surfaced up
-  // front since the wizard is reachable while the VM is down (deep
-  // links, or the user stopped it mid-session). A non-microVM selection
-  // is a cloud / BYO cluster the client already targets. Query keys are
-  // shared with the Clusters area so the two views never disagree.
-  const { cluster: selectedCluster } = useSelectedCluster();
+  // bound to it). The selection arrives ALREADY resolved: a CLI-profile
+  // alias of a running local VM reads as the VM's own `microvm*` cluster
+  // (useSelectedCluster rebinds it), so "is this a microVM target?" is
+  // answerable from the cluster id alone. When it is one, readiness is
+  // gated on that VM being up — surfaced up front since the wizard is
+  // reachable while the VM is down (deep links, or the user stopped it
+  // mid-session). A non-microVM selection is a cloud / BYO cluster the
+  // client already targets. Query keys are shared with the Clusters area
+  // so the two views never disagree.
+  const { cluster: selectedCluster, config, isLoading: selectionLoading } = useSelectedCluster();
   const vmName = selectedCluster ? microVmNameFromClusterId(selectedCluster.id) : null;
   const isMicroVmTarget = vmName !== null;
   const vmQuery = useQuery({
@@ -98,13 +105,76 @@ export function DeployPage() {
   });
   const vmUp = Boolean(vmQuery.data?.running && vmQuery.data?.kubeconfigReady);
   const targetUp = isMicroVmTarget ? vmUp : Boolean(client);
-  const targetLoading = isMicroVmTarget ? vmQuery.isLoading : false;
+  const targetLoading = selectionLoading || (isMicroVmTarget ? vmQuery.isLoading : false);
   const readyToDeploy = targetUp && Boolean(client);
+
+  // Local VM inventory — same query key TargetStep and the Machine page
+  // poll, so the cache is shared. Needed page-wide to decide the one-time
+  // auto-skip (the canonical target count folds Dev Machine aliases away)
+  // before the target step ever renders.
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
+    enabled: Boolean(host.vm),
+    queryFn: () => host.vm!.list(),
+    refetchInterval: 6_000,
+  });
+  const vms = vmListQuery.data ?? [];
+
+  const targetLabel = selectedCluster ? (vmName ? devMachineLabel(vmName) : selectedCluster.name) : null;
 
   // Q5: the wizard opens on the TARGET step so the first decision is always
   // "where does this deploy?". A user with a ready runtime confirms + clicks
   // Next; a user with none starts one inline without leaving the wizard.
   const [phase, setPhase] = React.useState<Phase>('target');
+
+  // …unless there's nothing to decide: exactly ONE distinct ready target
+  // ⇒ start on Pick folder (Back still returns to the target step).
+  // "Distinct" counts canonical targets (lib/dev-machine-targets.ts) —
+  // an alias of a running VM folds into that VM, and counting it would
+  // force a first-run user to choose between two names for the one
+  // machine they set up. Decided ONCE, on the first render where the
+  // cluster list, the VM inventory, the selection resolution, and the
+  // readiness probe have all answered — never re-evaluated, so going
+  // Back doesn't bounce the user forward again. Multiple targets, or a
+  // single target that isn't ready (a stopped VM needing the inline
+  // start), still land on the target step.
+  const autoSkipDecided = React.useRef(false);
+  React.useEffect(() => {
+    if (autoSkipDecided.current) return;
+    if (!config || selectionLoading) return;
+    if (host.vm && !vmListQuery.data) return;
+    if (isMicroVmTarget && vmQuery.isLoading) return;
+    autoSkipDecided.current = true;
+    const { cloudClusters } = resolveDevMachineTargets(config.clusters, vms);
+    // Mirrors TargetStep's runtime list: the canonical VM is always
+    // offered (even before it's created), plus any the engine reports.
+    const runtimeTargets = host.vm ? new Set([DEFAULT_MICROVM_NAME, ...vms.map((v) => v.name)]).size : 0;
+    if (cloudClusters.length + runtimeTargets === 1 && readyToDeploy) {
+      setPhase('pick');
+    }
+  }, [config, host.vm, isMicroVmTarget, readyToDeploy, selectionLoading, vmListQuery.data, vmQuery.isLoading, vms]);
+
+  // Capability preflight: newer api-servers advertise what they can do
+  // on GET /api/v1/cluster-info — `capabilities.uploadBuilds: false`
+  // means this control plane can't mint upload builds (a Dev Machine
+  // guest binary older than this app). Surfaced as a banner + a disabled
+  // "Build & deploy" so the failure is explained BEFORE step 3, not as a
+  // raw 4xx after packaging. The field is OPTIONAL: an older server
+  // omits `capabilities` entirely and nothing is blocked — missing data
+  // must never strand a working pre-capabilities server.
+  const clusterInfoQuery = useQuery({
+    queryKey: ['cluster-info', selectedCluster?.id],
+    enabled: Boolean(client) && targetUp,
+    queryFn: async () => {
+      const r = await client!.getClusterInfo();
+      if (!r.success) throw r.error;
+      // The SDK's return type predates the capability fields — widen
+      // locally until it catches up (both are additive + optional).
+      return r.data as typeof r.data & { serverVersion?: string; capabilities?: { uploadBuilds: boolean } };
+    },
+    retry: false,
+  });
+  const sourceBuildsUnsupported = clusterInfoQuery.data?.capabilities?.uploadBuilds === false;
 
   // Step 1 — folder + manifest
   const [folderPath, setFolderPath] = React.useState<string | null>(null);
@@ -125,16 +195,9 @@ export function DeployPage() {
   // Step 3 — run state
   const [runStatus, setRunStatus] = React.useState<RunStatus>('idle');
   const [logs, setLogs] = React.useState<LogLine[]>([]);
-  const [runError, setRunError] = React.useState<string | null>(null);
+  const [runError, setRunError] = React.useState<RunFailure | null>(null);
   const [resultUrl, setResultUrl] = React.useState<string | null>(null);
-  const logBoxRef = React.useRef<HTMLPreElement | null>(null);
-
-  React.useEffect(() => {
-    // Autoscroll to tail as new lines arrive.
-    if (logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [logs]);
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLPreElement>([logs]);
 
   // ============================================================
   // Step 1 — pick a folder, read its manifest.
@@ -198,18 +261,19 @@ export function DeployPage() {
     // return here used to leave step 3 stuck on "Starting…" forever.
     if (!client) {
       setRunStatus('failed');
-      setRunError(
-        'No deploy target is selected, so there are no credentials to deploy with. Start the Dev Machine (it registers itself automatically), then retry.'
-      );
+      setRunError({
+        message:
+          'No deploy target is selected, so there are no credentials to deploy with. Start the Dev Machine (it registers itself automatically), then retry.',
+      });
       return;
     }
     if (!targetUp) {
       setRunStatus('failed');
-      setRunError(
-        isMicroVmTarget
+      setRunError({
+        message: isMicroVmTarget
           ? 'The Dev Machine is not running. Go back to the Target step to start it (or start it from the Machine page), then retry.'
-          : 'The deploy target is not reachable. Go back to the Target step to pick another, then retry.'
-      );
+          : 'The deploy target is not reachable. Go back to the Target step to pick another, then retry.',
+      });
       return;
     }
     setRunStatus('running');
@@ -296,7 +360,11 @@ export function DeployPage() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       append({ stream: 'stderr', message });
-      setRunError(message);
+      // Structured server failures ({error, detail?, requestId} — e.g.
+      // build-create's 409 missing-builder precondition) promote the
+      // server's own words to the headline; anything else renders raw
+      // exactly as before.
+      setRunError({ message, ...(parseStructuredFailure(message) ?? {}) });
       setRunStatus('failed');
     }
   };
@@ -340,7 +408,7 @@ export function DeployPage() {
           <p className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]">
             Target:
             <span className="inline-flex items-center rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-medium text-[var(--color-foreground)]">
-              {isMicroVmTarget ? devMachineLabel(vmName!) : selectedCluster.name}
+              {targetLabel}
             </span>
             <span>· switch with the target menu in the top bar</span>
           </p>
@@ -362,6 +430,40 @@ export function DeployPage() {
             . You can still pick a folder and configure in the meantime.
           </span>
         </div>
+      ) : null}
+
+      {/* Capability preflight — the selected control plane said it can't
+          accept source-build uploads. Rendered only where it bites (the
+          configure/run steps); older servers that don't report
+          capabilities are assumed capable and never see this. The
+          remediation depends on the target: a Dev Machine's guest binary
+          genuinely updates on restart (banner + hard-disable below), but
+          a BYO kubernetes cluster just has no builder configured — that's
+          an info state with a remote-image alternative, and the button
+          stays enabled (the server's 409 carries the same remediation as
+          the backstop). */}
+      {(phase === 'configure' || phase === 'run') && sourceBuildsUnsupported ? (
+        isMicroVmTarget ? (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              The Dev Machine&apos;s control plane doesn&apos;t support source builds — it&apos;s likely older than this
+              app. Restart the Dev Machine from the{' '}
+              <Link to="/machine" className="underline">
+                Machine page
+              </Link>{' '}
+              to update it, then retry here.
+            </span>
+          </div>
+        ) : (
+          <div className="space-y-2 rounded-md border border-cyan-500/40 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-200">
+            <p>
+              No build system is configured on this target, so it can&apos;t build the uploaded source into an image.
+              You can deploy a prebuilt image from a terminal instead:
+            </p>
+            <CommandSnippet command="appliance deploy --image-uri <registry>/<image>:<tag>" />
+          </div>
+        )
       ) : null}
 
       {presetProject || presetEnvironment ? (
@@ -423,7 +525,9 @@ export function DeployPage() {
             setPhase('run');
             void runDeploy();
           }}
-          canNext={canRun && readyToDeploy}
+          // Hard-block only the Dev Machine (restart genuinely fixes it);
+          // a builder-less BYO target keeps the button — see the banner.
+          canNext={canRun && readyToDeploy && !(isMicroVmTarget && sourceBuildsUnsupported)}
         />
       ) : null}
 
@@ -432,6 +536,7 @@ export function DeployPage() {
           runStatus={runStatus}
           logs={logs}
           logBoxRef={logBoxRef}
+          onLogScroll={onLogScroll}
           error={runError}
           resultUrl={resultUrl}
           onRetry={runDeploy}
@@ -477,7 +582,15 @@ function TargetStep({
   });
   const vms = vmListQuery.data ?? [];
 
-  const cloudClusters = (config?.clusters ?? []).filter((c) => !isMicroVmClusterId(c.id));
+  // Canonical dedupe (see lib/dev-machine-targets.ts): a CLI profile
+  // whose URL points at a running local VM's forwarded api-server port
+  // IS that VM — one machine must not read as two targets, the duplicate
+  // mislabeled "cloud". The alias folds out of the cloud list into the
+  // VM's row; and because useSelectedCluster REBINDS an alias selection
+  // to the `microvm*` twin, `selectedCluster.id` is always the canonical
+  // id — the VM row's selected state needs no alias special case.
+  const selectedLabel = selectedCluster ? (vmName ? devMachineLabel(vmName) : selectedCluster.name) : null;
+  const { cloudClusters } = resolveDevMachineTargets(config?.clusters ?? [], vms);
   const runtimeNames = React.useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
@@ -618,19 +731,11 @@ function TargetStep({
           {selectedCluster ? (
             readyToDeploy ? (
               <>
-                Target{' '}
-                <span className="font-medium text-[var(--color-foreground)]">
-                  {vmName ? devMachineLabel(vmName) : selectedCluster.name}
-                </span>{' '}
-                is ready.
+                Target <span className="font-medium text-[var(--color-foreground)]">{selectedLabel}</span> is ready.
               </>
             ) : (
               <>
-                Selected{' '}
-                <span className="font-medium text-[var(--color-foreground)]">
-                  {vmName ? devMachineLabel(vmName) : selectedCluster.name}
-                </span>
-                .
+                Selected <span className="font-medium text-[var(--color-foreground)]">{selectedLabel}</span>.
               </>
             )
           ) : (
@@ -961,6 +1066,7 @@ function RunStep({
   runStatus,
   logs,
   logBoxRef,
+  onLogScroll,
   error,
   resultUrl,
   onRetry,
@@ -969,7 +1075,8 @@ function RunStep({
   runStatus: RunStatus;
   logs: LogLine[];
   logBoxRef: React.RefObject<HTMLPreElement | null>;
-  error: string | null;
+  onLogScroll: (event: React.UIEvent<HTMLPreElement>) => void;
+  error: RunFailure | null;
   resultUrl: string | null;
   onRetry: () => void;
   onDone: () => void;
@@ -983,6 +1090,7 @@ function RunStep({
 
       <pre
         ref={logBoxRef}
+        onScroll={onLogScroll}
         className="max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-[var(--color-border)] bg-black/40 p-3 font-mono text-[11px] leading-relaxed"
       >
         {logs.length === 0 ? (
@@ -999,7 +1107,25 @@ function RunStep({
         )}
       </pre>
 
-      {error ? <FriendlyError error={error} fallbackHeadline="The deploy didn't finish" /> : null}
+      {/* Structured failures put the server's own error (+ detail) up
+          front as the headline — the raw message stays in the log pane
+          and the Details disclosure — with the requestId alongside so a
+          user can correlate the failure with the server logs. */}
+      {error ? (
+        <div className="space-y-1">
+          <FriendlyError
+            error={error.message}
+            headline={error.serverError}
+            fallbackHeadline="The deploy didn't finish"
+          />
+          {error.requestId ? (
+            <p className="text-[10px] text-[var(--color-muted-foreground)]">
+              request id <code className="font-mono">{error.requestId}</code> — quote it to find this failure in the
+              server logs
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {resultUrl ? (
         <div className="rounded-md border border-green-500/40 bg-green-500/10 p-3 text-xs text-green-300">
@@ -1031,6 +1157,40 @@ function RunStep({
 interface LogLine {
   stream: 'stdout' | 'stderr' | 'meta';
   message: string;
+}
+
+/** A failed run, split for rendering: the raw `message` keeps feeding
+ *  the log pane + the Details disclosure, while a STRUCTURED server body
+ *  (`{error, detail?, requestId}` — build-create's 409 missing-builder
+ *  precondition and its 500s) promotes the server's human-readable
+ *  `error` to the headline and carries the requestId for correlating
+ *  with the server logs. */
+interface RunFailure {
+  message: string;
+  serverError?: string;
+  requestId?: string;
+}
+
+/** Extract the structured body from an SDK error message. The client
+ *  formats every non-2xx as `HTTP <status>: <raw body>` — when that body
+ *  is the api-server's structured error JSON, pull the fields out; any
+ *  other shape (older servers, proxies, plain text) returns null and the
+ *  caller falls back to the raw rendering. */
+function parseStructuredFailure(message: string): { serverError: string; requestId?: string } | null {
+  const match = /HTTP \d+: (\{[\s\S]*\})\s*$/.exec(message);
+  if (!match) return null;
+  try {
+    const body: unknown = JSON.parse(match[1]);
+    if (typeof body !== 'object' || body === null) return null;
+    const { error, detail, requestId } = body as { error?: unknown; detail?: unknown; requestId?: unknown };
+    if (typeof error !== 'string' || !error) return null;
+    return {
+      serverError: typeof detail === 'string' && detail ? `${error} — ${detail}` : error,
+      requestId: typeof requestId === 'string' && requestId ? requestId : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function StatusBadge({ status }: { status: RunStatus }) {

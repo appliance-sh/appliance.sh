@@ -426,6 +426,11 @@ export function devMachineLabel(vmName: string): string {
   return vmName === DEFAULT_MICROVM_NAME ? 'Dev Machine' : `Dev Machine (${vmName})`;
 }
 
+// NOTE: alias detection for CLI profiles that point at a local VM's
+// forwarded api-server port lives in lib/dev-machine-targets.ts — that
+// module owns the whole dedupe/rebind policy (which entries fold into
+// which VM row, and what a stored alias selection resolves to).
+
 /** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
  *  Ordered: media → booting → network → cluster → ready (terminal), or
  *  failed (terminal). */

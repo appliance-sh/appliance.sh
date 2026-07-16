@@ -4,6 +4,7 @@ import {
   applianceBaseConfig,
   BuildType,
   generateId,
+  isDockerBase,
   isKubernetesBase,
   type ApplianceBaseConfig,
   type Build,
@@ -13,6 +14,37 @@ import { getStorageService } from './storage.service';
 import { assertSupportedBase } from './deployment-backend';
 
 const COLLECTION = 'builds';
+
+/**
+ * Upload-flow build requested on a base with no builder advertised.
+ * A precondition of the base config, not a server fault — the builds
+ * route maps it to a 409 carrying this message verbatim, so clients
+ * get the remediation instead of a generic 500.
+ */
+export class MissingBuilderError extends Error {
+  constructor() {
+    super(
+      'Upload-flow builds need a builder, and this base has none configured (kubernetes.buildkit.addr). ' +
+        'Use a remote-image build referencing a container image instead.'
+    );
+    this.name = 'MissingBuilderError';
+  }
+}
+
+/**
+ * Whether `createUpload()` can succeed on this base — the same gates
+ * it enforces, evaluated without side effects. Surfaced through
+ * /api/v1/cluster-info (`capabilities.uploadBuilds`) so clients can
+ * warn before hitting the 409: Kubernetes bases need an advertised
+ * builder; cloud bases only need the data bucket the presigned PUT
+ * targets (server-side container builds gate on `aws.buildkit` at
+ * resolve time, not at upload); removed/unknown bases can't.
+ */
+export function supportsUploadBuilds(config: ApplianceBaseConfig): boolean {
+  if (isDockerBase(config)) return false;
+  if (isKubernetesBase(config)) return Boolean(config.kubernetes?.buildkit?.addr);
+  return Boolean(config.aws?.dataBucketName);
+}
 
 export interface BuildUploadResult {
   buildId: string;
@@ -49,10 +81,7 @@ export class BuildUploadService {
     if (isKubernetesBase(config)) {
       const buildkitAddr = config.kubernetes?.buildkit?.addr;
       if (!buildkitAddr) {
-        throw new Error(
-          'Upload-flow builds need a builder, and this base has none configured (kubernetes.buildkit.addr). ' +
-            'Use a remote-image build referencing a container image instead.'
-        );
+        throw new MissingBuilderError();
       }
       if (!requestOrigin) {
         throw new Error('Upload-flow builds need the request origin to mint an upload URL');

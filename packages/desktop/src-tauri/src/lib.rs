@@ -2559,6 +2559,63 @@ fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+/// Repo-built guest api-server staged as a bundle resource by
+/// scripts/stage-apiserver.mjs (dev/debug pipelines only; the release
+/// pipeline clears the dir). When present, the CLI spawns that stage
+/// guest artifacts (`vm up` / `agent start`) export it as
+/// APPLIANCE_API_SERVER_BINARY so the bundled CLI stages this build
+/// instead of its version-pinned release download — a desktop built
+/// from unreleased main can be schema-skewed against the released
+/// guest binary.
+fn bundled_api_server_binary(app: &AppHandle) -> Option<PathBuf> {
+    let (arch, other_arch) = if cfg!(target_arch = "aarch64") {
+        ("arm64", "x64")
+    } else {
+        ("x64", "arm64")
+    };
+    let name = format!("appliance-api-server-linux-{arch}");
+    let other_name = format!("appliance-api-server-linux-{other_arch}");
+
+    let mut staging_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app
+        .path()
+        .resolve("apiserver-bin", tauri::path::BaseDirectory::Resource)
+    {
+        staging_dirs.push(resource_dir);
+    }
+    // Dev runs can outrace the resource copy tauri-build does at
+    // compile time — fall back to the checkout's staging dir.
+    #[cfg(debug_assertions)]
+    staging_dirs.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("apiserver-bin"));
+
+    for dir in &staging_dirs {
+        let staged = dir.join(&name);
+        if staged.is_file() {
+            return Some(staged);
+        }
+    }
+    // A wrong-arch staging (e.g. a Rosetta x64 Node staged `-x64` into
+    // an arm64 app) is genuinely unusable: the guest VM runs the host's
+    // arch, so a linux-x64 binary cannot boot in an arm64 VM. Never
+    // export it — warn loudly instead so the developer knows staging
+    // misfired rather than letting the release download silently
+    // resurrect the schema skew this staging exists to prevent.
+    for dir in &staging_dirs {
+        let other = dir.join(&other_name);
+        if other.is_file() {
+            eprintln!(
+                "[appliance] apiserver-bin arch mismatch: staging produced {} but this {arch} build \
+                 needs {} — ignoring it (the CLI falls back to its release download). \
+                 Re-run stage-apiserver.mjs with a {arch}-native toolchain.",
+                other.display(),
+                dir.join(&name).display()
+            );
+            return None;
+        }
+    }
+    None
+}
+
 /// The entitlement Virtualization.framework gates VM creation on —
 /// compiled in from packages/vm/vz.entitlements (one source of truth).
 #[cfg(target_os = "macos")]
@@ -3340,11 +3397,17 @@ async fn run_microvm_up(
     if let Some(m) = mount.as_deref() {
         argv.extend(["--mount", m]);
     }
-    let sidecar = app
+    let mut sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .args(argv);
+    // Prefer the bundle's repo-built guest api-server over the CLI's
+    // version-pinned release download (dev/debug builds only — release
+    // bundles carry no staged binary).
+    if let Some(bin) = bundled_api_server_binary(&app) {
+        sidecar = sidecar.env("APPLIANCE_API_SERVER_BINARY", bin.to_string_lossy().to_string());
+    }
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -4281,11 +4344,16 @@ async fn microvm_agent_start(app: AppHandle, input: AgentStartInput) -> Result<(
         args.push("--task".into());
         args.push(task.to_string());
     }
-    let sidecar = app
+    let mut sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .args(args);
+    // `agent start` can boot the VM itself (ensureSandboxVm) and stage
+    // guest artifacts — same repo-built preference as run_microvm_up.
+    if let Some(bin) = bundled_api_server_binary(&app) {
+        sidecar = sidecar.env("APPLIANCE_API_SERVER_BINARY", bin.to_string_lossy().to_string());
+    }
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;

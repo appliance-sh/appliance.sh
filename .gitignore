@@ -191,6 +191,7 @@ resources/*
 # tauri-build packages it. Also covered by the subpackage gitignore.
 packages/desktop/src-tauri/binaries/
 packages/desktop/src-tauri/vm-bin/
+packages/desktop/src-tauri/apiserver-bin/
 
 # Bun's internal lockfile if used alongside pnpm. We commit
 # pnpm-lock.yaml as the source of truth.
