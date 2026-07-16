@@ -68,6 +68,56 @@ const AGENT_IMAGE_SHA256_AARCH64: &str =
 const AGENT_IMAGE_SHA256_X86_64: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The k3s release whose airgap-images tarball is preloaded into k3s VMs
+/// so first boot imports its core images (registry:2 aside) locally
+/// instead of pulling ~300 MB from docker.io through k3s's containerd.
+/// MUST equal `guest::K3S_VERSION` — the tarball only matches the binary
+/// it shipped with. A pins-equality test locks the two together so a
+/// K3S_VERSION bump forces this version + both digests in one commit.
+pub const K3S_AIRGAP_VERSION: &str = "v1.31.4+k3s1";
+
+// Sasha condition #3: like k3s itself, the airgap tarball is an
+// UNAUTHENTICATED download whose contents become cluster workloads —
+// hash-pinned from the k3s-io release's sha256sum assets and verified
+// before use, every boot (cache-hit included).
+const K3S_AIRGAP_SHA256_ARM64: &str =
+    "02694da4fb6831757f8d198dd5d9f11fcc435bce468426a56109b9d94a025877";
+const K3S_AIRGAP_SHA256_AMD64: &str =
+    "f7a94dc28b3a8da063a41360f480ace1de3040ffd9c9228283975c8dca74d3b7";
+
+fn k3s_airgap_asset() -> Result<(&'static str, &'static str)> {
+    // (release asset name, committed sha256) — k3s names these by the
+    // k3s arch suffix (arm64/amd64), not the uname arch.
+    match std::env::consts::ARCH {
+        "aarch64" => Ok(("k3s-airgap-images-arm64.tar.zst", K3S_AIRGAP_SHA256_ARM64)),
+        "x86_64" => Ok(("k3s-airgap-images-amd64.tar.zst", K3S_AIRGAP_SHA256_AMD64)),
+        other => bail!("unsupported host architecture: {other}"),
+    }
+}
+
+/// Resolve (fetching + verifying on first use, re-verifying on every
+/// cache hit) the pinned k3s airgap-images tarball for this arch —
+/// `ensure_agent_image`'s pattern, cached under the shared guest-assets
+/// dir next to the k3s binary it belongs to. Callers treat an `Err` as
+/// "no preload": the guest then pulls from the network exactly as before.
+pub fn ensure_k3s_airgap_images() -> Result<PathBuf> {
+    let (asset, sha) = k3s_airgap_asset()?;
+    let dir = crate::guest::assets_dir();
+    fs::create_dir_all(&dir)?;
+    // Version-keyed like `k3s-{K3S_VERSION}`: a pin bump fetches fresh
+    // instead of failing verification against the old cached bytes.
+    let dest = dir.join(format!("k3s-airgap-{K3S_AIRGAP_VERSION}-{asset}"));
+    download_and_verify(
+        &format!(
+            "https://github.com/k3s-io/k3s/releases/download/{}/{asset}",
+            K3S_AIRGAP_VERSION.replace('+', "%2B")
+        ),
+        &dest,
+        sha,
+    )?;
+    Ok(dest)
+}
+
 pub struct GuestImage {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -403,6 +453,29 @@ mod tests {
         let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
         assert!(verify_sha256(&path, wrong).is_err(), "wrong digest must reject");
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn airgap_pin_matches_the_k3s_version() {
+        // The airgap tarball only matches the k3s binary it shipped with:
+        // bumping K3S_VERSION MUST bump this pin (and both digests) in the
+        // same commit, or the preload would import a different release's
+        // images than the binary expects.
+        assert_eq!(K3S_AIRGAP_VERSION, crate::guest::K3S_VERSION);
+    }
+
+    #[test]
+    fn airgap_digests_are_committed_not_sentinels() {
+        // Unlike the agent image (whose all-zero sentinel is an explicit
+        // OWED-LIVE fallback), the airgap digests come straight off the
+        // k3s-io release's sha256sum assets — a zero digest here would
+        // silently disable the preload on every boot.
+        for sha in [K3S_AIRGAP_SHA256_ARM64, K3S_AIRGAP_SHA256_AMD64] {
+            assert_eq!(sha.len(), 64);
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_ne!(sha, "0000000000000000000000000000000000000000000000000000000000000000");
+        }
+        assert_ne!(K3S_AIRGAP_SHA256_ARM64, K3S_AIRGAP_SHA256_AMD64);
     }
 
     #[test]

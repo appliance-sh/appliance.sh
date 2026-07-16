@@ -89,7 +89,7 @@ fn arch_tuple() -> Result<(&'static str, &'static str)> {
     }
 }
 
-fn assets_dir() -> PathBuf {
+pub(crate) fn assets_dir() -> PathBuf {
     crate::store::vm_root().join("images").join("guest-assets")
 }
 
@@ -147,6 +147,73 @@ fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
     let (k3s, _) = ensure_k3s()?;
 
     Ok((modloop, k3s))
+}
+
+/// Volume label of the platform-images media (the FAT wrapper around the
+/// k3s airgap tarball, attached as an extra read-only virtio-blk on k3s
+/// VMs). The guest probes `blkid` for THIS LABEL — never a device node:
+/// /dev/vdc is the agent image on agent-only VMs, and device order is an
+/// attachment detail, not a contract. A guest test locks the probe.
+pub const K3S_AIRGAP_VOLUME_LABEL: &str = "K3SIMAGES";
+
+/// File name the airgap tarball rides under, both on the media and in
+/// `$PERSIST/k3s/agent/images/` (k3s auto-imports anything there).
+pub const K3S_AIRGAP_MEDIA_FILE: &str = "k3s-airgap-images.tar.zst";
+
+/// Resolve (building on first use) the platform-images media: the pinned,
+/// hash-verified k3s airgap tarball wrapped in a small FAT volume so the
+/// guest can find it by label and mount it read-only. The SOURCE tarball
+/// is re-verified against its committed sha256 on every call (cache-hit
+/// included, `download_and_verify` semantics); the derived FAT image is a
+/// deterministic function of it, re-derived only when absent — the same
+/// verified-raw/derived split the normalized kernel uses.
+pub fn ensure_k3s_airgap_media() -> Result<PathBuf> {
+    let tarball = crate::images::ensure_k3s_airgap_images()?;
+    let dir = assets_dir();
+    let image_path = dir.join(format!(
+        "k3s-airgap-media-{}.img",
+        crate::images::K3S_AIRGAP_VERSION
+    ));
+    if image_path.exists() {
+        return Ok(image_path);
+    }
+
+    let tar_data = fs::read(&tarball)?;
+    let volume_bytes =
+        ((tar_data.len() as u64 + 64 * 1024 * 1024) / (16 * 1024 * 1024) + 1) * (16 * 1024 * 1024);
+    // Atomic like download_and_verify: build at .partial, rename into
+    // place — a killed build never leaves a truncated image at the
+    // canonical name.
+    let partial = image_path.with_extension("partial");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&partial)
+        .with_context(|| format!("create {}", partial.display()))?;
+    file.set_len(volume_bytes)?;
+    // FAT volume labels are exactly 11 bytes, space-padded.
+    let mut label = [b' '; 11];
+    label[..K3S_AIRGAP_VOLUME_LABEL.len()].copy_from_slice(K3S_AIRGAP_VOLUME_LABEL.as_bytes());
+    let buf = fscommon::BufStream::new(&file);
+    fatfs::format_volume(
+        buf,
+        fatfs::FormatVolumeOptions::new().volume_label(label),
+    )
+    .context("format platform-images FAT volume")?;
+    let buf = fscommon::BufStream::new(&file);
+    let fs = fatfs::FileSystem::new(buf, fatfs::FsOptions::new())
+        .context("open platform-images FAT volume")?;
+    {
+        let root = fs.root_dir();
+        let mut f = root.create_file(K3S_AIRGAP_MEDIA_FILE)?;
+        f.write_all(&tar_data)?;
+    }
+    fs.unmount().context("unmount platform-images FAT volume")?;
+    drop(file);
+    std::fs::rename(&partial, &image_path)?;
+    Ok(image_path)
 }
 
 /// CLI-staged api-server guest artifacts: the compiled linux binary
@@ -385,6 +452,42 @@ spec:
     targetPort: 5000
     nodePort: __REGISTRY_NODEPORT__
 RMANIFEST
+
+# --- k3s airgap image preload -----------------------------------------
+# __K3S_AIRGAP_PREAMBLE__ is substituted per backend: vz sets the probe
+# var (it may attach the platform-images media as an extra read-only
+# virtio-blk); WSL leaves it empty, so the whole block is skipped and
+# k3s pulls from the network exactly as before. Runs BEFORE `k3s server`
+# so the tarball is in the import dir when containerd starts.
+__K3S_AIRGAP_PREAMBLE__
+if [ -n "$APPLIANCE_AIRGAP_PROBE" ]; then
+  mkdir -p "$PERSIST/k3s/agent/images"
+  # First boot only: the staged tarball persists on the data disk, so
+  # its presence is the stamp. Probe by FILESYSTEM LABEL, never a device
+  # node — the third disk is the agent image on agent-only VMs, and
+  # device order is an attachment detail.
+  if [ ! -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    AIRGAP_DEV=$(blkid 2>/dev/null | awk -F: '/LABEL="K3SIMAGES"/ {print $1; exit}')
+    if [ -n "$AIRGAP_DEV" ]; then
+      mkdir -p /media/k3s-images
+      if mount -o ro "$AIRGAP_DEV" /media/k3s-images 2>/dev/null; then
+        if cp /media/k3s-images/k3s-airgap-images.tar.zst "$PERSIST/k3s/agent/images/"; then
+          echo "k3s-airgap: staged platform images for k3s import"
+        else
+          # Never leave a truncated tarball behind: its presence is the
+          # stamp, and k3s would trip over half a file every boot.
+          rm -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst"
+        fi
+        umount /media/k3s-images
+      fi
+    else
+      echo "k3s-airgap: no platform-images media — k3s pulls from the network"
+    fi
+  fi
+  if [ -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    echo images-imported >> /srv/handoff/progress
+  fi
+fi
 
 # Single-node dev cluster. Traefik (bundled) terminates ingress on
 # node port 80 via servicelb — the host forwards 127.0.0.1:<hostPort>
@@ -1259,6 +1362,11 @@ fn build_apkovl(
                     format!("{APISERVER_MEDIA_COPY}{APISERVER_COMMON}")
                 },
             )
+            // vz boot media: arm the guest-side probe for the
+            // platform-images media. Harmless when the media wasn't
+            // attached (the probe finds no label and k3s pulls from the
+            // network); the WSL bootstrap substitutes this to empty.
+            .replace("__K3S_AIRGAP_PREAMBLE__", "APPLIANCE_AIRGAP_PROBE=1")
             .replace("__APISERVER_GUEST_PORT__", &API_SERVER_GUEST_PORT.to_string())
             .replace("__HOST_PORT__", &host_port.to_string())
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
@@ -2227,6 +2335,54 @@ mod tests {
         // API marker fires (the marker means "the file is fetchable").
         let copy_at = start.find("cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml").unwrap();
         assert!(copy_at < api_at, "k3s.yaml is published before k3s-api-up");
+    }
+
+    #[test]
+    fn k3s_airgap_preload_probes_by_label_and_marks_progress() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The vz boot media arms the probe; the marker itself must be gone.
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"), "marker must be substituted");
+        assert!(start.contains("APPLIANCE_AIRGAP_PROBE=1"), "vz arms the airgap probe");
+        // Device discovery is BY VOLUME LABEL, never a hard-coded node —
+        // /dev/vdc is the agent image on agent VMs (a separate test pins
+        // that a k3s VM's bootstrap has no /dev/vdc at all).
+        assert!(
+            start.contains(&format!("LABEL=\"{K3S_AIRGAP_VOLUME_LABEL}\"")),
+            "the guest must probe blkid for the platform-images label"
+        );
+        assert!(!start.contains("AIRGAP_DEV=/dev/"), "no hard-coded airgap device node");
+        // Stamp-guarded copy into k3s's auto-import dir, with the T2 hook.
+        assert!(start.contains(&format!("$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains(&format!("cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains("echo images-imported >> /srv/handoff/progress"));
+        // A failed copy must not leave a truncated tarball as the stamp.
+        assert!(start.contains(&format!("rm -f \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}\"")));
+        // The preload runs before k3s server starts (containerd imports at
+        // startup) and after the persist mount.
+        let preload_at = start.find("APPLIANCE_AIRGAP_PROBE=1").unwrap();
+        let k3s_at = start.find("k3s server").unwrap();
+        let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
+        assert!(mount_at < preload_at && preload_at < k3s_at, "preload sits between the persist mount and k3s launch");
+
+        // Agent-only VMs run no k3s: the preload block is absent entirely.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_AIRGAP_PROBE"), "no airgap preload on agent-only VMs");
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"));
+    }
+
+    #[test]
+    fn airgap_volume_label_fits_fat_and_matches_the_probe() {
+        // FAT labels are at most 11 bytes (the builder space-pads to
+        // exactly 11); an oversized const would panic the copy there.
+        assert!(K3S_AIRGAP_VOLUME_LABEL.len() <= 11);
+        // The guest probe greps blkid for the label VERBATIM — busybox
+        // blkid prints it space-trimmed, so it must carry none itself.
+        assert_eq!(K3S_AIRGAP_VOLUME_LABEL, K3S_AIRGAP_VOLUME_LABEL.trim());
+        // And distinct from the boot media's label, so the probe can never
+        // grab the wrong FAT volume.
+        assert_ne!(K3S_AIRGAP_VOLUME_LABEL, "APPLIANCE");
     }
 
     #[test]

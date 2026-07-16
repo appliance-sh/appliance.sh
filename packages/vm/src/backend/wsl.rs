@@ -661,6 +661,10 @@ fn build_bootstrap(
             if spec.agent_only { "" } else { crate::guest::BUILDKIT_PROVISION },
         )
         .replace("__EGRESS_CA__", &ca_block)
+        // No virtio-blk media inside a WSL distro: leave the airgap
+        // probe unarmed so the shared K3S_COMMON block is a no-op and
+        // k3s pulls from the network exactly as before.
+        .replace("__K3S_AIRGAP_PREAMBLE__", "")
         .replace("__TMUX_CONF__\n", crate::guest::TMUX_CONF)
         .replace("__KUBECONFIG_PORT__", &crate::guest::KUBECONFIG_PORT.to_string())
         .replace("__REGISTRY_NODEPORT__", &crate::guest::REGISTRY_NODEPORT.to_string())
@@ -856,6 +860,7 @@ mod tests {
             "__DOCKER_PROVISION__",
             "__BUILDKIT_PROVISION__",
             "__BUILDKITD_GUEST_PORT__",
+            "__K3S_AIRGAP_PREAMBLE__",
             "__APISERVER_PROVISION__",
             "__APISERVER_WIN_PATH__",
             "__CONSOLE_WIN_PATH__",
@@ -875,6 +880,12 @@ mod tests {
                 "literal marker {marker} leaked into the WSL bootstrap"
             );
         }
+        // The airgap probe stays UNARMED on WSL (no virtio-blk media in a
+        // distro): the shared preload block must be a no-op here.
+        assert!(
+            !script.contains("APPLIANCE_AIRGAP_PROBE=1"),
+            "WSL must not arm the k3s airgap probe"
+        );
         // The k3s core is the shared fragment, wired to the real ports.
         assert!(script.contains("k3s server"));
         assert!(script.contains(&format!(

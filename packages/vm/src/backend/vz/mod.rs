@@ -110,6 +110,26 @@ impl VmBackend for VzBackend {
             None
         };
 
+        // k3s VMs: the pinned airgap-images tarball (hash-verified, FAT-
+        // wrapped) rides as another read-only virtio-blk so first boot
+        // imports its core images locally instead of pulling ~300 MB from
+        // docker.io. Best-effort by contract: any failure here falls back
+        // to today's network pulls — bring-up must never get WORSE. The
+        // guest finds the media by volume label, never a device node.
+        let platform_images: Option<std::path::PathBuf> = if spec.agent_only {
+            None
+        } else {
+            match crate::guest::ensure_k3s_airgap_media() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    crate::bringup::hostlog(&format!(
+                        "k3s airgap images unavailable ({e:#}); first boot pulls from the network"
+                    ));
+                    None
+                }
+            }
+        };
+
         // The console log is the VM's primary observable output —
         // truncate per boot so `console` shows the current boot, not
         // an append-forever scroll of every boot since creation.
@@ -126,6 +146,7 @@ impl VmBackend for VzBackend {
             &image.initramfs,
             &boot_media.image,
             agent_image.as_deref(),
+            platform_images.as_deref(),
             &paths,
         )?;
         let config = built.config;
@@ -222,6 +243,7 @@ struct BuiltConfig {
     host_fd: Option<std::os::fd::RawFd>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_configuration(
     spec: &VmSpec,
     kernel: &Path,
@@ -230,6 +252,10 @@ fn build_configuration(
     // The verified prebuilt agent image to attach read-only as `vdc`
     // (agent-only VMs only). `None` ⇒ no third disk.
     agent_image: Option<&Path>,
+    // The FAT-wrapped k3s airgap-images media, attached read-only on k3s
+    // VMs (mutually exclusive with `agent_image` — the caller gates each
+    // on `spec.agent_only`). The guest probes it by volume label.
+    platform_images: Option<&Path>,
     paths: &VmPaths,
 ) -> Result<BuiltConfig> {
     // The host end of the netstack link, set only on the Netstack path.
@@ -337,6 +363,23 @@ fn build_configuration(
                 &agent_attachment,
             );
             storage.push(Retained::into_super(agent_device));
+        }
+        if let Some(images_path) = platform_images {
+            // Read-only like the boot media: regenerated host-side from
+            // the hash-verified tarball (`ensure_k3s_airgap_media` re-
+            // verified the source bytes this same boot), never written
+            // by the guest.
+            let images_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &file_url(images_path),
+                true,
+            )
+            .map_err(|e| anyhow!("platform images attachment: {}", error_text(&e)))?;
+            let images_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &images_attachment,
+            );
+            storage.push(Retained::into_super(images_device));
         }
 
         let entropy = VZVirtioEntropyDeviceConfiguration::new();
