@@ -1587,7 +1587,7 @@ pub fn host_services(
     // skipped above, never the discovery/lease. `persist_guest_ip` is
     // always true (the plan locks it); guarding the write through it keeps
     // the invariant a single tested decision.
-    eprintln!("guest address: {guest_ip}");
+    crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     if plan.persist_guest_ip {
         fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     }
@@ -1598,20 +1598,23 @@ pub fn host_services(
         // guest serves an `agent-ready` sentinel once the Node toolchain
         // (.dev-ready) is up (Quinn gap #2). Then write the host-side
         // readiness marker `up`/`status`/`list` poll on for this spec.
-        eprintln!("agent-only: gating on the agent runtime (node + vsock shell)");
+        crate::bringup::hostlog("agent-only: gating on the agent runtime (node + vsock shell)");
         crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
         let handoff = format!("http://{handoff_host}:{handoff_port}/agent-ready");
         crate::net::wait_http(&handoff, Duration::from_secs(600))?;
         fs::write(vm_dir.join("agent-ready"), b"agent-ready\n")?;
-        eprintln!("agent runtime ready: {}", vm_dir.join("agent-ready").display());
+        crate::bringup::hostlog(&format!(
+            "agent runtime ready: {}",
+            vm_dir.join("agent-ready").display()
+        ));
         crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
         return Ok(());
     }
 
-    eprintln!(
+    crate::bringup::hostlog(&format!(
         "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
-    );
+    ));
 
     // The guest serves its kubeconfig only after k3s has written it —
     // first boot includes apk installs + image pulls, so be generous.
@@ -1620,7 +1623,10 @@ pub fn host_services(
     crate::net::wait_http(&handoff, Duration::from_secs(600))?;
     let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
+    crate::bringup::hostlog(&format!(
+        "kubeconfig written to {}",
+        vm_dir.join("kubeconfig.yaml").display()
+    ));
     crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
     Ok(())
 }

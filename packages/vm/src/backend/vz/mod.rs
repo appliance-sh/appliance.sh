@@ -77,7 +77,7 @@ impl VmBackend for VzBackend {
         crate::bringup::clear(&paths.dir);
         crate::bringup::set(&paths.dir, crate::bringup::Phase::Media, None);
         let image = crate::images::ensure_image(&spec.image)?;
-        eprintln!("assembling boot media");
+        crate::bringup::hostlog("assembling boot media");
         let boot_media = crate::guest::build_boot_media(
             &paths.dir,
             spec.registry_port,
@@ -100,9 +100,9 @@ impl VmBackend for VzBackend {
             match crate::images::ensure_agent_image() {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    eprintln!(
+                    crate::bringup::hostlog(&format!(
                         "agent image unavailable ({e:#}); the guest will self-heal the CLIs via npm"
-                    );
+                    ));
                     None
                 }
             }
@@ -138,7 +138,7 @@ impl VmBackend for VzBackend {
         // guest its deterministic address and owns its only path off-box.
         // Behaviour-neutral in F1: every flow is forwarded, no filtering.
         let netstack: Option<Netstack> = built.host_fd.map(|fd| {
-            eprintln!("network: host-mediated smoltcp netstack (net_link=netstack)");
+            crate::bringup::hostlog("network: host-mediated smoltcp netstack (net_link=netstack)");
             crate::netstack::start(
                 fd,
                 crate::netstack::LinkConfig::for_guest_mac(&spec.name, &spec.mac),
@@ -156,7 +156,7 @@ impl VmBackend for VzBackend {
         }
 
         start_vm(&queue, &vm)?;
-        eprintln!("VM '{}' started", spec.name);
+        crate::bringup::hostlog(&format!("VM '{}' started", spec.name));
         // Guest is launching; host_services drives the rest of the phases.
         crate::bringup::set(&paths.dir, crate::bringup::Phase::Booting, None);
 
@@ -181,7 +181,7 @@ impl VmBackend for VzBackend {
             let netstack = netstack.clone();
             std::thread::spawn(move || {
                 if let Err(err) = crate::guest::host_services(&spec, &paths_dir, netstack.as_ref()) {
-                    eprintln!("host services: {err:#}");
+                    crate::bringup::hostlog(&format!("host services: {err:#}"));
                     // Record the failure so `up` can stop waiting and
                     // report what broke instead of timing out blind.
                     crate::bringup::set(

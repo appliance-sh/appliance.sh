@@ -122,6 +122,12 @@ enum Cmd {
         /// one-way, applies on the next boot; never silently turned off.
         #[arg(long, default_value_t = false)]
         agent_only: bool,
+        /// Fail (exit non-zero) if the whole bring-up takes longer than
+        /// this many seconds, even when it eventually succeeds. A
+        /// regression tripwire for CI / perf work — readiness itself is
+        /// unaffected.
+        #[arg(long)]
+        time_budget: Option<u64>,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -136,6 +142,11 @@ enum Cmd {
     },
     /// Report VM state as JSON.
     Status {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Print per-phase timings from the last boot's bring-up history.
+    Timings {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
@@ -476,7 +487,9 @@ fn run() -> Result<()> {
             no_mount,
             docker,
             agent_only,
+            time_budget,
         } => {
+            let up_started = std::time::Instant::now();
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
             // Persist resource overrides into the spec *before* spawning
@@ -636,6 +649,20 @@ fn run() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             println!();
+            // Regression tripwire: readiness was reached, but did it fit
+            // the budget? Checked on BOTH readiness shapes (k3s and
+            // agent-only); failures already exit non-zero above.
+            let check_time_budget = |budget: Option<u64>| -> Result<()> {
+                let Some(budget) = budget else { return Ok(()) };
+                let elapsed = up_started.elapsed().as_secs_f64();
+                if elapsed > budget as f64 {
+                    bail!(
+                        "VM '{name}' is up, but bring-up took {elapsed:.1}s — over the --time-budget of {budget}s.\nSee `appliance-vm timings {name}` for the per-phase breakdown."
+                    );
+                }
+                println!("  bring-up:    {elapsed:.1}s (within the {budget}s budget)");
+                Ok(())
+            };
             if spec.agent_only {
                 // No k3s API to confirm — readiness is the agent runtime,
                 // already proven by the agent-ready marker above. Reach the
@@ -643,6 +670,7 @@ fn run() -> Result<()> {
                 println!("VM '{name}' is up (agent-only)");
                 println!("  agent runtime: node + vsock shell ready");
                 println!("  shell: appliance-vm shell {name}");
+                check_time_budget(time_budget)?;
                 return Ok(());
             }
             net::wait_tcp(
@@ -653,12 +681,28 @@ fn run() -> Result<()> {
             println!("  kubeconfig:  {}", paths.kubeconfig().display());
             println!("  kubernetes:  https://127.0.0.1:{}", spec.api_port);
             println!("  ingress:     http://*.appliance.localhost:{}", spec.host_port);
+            check_time_budget(time_budget)?;
             println!();
             println!("try: KUBECONFIG={} kubectl get nodes", paths.kubeconfig().display());
             Ok(())
         }
 
+        Cmd::Timings { name } => {
+            let paths = VmPaths::for_name(&name);
+            let history = bringup::read_history(&paths.dir);
+            if history.is_empty() {
+                bail!(
+                    "no bring-up history for VM '{name}' — it hasn't booted under this engine version yet (boot it with `appliance-vm up {name}`)"
+                );
+            }
+            print!("{}", bringup::render_timings(&history));
+            Ok(())
+        }
+
         Cmd::Run { name } => {
+            // Pin the bring-up clock before anything slow so hostlog
+            // prefixes measure from the very top of the host process.
+            bringup::init_host_clock();
             backend.availability()?;
             let spec = ensure_spec(&name)?;
             store::ensure_disk(&spec)?;

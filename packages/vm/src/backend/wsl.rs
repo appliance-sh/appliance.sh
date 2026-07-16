@@ -682,7 +682,7 @@ fn build_bootstrap(
 /// files `up` polls on — is the same contract.
 fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
     let guest_ip = discover_guest_ip(distro, Duration::from_secs(120))?;
-    eprintln!("guest address: {guest_ip}");
+    crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     std::fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     crate::bringup::set(vm_dir, crate::bringup::Phase::Network, Some(guest_ip.to_string()));
 
@@ -711,7 +711,7 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
         for port in 30000..=30050u16 {
             let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
         }
-        eprintln!(
+        crate::bringup::hostlog(&format!(
             "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
             spec.api_port,
             spec.host_port,
@@ -719,11 +719,11 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
             crate::guest::REGISTRY_NODEPORT,
             spec.buildkit_port,
             crate::guest::BUILDKITD_GUEST_PORT
-        );
+        ));
     }
 
     if spec.agent_only {
-        eprintln!("agent-only: gating on the agent runtime (node toolchain)");
+        crate::bringup::hostlog("agent-only: gating on the agent runtime (node toolchain)");
         crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
         let handoff = format!(
             "http://{guest_ip}:{}/agent-ready",
@@ -741,7 +741,10 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
     let kubeconfig =
         crate::net::fetch_kubeconfig(guest_ip, crate::guest::KUBECONFIG_PORT, spec.api_port)?;
     std::fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
+    crate::bringup::hostlog(&format!(
+        "kubeconfig written to {}",
+        vm_dir.join("kubeconfig.yaml").display()
+    ));
     crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
     Ok(())
 }

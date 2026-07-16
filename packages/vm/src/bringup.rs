@@ -13,8 +13,10 @@
 //! *cluster ready*.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A stage in the boot → cluster-ready lifecycle, ordered by the
 /// sequence a healthy boot passes through.
@@ -76,8 +78,35 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn path(vm_dir: &Path) -> PathBuf {
     vm_dir.join("bringup.json")
+}
+
+fn history_path(vm_dir: &Path) -> PathBuf {
+    vm_dir.join("bringup-history.jsonl")
+}
+
+/// One bring-up transition, appended to `bringup-history.jsonl` on every
+/// `set`. `bringup.json` keeps only the CURRENT phase (its consumers —
+/// `up`, `status`, the desktop — want the live state); the history file
+/// is what makes a finished boot measurable after the fact
+/// (`appliance-vm timings`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Unix milliseconds when this phase was entered. Millis, not the
+    /// seconds `Bringup.since` uses — sub-second phases (media on a warm
+    /// cache, booting) would all read 0s otherwise.
+    pub at: u64,
 }
 
 /// Publish the current phase. Best-effort: a write failure must never
@@ -91,6 +120,87 @@ pub fn set(vm_dir: &Path, phase: Phase, detail: Option<String>) {
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = std::fs::write(path(vm_dir), json);
     }
+    let entry = HistoryEntry {
+        phase: state.phase,
+        detail: state.detail,
+        at: now_millis(),
+    };
+    if let Ok(line) = serde_json::to_string(&entry) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_path(vm_dir))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Read the boot's transition history, oldest first. Empty when the VM
+/// has never booted under a history-writing engine (or was cleared).
+/// Unparseable lines are skipped, not fatal — the file is best-effort
+/// telemetry, never load-bearing state.
+pub fn read_history(vm_dir: &Path) -> Vec<HistoryEntry> {
+    let Ok(raw) = std::fs::read_to_string(history_path(vm_dir)) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Render per-phase deltas (time spent IN each phase, i.e. until the
+/// next transition) plus the boot total. Pure so `timings` is testable
+/// without a live boot.
+pub fn render_timings(entries: &[HistoryEntry]) -> String {
+    fn secs(ms: u64) -> String {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+    let mut out = String::new();
+    for (i, e) in entries.iter().enumerate() {
+        let wire = serde_json::to_string(&e.phase)
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+        let delta = entries
+            .get(i + 1)
+            .map(|next| secs(next.at.saturating_sub(e.at)))
+            .unwrap_or_else(|| "—".to_string());
+        let detail = e.detail.as_deref().map(|d| format!("  ({d})")).unwrap_or_default();
+        out.push_str(&format!("{wire:<16} {delta:>8}  {}{detail}\n", e.phase.label()));
+    }
+    if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+        out.push_str(&format!(
+            "{:<16} {:>8}\n",
+            "total",
+            secs(last.at.saturating_sub(first.at))
+        ));
+    }
+    out
+}
+
+// --- timestamped host-side logging -----------------------------------
+// host.log is created fresh per boot, so an elapsed-since-start prefix
+// is exactly the delta a "where did the time go" read cares about (and
+// needs no date formatting the crate doesn't otherwise carry).
+
+static HOST_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+/// Pin the process-wide bring-up clock. Called at the top of the
+/// resident host process (`run`) so every `hostlog` line shares one
+/// epoch; a missed init just makes the first log line the epoch.
+pub fn init_host_clock() {
+    let _ = HOST_CLOCK.get_or_init(Instant::now);
+}
+
+fn fmt_elapsed(secs: f64) -> String {
+    format!("[+{secs:.1}s]")
+}
+
+/// A host-side bring-up log line, prefixed with seconds since the host
+/// process started.
+pub fn hostlog(msg: &str) {
+    let elapsed = HOST_CLOCK.get_or_init(Instant::now).elapsed().as_secs_f64();
+    eprintln!("{} {msg}", fmt_elapsed(elapsed));
 }
 
 /// Read the last published phase, if any.
@@ -100,9 +210,11 @@ pub fn read(vm_dir: &Path) -> Option<Bringup> {
 }
 
 /// Clear any prior bring-up state. Call before a fresh boot so the
-/// poller never reads a stale phase from the previous run.
+/// poller never reads a stale phase from the previous run — and so the
+/// history (and therefore `timings`) always describes ONE boot.
 pub fn clear(vm_dir: &Path) {
     let _ = std::fs::remove_file(path(vm_dir));
+    let _ = std::fs::remove_file(history_path(vm_dir));
 }
 
 #[cfg(test)]
@@ -131,6 +243,74 @@ mod tests {
         assert!(read(&dir).is_none(), "cleared");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_appends_every_transition() {
+        let dir = std::env::temp_dir().join(format!("bringup-history-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        clear(&dir);
+
+        assert!(read_history(&dir).is_empty(), "no history before the first set");
+
+        set(&dir, Phase::Media, None);
+        set(&dir, Phase::Booting, None);
+        set(&dir, Phase::Network, Some("10.0.0.5".into()));
+        set(&dir, Phase::Ready, None);
+
+        // bringup.json still holds ONLY the current phase (compat).
+        assert_eq!(read(&dir).unwrap().phase, Phase::Ready);
+
+        // The history holds every transition, in order, timestamped.
+        let history = read_history(&dir);
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].phase, Phase::Media);
+        assert_eq!(history[2].phase, Phase::Network);
+        assert_eq!(history[2].detail.as_deref(), Some("10.0.0.5"));
+        assert_eq!(history[3].phase, Phase::Ready);
+        assert!(
+            history.windows(2).all(|w| w[0].at <= w[1].at),
+            "timestamps must be monotonic"
+        );
+
+        // clear removes the history too — timings always describe one boot.
+        clear(&dir);
+        assert!(read_history(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timings_render_per_phase_deltas_and_a_total() {
+        let entries = vec![
+            HistoryEntry { phase: Phase::Media, detail: None, at: 1_000 },
+            HistoryEntry { phase: Phase::Booting, detail: None, at: 3_500 },
+            HistoryEntry { phase: Phase::Network, detail: Some("192.168.64.7".into()), at: 4_000 },
+            HistoryEntry { phase: Phase::Cluster, detail: None, at: 4_200 },
+            HistoryEntry { phase: Phase::Ready, detail: None, at: 64_200 },
+        ];
+        let out = render_timings(&entries);
+        // Per-phase deltas: time spent IN each phase until the next.
+        assert!(out.contains("media") && out.contains("2.5s"), "{out}");
+        assert!(out.contains("booting") && out.contains("0.5s"), "{out}");
+        assert!(out.contains("cluster") && out.contains("60.0s"), "{out}");
+        // The terminal phase has no successor — rendered as a dash.
+        assert!(out.contains('—'), "{out}");
+        // The detail rides along.
+        assert!(out.contains("(192.168.64.7)"), "{out}");
+        // And the boot total closes the report.
+        assert!(out.contains("total") && out.contains("63.2s"), "{out}");
+    }
+
+    #[test]
+    fn timings_render_is_empty_for_no_history() {
+        assert_eq!(render_timings(&[]), "");
+    }
+
+    #[test]
+    fn elapsed_prefix_is_stable() {
+        assert_eq!(fmt_elapsed(0.0), "[+0.0s]");
+        assert_eq!(fmt_elapsed(12.34), "[+12.3s]");
+        assert_eq!(fmt_elapsed(365.06), "[+365.1s]");
     }
 
     #[test]
