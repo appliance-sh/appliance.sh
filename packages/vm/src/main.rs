@@ -1,7 +1,9 @@
 mod backend;
 mod bringup;
 mod creds;
+mod doctor;
 mod egress;
+mod guest_exec;
 // guest/images/net/netstack carry the vz/kvm boot-media and
 // host-networking surfaces. They compile everywhere (their pure parts
 // are unit-tested on every platform, and the WSL backend reuses several
@@ -44,8 +46,25 @@ const DEFAULT_VM: &str = "appliance";
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Probe whether this machine can run microVMs.
-    Doctor,
+    /// Probe whether this machine can run microVMs. With --vm-checks,
+    /// run runtime checks against a VM instead (clock skew, guest
+    /// api-server reachability) and print a JSON findings report.
+    Doctor {
+        /// VM to run runtime checks against (JSON report on stdout).
+        #[arg(long, value_name = "VM")]
+        vm_checks: Option<String>,
+        /// Print the named VM's guest api-server log tail, scrubbed of
+        /// secret-shaped tokens — the support-bundle feed.
+        #[arg(long, value_name = "VM", conflicts_with = "vm_checks")]
+        apiserver_log: Option<String>,
+        /// Byte budget for --apiserver-log.
+        #[arg(long, default_value_t = 512 * 1024)]
+        tail_bytes: usize,
+        /// Emit JSON (the default for --vm-checks; opts the plain
+        /// backend probe into a machine-readable verdict too).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// List all defined VMs with their ports and running state (JSON).
     List,
     /// Create (or update) a VM definition and its data disk.
@@ -385,11 +404,48 @@ fn run() -> Result<()> {
     let backend = backend::platform_backend();
 
     match cli.command {
-        Cmd::Doctor => {
+        Cmd::Doctor { vm_checks, apiserver_log, tail_bytes, json } => {
+            // Support-bundle feed: the scrubbed guest api-server log.
+            if let Some(name) = apiserver_log {
+                match doctor::apiserver_log_tail(&name, tail_bytes) {
+                    Ok(text) => {
+                        print!("{text}");
+                        if !text.ends_with('\n') {
+                            println!();
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => bail!("apiserver log tail for '{name}': {e}"),
+                }
+            }
+            // Runtime checks against one VM — always JSON (the CLI's
+            // runtime doctor folds the findings in verbatim).
+            if let Some(name) = vm_checks {
+                let report = doctor::run_vm_checks(&name);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            // Legacy backend probe, unchanged (plus an opt-in JSON form).
             match backend.availability() {
-                Ok(()) => println!("ok: backend '{}' is available", backend.name()),
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ok": true, "backend": backend.name() })
+                        );
+                    } else {
+                        println!("ok: backend '{}' is available", backend.name());
+                    }
+                }
                 Err(err) => {
-                    println!("unavailable: {err:#}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ok": false, "backend": backend.name(), "error": format!("{err:#}") })
+                        );
+                    } else {
+                        println!("unavailable: {err:#}");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -832,6 +888,19 @@ fn run() -> Result<()> {
             backend.destroy(&name)?;
             store::delete_vm_dir(&name)?;
             println!("deleted VM '{name}'");
+            // Prune the credential profiles this VM owned — previously
+            // only the CLI's deleteVmAndProfile did this, so an
+            // engine-side delete left orphan clusters behind in both
+            // the CLI and the desktop (they read the same
+            // ~/.appliance/profiles.json). Best-effort: a store hiccup
+            // must not fail a delete that already happened.
+            for profile in profiles::vm_profile_ids(&name) {
+                match profiles::remove_profile(&profile) {
+                    Ok(true) => println!("removed credential profile '{profile}'"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("warn: could not remove credential profile '{profile}': {e}"),
+                }
+            }
             Ok(())
         }
 

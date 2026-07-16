@@ -959,6 +959,13 @@ APIMANIFEST
   # Launcher: wait for k3s + the SA token, write the base config, then
   # supervise the binary. Backgrounded — k3s readiness never waits on it.
   (
+    # Secrets flow through this launcher: the bootstrap token and the
+    # ServiceAccount token both ride $(…) expansions, and the boot
+    # script's `set -x` EXPANDS command substitutions into the traced
+    # line — without this they would be painted verbatim into the
+    # console log (which support bundles collect). Subshell-local: the
+    # rest of the bootstrap keeps tracing.
+    set +x
     while [ ! -s /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
     # Retire the legacy in-cluster api-server (VMs provisioned before
     # the guest-binary control plane): its ingress claims the same
@@ -2043,6 +2050,36 @@ mod tests {
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__APISERVER_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("base-config.json"));
+    }
+
+    #[test]
+    fn apiserver_launcher_never_traces_its_tokens() {
+        // The boot script runs under `set -x`, and xtrace EXPANDS
+        // command substitutions — so the launcher lines
+        // `BOOTSTRAP_TOKEN="$(cat …)"` and `SA_TOKEN=$(kubectl get
+        // secret …)` would paint both secrets verbatim into the console
+        // log unless the launcher subshell turns tracing off first.
+        // Assert `set +x` exists and precedes EVERY token expansion.
+        let off = APISERVER_COMMON
+            .find("set +x")
+            .expect("the api-server launcher must disable xtrace");
+        for token_read in ["SA_TOKEN=", "BOOTSTRAP_TOKEN=", "base64 -d"] {
+            let at = APISERVER_COMMON
+                .find(token_read)
+                .unwrap_or_else(|| panic!("{token_read} expected in the launcher"));
+            assert!(
+                off < at,
+                "`set +x` must come before {token_read} or the secret leaks into console.log"
+            );
+        }
+        // The trace-off is scoped to the backgrounded launcher subshell
+        // — it must appear after the subshell opens, so the rest of the
+        // bootstrap keeps its (deliberate) tracing.
+        let subshell = APISERVER_COMMON.find("(\n").expect("backgrounded launcher subshell");
+        assert!(off > subshell, "`set +x` must be inside the launcher subshell");
+        // And the boot script itself still traces (the console log is
+        // the primary debugging surface).
+        assert!(APPLIANCE_START.contains("set -x"));
     }
 
     #[test]

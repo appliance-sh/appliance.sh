@@ -41,6 +41,19 @@ pub struct ProfileCredentials {
     pub secret: String,
 }
 
+/// The profile ids a VM's credentials live under. The default VM owns
+/// the CLI-canonical `local` profile plus the legacy `microvm` id the
+/// desktop's cluster registry reads; other VMs get `microvm-<name>`.
+/// First entry is the primary. Mirrors profileForVm +
+/// persistVmCredentials in packages/cli/src/utils/microvm-up.ts.
+pub fn vm_profile_ids(vm_name: &str) -> Vec<String> {
+    if vm_name == crate::spec::DEFAULT_VM_NAME {
+        vec!["local".to_string(), "microvm".to_string()]
+    } else {
+        vec![format!("microvm-{vm_name}")]
+    }
+}
+
 /// Upsert `credentials` under each of `profile_names`, preserving any
 /// existing entry's `createdAt` and every field this writer doesn't
 /// know about. `activeProfile` is only claimed when none is set — the
@@ -50,7 +63,7 @@ pub struct ProfileCredentials {
 /// Returns `Err` only for real write failures; a missing HOME resolves
 /// to a no-op `Ok` (nowhere to write, nothing to corrupt).
 pub fn upsert_vm_credentials(
-    profile_names: &[&str],
+    profile_names: &[String],
     credentials: &ProfileCredentials,
 ) -> Result<(), String> {
     let Some(dir) = appliance_dir() else {
@@ -82,13 +95,13 @@ pub fn upsert_vm_credentials(
         .expect("normalized to object above");
     for name in profile_names {
         let created_at = profiles
-            .get(*name)
+            .get(name)
             .and_then(|e| e.get("createdAt"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| now.clone());
         let entry = profiles
-            .entry(name.to_string())
+            .entry(name.clone())
             .or_insert_with(|| serde_json::json!({}));
         if !entry.is_object() {
             *entry = serde_json::json!({});
@@ -114,7 +127,7 @@ pub fn upsert_vm_credentials(
         .unwrap_or(true);
     if active_is_unset {
         if let Some(first) = profile_names.first() {
-            root.insert("activeProfile".into(), (*first).into());
+            root.insert("activeProfile".into(), first.clone().into());
         }
     }
 
@@ -140,6 +153,91 @@ pub fn upsert_vm_credentials(
         atomic_write_json(&dir.join("credentials.json"), &legacy)?;
     }
     Ok(())
+}
+
+/// Remove a credential profile — the engine-side counterpart of the
+/// CLI's removeProfile (profile-store.ts), so `appliance-vm delete`
+/// prunes the profiles a deleted VM owned instead of leaving orphan
+/// clusters behind in the CLI and desktop. Same protocol as the upsert:
+/// lock, edit the raw tree (never dropping unknown fields), atomic
+/// write, legacy credentials.json mirror.
+///
+/// Returns `Ok(true)` when a profile was actually removed; `Ok(false)`
+/// when it didn't exist (or there is nowhere to read from).
+pub fn remove_profile(profile_name: &str) -> Result<bool, String> {
+    let Some(dir) = appliance_dir() else {
+        return Ok(false);
+    };
+    let path = dir.join("profiles.json");
+    // Lock BEFORE the read: this is a read-modify-write, and reading
+    // outside the lock could drop a concurrent writer's update.
+    let _lock = ProfilesLock::acquire(dir.join("profiles.json.lock"));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let mut file: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        // An unparseable store is not ours to "fix" by rewriting it.
+        Err(_) => return Ok(false),
+    };
+    if !remove_profile_from_tree(&mut file, profile_name) {
+        return Ok(false);
+    }
+    let legacy = legacy_mirror_of(&file);
+    atomic_write_json(&path, &file)?;
+    let legacy_path = dir.join("credentials.json");
+    match legacy {
+        Some(legacy) => atomic_write_json(&legacy_path, &legacy)?,
+        // No active profile any more — clear the legacy mirror so a
+        // downgraded CLI doesn't keep using stale creds (mirrors
+        // writeProfiles in profile-store.ts). Best-effort.
+        None => {
+            let _ = std::fs::remove_file(&legacy_path);
+        }
+    }
+    Ok(true)
+}
+
+/// Pure tree edit for `remove_profile`: drop the entry and, when it was
+/// the active profile, fall back to the first remaining profile (or
+/// null when the store is now empty) — the activeProfile rule of
+/// removeProfile in profile-store.ts. ("First" here is serde_json's
+/// sorted key order rather than JS insertion order; both are arbitrary
+/// fallbacks, not a contract.) Returns whether the profile existed.
+fn remove_profile_from_tree(file: &mut serde_json::Value, profile_name: &str) -> bool {
+    let Some(profiles) = file.get_mut("profiles").and_then(|p| p.as_object_mut()) else {
+        return false;
+    };
+    if profiles.remove(profile_name).is_none() {
+        return false;
+    }
+    let next_active = profiles.keys().next().cloned();
+    let was_active = file
+        .get("activeProfile")
+        .and_then(|v| v.as_str())
+        .is_some_and(|active| active == profile_name);
+    if was_active {
+        if let Some(root) = file.as_object_mut() {
+            root.insert(
+                "activeProfile".into(),
+                next_active.map(Into::into).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    true
+}
+
+/// The legacy credentials.json payload mirroring the active profile,
+/// or None when no active profile exists (the mirror must be cleared).
+/// Matches writeProfiles in profile-store.ts.
+fn legacy_mirror_of(file: &serde_json::Value) -> Option<serde_json::Value> {
+    let active = file.get("activeProfile")?.as_str()?;
+    let entry = file.get("profiles")?.get(active)?.as_object()?;
+    Some(serde_json::json!({
+        "apiUrl": entry.get("apiUrl").cloned().unwrap_or_default(),
+        "keyId": entry.get("keyId").cloned().unwrap_or_default(),
+        "secret": entry.get("secret").cloned().unwrap_or_default(),
+    }))
 }
 
 /// Read a profile's stored key id, if the entry exists and carries one.
@@ -256,6 +354,71 @@ impl Drop for ProfilesLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_vm_owns_local_and_legacy_microvm_profiles() {
+        assert_eq!(vm_profile_ids("appliance"), vec!["local", "microvm"]);
+        assert_eq!(vm_profile_ids("claude"), vec!["microvm-claude"]);
+    }
+
+    fn store(active: Option<&str>, names: &[&str]) -> serde_json::Value {
+        let mut profiles = serde_json::Map::new();
+        for name in names {
+            profiles.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "apiUrl": format!("http://api.appliance.localhost:8081/{name}"),
+                    "keyId": format!("key-{name}"),
+                    "secret": format!("s3cret-{name}"),
+                    // A field this writer doesn't know about must survive.
+                    "stateBackendUrl": "s3://state",
+                }),
+            );
+        }
+        serde_json::json!({
+            "version": 1,
+            "activeProfile": active,
+            "profiles": profiles,
+        })
+    }
+
+    #[test]
+    fn removing_a_missing_profile_is_a_no_op() {
+        let mut file = store(Some("local"), &["local"]);
+        let before = file.clone();
+        assert!(!remove_profile_from_tree(&mut file, "microvm-ghost"));
+        assert_eq!(file, before, "a miss must not rewrite anything");
+    }
+
+    #[test]
+    fn removing_an_inactive_profile_keeps_the_active_slot() {
+        let mut file = store(Some("local"), &["local", "microvm-x"]);
+        assert!(remove_profile_from_tree(&mut file, "microvm-x"));
+        assert_eq!(file["activeProfile"], "local");
+        assert!(file["profiles"].get("microvm-x").is_none());
+        // Untouched entries keep their unknown fields.
+        assert_eq!(file["profiles"]["local"]["stateBackendUrl"], "s3://state");
+    }
+
+    #[test]
+    fn removing_the_active_profile_falls_back_to_a_remaining_one() {
+        let mut file = store(Some("local"), &["local", "prod"]);
+        assert!(remove_profile_from_tree(&mut file, "local"));
+        assert_eq!(file["activeProfile"], "prod");
+        // The legacy mirror follows the new active profile.
+        let legacy = legacy_mirror_of(&file).expect("an active profile mirrors");
+        assert_eq!(legacy["keyId"], "key-prod");
+        assert_eq!(legacy["secret"], "s3cret-prod");
+    }
+
+    #[test]
+    fn removing_the_last_profile_clears_active_and_the_mirror() {
+        let mut file = store(Some("local"), &["local"]);
+        assert!(remove_profile_from_tree(&mut file, "local"));
+        assert!(file["activeProfile"].is_null());
+        // No active profile → the caller must delete credentials.json.
+        assert!(legacy_mirror_of(&file).is_none());
+    }
 
     #[test]
     fn epoch_converts_to_civil_utc() {

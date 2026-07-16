@@ -1,0 +1,387 @@
+//! Engine-side runtime doctor: `appliance-vm doctor --vm-checks <name>`.
+//!
+//! The engine owns the two probes only it can run — they ride the vsock
+//! shell channel, which works before (and independently of) k3s and the
+//! ingress:
+//!
+//!   * guest clock skew vs the host (the source of the opaque signed-
+//!     request 401s: the api-server verifies signature timestamps with
+//!     a 15s tolerance);
+//!   * guest api-server reachability at 127.0.0.1:9091, bypassing the
+//!     whole host→ingress path — which lets the CLI triangulate a 401
+//!     ("server up + clock fine ⇒ the key is unknown").
+//!
+//! Output is a JSON report whose findings use the same shape the CLI's
+//! runtime doctor renders ({id, title, severity, detail, remediation}),
+//! so the CLI folds them in verbatim. The CLI feature-detects this
+//! command (an old engine rejects the flag) and skips engine checks
+//! gracefully.
+
+use crate::guest_exec::run_wrapped;
+use crate::{mint, store};
+use serde::Serialize;
+
+/// The api-server's signed-request clock tolerance (sdk signing
+/// `tolerance: 15` — packages/sdk/src/signing/index.ts). Skew at or
+/// beyond this means every signed request 401s.
+const SIGNATURE_TOLERANCE_SECS: i64 = 15;
+/// Skew worth flagging before it reaches the hard tolerance.
+const SKEW_WARN_SECS: i64 = 10;
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Ok,
+    Info,
+    Warn,
+    Fail,
+}
+
+/// One finding, shaped exactly like the CLI runtime doctor's schema so
+/// the CLI can merge engine findings without translation.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    pub id: String,
+    pub title: String,
+    pub severity: Severity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+impl Finding {
+    fn new(id: &str, title: &str, severity: Severity, detail: String) -> Self {
+        Self {
+            id: id.to_string(),
+            title: title.to_string(),
+            severity,
+            detail: Some(detail),
+            remediation: None,
+        }
+    }
+    fn remedy(mut self, r: String) -> Self {
+        self.remediation = Some(r);
+        self
+    }
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    pub vm: String,
+    /// This engine binary's version — lets the CLI report host/engine
+    /// version skew in one place.
+    pub engine_version: &'static str,
+    pub exists: bool,
+    pub running: bool,
+    /// guest clock minus host clock, seconds (positive = guest ahead).
+    /// Absent when the guest probe couldn't run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_skew_seconds: Option<i64>,
+    /// The guest api-server's own bootstrap state (has the key store
+    /// ever been initialized?). Absent when unreachable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_initialized: Option<bool>,
+    pub findings: Vec<Finding>,
+}
+
+/// Run the engine's runtime checks against one VM. Never fails — every
+/// probe error degrades to a finding, so the CLI always gets a full
+/// report to fold in.
+pub fn run_vm_checks(name: &str) -> Report {
+    let spec = store::load_spec(name).ok().flatten();
+    let running = store::read_live_pid(name).is_some();
+    let mut report = Report {
+        vm: name.to_string(),
+        engine_version: env!("CARGO_PKG_VERSION"),
+        exists: spec.is_some(),
+        running,
+        clock_skew_seconds: None,
+        bootstrap_initialized: None,
+        findings: Vec::new(),
+    };
+
+    if spec.is_none() {
+        report.findings.push(
+            Finding::new(
+                "engine:vm",
+                "VM definition",
+                Severity::Fail,
+                format!("no VM named '{name}' is defined on this host"),
+            )
+            .remedy(format!("appliance vm up{}", name_flag(name))),
+        );
+        return report;
+    }
+    if !running {
+        report.findings.push(
+            Finding::new(
+                "engine:vm",
+                "VM running",
+                Severity::Info,
+                format!("VM '{name}' is not running — guest checks skipped"),
+            )
+            .remedy(format!("appliance vm up{}", name_flag(name))),
+        );
+        return report;
+    }
+    report.findings.push(Finding::new(
+        "engine:vm",
+        "VM running",
+        Severity::Ok,
+        format!("VM '{name}' is running"),
+    ));
+
+    // --- clock skew (guest vs host) --------------------------------
+    match guest_clock_skew(name) {
+        Ok(skew) => {
+            report.clock_skew_seconds = Some(skew);
+            report.findings.push(skew_finding(skew));
+        }
+        Err(e) => report.findings.push(Finding::new(
+            "engine:clock-skew",
+            "Guest clock vs host",
+            Severity::Warn,
+            format!("could not read the guest clock: {e}"),
+        )),
+    }
+
+    // --- guest api-server reachability ------------------------------
+    let agent_only = spec.as_ref().is_some_and(|s| s.agent_only);
+    if agent_only {
+        report.findings.push(Finding::new(
+            "engine:apiserver",
+            "Guest api-server (in-VM probe)",
+            Severity::Info,
+            "agent-only VM — no api-server control plane to probe".to_string(),
+        ));
+    } else {
+        match mint::probe_initialized(name) {
+            Ok(initialized) => {
+                report.bootstrap_initialized = Some(initialized);
+                report.findings.push(Finding::new(
+                    "engine:apiserver",
+                    "Guest api-server (in-VM probe)",
+                    Severity::Ok,
+                    format!(
+                        "answering inside the guest (key store {})",
+                        if initialized { "initialized" } else { "EMPTY — no keys minted yet" }
+                    ),
+                ));
+            }
+            Err(e) => report.findings.push(
+                Finding::new(
+                    "engine:apiserver",
+                    "Guest api-server (in-VM probe)",
+                    Severity::Fail,
+                    format!("not answering inside the guest: {e}"),
+                )
+                .remedy(format!(
+                    "check the guest log: appliance vm console{} (the api-server may still be starting, or was never staged)",
+                    name_flag(name)
+                )),
+            ),
+        }
+    }
+
+    report
+}
+
+/// ` --name <vm>` suffix for remediation commands — the default VM's
+/// commands take no flag.
+fn name_flag(name: &str) -> String {
+    if name == crate::spec::DEFAULT_VM_NAME {
+        String::new()
+    } else {
+        format!(" --name {name}")
+    }
+}
+
+/// Guest epoch seconds via `date +%s`, compared against the host clock.
+/// Positive = guest ahead of host.
+fn guest_clock_skew(name: &str) -> Result<i64, String> {
+    let out = run_wrapped(name, "date +%s")?;
+    let guest: i64 = out
+        .trim()
+        .parse()
+        .map_err(|e| format!("unparseable guest 'date +%s' output {out:?}: {e}"))?;
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "host clock is before the Unix epoch".to_string())?
+        .as_secs() as i64;
+    Ok(guest - host)
+}
+
+/// Pure skew classification: within 10s is healthy; beyond the 15s
+/// signature tolerance every signed request 401s.
+fn skew_finding(skew: i64) -> Finding {
+    let abs = skew.abs();
+    let direction = if skew >= 0 { "ahead of" } else { "behind" };
+    if abs <= SKEW_WARN_SECS {
+        Finding::new(
+            "engine:clock-skew",
+            "Guest clock vs host",
+            Severity::Ok,
+            format!("guest clock is {abs}s {direction} the host (within tolerance)"),
+        )
+    } else if abs < SIGNATURE_TOLERANCE_SECS {
+        Finding::new(
+            "engine:clock-skew",
+            "Guest clock vs host",
+            Severity::Warn,
+            format!(
+                "guest clock is {abs}s {direction} the host — approaching the {SIGNATURE_TOLERANCE_SECS}s signature tolerance"
+            ),
+        )
+        .remedy("restart the VM (`appliance vm stop && appliance vm up`) — the engine re-syncs the guest clock at boot and every 30s".to_string())
+    } else {
+        Finding::new(
+            "engine:clock-skew",
+            "Guest clock vs host",
+            Severity::Fail,
+            format!(
+                "guest clock is {abs}s {direction} the host — beyond the {SIGNATURE_TOLERANCE_SECS}s signature tolerance, signed requests will 401"
+            ),
+        )
+        .remedy("restart the VM (`appliance vm stop && appliance vm up`) — the engine re-syncs the guest clock at boot and every 30s".to_string())
+    }
+}
+
+// --- support-bundle log tail -------------------------------------------
+
+/// Tail the guest api-server log for a support bundle, scrubbed of
+/// secret-shaped tokens. The log can carry auth diagnostics next to
+/// requests that embedded credentials, so the scrub is unconditional.
+pub fn apiserver_log_tail(name: &str, max_bytes: usize) -> Result<String, String> {
+    let cmd = format!(
+        "if [ -f /var/log/appliance-api-server.log ]; then tail -c {max_bytes} /var/log/appliance-api-server.log; else echo '(no api-server log in this VM)'; fi"
+    );
+    Ok(scrub_secrets(&run_wrapped(name, &cmd)?))
+}
+
+/// Replace secret-shaped tokens in free text:
+///   * hex runs of 32+ chars (bootstrap tokens, api-key secrets);
+///   * JWT-shaped `eyJ…` words (the api-server's ServiceAccount token).
+///
+/// Word-at-a-time scan over `[A-Za-z0-9_./-]` runs — no regex crate.
+pub fn scrub_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+            word.push(c);
+        } else {
+            flush_word(&mut out, &mut word);
+            out.push(c);
+        }
+    }
+    flush_word(&mut out, &mut word);
+    out
+}
+
+fn flush_word(out: &mut String, word: &mut String) {
+    if word.is_empty() {
+        return;
+    }
+    if is_secret_shaped(word) {
+        out.push_str(&format!("<scrubbed:{}ch>", word.len()));
+    } else {
+        out.push_str(word);
+    }
+    word.clear();
+}
+
+/// Pure token classification for the scrubber.
+fn is_secret_shaped(word: &str) -> bool {
+    // Long hex run: bootstrap token (64 hex), api-key secrets.
+    if word.len() >= 32 && word.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    // JWT: three dot-separated base64url segments starting with the
+    // `{"` header ("eyJ"). ServiceAccount tokens are exactly this.
+    if word.starts_with("eyJ") && word.len() >= 20 && word.matches('.').count() >= 1 {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skew_within_ten_seconds_is_healthy() {
+        for skew in [0, 3, -9, 10, -10] {
+            assert_eq!(skew_finding(skew).severity, Severity::Ok, "skew {skew}");
+        }
+    }
+
+    #[test]
+    fn skew_between_tolerance_bounds_warns() {
+        for skew in [11, -11, 14, -14] {
+            let f = skew_finding(skew);
+            assert_eq!(f.severity, Severity::Warn, "skew {skew}");
+            assert!(f.remediation.is_some(), "a warn carries the restart remediation");
+        }
+    }
+
+    #[test]
+    fn skew_beyond_signature_tolerance_fails() {
+        // 15s IS the api-server's tolerance: at/beyond it every signed
+        // request 401s, so this is a hard failure, not a warning.
+        for skew in [15, -15, 120, -3600] {
+            let f = skew_finding(skew);
+            assert_eq!(f.severity, Severity::Fail, "skew {skew}");
+            assert!(f.detail.as_deref().unwrap_or("").contains("401"));
+        }
+    }
+
+    #[test]
+    fn findings_serialize_in_the_cli_schema() {
+        // The CLI merges these verbatim: camelCase fields, lowercase
+        // severity, absent optionals omitted (not null).
+        let json = serde_json::to_string(&skew_finding(0)).unwrap();
+        assert!(json.contains("\"id\":\"engine:clock-skew\""));
+        assert!(json.contains("\"severity\":\"ok\""));
+        assert!(!json.contains("remediation"), "absent remediation is omitted");
+        let json = serde_json::to_string(&skew_finding(120)).unwrap();
+        assert!(json.contains("\"severity\":\"fail\""));
+        assert!(json.contains("\"remediation\":"));
+    }
+
+    #[test]
+    fn scrubs_long_hex_tokens() {
+        let token = "9f".repeat(32); // 64 hex chars, the bootstrap-token shape
+        let text = format!("X-Bootstrap-Token: {token} accepted");
+        let scrubbed = scrub_secrets(&text);
+        assert!(!scrubbed.contains(&token), "the token must not survive");
+        assert!(scrubbed.contains("<scrubbed:64ch>"));
+        assert!(scrubbed.contains("X-Bootstrap-Token:"), "context survives");
+    }
+
+    #[test]
+    fn scrubs_jwt_shaped_tokens() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhcHBsaWFuY2UifQ.c2lnbmF0dXJl";
+        let scrubbed = scrub_secrets(&format!("Authorization: Bearer {jwt}\n"));
+        assert!(!scrubbed.contains(jwt));
+        assert!(scrubbed.contains("Bearer <scrubbed:"));
+    }
+
+    #[test]
+    fn leaves_ordinary_log_lines_alone() {
+        let text = "2026-07-16T10:00:00Z info: listening on 0.0.0.0:9091\n\
+                    GET /bootstrap/status 200 3ms request-id=req_01HZX\n\
+                    key k-2b06a172 last used updated";
+        assert_eq!(scrub_secrets(text), text);
+    }
+
+    #[test]
+    fn short_hex_and_uuids_survive() {
+        // Request ids / short hashes / uuids are diagnostics, not
+        // secrets — a 32-char threshold keeps them readable.
+        let text = "commit 548b1b1 uuid 2b06a172-1ea9-4410-b42c-e06eae91843b";
+        assert_eq!(scrub_secrets(text), text);
+    }
+}
