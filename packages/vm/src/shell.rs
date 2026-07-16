@@ -474,6 +474,52 @@ pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
     Ok(out.status.success())
 }
 
+// ---------------------------------------------------------------------
+// Guest clock-set command. Platform-neutral (the guest is Linux under
+// every backend): shared by the vz backend's resident clock-sync thread
+// and the one-shot `appliance-vm sync-clock` subcommand.
+// ---------------------------------------------------------------------
+
+/// Build the busybox-compatible command that sets the guest clock to the
+/// given Unix epoch seconds. Tries the epoch form first; on the busybox
+/// builds where `date -s @EPOCH` isn't honoured, falls back to a
+/// `-D`-typed formatted UTC string built from the same instant. Both are
+/// UTC (`-u`) so the guest's timezone never enters into it.
+pub fn clock_set_command(epoch_secs: u64) -> String {
+    let formatted = format_utc(epoch_secs);
+    format!(
+        "date -u -s @{epoch_secs} 2>/dev/null \
+         || date -u -D '%Y-%m-%d %H:%M:%S' -s '{formatted}' 2>/dev/null \
+         || true"
+    )
+}
+
+/// Convert Unix epoch seconds to a `YYYY-MM-DD HH:MM:SS` UTC string, with
+/// no dependency: a Howard Hinnant civil-from-days calculation for the
+/// date plus plain modular arithmetic for the time of day.
+fn format_utc(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let secs_of_day = epoch_secs % 86_400;
+    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
+}
+
+/// Days since 1970-01-01 → (year, month, day), proleptic Gregorian.
+/// Howard Hinnant's `civil_from_days` algorithm (public domain).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +613,24 @@ mod tests {
         for bad in ["", "has space", "two\nlines", "a/b", "a:b", "semi;rm"] {
             assert!(validate_session_id(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn formats_known_epochs_as_utc() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
+        // 2009-02-13T23:31:30Z — the classic 1234567890 timestamp.
+        assert_eq!(format_utc(1_234_567_890), "2009-02-13 23:31:30");
+        // A leap day: 2020-02-29T12:00:00Z.
+        assert_eq!(format_utc(1_582_977_600), "2020-02-29 12:00:00");
+        // End-of-year boundary: 2023-12-31T23:59:59Z.
+        assert_eq!(format_utc(1_704_067_199), "2023-12-31 23:59:59");
+    }
+
+    #[test]
+    fn command_tries_epoch_then_formatted_fallback() {
+        let cmd = clock_set_command(1_234_567_890);
+        assert!(cmd.contains("date -u -s @1234567890 2>/dev/null"));
+        assert!(cmd.contains("date -u -D '%Y-%m-%d %H:%M:%S' -s '2009-02-13 23:31:30' 2>/dev/null"));
+        assert!(cmd.ends_with("|| true"));
     }
 }

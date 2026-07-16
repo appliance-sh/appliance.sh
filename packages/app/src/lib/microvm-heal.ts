@@ -1,4 +1,5 @@
 import type { QueryClient } from '@tanstack/react-query';
+import type { AuthFailureCause } from '@appliance.sh/sdk';
 import { clearAuthFailure, reportAuthFailure } from '@/lib/auth-signal';
 import { isMicroVmClusterId, microVmNameFromClusterId, type ConsoleHost } from '@/lib/host';
 
@@ -38,15 +39,20 @@ const POST_HEAL_GRACE_MS = 10_000;
  * Entry point for the query cache's error handler: try to self-heal,
  * and only raise the auth-expired banner when healing isn't possible
  * or didn't work. Fire-and-forget — errors degrade to the banner.
+ *
+ * `cause` is the server's machine-readable 401 classification when it
+ * sent one; the host bridge uses it to pick the recovery (re-mint vs
+ * clock sync vs nothing). A recurring failure (clock sync didn't take)
+ * lands inside the retry spacing and raises the banner.
  */
-export function handleAuthShapedError(): void {
+export function handleAuthShapedError(cause?: AuthFailureCause): void {
   if (inflight) return; // a heal is deciding the outcome already
   if (Date.now() - lastHealedAt < POST_HEAL_GRACE_MS) return;
   if (Date.now() - lastSettledAt < RETRY_SPACING_MS) {
     reportAuthFailure();
     return;
   }
-  inflight = attemptHeal()
+  inflight = attemptHeal(cause)
     .catch(() => false)
     .then((healed) => {
       inflight = null;
@@ -57,7 +63,7 @@ export function handleAuthShapedError(): void {
     });
 }
 
-async function attemptHeal(): Promise<boolean> {
+async function attemptHeal(cause?: AuthFailureCause): Promise<boolean> {
   const host = healHost;
   const queryClient = healQueryClient;
   if (!host || !queryClient) return false;
@@ -71,7 +77,7 @@ async function attemptHeal(): Promise<boolean> {
   const instance = host.vm?.instance(vmName);
   if (!instance?.healCredentials) return false;
 
-  const healed = await instance.healCredentials(config.apiKey?.id);
+  const healed = await instance.healCredentials(config.apiKey?.id, cause);
   if (!healed) return false;
 
   // Fresh credentials are on disk: rebuild the client (the config

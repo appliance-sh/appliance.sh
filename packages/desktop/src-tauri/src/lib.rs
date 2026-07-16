@@ -3138,20 +3138,40 @@ enum HealDecision {
     /// The shared profile already carries a different key than the one
     /// that failed (the CLI re-keyed) — sync it instead of minting.
     AlreadyRekeyed,
+    /// The server said `clock_skew`: push the host clock into the guest
+    /// (`appliance-vm sync-clock`) instead of minting — a fresh key
+    /// would be rejected exactly the same way.
+    SyncClock,
     /// Do nothing; the caller falls back to the auth-expired banner.
     Skip(&'static str),
 }
 
 /// Decide whether a heal request should mint. Pure: all clock/store
-/// reads are resolved by the caller and passed in.
+/// reads are resolved by the caller and passed in. `cause` is the
+/// server's machine-readable 401 classification (AuthFailureCause) when
+/// it sent one; cause-less (older) servers keep the local heuristics.
 fn decide_heal(
     record: &HealRecord,
     now: std::time::Instant,
     failed_key_id: Option<&str>,
     stored_key_id: Option<&str>,
+    cause: Option<&str>,
 ) -> HealDecision {
     if record.in_flight {
         return HealDecision::Skip("heal already in flight");
+    }
+    match cause {
+        Some("clock_skew") => return HealDecision::SyncClock,
+        // Not credential-shaped: the request itself is what the server
+        // rejects (body digest, signature structure). Minting can't fix
+        // it and would only grow the key store — banner instead.
+        Some("digest_mismatch") | Some("malformed_signature") => {
+            return HealDecision::Skip("server says the failure is not credential-shaped");
+        }
+        // unknown_key / signature_mismatch are credential-shaped —
+        // today's mint path below. Unrecognized future causes fall
+        // through to the cause-less heuristics too.
+        _ => {}
     }
     // Someone (CLI `vm up`, another window) already replaced the key
     // the caller failed with — adopt it rather than minting yet
@@ -3162,13 +3182,21 @@ fn decide_heal(
             return HealDecision::AlreadyRekeyed;
         }
     }
-    if let (Some(failed), Some(minted)) = (failed_key_id, record.last_minted_key.as_deref()) {
-        if failed == minted
-            && record
-                .last_attempt
-                .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
-        {
-            return HealDecision::Skip("freshly minted key still rejected — not credential-shaped");
+    // The blunt remint guard exists to infer exactly what a cause now
+    // states outright ("would a fresh key help?") — a cause-carrying
+    // credential-shaped 401 supersedes it; cause-less servers keep it.
+    let credential_shaped = matches!(cause, Some("unknown_key") | Some("signature_mismatch"));
+    if !credential_shaped {
+        if let (Some(failed), Some(minted)) = (failed_key_id, record.last_minted_key.as_deref()) {
+            if failed == minted
+                && record
+                    .last_attempt
+                    .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
+            {
+                return HealDecision::Skip(
+                    "freshly minted key still rejected — not credential-shaped",
+                );
+            }
         }
     }
     if record
@@ -3273,6 +3301,7 @@ async fn microvm_heal_credentials(
     app: AppHandle,
     name: Option<String>,
     failed_key_id: Option<String>,
+    cause: Option<String>,
 ) -> Result<bool, String> {
     let name = vm_name(name);
     let cluster_id = microvm_cluster_id(&name);
@@ -3304,6 +3333,7 @@ async fn microvm_heal_credentials(
             std::time::Instant::now(),
             failed_key_id.as_deref(),
             stored_key_id.as_deref(),
+            cause.as_deref(),
         );
         if decision == HealDecision::Proceed {
             record.in_flight = true;
@@ -3318,6 +3348,31 @@ async fn microvm_heal_credentials(
         HealDecision::AlreadyRekeyed => {
             sync_microvm_cluster(&app, &name).map_err(|e| e.to_string())?;
             return Ok(true);
+        }
+        HealDecision::SyncClock => {
+            // One-shot host→guest clock push via the engine binary; the
+            // resident 30s sync thread will keep it corrected after. Not
+            // recorded as a mint attempt, so a later credential-shaped
+            // heal isn't cooldown-blocked by a clock fix.
+            let Some(bin) = vm_binary() else {
+                eprintln!("microvm heal: clock_skew reported but no engine binary to sync with");
+                return Ok(false);
+            };
+            let bin = bin.to_string_lossy().to_string();
+            return match run_status_command(&[&bin, "sync-clock", &name]).await {
+                Ok((true, _, _)) => {
+                    eprintln!("microvm heal: pushed host clock into VM '{name}' (cause=clock_skew)");
+                    Ok(true)
+                }
+                Ok((false, _, stderr)) => {
+                    eprintln!("microvm heal: clock sync failed for '{name}': {}", stderr.trim());
+                    Ok(false)
+                }
+                Err(e) => {
+                    eprintln!("microvm heal: clock sync failed for '{name}': {e}");
+                    Ok(false)
+                }
+            };
         }
         HealDecision::Proceed => {}
     }
@@ -5633,7 +5688,7 @@ mod tests {
         // attempt — mint.
         let record = HealRecord::default();
         assert_eq!(
-            decide_heal(&record, Instant::now(), Some("key-dead"), Some("key-dead")),
+            decide_heal(&record, Instant::now(), Some("key-dead"), Some("key-dead"), None),
             HealDecision::Proceed
         );
     }
@@ -5644,7 +5699,7 @@ mod tests {
         // to compare, mint.
         let record = HealRecord::default();
         assert_eq!(
-            decide_heal(&record, Instant::now(), Some("key-dead"), None),
+            decide_heal(&record, Instant::now(), Some("key-dead"), None, None),
             HealDecision::Proceed
         );
     }
@@ -5660,7 +5715,7 @@ mod tests {
             last_minted_key: Some("key-new".into()),
         };
         assert_eq!(
-            decide_heal(&record, Instant::now(), Some("key-old"), Some("key-new")),
+            decide_heal(&record, Instant::now(), Some("key-old"), Some("key-new"), None),
             HealDecision::AlreadyRekeyed
         );
     }
@@ -5672,7 +5727,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            decide_heal(&record, Instant::now(), Some("k"), Some("k")),
+            decide_heal(&record, Instant::now(), Some("k"), Some("k"), None),
             HealDecision::Skip("heal already in flight")
         );
     }
@@ -5685,7 +5740,7 @@ mod tests {
             last_minted_key: None,
         };
         assert_eq!(
-            decide_heal(&record, Instant::now(), Some("k"), Some("k")),
+            decide_heal(&record, Instant::now(), Some("k"), Some("k"), None),
             HealDecision::Skip("cooldown")
         );
     }
@@ -5703,7 +5758,7 @@ mod tests {
             last_minted_key: Some("key-new".into()),
         };
         assert_eq!(
-            decide_heal(&record, now, Some("key-new"), Some("key-new")),
+            decide_heal(&record, now, Some("key-new"), Some("key-new"), None),
             HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
         );
     }
@@ -5719,8 +5774,119 @@ mod tests {
             last_minted_key: Some("key-a".into()),
         };
         assert_eq!(
-            decide_heal(&record, now, Some("key-a"), Some("key-a")),
+            decide_heal(&record, now, Some("key-a"), Some("key-a"), None),
             HealDecision::Proceed
+        );
+    }
+
+    // ---- cause-carrying servers (V3 distinguishable 401s) ---------
+
+    #[test]
+    fn heal_syncs_clock_on_clock_skew() {
+        // The server said the timestamp is out of window: push the host
+        // clock instead of minting a key that would fail the same way.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(
+                &record,
+                Instant::now(),
+                Some("k"),
+                Some("k"),
+                Some("clock_skew")
+            ),
+            HealDecision::SyncClock
+        );
+    }
+
+    #[test]
+    fn heal_refuses_non_credential_causes() {
+        let record = HealRecord::default();
+        for cause in ["digest_mismatch", "malformed_signature"] {
+            assert_eq!(
+                decide_heal(&record, Instant::now(), Some("k"), Some("k"), Some(cause)),
+                HealDecision::Skip("server says the failure is not credential-shaped")
+            );
+        }
+    }
+
+    #[test]
+    fn heal_mints_on_credential_shaped_causes() {
+        let record = HealRecord::default();
+        for cause in ["unknown_key", "signature_mismatch"] {
+            assert_eq!(
+                decide_heal(&record, Instant::now(), Some("k"), Some("k"), Some(cause)),
+                HealDecision::Proceed
+            );
+        }
+    }
+
+    #[test]
+    fn credential_shaped_cause_supersedes_the_remint_guard() {
+        // A cause-carrying server rejected OUR freshly minted key as
+        // unknown (e.g. the VM was recreated again right away): the
+        // explicit cause replaces the blunt "same key ⇒ not
+        // credential-shaped" heuristic, so we mint (cooldown permitting).
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            // Past the 60s cooldown but inside the 10min re-mint guard.
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                now,
+                Some("key-new"),
+                Some("key-new"),
+                Some("unknown_key")
+            ),
+            HealDecision::Proceed
+        );
+        // …while a cause-less 401 on the same state keeps the guard.
+        assert_eq!(
+            decide_heal(&record, now, Some("key-new"), Some("key-new"), None),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn unrecognized_causes_fall_back_to_cause_less_heuristics() {
+        // Future cause values must not break old desktops: treat them
+        // exactly like a cause-less server (guard + cooldown apply).
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                now,
+                Some("key-new"),
+                Some("key-new"),
+                Some("some_future_cause")
+            ),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn clock_skew_still_defers_to_an_in_flight_heal() {
+        let record = HealRecord {
+            in_flight: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                Instant::now(),
+                Some("k"),
+                Some("k"),
+                Some("clock_skew")
+            ),
+            HealDecision::Skip("heal already in flight")
         );
     }
 }

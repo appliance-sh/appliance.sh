@@ -4,7 +4,7 @@ import { HostProvider } from '@/providers/host-provider';
 import { TerminalSessionsProvider } from '@/providers/terminal-sessions-provider';
 import { ToastProvider } from '@/components/ui/toast';
 import { ConfirmProvider } from '@/components/ui/confirm-dialog';
-import { isAuthShapedError } from '@/components/friendly-error';
+import { authFailureCause, isAuthShapedError } from '@/components/friendly-error';
 import { handleAuthShapedError, registerAuthHeal } from '@/lib/microvm-heal';
 import { routes } from '@/router/routes';
 import type { ConsoleHost } from '@/lib/host';
@@ -20,7 +20,10 @@ const queryClient = new QueryClient({
   // a Reconnect CTA — when healing isn't possible or didn't work.
   queryCache: new QueryCache({
     onError: (error) => {
-      if (isAuthShapedError(error)) handleAuthShapedError();
+      // Newer servers attach a machine-readable cause to the 401 body;
+      // it picks the heal strategy (mint vs clock-sync vs nothing).
+      // Cause-less errors keep the text-shape heuristic behavior.
+      if (isAuthShapedError(error)) handleAuthShapedError(authFailureCause(error));
     },
   }),
   defaultOptions: {
