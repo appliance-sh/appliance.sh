@@ -2,9 +2,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
-import { IN_CLUSTER_API_SERVER_HOSTNAME } from '@appliance.sh/helper';
-import { readProfiles, type Profile } from './profile-store.js';
-import { resolveProfileSecret, keychainAccountFor, readKeychainApiKey } from './keychain.js';
+import { apiServerUrlForHostPort, IN_CLUSTER_API_SERVER_HOSTNAME, mintApiKey } from '@appliance.sh/helper';
+import { readProfiles, removeProfile, upsertProfile, type Profile } from './profile-store.js';
+import {
+  resolveProfileSecret,
+  keychainAccountFor,
+  readKeychainApiKey,
+  writeKeychainApiKey,
+  deleteKeychainApiKey,
+} from './keychain.js';
 import { DEFAULT_VM_NAME, LEGACY_MICROVM_PROFILE, profileForVm, resolveVmBinary, vmDir } from './microvm-up.js';
 import { guestAssetsDir } from './api-server-artifact.js';
 
@@ -148,7 +154,7 @@ export type ProfileBinding =
   | { kind: 'ok'; vmName: string; port: number }
   | { kind: 'orphan'; vmName: string }
   | { kind: 'stale-port'; vmName: string; profilePort: number; vmPort: number }
-  | { kind: 'cross-wired'; vmName: string; profilePort: number; portOwner: string };
+  | { kind: 'cross-wired'; vmName: string; profilePort: number; vmPort: number; portOwner: string };
 
 /**
  * Classify one profile against the engine's VM registry (check d):
@@ -173,7 +179,7 @@ export function classifyProfileBinding(profileName: string, apiUrl: string, engi
   if (profilePort === vm.hostPort) return { kind: 'ok', vmName, port: vm.hostPort };
   const owner = engine.vms.find((v) => v.name !== vmName && v.hostPort === profilePort);
   if (owner && profilePort !== null) {
-    return { kind: 'cross-wired', vmName, profilePort, portOwner: owner.name };
+    return { kind: 'cross-wired', vmName, profilePort, vmPort: vm.hostPort, portOwner: owner.name };
   }
   return { kind: 'stale-port', vmName, profilePort: profilePort ?? -1, vmPort: vm.hostPort };
 }
@@ -772,15 +778,25 @@ export async function runRuntimeDoctor(opts: RuntimeDoctorOptions = {}): Promise
   };
 }
 
-// ---- fixers (D2) — filled in by the fixes commit ---------------------------
+// ---- fixers (D2) --------------------------------------------------------------
 
 /** Render a binding classification as a finding, applying the SAFE
- *  auto-fixes. Returns null for remote profiles (out of scope). */
+ *  auto-fixes. Returns null for remote profiles (out of scope).
+ *
+ *  Auto-fix policy (runs on every `doctor`, no --fix needed — each
+ *  applied fix is listed per item):
+ *   - orphan: removeProfile + Keychain-entry delete. Safe because the
+ *     classification already required: local profile AND a SUCCESSFUL
+ *     engine listing AND the VM absent from it. The CLI never edits the
+ *     desktop's config.json (no shared lock) — the desktop converges
+ *     via its own cluster sync.
+ *   - stale-port / cross-wired: rewrite apiUrl to the VM's real
+ *     hostPort (apiServerUrlForHostPort) via upsertProfile. */
 async function renderBindingFinding(
   profileName: string,
   profile: Profile,
   binding: ProfileBinding,
-  _ctx: { autoFix: boolean; fixes: RuntimeFixOutcome[] }
+  ctx: { autoFix: boolean; fixes: RuntimeFixOutcome[] }
 ): Promise<RuntimeFinding | null> {
   const id = `profile:${profileName}`;
   const title = `Profile '${profileName}' ↔ VM registry`;
@@ -802,62 +818,185 @@ async function renderBindingFinding(
         severity: 'ok',
         detail: `bound to VM '${binding.vmName}' on port ${binding.port}`,
       };
-    case 'orphan':
+    case 'orphan': {
+      if (ctx.autoFix) {
+        const label = `remove orphan profile '${profileName}'`;
+        try {
+          const account = keychainAccountFor(profileName, profile);
+          if (removeProfile(profileName)) {
+            const keychainNote = account && deleteKeychainApiKey(account) ? ' + its Keychain entry' : '';
+            ctx.fixes.push({
+              label,
+              status: 'fixed',
+              detail: `VM '${binding.vmName}' no longer exists — pruned the profile${keychainNote} (the desktop converges via its own sync)`,
+            });
+            return {
+              id,
+              title,
+              severity: 'ok',
+              detail: `orphan profile removed (its VM '${binding.vmName}' no longer exists)`,
+              fix: { kind: 'remove-orphan-profile', applied: true },
+            };
+          }
+          ctx.fixes.push({ label, status: 'failed', detail: 'profile store reported nothing to remove' });
+        } catch (err) {
+          ctx.fixes.push({ label, status: 'failed', detail: err instanceof Error ? err.message : String(err) });
+        }
+      }
       return {
         id,
         title,
         severity: 'warn',
         detail: `profile points at VM '${binding.vmName}', which no longer exists (engine listing succeeded)`,
-        remediation: `Remove it: \`appliance cluster rm ${profileName}\` (doctor auto-removes orphans).`,
+        remediation: `Remove it: \`appliance cluster rm ${profileName}\`.`,
         fix: { kind: 'remove-orphan-profile' },
       };
+    }
     case 'stale-port':
+    case 'cross-wired': {
+      const crossWired = binding.kind === 'cross-wired';
+      if (ctx.autoFix) {
+        const label = `rewrite apiUrl of profile '${profileName}'`;
+        try {
+          const newUrl = apiServerUrlForHostPort(binding.vmPort);
+          upsertProfile(profileName, { ...profile, apiUrl: newUrl });
+          ctx.fixes.push({ label, status: 'fixed', detail: `${profile.apiUrl} → ${newUrl}` });
+          return {
+            id,
+            title,
+            severity: 'ok',
+            detail: `apiUrl rewritten from port ${binding.profilePort}${
+              crossWired ? ` (owned by VM '${binding.portOwner}'!)` : ''
+            } to VM '${binding.vmName}' port ${binding.vmPort}`,
+            fix: { kind: 'rewrite-stale-port', applied: true },
+          };
+        } catch (err) {
+          ctx.fixes.push({ label, status: 'failed', detail: err instanceof Error ? err.message : String(err) });
+        }
+      }
       return {
         id,
         title,
-        severity: 'warn',
-        detail: `profile apiUrl points at port ${binding.profilePort} but VM '${binding.vmName}' owns port ${binding.vmPort}`,
-        remediation: "Doctor rewrites the profile apiUrl to the VM's real port.",
+        severity: crossWired ? 'fail' : 'warn',
+        detail: crossWired
+          ? `profile apiUrl points at port ${binding.profilePort}, which belongs to a DIFFERENT VM ('${binding.portOwner}') — requests would hit the wrong cluster`
+          : `profile apiUrl points at port ${binding.profilePort} but VM '${binding.vmName}' owns port ${binding.vmPort}`,
+        remediation: `Point the profile back at its VM: apiUrl ${apiServerUrlForHostPort(binding.vmPort)}.`,
         fix: { kind: 'rewrite-stale-port' },
       };
-    case 'cross-wired':
-      return {
-        id,
-        title,
-        severity: 'fail',
-        detail: `profile apiUrl points at port ${binding.profilePort}, which belongs to a DIFFERENT VM ('${binding.portOwner}') — requests would hit the wrong cluster`,
-        remediation: "Doctor rewrites the profile apiUrl to its own VM's port.",
-        fix: { kind: 'rewrite-stale-port' },
-      };
+    }
   }
 }
 
+/** Pure decide_heal-style safeguard for the re-mint fix: if the stored
+ *  keyId moved since the failing probe (another surface re-keyed while
+ *  doctor ran), VERIFY that rekey first instead of minting yet another
+ *  key on top of it. */
+export function decideRemintPlan(failingKeyId: string, freshKeyId: string | undefined): 'verify-first' | 'mint' {
+  return freshKeyId && freshKeyId !== failingKeyId ? 'verify-first' : 'mint';
+}
+
+/** `--fix` for the dead-key class: adopt a concurrent rekey when one
+ *  verifies, else mint a new key with the VM's bootstrap token and
+ *  persist it exactly as `vm up` would (primary profile + legacy dual-
+ *  write for the default VM). Never steals the active-profile slot —
+ *  a doctor repair must not switch the user's selected cluster. */
 async function applyRemintFix(
-  _vm: string,
-  _profileName: string,
-  _profile: Profile,
-  _failingKeyId: string,
+  vm: string,
+  profileName: string,
+  profile: Profile,
+  failingKeyId: string,
   finding: RuntimeFinding,
   fixes: RuntimeFixOutcome[]
 ): Promise<RuntimeFinding> {
-  fixes.push({
-    label: 're-mint API key',
-    status: 'skipped',
-    detail: 'fix implementation lands with the fixes commit',
-  });
-  return finding;
+  const label = 're-mint API key';
+  const apiUrl = profile.apiUrl;
+  try {
+    // Safeguard 1: adopt an existing rekey instead of minting over it.
+    const fresh = readProfiles().profiles[profileName];
+    if (fresh && decideRemintPlan(failingKeyId, fresh.keyId) === 'verify-first') {
+      const creds = resolveProfileSecret(profileName, fresh);
+      if (creds.keyId && creds.secret && (await probeSigned(apiUrl, creds.keyId, creds.secret)).kind === 'ok') {
+        fixes.push({
+          label,
+          status: 'fixed',
+          detail: `adopted existing rekey ${creds.keyId} (verified) — no new key minted`,
+        });
+        return {
+          ...finding,
+          severity: 'ok',
+          detail: `a newer key (${creds.keyId}) already existed and verifies — adopted instead of re-minting`,
+          remediation: undefined,
+          fix: { kind: 'remint-key', applied: true },
+        };
+      }
+    }
+    const token = fs.readFileSync(bootstrapTokenPath(vm), 'utf8').trim();
+    if (!token) throw new Error(`empty bootstrap token at ${bootstrapTokenPath(vm)}`);
+    const keyName = vm === DEFAULT_VM_NAME ? 'Dev Machine' : `Dev Machine (${vm})`;
+    const minted = await mintApiKey(apiUrl, token, keyName);
+    const creds: Profile = { apiUrl, keyId: minted.id, secret: minted.secret, managed: 'cli' };
+    // Persist under the VM's canonical profile ids (persistVmCredentials'
+    // dual-write), but WITHOUT makeActive — repairs don't switch clusters.
+    upsertProfile(profileForVm(vm), creds);
+    if (vm === DEFAULT_VM_NAME) upsertProfile(LEGACY_MICROVM_PROFILE, creds);
+    // Safeguard 2: prove the mint actually heals before reporting fixed.
+    const confirm = await probeSigned(apiUrl, minted.id, minted.secret);
+    if (confirm.kind !== 'ok') {
+      fixes.push({
+        label,
+        status: 'failed',
+        detail: `minted ${minted.id} and saved it, but the signed probe still fails — see the api-server log`,
+      });
+      return { ...finding, detail: `${finding.detail} (re-mint attempted: new key saved but still rejected)` };
+    }
+    fixes.push({
+      label,
+      status: 'fixed',
+      detail: `minted ${minted.id} with the VM bootstrap token and saved it to profile '${profileForVm(vm)}'`,
+    });
+    return {
+      ...finding,
+      severity: 'ok',
+      detail: `dead key replaced: re-minted ${minted.id} with the VM bootstrap token; signed request now accepted`,
+      remediation: undefined,
+      fix: { kind: 'remint-key', applied: true },
+    };
+  } catch (err) {
+    fixes.push({ label, status: 'failed', detail: err instanceof Error ? err.message : String(err) });
+    return finding;
+  }
 }
 
+/** `--fix` for Keychain desync where profiles.json holds the fresher
+ *  secret: write it back to the desktop's Keychain entry. The file copy
+ *  is left in place — clearing it is the desktop's own convergence. */
 function applyKeychainWriteback(
-  _profileName: string,
-  _profile: Profile,
+  profileName: string,
+  profile: Profile,
   finding: RuntimeFinding,
   fixes: RuntimeFixOutcome[]
 ): RuntimeFinding {
+  const label = `write '${profileName}' secret back to the Keychain`;
+  const account = keychainAccountFor(profileName, profile);
+  if (!account || !profile.keyId || !profile.secret) {
+    fixes.push({ label, status: 'skipped', detail: 'no Keychain account or no on-disk secret to write' });
+    return finding;
+  }
+  if (writeKeychainApiKey(account, { keyId: profile.keyId, secret: profile.secret })) {
+    fixes.push({ label, status: 'fixed', detail: `Keychain account ${account} now carries key ${profile.keyId}` });
+    return {
+      ...finding,
+      severity: 'ok',
+      detail: `Keychain entry rewritten from the fresher profiles.json copy (key ${profile.keyId})`,
+      remediation: undefined,
+      fix: { kind: 'keychain-writeback', applied: true },
+    };
+  }
   fixes.push({
-    label: 'write secret back to Keychain',
-    status: 'skipped',
-    detail: 'fix implementation lands with the fixes commit',
+    label,
+    status: 'failed',
+    detail: '`security add-generic-password -U` failed (macOS may have denied access)',
   });
   return finding;
 }

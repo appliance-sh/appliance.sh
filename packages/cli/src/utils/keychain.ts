@@ -117,6 +117,25 @@ export function writeKeychainApiKey(account: string, key: KeychainApiKey): boole
 }
 
 /**
+ * Delete a desktop Keychain entry from the CLI — used by `appliance
+ * doctor`'s orphan-profile cleanup so a removed cluster doesn't leave a
+ * dangling secret behind. Best-effort: returns false on any failure
+ * (missing item included); nothing sensitive rides argv. Never logs
+ * the secret.
+ */
+export function deleteKeychainApiKey(account: string): boolean {
+  if (!isMacOS()) return false;
+  try {
+    execFileSync(SECURITY_BIN, ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Pure credential-source choice (unit-testable; mirrors the desktop's
  * pure `decide_seed`). Given the profile's file copy and what the
  * Keychain returned (or null), pick the authoritative {keyId, secret}:

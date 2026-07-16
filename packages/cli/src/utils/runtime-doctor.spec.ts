@@ -5,6 +5,7 @@ import {
   classifyKeychainCoherence,
   classifyProfileBinding,
   compareVersionStamp,
+  decideRemintPlan,
   doctorVmForProfile,
   extractIngressClaims,
   portOfApiUrl,
@@ -100,6 +101,7 @@ describe('classifyProfileBinding', () => {
       kind: 'cross-wired',
       vmName: 'appliance',
       profilePort: 8100,
+      vmPort: 8081,
       portOwner: 'staging',
     });
   });
@@ -302,6 +304,20 @@ describe('classifyKeychainCoherence', () => {
     const f = classifyKeychainCoherence('c1', profile('k1', ''), { kind: 'unreadable' });
     expect(f?.severity).toBe('info');
     expect(f?.detail).toContain('denied');
+  });
+});
+
+describe('decideRemintPlan', () => {
+  it('verifies first when the stored keyId moved since the failing probe (concurrent rekey)', () => {
+    // decide_heal safeguard: another surface re-keyed while doctor ran
+    // — verify + adopt that key instead of minting on top of it.
+    expect(decideRemintPlan('k-old', 'k-new')).toBe('verify-first');
+  });
+
+  it('mints when the stored key is still the failing one (or gone)', () => {
+    expect(decideRemintPlan('k-old', 'k-old')).toBe('mint');
+    expect(decideRemintPlan('k-old', undefined)).toBe('mint');
+    expect(decideRemintPlan('k-old', '')).toBe('mint');
   });
 });
 
