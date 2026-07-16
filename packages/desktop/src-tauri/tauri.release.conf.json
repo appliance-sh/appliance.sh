@@ -1,16 +1,5 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "_comment": [
-    "Release-only config overlay, merged onto tauri.conf.json via",
-    "`tauri build --config src-tauri/tauri.release.conf.json`. Kept out of",
-    "the base config so that a plain `pnpm tauri build` (local dev, or any",
-    "build without the updater signing key) does NOT try to produce signed",
-    "updater artifacts — `createUpdaterArtifacts: true` makes `tauri build`",
-    "HARD-FAIL when TAURI_SIGNING_PRIVATE_KEY is absent. The GitHub Actions",
-    "release workflow applies this overlay only after confirming the signing",
-    "secret is present, mirroring the no-op-when-absent ethos of",
-    "scripts/sign-macos.mjs. See packages/desktop/README.md -> Auto-update."
-  ],
   "bundle": {
     "createUpdaterArtifacts": true
   }
