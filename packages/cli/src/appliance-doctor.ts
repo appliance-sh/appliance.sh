@@ -3,28 +3,35 @@ import chalk from 'chalk';
 import { ensureHelperBinOnPath } from '@appliance.sh/helper';
 import { runFixes, runPreflight } from './utils/preflight.js';
 import type { CheckResult, FixOutcome, PreflightReport } from './utils/preflight.js';
+import { runRuntimeDoctor } from './utils/runtime-doctor.js';
+import type { RuntimeDoctorReport, RuntimeFinding, RuntimeFixOutcome } from './utils/runtime-doctor.js';
 
-// `appliance doctor` — first-run reliability preflight. Probes every
-// prerequisite a fresh machine needs to run an Appliance runtime
-// (container runtime + daemon, helper binaries, build toolchains, free
-// ports, a resolvable api-server image, macOS signing) and prints a
-// pass/fail checklist where every failure carries its exact
-// remediation. Exits non-zero when any hard check fails so it slots
-// into CI and pre-deploy gates.
+// `appliance doctor` — reliability diagnostics in two sections:
 //
-// The checks themselves live in utils/preflight.ts so the desktop
-// sidecar and other surfaces can reuse the same verdicts; this file is
-// only the CLI presentation + the `--fix` driver.
+//   Preflight: can a fresh machine run an Appliance runtime? (container
+//   runtime, helper binaries, toolchains, free ports, macOS signing.)
+//
+//   Runtime: why doesn't the ALREADY-SET-UP runtime work? Dead/unknown
+//   API keys (the opaque-401 class), guest clock skew, orphaned or
+//   cross-wired credential profiles, duplicate ingress claims, stale
+//   guest binaries, profiles↔Keychain drift.
+//
+// Exits non-zero when any hard check fails so it slots into CI and
+// pre-deploy gates. The checks live in utils/preflight.ts and
+// utils/runtime-doctor.ts so the desktop sidecar and other surfaces can
+// reuse the same verdicts; this file is only the CLI presentation +
+// the `--fix` driver.
 
 ensureHelperBinOnPath();
 
 const program = new Command();
 
 program
-  .description('run first-run preflight checks and print a pass/fail checklist with remediations')
-  .option('--fix', 'auto-resolve the checks doctor can safely fix (e.g. pull the api-server image)', false)
+  .description('run preflight + runtime diagnostics and print a pass/fail checklist with remediations')
+  .option('--fix', 'auto-resolve the checks doctor can safely fix (pull binaries, re-mint a dead key, …)', false)
   .option('--json', 'emit the report as JSON instead of a checklist', false)
-  .action(async (opts: { fix: boolean; json: boolean }) => {
+  .option('--vm <name>', 'microVM whose runtime to diagnose', 'appliance')
+  .action(async (opts: { fix: boolean; json: boolean; vm: string }) => {
     let report = await runPreflight();
 
     let fixes: FixOutcome[] = [];
@@ -37,28 +44,40 @@ program
       }
     }
 
+    const runtime = await runRuntimeDoctor({ vm: opts.vm, fix: opts.fix });
+
     if (opts.json) {
-      printJson(report, fixes);
+      printJson(report, fixes, runtime);
     } else {
-      printChecklist(report, fixes);
+      printChecklist(report, fixes, runtime);
     }
 
-    if (!report.ok) process.exit(1);
+    if (!report.ok || !runtime.ok) process.exit(1);
   });
 
 program.parse(process.argv);
 
 // ---- rendering ----------------------------------------------------------
 
-function marker(status: CheckResult['status']): string {
-  if (status === 'pass') return chalk.green('✓');
+function marker(status: CheckResult['status'] | RuntimeFinding['severity']): string {
+  if (status === 'pass' || status === 'ok') return chalk.green('✓');
   if (status === 'warn') return chalk.yellow('!');
+  if (status === 'info') return chalk.cyan('i');
   return chalk.red('✗');
 }
 
-function printChecklist(report: PreflightReport, fixes: FixOutcome[]): void {
+function fixTag(status: 'fixed' | 'failed' | 'skipped'): string {
+  return status === 'fixed'
+    ? chalk.green('fixed  ')
+    : status === 'failed'
+      ? chalk.red('failed ')
+      : chalk.yellow('skipped');
+}
+
+function printChecklist(report: PreflightReport, fixes: FixOutcome[], runtime: RuntimeDoctorReport): void {
   console.log(chalk.bold('Appliance doctor'));
   console.log();
+  console.log(chalk.bold('Preflight (can this machine run Appliance?)'));
 
   for (const result of report.results) {
     const detail = result.detail ? chalk.dim(` — ${result.detail}`) : '';
@@ -68,31 +87,42 @@ function printChecklist(report: PreflightReport, fixes: FixOutcome[]): void {
     }
   }
 
-  if (fixes.length > 0) {
+  console.log();
+  console.log(chalk.bold(`Runtime (VM '${runtime.vm}')`));
+  for (const finding of runtime.findings) {
+    const detail = finding.detail ? chalk.dim(` — ${finding.detail}`) : '';
+    const fixed = finding.fix?.applied ? chalk.green(' [fixed]') : '';
+    console.log(`${marker(finding.severity)} ${finding.title}${detail}${fixed}`);
+    if (finding.severity !== 'ok' && !finding.fix?.applied && finding.remediation) {
+      console.log(`    ${chalk.cyan('→')} ${finding.remediation}`);
+    }
+  }
+
+  const allFixes: Array<FixOutcome | RuntimeFixOutcome> = [...fixes, ...runtime.fixes];
+  if (allFixes.length > 0) {
     console.log();
     console.log(chalk.bold('Fixes'));
-    for (const fix of fixes) {
-      const tag =
-        fix.status === 'fixed'
-          ? chalk.green('fixed  ')
-          : fix.status === 'failed'
-            ? chalk.red('failed ')
-            : chalk.yellow('skipped');
-      console.log(`${tag} ${fix.label} ${chalk.dim(`— ${fix.detail}`)}`);
+    for (const fix of allFixes) {
+      console.log(`${fixTag(fix.status)} ${fix.label} ${chalk.dim(`— ${fix.detail}`)}`);
     }
   }
 
   console.log();
-  const fails = report.results.filter((r) => r.status === 'fail').length;
-  const warns = report.results.filter((r) => r.status === 'warn').length;
+  const combined = [
+    ...report.results.map((r) => r.status as string),
+    ...runtime.findings.map((f) => f.severity as string),
+  ];
+  const fails = combined.filter((s) => s === 'fail').length;
+  const warns = combined.filter((s) => s === 'warn').length;
   if (fails === 0 && warns === 0) {
-    console.log(chalk.green('All checks passed. This machine is ready to run Appliance.'));
+    console.log(chalk.green('All checks passed. This machine and its runtime look healthy.'));
   } else if (fails === 0) {
     console.log(chalk.yellow(`${warns} warning${warns === 1 ? '' : 's'} — non-blocking, but worth a look above.`));
   } else {
-    const hint = report.results.some((r) => r.status !== 'pass' && r.remediation && !fixes.length)
-      ? ' Re-run with `appliance doctor --fix` to auto-resolve the safe ones.'
-      : '';
+    const hint =
+      !fixes.length && !runtime.fixes.length
+        ? ' Re-run with `appliance doctor --fix` to auto-resolve the safe ones.'
+        : '';
     console.log(
       chalk.red(
         `${fails} check${fails === 1 ? '' : 's'} failed${warns ? ` (and ${warns} warning${warns === 1 ? '' : 's'})` : ''}. Fix the items marked → above, then re-run.${hint}`
@@ -101,13 +131,14 @@ function printChecklist(report: PreflightReport, fixes: FixOutcome[]): void {
   }
 }
 
-function printJson(report: PreflightReport, fixes: FixOutcome[]): void {
+function printJson(report: PreflightReport, fixes: FixOutcome[], runtime: RuntimeDoctorReport): void {
   console.log(
     JSON.stringify(
       {
-        ok: report.ok,
+        ok: report.ok && runtime.ok,
         checks: report.results,
         fixes,
+        runtime,
       },
       null,
       2
