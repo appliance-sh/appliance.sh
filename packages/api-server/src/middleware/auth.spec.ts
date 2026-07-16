@@ -51,6 +51,7 @@ describe('signatureAuth middleware', () => {
     const res = await request(app).get('/api/v1/test');
     expect(res.status).toBe(401);
     expect(res.body.error).toBe('Missing signature headers');
+    expect(res.body.cause).toBe('missing_signature');
   });
 
   it('should return 401 with invalid signature', async () => {
@@ -127,6 +128,7 @@ describe('signatureAuth middleware', () => {
       .send(JSON.stringify({ name: 'tampered' }));
 
     expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('digest_mismatch');
   });
 
   it('should return 401 for unknown key', async () => {
@@ -145,5 +147,97 @@ describe('signatureAuth middleware', () => {
       .set(sigHeaders);
 
     expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('unknown_key');
+  });
+
+  it('should return 401 with cause missing_digest when a body ships without Content-Digest', async () => {
+    const app = createTestApp();
+    const body = JSON.stringify({ name: 'test' });
+    const url = `http://${TEST_HOST}/api/v1/test`;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+
+    const sigHeaders = await signRequest(
+      { keyId: TEST_KEY_ID, secret: TEST_SECRET },
+      { method: 'POST', url, headers, body }
+    );
+    delete sigHeaders['content-digest'];
+
+    const res = await request(app)
+      .post('/api/v1/test')
+      .set('host', TEST_HOST)
+      .set('content-type', 'application/json')
+      .set(sigHeaders)
+      .send(body);
+
+    expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('missing_digest');
+  });
+
+  it('should return 401 with cause signature_mismatch for a known key signed with the wrong secret', async () => {
+    const app = createTestApp();
+    const url = `http://${TEST_HOST}/api/v1/test`;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+
+    // Right key id, wrong bytes — must NOT look like unknown_key (that
+    // would tell the healer a re-mint fixes it).
+    const sigHeaders = await signRequest(
+      { keyId: TEST_KEY_ID, secret: 'sk_not-the-real-secret' },
+      { method: 'GET', url, headers }
+    );
+
+    const res = await request(app)
+      .get('/api/v1/test')
+      .set('host', TEST_HOST)
+      .set('content-type', 'application/json')
+      .set(sigHeaders);
+
+    expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('signature_mismatch');
+  });
+
+  it('should return 401 with cause clock_skew for a stale signature', async () => {
+    const app = createTestApp();
+    const url = `http://${TEST_HOST}/api/v1/test`;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() - 10 * 60 * 1000);
+    const sigHeaders = await signRequest({ keyId: TEST_KEY_ID, secret: TEST_SECRET }, { method: 'GET', url, headers });
+    vi.useRealTimers();
+
+    const res = await request(app)
+      .get('/api/v1/test')
+      .set('host', TEST_HOST)
+      .set('content-type', 'application/json')
+      .set(sigHeaders);
+
+    expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('clock_skew');
+  });
+
+  it('should return 401 with cause malformed_signature for corrupted signature bytes', async () => {
+    const app = createTestApp();
+    const url = `http://${TEST_HOST}/api/v1/test`;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+
+    const sigHeaders = await signRequest({ keyId: TEST_KEY_ID, secret: TEST_SECRET }, { method: 'GET', url, headers });
+    sigHeaders['signature'] = 'sig1=notbytes';
+
+    const res = await request(app)
+      .get('/api/v1/test')
+      .set('host', TEST_HOST)
+      .set('content-type', 'application/json')
+      .set(sigHeaders);
+
+    expect(res.status).toBe(401);
+    expect(res.body.cause).toBe('malformed_signature');
   });
 });
