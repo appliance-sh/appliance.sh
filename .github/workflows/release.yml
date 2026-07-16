@@ -7,6 +7,14 @@ on:
 permissions:
   contents: read # for checkout
 
+# One release train at a time. GitHub keeps at most one PENDING run per
+# group, so a new push to main supersedes a run still waiting on the
+# `release` environment approval. cancel-in-progress stays false so an
+# approved, in-flight publish is never killed halfway through.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Release
