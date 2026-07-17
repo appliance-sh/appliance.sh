@@ -26,18 +26,11 @@
 //! up on its next status poll.
 
 use crate::guest::API_SERVER_GUEST_PORT;
+use crate::guest_exec::run_wrapped;
 use crate::profiles;
-use crate::spec::{VmPaths, VmSpec};
-use crate::{bringup, shell};
+use crate::spec::{VmPaths, VmSpec, DEFAULT_VM_NAME};
+use crate::bringup;
 use std::time::{Duration, Instant};
-
-/// The default VM owns the CLI-canonical `local` profile plus the
-/// legacy `microvm` id the desktop's cluster registry reads; other VMs
-/// get `microvm-<name>`. Mirrors profileForVm + persistVmCredentials in
-/// packages/cli/src/utils/microvm-up.ts.
-const DEFAULT_VM: &str = "appliance";
-const PROFILE_LOCAL: &str = "local";
-const PROFILE_MICROVM: &str = "microvm";
 
 /// How long the thread keeps trying before giving up. The shell agent
 /// and api-server start seconds into boot; the budget is generous only
@@ -83,8 +76,8 @@ fn run_mint_loop(name: &str, host_port: u16) {
             // starting) — quiet wait.
             Err(_) => {}
             Ok(initialized) => {
-                let ids = profile_ids(name);
-                let host_has_profile = profiles::profile_key_id(ids[0]).is_some();
+                let ids = profiles::vm_profile_ids(name);
+                let host_has_profile = profiles::profile_key_id(&ids[0]).is_some();
                 if !needs_mint(initialized, host_has_profile) {
                     return;
                 }
@@ -119,20 +112,10 @@ fn needs_mint(store_initialized: bool, host_has_profile: bool) -> bool {
     !(store_initialized && host_has_profile)
 }
 
-/// The profile ids a VM's credentials are written under. First entry is
-/// the primary (checked for presence).
-fn profile_ids(name: &str) -> Vec<&str> {
-    if name == DEFAULT_VM {
-        vec![PROFILE_LOCAL, PROFILE_MICROVM]
-    } else {
-        // Leaked as 'static via Box: the loop runs once per boot.
-        vec![Box::leak(format!("{PROFILE_MICROVM}-{name}").into_boxed_str())]
-    }
-}
-
 /// GET /bootstrap/status inside the guest. `Ok(initialized)` when the
-/// api-server answered with its bootstrap state.
-fn probe_initialized(name: &str) -> Result<bool, String> {
+/// api-server answered with its bootstrap state. Shared with the
+/// runtime doctor's guest reachability check.
+pub(crate) fn probe_initialized(name: &str) -> Result<bool, String> {
     let out = run_wrapped(
         name,
         &format!("wget -qO- -T 5 http://127.0.0.1:{API_SERVER_GUEST_PORT}/bootstrap/status"),
@@ -148,7 +131,7 @@ fn probe_initialized(name: &str) -> Result<bool, String> {
 /// POST /bootstrap/create-key inside the guest (authorized by the
 /// guest's own token file) and persist the minted key host-side.
 /// Returns the new key id.
-fn mint_and_persist(name: &str, host_port: u16, profile_ids: &[&str]) -> Result<String, String> {
+fn mint_and_persist(name: &str, host_port: u16, profile_ids: &[String]) -> Result<String, String> {
     let body = serde_json::json!({ "name": key_name(name) }).to_string();
     let out = run_wrapped(
         name,
@@ -184,7 +167,7 @@ fn mint_and_persist(name: &str, host_port: u16, profile_ids: &[&str]) -> Result<
 /// VM names are constrained upstream, but defend the JSON body anyway:
 /// anything outside a safe charset falls back to the bare label.
 fn key_name(name: &str) -> String {
-    if name == DEFAULT_VM {
+    if name == DEFAULT_VM_NAME {
         return "Dev Machine".to_string();
     }
     let safe = name
@@ -195,60 +178,6 @@ fn key_name(name: &str) -> String {
     } else {
         "Dev Machine".to_string()
     }
-}
-
-// --- guest command transport ------------------------------------------
-//
-// The one-shot shell channel is a PTY: it echoes the command line (which
-// may wrap at the guest terminal width, scattering fragments of it into
-// the stream). The payload is delimited with markers the guest EXPANDS
-// from a variable — `"$M"` in the echoed command never matches the
-// expanded marker in the real output, so extraction is unambiguous
-// without any echo-suppression games.
-
-const MARK: &str = "APPLIANCE-MINT-7f3a";
-
-fn begin_mark() -> String {
-    format!("{MARK}:BEGIN")
-}
-fn end_mark() -> String {
-    format!("{MARK}:END")
-}
-
-/// Wrap `cmd` so its stdout+stderr travel between expanded markers and
-/// its exit status becomes the one-shot's exit code.
-fn wrap_command(cmd: &str) -> String {
-    format!(
-        "M={MARK}; OUT=$({cmd} 2>&1); RC=$?; printf '%s:BEGIN\\n%s\\n%s:END\\n' \"$M\" \"$OUT\" \"$M\"; [ \"$RC\" -eq 0 ]"
-    )
-}
-
-/// Extract the payload between the LAST begin marker and the first end
-/// marker after it, with PTY carriage returns stripped. `None` when the
-/// markers never made it through (shell died, wrapping mangled).
-fn extract_payload(raw: &str) -> Option<String> {
-    let cleaned = raw.replace('\r', "");
-    let begin = begin_mark();
-    let start = cleaned.rfind(&begin)? + begin.len();
-    let rest = &cleaned[start..];
-    let end = rest.find(&end_mark())?;
-    Some(rest[..end].trim().to_string())
-}
-
-/// Run a command inside the guest as root over the shell channel and
-/// return its output. Errors cover: no channel yet, the command failing
-/// (non-zero exit), or the payload markers not surviving the PTY.
-fn run_wrapped(name: &str, cmd: &str) -> Result<String, String> {
-    let (code, raw) = shell::run_captured(name, &wrap_command(cmd), true)
-        .map_err(|e| format!("shell channel: {e:#}"))?;
-    let payload = extract_payload(&raw);
-    if code != 0 {
-        return Err(format!(
-            "guest command exited {code}: {}",
-            payload.unwrap_or_else(|| "<no output>".to_string())
-        ));
-    }
-    payload.ok_or_else(|| "guest output markers missing".to_string())
 }
 
 #[cfg(test)]
@@ -278,51 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn default_vm_owns_local_and_legacy_microvm_profiles() {
-        assert_eq!(profile_ids("appliance"), vec!["local", "microvm"]);
-        assert_eq!(profile_ids("claude"), vec!["microvm-claude"]);
-    }
-
-    #[test]
     fn key_names_match_cli_labels_and_stay_json_safe() {
         assert_eq!(key_name("appliance"), "Dev Machine");
         assert_eq!(key_name("claude"), "Dev Machine (claude)");
         // A hostile name never reaches the JSON body.
         assert_eq!(key_name("x\"y"), "Dev Machine");
-    }
-
-    #[test]
-    fn extracts_payload_between_expanded_markers() {
-        // Simulated PTY stream: echoed (wrapped) command line carrying
-        // the UNexpanded "$M" forms, then the real expanded markers.
-        let raw = "M=APPLIANCE-MINT-7f3a; OUT=$(wget -qO- http://127.0.0.1:9\r\n\
-                   091/bootstrap/status 2>&1); printf '%s:BEGIN\\n%s\\n%s:END\r\n\
-                   APPLIANCE-MINT-7f3a:BEGIN\r\n\
-                   {\"initialized\":false}\r\n\
-                   APPLIANCE-MINT-7f3a:END\r\n";
-        assert_eq!(
-            extract_payload(raw).as_deref(),
-            Some("{\"initialized\":false}")
-        );
-    }
-
-    #[test]
-    fn missing_markers_yield_none() {
-        assert_eq!(extract_payload("shell died before printing\n"), None);
-        // A begin without an end (stream truncated) is also a miss.
-        assert_eq!(
-            extract_payload("APPLIANCE-MINT-7f3a:BEGIN\npartial"),
-            None
-        );
-    }
-
-    #[test]
-    fn wrapped_command_binds_payload_to_exit_status() {
-        let wrapped = wrap_command("wget -qO- http://x/status");
-        // The guest expands $M; the literal marker with suffix must not
-        // appear pre-expansion, or the echoed command would false-match.
-        assert!(!wrapped.contains(&begin_mark()));
-        assert!(wrapped.contains("RC=$?"));
-        assert!(wrapped.ends_with("[ \"$RC\" -eq 0 ]"));
     }
 }
