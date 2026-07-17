@@ -37,6 +37,12 @@ export interface ClusterInfoResponse {
    * and let the request's error responses decide.
    */
   capabilities?: { uploadBuilds: boolean };
+  /**
+   * Operational warnings raised around the server (e.g. the microVM
+   * guest's legacy-deploy quarantine watchdog). Human-readable lines,
+   * deduplicated; absent when there are none.
+   */
+  warnings?: string[];
 }
 
 export class ApplianceClient {

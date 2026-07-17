@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import { writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { VERSION } from '@appliance.sh/sdk';
 import { clusterInfoRoutes } from './index';
 
@@ -57,5 +60,31 @@ describe('GET /api/v1/cluster-info', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.capabilities).toEqual({ uploadBuilds: false });
+  });
+
+  it('surfaces deduplicated watchdog warnings from APPLIANCE_WARNINGS_FILE', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    const file = join(tmpdir(), `appliance-warnings-${process.pid}-${Date.now()}`);
+    const line = 'legacy api-server deploy detected and removed (namespace appliance-system) — update the CLI';
+    writeFileSync(file, `${line}\n${line}\n\n`);
+    process.env.APPLIANCE_WARNINGS_FILE = file;
+
+    try {
+      const res = await request(createTestApp()).get('/api/v1/cluster-info');
+      expect(res.status).toBe(200);
+      expect(res.body.warnings).toEqual([line]);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  });
+
+  it('omits warnings when the file is absent or empty', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    process.env.APPLIANCE_WARNINGS_FILE = join(tmpdir(), 'appliance-warnings-does-not-exist');
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toBeUndefined();
   });
 });

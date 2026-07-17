@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { readFileSync } from 'fs';
 import { applianceBaseConfig, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getConsoleMode, getExternalConsoleUrl, type ConsoleMode } from '../../console-static';
 import { supportsUploadBuilds } from '../../services/build-upload.service';
@@ -44,6 +45,14 @@ export interface ClusterInfo {
    * older servers.
    */
   capabilities: { uploadBuilds: boolean };
+  /**
+   * Operational warnings raised OUTSIDE this process (e.g. the guest's
+   * legacy-deploy quarantine watchdog appends to the file named by
+   * APPLIANCE_WARNINGS_FILE). Deduplicated; omitted when there are
+   * none. Best-effort — a missing/unreadable file is simply no
+   * warnings.
+   */
+  warnings?: string[];
 }
 
 /**
@@ -51,6 +60,22 @@ export interface ClusterInfo {
  * is acceptable (the advisory floor has never been raised).
  */
 const MIN_CLIENT_VERSION = '0.0.0';
+
+/** Read + dedupe the watchdog warnings file. Never throws. */
+function readWarnings(): string[] | undefined {
+  const file = process.env.APPLIANCE_WARNINGS_FILE;
+  if (!file) return undefined;
+  try {
+    const lines = readFileSync(file, 'utf8')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const unique = [...new Set(lines)];
+    return unique.length > 0 ? unique : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const clusterInfoRoutes: Router = Router();
 
@@ -63,6 +88,7 @@ clusterInfoRoutes.get('/', async (req, res) => {
     }
     const baseConfig = applianceBaseConfig.parse(JSON.parse(raw));
     const externalUrl = getExternalConsoleUrl();
+    const warnings = readWarnings();
     const body: ClusterInfo = {
       version: VERSION,
       baseConfig,
@@ -71,6 +97,7 @@ clusterInfoRoutes.get('/', async (req, res) => {
       serverVersion: VERSION,
       minClientVersion: MIN_CLIENT_VERSION,
       capabilities: { uploadBuilds: supportsUploadBuilds(baseConfig) },
+      ...(warnings ? { warnings } : {}),
     };
     res.json(body);
   } catch (error) {

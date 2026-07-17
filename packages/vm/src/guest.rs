@@ -998,6 +998,9 @@ BASECFG
     export BOOTSTRAP_TOKEN="$(cat /etc/appliance/bootstrap-token 2>/dev/null)"
     export APPLIANCE_BASE_CONFIG="$(cat /persist/appliance/base-config.json)"
     export APPLIANCE_CONSOLE_DIR=/persist/appliance/console
+    # Warnings the quarantine watchdog (below) appends; cluster-info
+    # surfaces them so an out-of-date CLI is visible in every client.
+    export APPLIANCE_WARNINGS_FILE=/var/log/appliance-api-server.warnings
     # bun honors NODE_EXTRA_CA_CERTS: trust the k3s server CA without
     # disabling TLS verification process-wide.
     export NODE_EXTRA_CA_CERTS="$PERSIST/k3s/server/tls/server-ca.crt"
@@ -1007,6 +1010,47 @@ BASECFG
       /usr/local/bin/appliance-api-server >> /var/log/appliance-api-server.log 2>&1
       echo "appliance-api-server: exited — respawning in 2s" >> /var/log/appliance-api-server.log
       sleep 2
+    done
+  ) &
+  # Quarantine watchdog: a CLI older than this VM can re-apply the
+  # LEGACY in-cluster api-server deploy (namespace appliance-system +
+  # an Ingress claiming api.appliance.localhost), shadowing the
+  # canonical default/appliance-api-server route above with a stale
+  # image. The one-shot retirement in the launcher only covers boot —
+  # this loop keeps the VM clean while it runs. Best-effort throughout;
+  # every removal leaves a distinctive line in the api-server log AND
+  # the warnings file cluster-info surfaces to clients.
+  (
+    WARNINGS_FILE=/var/log/appliance-api-server.warnings
+    while :; do
+      sleep 60
+      [ -s /etc/rancher/k3s/k3s.yaml ] || continue
+      REMOVED=""
+      # Any Ingress OUTSIDE `default` claiming the api hostname is a
+      # legacy deploy (per-app ingresses use <stack>.appliance.localhost).
+      OFFENDERS=$(/usr/local/bin/k3s kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.rules[*].host}{"\n"}{end}' 2>/dev/null \
+        | awk '$1 != "default" { for (i = 3; i <= NF; i++) if ($i == "api.appliance.localhost") { print $1 "/" $2; break } }')
+      for ING in $OFFENDERS; do
+        NS=${ING%%/*}
+        NAME=${ING#*/}
+        /usr/local/bin/k3s kubectl -n "$NS" delete ingress "$NAME" --ignore-not-found >/dev/null 2>&1 || true
+        REMOVED="ingress $ING"
+      done
+      # Re-retire the legacy namespace if something re-created it. Only
+      # an Active namespace counts — a Terminating one is the previous
+      # delete still draining, not a new offense.
+      if [ "$(/usr/local/bin/k3s kubectl get namespace appliance-system -o jsonpath='{.status.phase}' 2>/dev/null)" = "Active" ]; then
+        /usr/local/bin/k3s kubectl delete namespace appliance-system --ignore-not-found >/dev/null 2>&1 || true
+        REMOVED="${REMOVED:+$REMOVED, }namespace appliance-system"
+      fi
+      if [ -n "$REMOVED" ]; then
+        MSG="legacy api-server deploy detected and removed ($REMOVED) — an out-of-date appliance CLI deployed it; update the CLI (run: appliance upgrade)"
+        echo "appliance-api-server: WARNING: $MSG" >> /var/log/appliance-api-server.log
+        echo "$MSG" >> "$WARNINGS_FILE"
+        # Cap the warnings file so a persistent legacy CLI can't grow it
+        # unbounded; cluster-info dedupes what remains.
+        tail -n 50 "$WARNINGS_FILE" > "$WARNINGS_FILE.tmp" 2>/dev/null && mv "$WARNINGS_FILE.tmp" "$WARNINGS_FILE" || true
+      fi
     done
   ) &
 else
@@ -2048,6 +2092,35 @@ mod tests {
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__APISERVER_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("base-config.json"));
+    }
+
+    #[test]
+    fn apiserver_ships_the_legacy_quarantine_watchdog() {
+        // The watchdog rides only the guest-binary bootstrap: pure-legacy
+        // VMs (no staged api-server) must never run it.
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        // Sweep: hostname-claiming ingresses outside `default`…
+        assert!(start.contains("kubectl get ingress -A -o jsonpath="));
+        assert!(start.contains(r#"$1 != "default""#));
+        assert!(start.contains(r#"$i == "api.appliance.localhost""#));
+        // …and a re-created legacy namespace, but only when Active (a
+        // Terminating one is the previous delete still draining).
+        assert!(start.contains("kubectl get namespace appliance-system -o jsonpath='{.status.phase}'"));
+        // Distinctive warning line lands in the log AND the surfaced file.
+        assert!(start.contains("legacy api-server deploy detected and removed"));
+        assert!(start.contains("APPLIANCE_WARNINGS_FILE=/var/log/appliance-api-server.warnings"));
+        assert!(start.contains(r#"echo "$MSG" >> "$WARNINGS_FILE""#));
+
+        // Gated on the staged binary: absent without assets and on
+        // agent-only VMs.
+        let unstaged = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&unstaged, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_WARNINGS_FILE"));
+        assert!(!start.contains("legacy api-server deploy detected"));
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_WARNINGS_FILE"));
     }
 
     #[test]
