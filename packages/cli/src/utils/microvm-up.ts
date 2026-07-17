@@ -308,6 +308,7 @@ export async function runUp(
       const client = createApplianceClient({
         baseUrl: apiServerUrl,
         credentials: { keyId: existing.keyId, secret: existing.secret },
+        product: 'cli',
       });
       verified = (await client.listProjects()).success;
     } catch {

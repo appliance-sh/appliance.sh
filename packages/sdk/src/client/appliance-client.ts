@@ -50,16 +50,28 @@ export class ApplianceClient {
   private readonly timeout: number;
   private readonly credentials?: { keyId: string; secret: string };
   /** `x-appliance-client` header value: `<product>/<version>`. Sent on
-   *  every request; deliberately OUTSIDE the signed field set (the
-   *  signing FIELDS_* stay untouched) so old servers ignore it and a
-   *  proxy stripping it can't break signatures. */
-  private readonly clientTag: string;
+   *  every request from NON-BROWSER contexts (CLI, server-side callers);
+   *  `undefined` — never sent — when a `document` global exists.
+   *  Browser/webview requests would need the header allow-listed in the
+   *  server's CORS preflight, and servers deployed before the header
+   *  existed don't list it: attaching it there kills every cross-origin
+   *  request as a network-shaped TypeError (no 401, so no heal path).
+   *  Deliberately OUTSIDE the signed field set (the signing FIELDS_*
+   *  stay untouched) so old servers ignore it and a proxy stripping it
+   *  can't break signatures. */
+  private readonly clientTag?: string;
 
   constructor(config: ClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.timeout = config.timeout ?? 30000;
     this.credentials = config.credentials;
-    this.clientTag = `${config.product ?? 'sdk'}/${VERSION}`;
+    this.clientTag = typeof document === 'undefined' ? `${config.product ?? 'sdk'}/${VERSION}` : undefined;
+  }
+
+  /** The `x-appliance-client` header — or nothing, in browser contexts
+   *  (see `clientTag`). Spread into every request's headers. */
+  private clientTagHeaders(): Record<string, string> {
+    return this.clientTag ? { 'x-appliance-client': this.clientTag } : {};
   }
 
   private async request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<Result<T>> {
@@ -72,7 +84,7 @@ export class ApplianceClient {
 
       const headers: Record<string, string> = {
         'content-type': 'application/json',
-        'x-appliance-client': this.clientTag,
+        ...this.clientTagHeaders(),
       };
 
       if (this.credentials && bodyStr) {
@@ -141,7 +153,7 @@ export class ApplianceClient {
       const timeoutId = setTimeout(() => controller.abort(), timeout ?? this.timeout);
 
       const url = `${this.baseUrl}${path}`;
-      const headers: Record<string, string> = { 'x-appliance-client': this.clientTag };
+      const headers: Record<string, string> = { ...this.clientTagHeaders() };
 
       if (this.credentials) {
         const sigHeaders = await signRequest(this.credentials, {
@@ -181,7 +193,7 @@ export class ApplianceClient {
         headers: {
           'content-type': 'application/json',
           'x-bootstrap-token': token,
-          'x-appliance-client': this.clientTag,
+          ...this.clientTagHeaders(),
         },
         body: JSON.stringify({ name }),
         signal: controller.signal,
@@ -217,7 +229,7 @@ export class ApplianceClient {
 
       const response = await fetch(`${this.baseUrl}/bootstrap/status`, {
         method: 'GET',
-        headers: { 'x-appliance-client': this.clientTag },
+        headers: this.clientTagHeaders(),
         signal: controller.signal,
       });
 
@@ -326,7 +338,7 @@ export class ApplianceClient {
 
       const response = await fetch(`${this.baseUrl}/bootstrap/redeem-invite`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-appliance-client': this.clientTag },
+        headers: { 'content-type': 'application/json', ...this.clientTagHeaders() },
         body: JSON.stringify({ token }),
         signal: controller.signal,
       });
@@ -595,7 +607,7 @@ export class ApplianceClient {
       if (opts.sinceSeconds !== undefined) params.set('sinceSeconds', String(opts.sinceSeconds));
       const url = `${this.baseUrl}/api/v1/pods/${encodeURIComponent(pod)}/logs?${params.toString()}`;
 
-      const headers: Record<string, string> = { 'x-appliance-client': this.clientTag };
+      const headers: Record<string, string> = { ...this.clientTagHeaders() };
       if (this.credentials) {
         const sigHeaders = await signRequest(this.credentials, { method: 'GET', url, headers });
         Object.assign(headers, sigHeaders);
@@ -657,7 +669,7 @@ export class ApplianceClient {
 
       const response = await fetch(`${this.baseUrl}/healthz`, {
         method: 'GET',
-        headers: { 'x-appliance-client': this.clientTag },
+        headers: this.clientTagHeaders(),
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -774,7 +786,7 @@ export class ApplianceClient {
 
       const response = await fetch(uploadUrl, {
         method: 'PUT',
-        headers: { 'content-type': 'application/zip' },
+        headers: { 'content-type': 'application/zip', ...this.clientTagHeaders() },
         body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
         signal: controller.signal,
       });

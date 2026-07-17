@@ -379,6 +379,54 @@ export const applianceBaseConfig = z
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
 
+/** Rebuild a schema tree in strip mode: same shape at every level, but
+ *  unknown keys are DROPPED instead of preserved. Derived mechanically
+ *  from the schema above so the two can never drift. Only the wrapper
+ *  kinds the resolved config actually uses need handling (objects and
+ *  optionals); other leaves pass through untouched. */
+function stripDeep(schema: z.ZodType): z.ZodType {
+  if (schema instanceof z.ZodOptional) {
+    return stripDeep(schema.unwrap() as z.ZodType).optional();
+  }
+  if (schema instanceof z.ZodObject) {
+    const shape = Object.fromEntries(
+      Object.entries(schema.shape).map(([key, value]) => [key, stripDeep(value as z.ZodType)])
+    );
+    return z.object(shape);
+  }
+  return schema;
+}
+
+/**
+ * Strict (strip-mode) twin of {@link applianceBaseConfig}. The
+ * passthrough schema exists for the INTERNAL round-trip (engine ⇄ env
+ * file ⇄ api-server) where unknown keys must survive; anything leaving
+ * the trust boundary — the cluster-info response any authenticated
+ * caller can read — must be parsed through this twin instead, so keys
+ * the schema doesn't know can't ride along to clients.
+ */
+export const applianceBaseConfigStrict = stripDeep(applianceBaseConfig) as unknown as typeof applianceBaseConfig;
+
+/**
+ * Project a resolved base config for UNTRUSTED wire consumers (any
+ * authenticated cluster-info caller — member-role keys included):
+ * strict-parse to drop unknown keys at every level, then remove the
+ * credential-bearing Kubernetes fields — the ServiceAccount `token`,
+ * the inline `kubeconfig` (embeds client credentials), and the `ca`
+ * bundle (no client consumer reads it). Everything clients actually
+ * use survives: `stateBackendUrl`, `baselineVersion`, base `type`,
+ * block presence, registry/buildkit endpoints.
+ */
+export function sanitizeBaseConfigForWire(config: ApplianceBaseConfig): ApplianceBaseConfig {
+  const stripped = applianceBaseConfigStrict.parse(config);
+  if (stripped.kubernetes) {
+    delete stripped.kubernetes.token;
+    delete stripped.kubernetes.kubeconfig;
+    delete stripped.kubernetes.ca;
+  }
+  return stripped;
+}
+
 /**
  * Common Kubernetes deploy parameters extracted from either an
  * `appliance-base-local` or `appliance-base-kubernetes` config.

@@ -86,6 +86,7 @@ program
     const client = createApplianceClient({
       baseUrl: credentials.apiUrl,
       credentials: { keyId: credentials.keyId, secret: credentials.secret },
+      product: 'cli',
     });
 
     console.log(`Rotating the API key for profile ${chalk.bold(profileName)} (${chalk.dim(credentials.apiUrl)}).`);
@@ -115,6 +116,7 @@ program
     const verifyClient = createApplianceClient({
       baseUrl: credentials.apiUrl,
       credentials: { keyId: next.id, secret: next.secret },
+      product: 'cli',
     });
     const verify = await verifyClient.listProjects();
     if (!verify.success) {

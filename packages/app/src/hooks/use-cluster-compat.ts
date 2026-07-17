@@ -29,6 +29,11 @@ export interface ClusterCompat {
    *  on a microVM it means the guest binary lags the app — a Dev
    *  Machine restart updates it. */
   versionDrift: boolean;
+  /** Operational warnings the server reports on cluster-info (e.g. the
+   *  guest watchdog's "legacy deploy removed — update the CLI").
+   *  Human-readable lines, deduplicated, passed through verbatim;
+   *  empty when the server has none (or predates the field). */
+  warnings: string[];
 }
 
 /** Dev/test builds carry unstamped placeholder versions; comparing
@@ -97,6 +102,10 @@ export function useClusterCompat(): ClusterCompat {
       ? compareVersions(clientVersion, serverVersion) !== 0
       : false;
 
+  // The server already dedupes its warnings file, but re-dedupe here so
+  // a future server (or proxy) repeating lines can't stack the banner.
+  const warnings = [...new Set(info?.warnings ?? [])];
+
   return {
     loading: !client || clusterInfoQuery.isPending,
     clientVersion,
@@ -106,5 +115,6 @@ export function useClusterCompat(): ClusterCompat {
     clientBelowMinimum,
     controlPlanePredatesReporting,
     versionDrift,
+    warnings,
   };
 }

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { readFileSync } from 'fs';
-import { applianceBaseConfig, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { applianceBaseConfig, sanitizeBaseConfigForWire, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getConsoleMode, getExternalConsoleUrl, type ConsoleMode } from '../../console-static';
 import { supportsUploadBuilds } from '../../services/build-upload.service';
 import { logger } from '../../logger';
@@ -15,6 +15,14 @@ export interface ClusterInfo {
    * "version unknown" and allow updating regardless.
    */
   version: string;
+  /**
+   * SANITIZED copy of the server's resolved base config: unknown keys
+   * are stripped (the passthrough round-trip is an internal surface,
+   * not a wire one) and credential-bearing fields (`kubernetes.token`,
+   * `kubernetes.kubeconfig`, `kubernetes.ca` — the k3s SA credentials)
+   * are dropped. This route answers ANY authenticated key, member role
+   * included, so nothing here may grant cluster access.
+   */
   baseConfig: ApplianceBaseConfig;
   /**
    * How this server exposes its web console (`full` | `bootstrap` |
@@ -91,7 +99,9 @@ clusterInfoRoutes.get('/', async (req, res) => {
     const warnings = readWarnings();
     const body: ClusterInfo = {
       version: VERSION,
-      baseConfig,
+      // The RESPONSE copy is sanitized; `baseConfig` itself (the full
+      // passthrough parse) stays local to compute capabilities.
+      baseConfig: sanitizeBaseConfigForWire(baseConfig),
       consoleMode: getConsoleMode(),
       ...(externalUrl ? { consoleUrl: externalUrl } : {}),
       serverVersion: VERSION,

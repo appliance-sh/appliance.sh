@@ -494,6 +494,22 @@ pub fn clock_set_command(epoch_secs: u64) -> String {
     )
 }
 
+/// Parse the guest's reply to `date -u +%s` out of raw one-shot PTY
+/// output (echo included): the last line that is purely ASCII digits.
+/// The echoed command line contains `+%s` (non-digit) so it can never
+/// match; shell banners/logout lines are skipped the same way. `None`
+/// when no such line exists — callers must treat that as "clock state
+/// unknown", i.e. failure, not success.
+pub fn parse_epoch_output(raw: &str) -> Option<u64> {
+    raw.lines().rev().find_map(|line| {
+        let t = line.trim_end_matches('\r').trim();
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<u64>().ok()
+    })
+}
+
 /// Convert Unix epoch seconds to a `YYYY-MM-DD HH:MM:SS` UTC string, with
 /// no dependency: a Howard Hinnant civil-from-days calculation for the
 /// date plus plain modular arithmetic for the time of day.
@@ -632,5 +648,26 @@ mod tests {
         assert!(cmd.contains("date -u -s @1234567890 2>/dev/null"));
         assert!(cmd.contains("date -u -D '%Y-%m-%d %H:%M:%S' -s '2009-02-13 23:31:30' 2>/dev/null"));
         assert!(cmd.ends_with("|| true"));
+    }
+
+    #[test]
+    fn parses_epoch_from_echoed_pty_output() {
+        // Real one-shot shape: echoed command, the reply, a logout line —
+        // with PTY \r\n endings throughout.
+        let raw = "date -u +%s\r\n1234567890\r\nlogout\r\n";
+        assert_eq!(parse_epoch_output(raw), Some(1_234_567_890));
+        // Bare reply, no echo.
+        assert_eq!(parse_epoch_output("42\n"), Some(42));
+        // The LAST digit line wins (a banner containing digits+text is
+        // skipped; an earlier stray number is superseded by the reply).
+        assert_eq!(parse_epoch_output("999\nWelcome to VM 3\n1000\n"), Some(1000));
+    }
+
+    #[test]
+    fn epoch_parse_fails_closed_without_a_digit_line() {
+        // The read-back verifying a clock set must not fabricate success.
+        assert_eq!(parse_epoch_output(""), None);
+        assert_eq!(parse_epoch_output("date -u +%s\r\nsh: date: not found\r\n"), None);
+        assert_eq!(parse_epoch_output("date: invalid option\n"), None);
     }
 }

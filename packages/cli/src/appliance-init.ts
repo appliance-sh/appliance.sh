@@ -329,7 +329,7 @@ async function runRemoteInit(apiUrl: string, profileOverride?: string): Promise<
     });
   }
 
-  const client = createApplianceClient({ baseUrl: apiUrl });
+  const client = createApplianceClient({ baseUrl: apiUrl, product: 'cli' });
 
   // Check server connectivity and bootstrap status
   console.log(chalk.dim('Checking server status...'));
@@ -381,6 +381,7 @@ async function runRemoteInit(apiUrl: string, profileOverride?: string): Promise<
   const verifyClient = createApplianceClient({
     baseUrl: apiUrl,
     credentials: { keyId, secret },
+    product: 'cli',
   });
 
   const testResult = await verifyClient.listProjects();

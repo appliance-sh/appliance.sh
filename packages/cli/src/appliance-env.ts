@@ -28,6 +28,7 @@ function client() {
   return createApplianceClient({
     baseUrl: credentials.apiUrl,
     credentials: { keyId: credentials.keyId, secret: credentials.secret },
+    product: 'cli',
   });
 }
 

@@ -844,16 +844,35 @@ fn run() -> Result<()> {
         }
 
         Cmd::SyncClock { name } => {
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("host clock is before the Unix epoch")?
-                .as_secs();
+            fn host_epoch() -> Result<u64> {
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .context("host clock is before the Unix epoch")?
+                    .as_secs())
+            }
             // Root shell: setting the clock needs root, and the root path
             // works before the appliance user is provisioned — mirrors
             // the resident clock-sync thread (backend/vz/shell.rs).
-            let (code, _out) = shell::run_captured(&name, &shell::clock_set_command(epoch), true)?;
+            let (code, _out) = shell::run_captured(&name, &shell::clock_set_command(host_epoch()?), true)?;
             if code != 0 {
                 bail!("clock-sync shell exited with code {code}");
+            }
+            // clock_set_command ends `|| true` (it is shared with the
+            // resident sync loop, which must never die on a failed set),
+            // so exit 0 proves nothing. This one-shot is the heal path —
+            // callers clear the auth banner when it succeeds — so verify
+            // by read-back: the guest clock must actually be within a few
+            // seconds of the host now, or this run must fail loudly.
+            let (code, out) = shell::run_captured(&name, "date -u +%s", true)?;
+            if code != 0 {
+                bail!("clock read-back shell exited with code {code}");
+            }
+            let guest = shell::parse_epoch_output(&out).ok_or_else(|| {
+                anyhow::anyhow!("clock read-back returned no epoch (output: {})", out.trim())
+            })?;
+            let host_now = host_epoch()?;
+            if guest.abs_diff(host_now) > 5 {
+                bail!("clock sync did not take: guest reports {guest}, host is {host_now}");
             }
             println!("VM '{name}' clock set to host time");
             Ok(())

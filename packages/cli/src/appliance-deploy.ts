@@ -97,6 +97,7 @@ registerManifestOptions(program)
     const client = createApplianceClient({
       baseUrl: credentials.apiUrl,
       credentials: { keyId: credentials.keyId, secret: credentials.secret },
+      product: 'cli',
     });
 
     try {

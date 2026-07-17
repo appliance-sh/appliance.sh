@@ -62,6 +62,37 @@ describe('GET /api/v1/cluster-info', () => {
     expect(res.body.capabilities).toEqual({ uploadBuilds: false });
   });
 
+  it('never leaks cluster credentials or unknown config keys in baseConfig', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify({
+      ...K8S_BASE,
+      futureTopLevelField: 'internal-only',
+      kubernetes: {
+        dataDir: '/data',
+        server: 'https://10.0.0.1:6443',
+        token: 'sha256~the-k3s-sa-token',
+        ca: 'LS0tLS1CRUdJTi==',
+        kubeconfig: 'apiVersion: v1\nkind: Config\n',
+        buildkit: { addr: 'tcp://127.0.0.1:5054' },
+        futureKubernetesField: 'internal-only',
+      },
+    });
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    // Credential-bearing fields are dropped from the wire copy…
+    expect(res.body.baseConfig.kubernetes.token).toBeUndefined();
+    expect(res.body.baseConfig.kubernetes.ca).toBeUndefined();
+    expect(res.body.baseConfig.kubernetes.kubeconfig).toBeUndefined();
+    expect(res.text).not.toContain('sha256~the-k3s-sa-token');
+    expect(res.text).not.toContain('internal-only');
+    // …while capabilities still see the FULL config (buildkit ⇒ uploads)
+    // and clients keep the fields they consume.
+    expect(res.body.capabilities).toEqual({ uploadBuilds: true });
+    expect(res.body.baseConfig.kubernetes.dataDir).toBe('/data');
+    expect(res.body.baseConfig.kubernetes.buildkit).toEqual({ addr: 'tcp://127.0.0.1:5054' });
+  });
+
   it('surfaces deduplicated watchdog warnings from APPLIANCE_WARNINGS_FILE', async () => {
     process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
     const file = join(tmpdir(), `appliance-warnings-${process.pid}-${Date.now()}`);

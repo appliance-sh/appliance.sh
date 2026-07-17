@@ -3123,6 +3123,12 @@ struct HealRecord {
     last_attempt: Option<std::time::Instant>,
     /// Key id of the last successful mint.
     last_minted_key: Option<String>,
+    /// When a clock sync was last attempted for a `clock_skew` cause.
+    /// A second clock_skew inside HEAL_REMINT_GUARD means the sync
+    /// didn't fix it — banner instead of syncing in a loop (the guest
+    /// engine's `sync-clock` verifies by read-back, but a persistent
+    /// skew source would otherwise flap heal→retry→401 forever).
+    last_clock_sync: Option<std::time::Instant>,
 }
 
 fn heal_state() -> &'static std::sync::Mutex<BTreeMap<String, HealRecord>> {
@@ -3161,7 +3167,19 @@ fn decide_heal(
         return HealDecision::Skip("heal already in flight");
     }
     match cause {
-        Some("clock_skew") => return HealDecision::SyncClock,
+        Some("clock_skew") => {
+            // One sync per guard window: if a clock push already ran and
+            // clock_skew is back, syncing again can't help (the skew is
+            // persistent or the sync path is broken) — banner instead of
+            // an infinite heal→invalidate→401 flap.
+            if record
+                .last_clock_sync
+                .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
+            {
+                return HealDecision::Skip("clock already synced recently — skew persists");
+            }
+            return HealDecision::SyncClock;
+        }
         // Not credential-shaped: the request itself is what the server
         // rejects (body digest, signature structure). Minting can't fix
         // it and would only grow the key store — banner instead.
@@ -3338,6 +3356,12 @@ async fn microvm_heal_credentials(
         if decision == HealDecision::Proceed {
             record.in_flight = true;
         }
+        if decision == HealDecision::SyncClock {
+            // Recorded at attempt time (success or failure): decide_heal
+            // banners a recurring clock_skew inside the guard window
+            // either way, so a broken sync can't flap the banner.
+            record.last_clock_sync = Some(std::time::Instant::now());
+        }
         decision
     };
     match decision {
@@ -3350,10 +3374,14 @@ async fn microvm_heal_credentials(
             return Ok(true);
         }
         HealDecision::SyncClock => {
-            // One-shot host→guest clock push via the engine binary; the
-            // resident 30s sync thread will keep it corrected after. Not
-            // recorded as a mint attempt, so a later credential-shaped
-            // heal isn't cooldown-blocked by a clock fix.
+            // One-shot host→guest clock push via the engine binary
+            // (which verifies by read-back and exits non-zero when the
+            // set didn't take); the resident 30s sync thread keeps it
+            // corrected after. Not recorded as a mint attempt — a later
+            // credential-shaped heal isn't cooldown-blocked by a clock
+            // fix — but it IS recorded as `last_clock_sync` above, so a
+            // clock_skew recurring inside the guard window banners
+            // instead of looping.
             let Some(bin) = vm_binary() else {
                 eprintln!("microvm heal: clock_skew reported but no engine binary to sync with");
                 return Ok(false);
@@ -5713,6 +5741,7 @@ mod tests {
             in_flight: false,
             last_attempt: Some(Instant::now()),
             last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(&record, Instant::now(), Some("key-old"), Some("key-new"), None),
@@ -5738,6 +5767,7 @@ mod tests {
             in_flight: false,
             last_attempt: Some(Instant::now()),
             last_minted_key: None,
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(&record, Instant::now(), Some("k"), Some("k"), None),
@@ -5756,6 +5786,7 @@ mod tests {
             // Past the 60s cooldown but inside the 10min re-mint guard.
             last_attempt: Some(now - Duration::from_secs(120)),
             last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(&record, now, Some("key-new"), Some("key-new"), None),
@@ -5772,6 +5803,7 @@ mod tests {
             in_flight: false,
             last_attempt: Some(now - HEAL_REMINT_GUARD),
             last_minted_key: Some("key-a".into()),
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(&record, now, Some("key-a"), Some("key-a"), None),
@@ -5795,6 +5827,58 @@ mod tests {
                 Some("clock_skew")
             ),
             HealDecision::SyncClock
+        );
+    }
+
+    #[test]
+    fn clock_skew_banners_when_it_recurs_within_the_guard() {
+        // First clock_skew → sync. A second one while the guard window
+        // is still open means the sync didn't fix it (persistent skew or
+        // a broken sync path) — banner, never an infinite sync loop.
+        let now = Instant::now();
+        let first = HealRecord::default();
+        assert_eq!(
+            decide_heal(&first, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::SyncClock
+        );
+        let synced = HealRecord {
+            last_clock_sync: Some(now - Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&synced, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::Skip("clock already synced recently — skew persists")
+        );
+    }
+
+    #[test]
+    fn clock_skew_syncs_again_after_the_guard_expires() {
+        // A genuinely new skew episode (guest paused/slept again long
+        // after the last fix) heals again once the window has passed.
+        let now = Instant::now();
+        let record = HealRecord {
+            last_clock_sync: Some(now - HEAL_REMINT_GUARD),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::SyncClock
+        );
+    }
+
+    #[test]
+    fn a_prior_clock_sync_does_not_block_credential_heals() {
+        // The clock guard is cause-scoped: a mint for a dead key must
+        // proceed even seconds after a clock fix (and vice versa — the
+        // SyncClock path never sets the mint cooldown).
+        let now = Instant::now();
+        let record = HealRecord {
+            last_clock_sync: Some(now - Duration::from_secs(5)),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-dead"), Some("key-dead"), Some("unknown_key")),
+            HealDecision::Proceed
         );
     }
 
@@ -5832,6 +5916,7 @@ mod tests {
             // Past the 60s cooldown but inside the 10min re-mint guard.
             last_attempt: Some(now - Duration::from_secs(120)),
             last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(
@@ -5859,6 +5944,7 @@ mod tests {
             in_flight: false,
             last_attempt: Some(now - Duration::from_secs(120)),
             last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
         };
         assert_eq!(
             decide_heal(

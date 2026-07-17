@@ -3,8 +3,10 @@ import {
   ApplianceBaseType,
   applianceBaseConfig,
   applianceBaseConfigInput,
+  applianceBaseConfigStrict,
   getKubernetesParams,
   isKubernetesBase,
+  sanitizeBaseConfigForWire,
   type ApplianceBaseConfig,
 } from './appliance-base';
 
@@ -137,6 +139,69 @@ describe('appliance-base-kubernetes schema', () => {
       docker: { dataDir: '/data', futureDockerField: true },
     });
     expect((docker.docker as Record<string, unknown>).futureDockerField).toBe(true);
+  });
+});
+
+describe('sanitizeBaseConfigForWire', () => {
+  const secretful = {
+    type: ApplianceBaseType.ApplianceKubernetes,
+    name: 'local',
+    stateBackendUrl: 's3://bucket',
+    baselineVersion: '1.50.0',
+    futureTopLevelField: 'leak-me-not',
+    kubernetes: {
+      server: 'https://10.0.0.1:6443',
+      token: 'sha256~the-sa-token',
+      ca: 'LS0tLS1CRUdJTi==',
+      kubeconfig: 'apiVersion: v1\nkind: Config\n',
+      kubeconfigPath: '/etc/rancher/k3s/k3s.yaml',
+      dataDir: '/data',
+      registry: { url: 'localhost:5052', futureRegistryField: 1 },
+      buildkit: { addr: 'tcp://127.0.0.1:5054' },
+      futureKubernetesField: 'leak-me-not',
+    },
+  };
+
+  it('drops the credential-bearing kubernetes fields from the wire copy', () => {
+    const wire = sanitizeBaseConfigForWire(applianceBaseConfig.parse(secretful));
+    expect(wire.kubernetes?.token).toBeUndefined();
+    expect(wire.kubernetes?.kubeconfig).toBeUndefined();
+    expect(wire.kubernetes?.ca).toBeUndefined();
+    // No credential material anywhere in the serialized copy.
+    const serialized = JSON.stringify(wire);
+    expect(serialized).not.toContain('sha256~the-sa-token');
+    expect(serialized).not.toContain('LS0tLS1CRUdJTi==');
+    expect(serialized).not.toContain('kind: Config');
+  });
+
+  it('strips unknown keys at every level (member keys must not see them)', () => {
+    const wire = sanitizeBaseConfigForWire(applianceBaseConfig.parse(secretful)) as Record<string, unknown>;
+    expect(wire.futureTopLevelField).toBeUndefined();
+    expect((wire.kubernetes as Record<string, unknown>).futureKubernetesField).toBeUndefined();
+    expect(
+      ((wire.kubernetes as { registry?: Record<string, unknown> }).registry ?? {}).futureRegistryField
+    ).toBeUndefined();
+  });
+
+  it('keeps everything clients actually consume', () => {
+    const wire = sanitizeBaseConfigForWire(applianceBaseConfig.parse(secretful));
+    expect(wire.type).toBe(ApplianceBaseType.ApplianceKubernetes);
+    expect(wire.stateBackendUrl).toBe('s3://bucket');
+    expect(wire.baselineVersion).toBe('1.50.0');
+    // Block presence drives the app's "kubernetes base?" probe; the
+    // registry/buildkit endpoints stay for host-side builds.
+    expect(wire.kubernetes?.dataDir).toBe('/data');
+    expect(wire.kubernetes?.registry?.url).toBe('localhost:5052');
+    expect(wire.kubernetes?.buildkit?.addr).toBe('tcp://127.0.0.1:5054');
+  });
+
+  it('the strict twin keeps strip semantics while the round-trip schema preserves (drift guard)', () => {
+    const parsedLoose = applianceBaseConfig.parse(secretful);
+    const parsedStrict = applianceBaseConfigStrict.parse(secretful);
+    expect((parsedLoose as Record<string, unknown>).futureTopLevelField).toBe('leak-me-not');
+    expect((parsedStrict as Record<string, unknown>).futureTopLevelField).toBeUndefined();
+    // Same known fields on both — the twin is the same shape.
+    expect(parsedStrict.kubernetes?.server).toBe(parsedLoose.kubernetes?.server);
   });
 });
 

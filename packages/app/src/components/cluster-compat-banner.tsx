@@ -6,9 +6,11 @@ import { useClusterCompat } from '@/hooks/use-cluster-compat';
 // Cluster-level version-compat banner (generalized from the deploy
 // wizard's capability banner): one amber line at the top of the shell
 // when the selected cluster's control plane and this app have drifted
-// apart, with the remediation that actually applies. Renders nothing
-// when versions agree, while data is loading, and for cloud clusters
-// whose (independent) version merely differs.
+// apart, with the remediation that actually applies. Also surfaces the
+// server's operational `warnings[]` (e.g. the guest watchdog's "legacy
+// deploy removed — update the CLI") verbatim. Renders nothing when
+// versions agree and no warnings exist, while data is loading, and for
+// cloud clusters whose (independent) version merely differs.
 
 export function ClusterCompatBanner() {
   const compat = useClusterCompat();
@@ -44,7 +46,9 @@ export function ClusterCompatBanner() {
       </>
     );
   }
-  if (!message) return null;
+  // Server-reported operational warnings ride the same banner, one
+  // line each, straight through (already deduplicated by the hook).
+  if (!message && compat.warnings.length === 0) return null;
 
   return (
     <div
@@ -52,7 +56,12 @@ export function ClusterCompatBanner() {
       className="mb-4 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-200"
     >
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      <span>{message}</span>
+      <span className="flex flex-col gap-1">
+        {message ? <span>{message}</span> : null}
+        {compat.warnings.map((warning) => (
+          <span key={warning}>{warning}</span>
+        ))}
+      </span>
     </div>
   );
 }
