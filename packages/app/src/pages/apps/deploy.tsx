@@ -1060,8 +1060,7 @@ function TargetStep({
             'No deploy target selected yet.'
           ) : baseProbeLoading ? (
             <>
-              Checking how <span className="font-medium text-[var(--color-foreground)]">{selectedLabel}</span>{' '}
-              deploys…
+              Checking how <span className="font-medium text-[var(--color-foreground)]">{selectedLabel}</span> deploys…
             </>
           ) : targetIsAwsBase ? (
             <>
