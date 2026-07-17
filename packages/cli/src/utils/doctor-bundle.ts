@@ -82,12 +82,15 @@ export function redactEgressPolicy(parsed: unknown): unknown {
 }
 
 /** Scrub secret-shaped tokens out of free log text: 32+ char hex runs
- *  (bootstrap tokens, api-key secrets) and JWT-shaped `eyJ…` words (the
- *  api-server's ServiceAccount token). Mirrors scrub_secrets in
- *  packages/vm/src/doctor.rs — keep the rules in sync. */
+ *  (bootstrap tokens), `sk_`/`sk-`-prefixed hex runs (minted api-key
+ *  secrets are `sk_` + 64 hex — api-key.service.ts — where the s/k/_
+ *  keep the word from passing a plain hex test), and JWT-shaped `eyJ…`
+ *  words (the api-server's ServiceAccount token). Mirrors scrub_secrets
+ *  in packages/vm/src/doctor.rs — keep the rules in sync. */
 export function scrubLogText(text: string): string {
   return text.replace(/[A-Za-z0-9_.-]+/g, (word) => {
     if (word.length >= 32 && /^[0-9a-fA-F]+$/.test(word)) return `<scrubbed:${word.length}ch>`;
+    if (/^sk[_-][0-9a-fA-F]{32,}$/.test(word)) return `<scrubbed:${word.length}ch>`;
     if (word.startsWith('eyJ') && word.length >= 20 && word.includes('.')) return `<scrubbed:${word.length}ch>`;
     return word;
   });

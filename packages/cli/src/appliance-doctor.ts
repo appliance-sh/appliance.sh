@@ -6,6 +6,7 @@ import type { CheckResult, FixOutcome, PreflightReport } from './utils/preflight
 import { runRuntimeDoctor } from './utils/runtime-doctor.js';
 import type { RuntimeDoctorReport, RuntimeFinding, RuntimeFixOutcome } from './utils/runtime-doctor.js';
 import { writeSupportBundle } from './utils/doctor-bundle.js';
+import { DEFAULT_VM_NAME } from './utils/microvm-up.js';
 
 // `appliance doctor` — reliability diagnostics in two sections:
 //
@@ -31,7 +32,7 @@ program
   .description('run preflight + runtime diagnostics and print a pass/fail checklist with remediations')
   .option('--fix', 'auto-resolve the checks doctor can safely fix (pull binaries, re-mint a dead key, …)', false)
   .option('--json', 'emit the report as JSON instead of a checklist', false)
-  .option('--vm <name>', 'microVM whose runtime to diagnose', 'appliance')
+  .option('--vm <name>', 'microVM whose runtime to diagnose', DEFAULT_VM_NAME)
   .option(
     '--bundle [path]',
     'also write a REDACTED support tarball (report + env + VM state + scrubbed log tails; no secrets)'
@@ -49,7 +50,11 @@ program
       }
     }
 
-    const runtime = await runRuntimeDoctor({ vm: opts.vm, fix: opts.fix });
+    // An IMPLICIT default-VM run (no --vm) must not fail a machine that
+    // has never created a Dev Machine; an explicit --vm keeps the hard
+    // "VM does not exist" verdict.
+    const vmExplicit = program.getOptionValueSource('vm') !== 'default';
+    const runtime = await runRuntimeDoctor({ vm: opts.vm, vmExplicit, fix: opts.fix });
 
     if (opts.json) {
       printJson(report, fixes, runtime);

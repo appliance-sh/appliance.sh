@@ -2063,15 +2063,33 @@ mod tests {
         let off = APISERVER_COMMON
             .find("set +x")
             .expect("the api-server launcher must disable xtrace");
+        // The launcher subshell's close: every token expansion must sit
+        // inside it, or it runs OUTSIDE the `set +x` scope and traces.
+        let close = APISERVER_COMMON
+            .find(") &")
+            .expect("the launcher subshell must close with `) &`");
+        let mut last_token = 0usize;
         for token_read in ["SA_TOKEN=", "BOOTSTRAP_TOKEN=", "base64 -d"] {
-            let at = APISERVER_COMMON
+            let first = APISERVER_COMMON
                 .find(token_read)
                 .unwrap_or_else(|| panic!("{token_read} expected in the launcher"));
             assert!(
-                off < at,
+                off < first,
                 "`set +x` must come before {token_read} or the secret leaks into console.log"
             );
+            let last = APISERVER_COMMON.rfind(token_read).unwrap();
+            assert!(
+                last < close,
+                "every {token_read} expansion must occur inside the launcher subshell (before `) &`)"
+            );
+            last_token = last_token.max(last);
         }
+        // No re-enable between the trace-off and the LAST token
+        // expansion — a stray `set -x` there would undo the protection.
+        assert!(
+            !APISERVER_COMMON[off..last_token].contains("set -x"),
+            "`set -x` must not re-enable tracing between `set +x` and the last token expansion"
+        );
         // The trace-off is scoped to the backgrounded launcher subshell
         // — it must appear after the subshell opens, so the rest of the
         // bootstrap keeps its (deliberate) tracing.

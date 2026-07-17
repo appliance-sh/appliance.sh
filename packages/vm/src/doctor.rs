@@ -200,18 +200,27 @@ fn name_flag(name: &str) -> String {
 }
 
 /// Guest epoch seconds via `date +%s`, compared against the host clock.
-/// Positive = guest ahead of host.
+/// Positive = guest ahead of host. The vsock round-trip takes real time,
+/// so the host clock is sampled before AND after and the guest reading
+/// is compared against the midpoint — halving the round-trip's bias in
+/// the reported skew.
 fn guest_clock_skew(name: &str) -> Result<i64, String> {
+    let before = host_epoch_secs()?;
     let out = run_wrapped(name, "date +%s")?;
+    let after = host_epoch_secs()?;
     let guest: i64 = out
         .trim()
         .parse()
         .map_err(|e| format!("unparseable guest 'date +%s' output {out:?}: {e}"))?;
-    let host = std::time::SystemTime::now()
+    let midpoint = before + (after - before) / 2;
+    Ok(guest - midpoint)
+}
+
+fn host_epoch_secs() -> Result<i64, String> {
+    Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "host clock is before the Unix epoch".to_string())?
-        .as_secs() as i64;
-    Ok(guest - host)
+        .as_secs() as i64)
 }
 
 /// Pure skew classification: within 10s is healthy; beyond the 15s
@@ -293,11 +302,21 @@ fn flush_word(out: &mut String, word: &mut String) {
     word.clear();
 }
 
-/// Pure token classification for the scrubber.
+/// Pure token classification for the scrubber. Keep in sync with
+/// scrubLogText in packages/cli/src/utils/doctor-bundle.ts.
 fn is_secret_shaped(word: &str) -> bool {
-    // Long hex run: bootstrap token (64 hex), api-key secrets.
+    // Long hex run: bootstrap token (64 hex).
     if word.len() >= 32 && word.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
+    }
+    // Minted api-key secrets are `sk_` + 64 hex (api-key.service.ts) —
+    // the s/k/_ keep the word from passing the plain hex test above, so
+    // the prefix is stripped and the remainder hex-tested. `sk-` covers
+    // the OpenAI-style spelling as well.
+    if let Some(rest) = word.strip_prefix("sk_").or_else(|| word.strip_prefix("sk-")) {
+        if rest.len() >= 32 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
     }
     // JWT: three dot-separated base64url segments starting with the
     // `{"` header ("eyJ"). ServiceAccount tokens are exactly this.
@@ -359,6 +378,27 @@ mod tests {
         assert!(!scrubbed.contains(&token), "the token must not survive");
         assert!(scrubbed.contains("<scrubbed:64ch>"));
         assert!(scrubbed.contains("X-Bootstrap-Token:"), "context survives");
+    }
+
+    #[test]
+    fn scrubs_sk_prefixed_minted_secrets() {
+        // Minted secrets are `sk_` + 64 hex (api-key.service.ts): the
+        // `_` keeps the word intact and the s/k defeat a plain hex test,
+        // so they need their own rule. A mint error path can paint the
+        // full response — secret included — into host.log.
+        let minted = format!("sk_{}", "5f".repeat(32));
+        let scrubbed = scrub_secrets(&format!("mint response: secret={minted} status=500\n"));
+        assert!(!scrubbed.contains(&minted), "the minted secret must not survive");
+        assert!(scrubbed.contains("<scrubbed:67ch>"));
+        assert!(scrubbed.contains("status=500"), "context survives");
+
+        // OpenAI-style `sk-` + hex gets the same treatment.
+        let openai = format!("sk-{}", "ab".repeat(20));
+        assert!(!scrub_secrets(&openai).contains(&openai));
+
+        // Short sk_-words are ordinary identifiers, not secrets.
+        let text = "sk_live sk_test_short sk-1234abcd";
+        assert_eq!(scrub_secrets(text), text);
     }
 
     #[test]

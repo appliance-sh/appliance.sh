@@ -7,7 +7,7 @@ import { readProfiles, removeProfile, upsertProfile, type Profile } from './prof
 import {
   resolveProfileSecret,
   keychainAccountFor,
-  readKeychainApiKey,
+  probeKeychainApiKey,
   writeKeychainApiKey,
   deleteKeychainApiKey,
 } from './keychain.js';
@@ -46,8 +46,9 @@ export interface RuntimeFinding {
   /** Actionable fix — the exact command/step the operator can run. */
   remediation?: string;
   /** Machine-actionable fix attached to this finding. `kind` names the
-   *  fixer; `applied` reports whether doctor ran it (auto-fixes and
-   *  `--fix` set it; report-only findings carry no fix at all). */
+   *  fixer; `applied` reports whether doctor ran it (only `--fix` runs
+   *  fixers — a plain doctor is read-only; report-only findings carry
+   *  no fix at all). */
   fix?: { kind: string; applied?: boolean };
 }
 
@@ -94,26 +95,49 @@ export interface EngineVmEntry {
  *  profile as orphaned. */
 export type EngineListing = { available: false } | { available: true; vms: EngineVmEntry[] };
 
-function engineList(): EngineListing {
-  const bin = resolveVmBinary();
-  if (!bin) return { available: false };
-  const r = spawnSync(bin, ['list'], { encoding: 'utf8' });
-  if (r.status !== 0 || r.error) return { available: false };
+/**
+ * Parse (and VALIDATE) `appliance-vm list` output. Pure and unit-tested.
+ * The listing gates the orphan/stale-port classifiers, whose fixes
+ * WRITE to the profile store — so any malformed output (non-array,
+ * entry without a string name or a finite hostPort) degrades the whole
+ * engine to `{available:false}`: doctor reports it cannot verify,
+ * instead of crashing or rewriting a healthy apiUrl to `:undefined`.
+ */
+export function parseEngineListing(stdout: string): EngineListing {
+  let parsed: unknown;
   try {
-    const entries = JSON.parse(r.stdout) as EngineVmEntry[];
-    return { available: true, vms: entries };
+    parsed = JSON.parse(stdout);
   } catch {
     return { available: false };
   }
+  if (!Array.isArray(parsed)) return { available: false };
+  const vms: EngineVmEntry[] = [];
+  for (const entry of parsed) {
+    const e = entry as { name?: unknown; running?: unknown; hostPort?: unknown } | null;
+    if (typeof e?.name !== 'string' || typeof e.hostPort !== 'number' || !Number.isFinite(e.hostPort)) {
+      return { available: false };
+    }
+    vms.push({ name: e.name, running: e.running === true, hostPort: e.hostPort });
+  }
+  return { available: true, vms };
+}
+
+function engineList(): EngineListing {
+  const bin = resolveVmBinary();
+  if (!bin) return { available: false };
+  const r = spawnSync(bin, ['list'], { encoding: 'utf8', timeout: 15_000 });
+  if (r.status !== 0 || r.error) return { available: false };
+  return parseEngineListing(r.stdout);
 }
 
 /** Run the engine's runtime checks. Null when the engine is missing or
  *  predates `doctor --vm-checks` (feature-detect: unknown flags exit
- *  non-zero with no parseable JSON). */
+ *  non-zero with no parseable JSON). Timeboxed: a wedged guest probe
+ *  must not hang doctor forever. */
 export function engineVmChecks(vm: string): EngineChecksReport | null {
   const bin = resolveVmBinary();
   if (!bin) return null;
-  const r = spawnSync(bin, ['doctor', '--vm-checks', vm, '--json'], { encoding: 'utf8' });
+  const r = spawnSync(bin, ['doctor', '--vm-checks', vm, '--json'], { encoding: 'utf8', timeout: 30_000 });
   if (r.error || r.status !== 0) return null;
   try {
     const parsed = JSON.parse(r.stdout) as EngineChecksReport;
@@ -148,8 +172,18 @@ export function portOfApiUrl(apiUrl: string): number | null {
   }
 }
 
+/** The hostname an apiUrl points at, or null when unparseable. */
+export function hostnameOfApiUrl(apiUrl: string): string | null {
+  try {
+    return new URL(apiUrl).hostname;
+  } catch {
+    return null;
+  }
+}
+
 export type ProfileBinding =
   | { kind: 'remote' }
+  | { kind: 'foreign-url'; vmName: string; hostname: string | null }
   | { kind: 'engine-unavailable'; vmName: string }
   | { kind: 'ok'; vmName: string; port: number }
   | { kind: 'orphan'; vmName: string }
@@ -162,9 +196,16 @@ export type ProfileBinding =
  * (vm.json ports via `appliance-vm list`).
  *
  *   - profile maps to no VM               → remote, out of scope;
+ *   - apiUrl hostname is not the Dev Machine hostname → foreign-url.
+ *     CRITICAL: a VM-ish NAME alone proves nothing — `appliance server`
+ *     (docker flow) writes a `local` profile at http://127.0.0.1:<port>
+ *     with no VM behind it, and `appliance login` accepts any profile
+ *     name. Only a profile whose URL host is the in-cluster api
+ *     hostname (api.appliance.localhost) is treated as VM-bound;
+ *     everything else is report-only and NEVER fixed;
  *   - engine missing/broken               → engine-unavailable. CRITICAL:
  *     never counted as VM-missing — a missing binary must not trigger
- *     the orphan auto-fix;
+ *     the orphan fix;
  *   - VM absent from a SUCCESSFUL listing → orphan;
  *   - apiUrl port owned by ANOTHER VM     → cross-wired;
  *   - apiUrl port ≠ the VM's hostPort     → stale-port.
@@ -172,6 +213,8 @@ export type ProfileBinding =
 export function classifyProfileBinding(profileName: string, apiUrl: string, engine: EngineListing): ProfileBinding {
   const vmName = doctorVmForProfile(profileName);
   if (!vmName) return { kind: 'remote' };
+  const hostname = hostnameOfApiUrl(apiUrl);
+  if (hostname !== IN_CLUSTER_API_SERVER_HOSTNAME) return { kind: 'foreign-url', vmName, hostname };
   if (!engine.available) return { kind: 'engine-unavailable', vmName };
   const vm = engine.vms.find((v) => v.name === vmName);
   if (!vm) return { kind: 'orphan', vmName };
@@ -274,6 +317,9 @@ export function triangulateAuth(input: AuthProbeInput): RuntimeFinding {
       ...(input.bootstrapTokenPresent ? { fix: { kind: 'remint-key' } } : {}),
     };
   }
+  // Ambiguous: without the engine's skew probe this could just as well
+  // be clock skew — minting a key would not heal that and only orphans
+  // another key in the store, so NO fix is attached (remediation only).
   return {
     id,
     title,
@@ -281,8 +327,7 @@ export function triangulateAuth(input: AuthProbeInput): RuntimeFinding {
     detail:
       'signed request 401s (cause ambiguous: unknown key or clock skew — engine checks unavailable to distinguish)',
     remediation:
-      'Update/rebuild appliance-vm so `doctor` can probe the guest clock, or restart the VM and re-run. If it persists, `appliance doctor --fix` re-mints the key.',
-    ...(input.bootstrapTokenPresent ? { fix: { kind: 'remint-key' } } : {}),
+      'Update/rebuild appliance-vm so `doctor` can probe the guest clock (it separates a dead key from clock skew), or restart the VM (`appliance vm stop && appliance vm up`) and re-run.',
   };
 }
 
@@ -598,15 +643,15 @@ function readGuestStamp(): string | null {
 function probeKeychain(profileName: string, profile: Profile): KeychainProbe {
   const account = keychainAccountFor(profileName, profile);
   if (!account) return { kind: 'not-applicable' };
-  const key = readKeychainApiKey(account);
-  // readKeychainApiKey folds "denied" and "missing" into null; use the
-  // `security` exit code to split them? It doesn't expose it — treat
-  // null as missing but soften the verdict when the file secret is
-  // empty and a desktop config exists... keep it simple: null = missing.
-  // (macOS denial is rare outside dev-signed binaries; the finding text
-  // covers it.)
-  if (!key) return { kind: 'missing' };
-  return { kind: 'found', keyId: key.keyId };
+  // probeKeychainApiKey splits the failure modes on the `security` exit
+  // code: 44 (errSecItemNotFound) = the entry really is missing; any
+  // other failure (ACL denial on dev-signed binaries, auth failure) =
+  // unreadable, which the classifier downgrades to info — a healthy
+  // desktop-managed profile must not FAIL doctor just because macOS
+  // declined to answer.
+  const probe = probeKeychainApiKey(account);
+  if (probe.state === 'present') return { kind: 'found', keyId: probe.key.keyId };
+  return probe.state === 'missing' ? { kind: 'missing' } : { kind: 'unreadable' };
 }
 
 interface IngressProbe {
@@ -643,9 +688,45 @@ function probeIngress(vm: string): IngressProbe {
 export interface RuntimeDoctorOptions {
   /** VM whose runtime to diagnose (default: the default VM). */
   vm?: string;
-  /** Apply the gated fixes (re-mint, keychain write-back). Safe
-   *  auto-fixes (orphan profile, stale port) run either way. */
+  /** True when the operator explicitly targeted this VM (`--vm <name>`
+   *  on the command line). An IMPLICIT default-VM run downgrades
+   *  "the VM does not exist" from fail to info — a machine that has
+   *  never run `appliance vm up` is not broken. Defaults to "a vm was
+   *  passed in", so programmatic callers naming a VM keep the strict
+   *  verdict unless they opt out. */
+  vmExplicit?: boolean;
+  /** Apply the fixes (re-mint, keychain write-back, orphan-profile
+   *  removal, stale-port rewrite). WITHOUT this flag doctor is strictly
+   *  read-only: it reports and never mutates the profile store, the
+   *  Keychain, or anything else. */
   fix?: boolean;
+}
+
+/**
+ * Pure post-filter for the engine's findings (check #3): when the
+ * target VM is the IMPLICIT default (the user never passed --vm) and
+ * the engine reports it does not exist, the "VM definition" fail is
+ * downgraded to info — every pre-first-run machine would otherwise
+ * exit 1 from a plain `appliance doctor`. An EXPLICIT `--vm <name>`
+ * keeps the hard failure: the user asked about that VM specifically.
+ */
+export function softenMissingDefaultVm(
+  findings: RuntimeFinding[],
+  exists: boolean,
+  vmExplicit: boolean
+): RuntimeFinding[] {
+  if (exists || vmExplicit) return findings;
+  return findings.map((f) =>
+    f.id === 'engine:vm' && f.severity === 'fail'
+      ? {
+          id: f.id,
+          title: f.title,
+          severity: 'info' as const,
+          detail: 'no Dev Machine yet — `appliance vm up` creates it',
+          remediation: 'Run `appliance vm up` when you want the local Dev Machine.',
+        }
+      : f
+  );
 }
 
 /** Resolve the credential profile the target VM's clients use: the VM's
@@ -663,14 +744,17 @@ export function resolveVmProfile(vm: string): { name: string; profile: Profile }
 
 export async function runRuntimeDoctor(opts: RuntimeDoctorOptions = {}): Promise<RuntimeDoctorReport> {
   const vm = opts.vm ?? DEFAULT_VM_NAME;
+  const vmExplicit = opts.vmExplicit ?? opts.vm !== undefined;
   const findings: RuntimeFinding[] = [];
   const fixes: RuntimeFixOutcome[] = [];
 
   // 1. Engine-side checks (guest clock, in-guest api-server liveness).
-  //    Old/missing engines degrade to an info row, never a failure.
+  //    Old/missing engines degrade to an info row, never a failure; a
+  //    missing IMPLICIT-default VM is a pre-first-run machine, not a
+  //    failure (softenMissingDefaultVm).
   const engine = engineVmChecks(vm);
   if (engine) {
-    findings.push(...engine.findings);
+    findings.push(...softenMissingDefaultVm(engine.findings, engine.exists, vmExplicit));
   } else {
     findings.push({
       id: 'engine:checks',
@@ -682,14 +766,15 @@ export async function runRuntimeDoctor(opts: RuntimeDoctorOptions = {}): Promise
   }
   const clockSkewSeconds = engine?.clockSkewSeconds ?? null;
 
-  // 2. Profile ↔ VM bindings for every local profile (check d), with
-  //    the safe auto-fixes (orphan removal, stale-port rewrite).
+  // 2. Profile ↔ VM bindings for every local profile (check d). The
+  //    fixes (orphan removal, stale-port rewrite) mutate the profile
+  //    store and the Keychain, so they run ONLY under --fix.
   const listing = engineList();
   const profilesFile = readProfiles();
   for (const [name, profile] of Object.entries(profilesFile.profiles)) {
     const binding = classifyProfileBinding(name, profile.apiUrl, listing);
     const bindingFinding = await renderBindingFinding(name, profile, binding, {
-      autoFix: true,
+      autoFix: opts.fix === true,
       fixes,
     });
     if (bindingFinding) findings.push(bindingFinding);
@@ -780,19 +865,22 @@ export async function runRuntimeDoctor(opts: RuntimeDoctorOptions = {}): Promise
 
 // ---- fixers (D2) --------------------------------------------------------------
 
-/** Render a binding classification as a finding, applying the SAFE
- *  auto-fixes. Returns null for remote profiles (out of scope).
+/** Render a binding classification as a finding. Returns null for
+ *  remote profiles (out of scope).
  *
- *  Auto-fix policy (runs on every `doctor`, no --fix needed — each
- *  applied fix is listed per item):
- *   - orphan: removeProfile + Keychain-entry delete. Safe because the
- *     classification already required: local profile AND a SUCCESSFUL
- *     engine listing AND the VM absent from it. The CLI never edits the
+ *  Fix policy (`ctx.autoFix` is true ONLY under `doctor --fix` — a
+ *  plain `appliance doctor` reports and never writes):
+ *   - orphan: removeProfile + Keychain-entry delete. Only offered when
+ *     the classification required: VM-bound profile (name AND the
+ *     in-cluster api hostname) AND a SUCCESSFUL validated engine
+ *     listing AND the VM absent from it. The CLI never edits the
  *     desktop's config.json (no shared lock) — the desktop converges
  *     via its own cluster sync.
  *   - stale-port / cross-wired: rewrite apiUrl to the VM's real
- *     hostPort (apiServerUrlForHostPort) via upsertProfile. */
-async function renderBindingFinding(
+ *     hostPort (apiServerUrlForHostPort) via upsertProfile.
+ *   - foreign-url: NEVER fixed, even under --fix — the profile's URL
+ *     does not prove it belongs to a Dev Machine. */
+export async function renderBindingFinding(
   profileName: string,
   profile: Profile,
   binding: ProfileBinding,
@@ -803,6 +891,17 @@ async function renderBindingFinding(
   switch (binding.kind) {
     case 'remote':
       return null;
+    case 'foreign-url':
+      return {
+        id,
+        title,
+        severity: 'warn',
+        detail: `profile name looks bound to VM '${binding.vmName}', but its apiUrl host ${
+          binding.hostname ? `'${binding.hostname}'` : '(unparseable)'
+        } is not the Dev Machine hostname (${IN_CLUSTER_API_SERVER_HOSTNAME}) — likely a docker-based local server or a remote cluster reusing the name; doctor leaves it untouched`,
+        remediation:
+          'If this profile SHOULD point at the microVM, `appliance vm up` rebinds it; otherwise nothing to do.',
+      };
     case 'engine-unavailable':
       return {
         id,
@@ -848,7 +947,7 @@ async function renderBindingFinding(
         title,
         severity: 'warn',
         detail: `profile points at VM '${binding.vmName}', which no longer exists (engine listing succeeded)`,
-        remediation: `Remove it: \`appliance cluster rm ${profileName}\`.`,
+        remediation: `Run \`appliance doctor --fix\` to prune it, or remove it yourself: \`appliance cluster rm ${profileName}\`.`,
         fix: { kind: 'remove-orphan-profile' },
       };
     }
@@ -881,7 +980,7 @@ async function renderBindingFinding(
         detail: crossWired
           ? `profile apiUrl points at port ${binding.profilePort}, which belongs to a DIFFERENT VM ('${binding.portOwner}') — requests would hit the wrong cluster`
           : `profile apiUrl points at port ${binding.profilePort} but VM '${binding.vmName}' owns port ${binding.vmPort}`,
-        remediation: `Point the profile back at its VM: apiUrl ${apiServerUrlForHostPort(binding.vmPort)}.`,
+        remediation: `Run \`appliance doctor --fix\` to point the profile back at its VM (apiUrl ${apiServerUrlForHostPort(binding.vmPort)}).`,
         fix: { kind: 'rewrite-stale-port' },
       };
     }

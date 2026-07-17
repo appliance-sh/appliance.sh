@@ -68,6 +68,19 @@ describe('scrubLogText', () => {
     expect(scrubbed).toContain('commit 548b1b1');
     expect(scrubbed).toContain('2b06a172-1ea9-4410-b42c-e06eae91843b');
   });
+
+  it('scrubs sk_-prefixed minted api-key secrets (the underscore defeats the plain hex rule)', () => {
+    // Minted secrets are `sk_` + 64 hex (api-key.service.ts); mint error
+    // paths can paint full responses into host.log, which bundles ship.
+    const minted = `sk_${'5f'.repeat(32)}`;
+    const openai = `sk-${'ab'.repeat(20)}`;
+    const scrubbed = scrubLogText(`mint failed: secret=${minted} upstream=${openai} status=500`);
+    expect(scrubbed).not.toContain(minted);
+    expect(scrubbed).not.toContain(openai);
+    expect(scrubbed).toContain('status=500');
+    // Short sk_-words are ordinary identifiers, not secrets.
+    expect(scrubLogText('sk_live sk_test_short')).toBe('sk_live sk_test_short');
+  });
 });
 
 describe('kubeconfigServerLines', () => {
@@ -101,6 +114,7 @@ const PLANTED = {
   kubeCert: 'PLANTEDCERTIFICATEDATA',
   kubeKey: 'PLANTEDCLIENTKEYDATA',
   consoleToken: 'deadbeefcafef00d'.repeat(4), // 64 hex painted into console.log
+  mintedSecret: `sk_${'0badf00d'.repeat(8)}`, // sk_ + 64 hex — the minted api-key shape
   saJwt: 'eyJhbGciOiJSUzI1NiJ9.eyJQTEFOVEVEIjp0cnVlfQ.UExBTlRFRFNJR05BVFVSRQ',
   helperCmd: 'cat /secrets/PLANTED-HELPER-API-KEY',
   desktopSecret: 'PLANTED-DESKTOP-APIKEY-SECRET',
@@ -170,7 +184,12 @@ describe('writeSupportBundle redaction', () => {
       path.join(vmDir, 'console.log'),
       `boot ok\n+ export BOOTSTRAP_TOKEN=${PLANTED.consoleToken}\n+ SA_TOKEN=${PLANTED.saJwt}\napi-server up\n`
     );
-    fs.writeFileSync(path.join(vmDir, 'host.log'), `host log line\ntoken ${PLANTED.consoleToken}\n`);
+    fs.writeFileSync(
+      path.join(vmDir, 'host.log'),
+      // A mint error path can paint the full response — minted secret
+      // included — into host.log; the sk_ prefix keeps it one word.
+      `host log line\ntoken ${PLANTED.consoleToken}\nmint 500: {"secret":"${PLANTED.mintedSecret}"}\n`
+    );
 
     // Plain state that ships as-is.
     fs.writeFileSync(path.join(vmDir, 'vm.json'), JSON.stringify({ name: 'appliance', hostPort: 8081 }));
