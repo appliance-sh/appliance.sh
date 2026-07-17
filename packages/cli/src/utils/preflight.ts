@@ -1,14 +1,7 @@
 import * as net from 'node:net';
 import * as tls from 'node:tls';
 import { spawnSync } from 'node:child_process';
-import {
-  IN_CLUSTER_API_SERVER_DEFAULT_IMAGE,
-  ensureDockerRunning,
-  helperBinDir,
-  runInstall,
-  runStatus,
-  runtimeDaemonStatus,
-} from '@appliance.sh/helper';
+import { helperBinDir, runInstall, runStatus } from '@appliance.sh/helper';
 import type { StatusEntry } from '@appliance.sh/helper';
 
 // Reusable preflight checks shared by `appliance doctor` and any other
@@ -17,21 +10,15 @@ import type { StatusEntry } from '@appliance.sh/helper';
 // the same {status, remediation} shape so callers render a uniform
 // checklist without branching on the check's identity.
 //
+// Docker is deliberately NOT checked: nothing in the appliance flow
+// needs it anymore. The control plane runs as a guest binary inside the
+// microVM and images build server-side with the in-VM BuildKit.
+//
 // Checks never throw: a probe that can't run (tool missing, command
 // errors) resolves to a `fail` (or `warn`) with an actionable
 // remediation, never a rejected promise. That keeps the orchestrator a
 // flat `Promise.all` and guarantees `doctor` always prints a full
 // report instead of bailing on the first surprise.
-
-/** The published api-server image the cluster pulls on first deploy.
- *  Re-exported from the helper's canonical constant so doctor's `--fix`
- *  (`docker pull`) and the bootstrap path can never drift apart. */
-export const PUBLISHED_API_SERVER_IMAGE = IN_CLUSTER_API_SERVER_DEFAULT_IMAGE;
-
-/** The microVM runtime can't emulate, so the api-server image must
- *  carry the host's architecture. Mirrors VM_HOST_ARCH in
- *  appliance-vm.ts. */
-export const HOST_ARCH: 'arm64' | 'amd64' = process.arch === 'arm64' ? 'arm64' : 'amd64';
 
 /** Ports the microVM runtime forwards on the host. A conflicting
  *  listener here is the single most common cause of a silent first-run
@@ -59,7 +46,7 @@ interface PortSpec {
 export type CheckStatus = 'pass' | 'fail' | 'warn';
 
 export interface CheckResult {
-  /** Stable identifier, e.g. `docker`, `port:8081`, `api-server-image`. */
+  /** Stable identifier, e.g. `bin:kubectl`, `port:8081`. */
   id: string;
   /** Short human label rendered as the checklist row title. */
   label: string;
@@ -97,35 +84,6 @@ function probeVersion(tool: string, args: string[]): string | null {
   }
 }
 
-// ---- container runtime --------------------------------------------------
-
-/** Docker CLI present *and* a daemon reachable. "installed but not
- *  running" is the canonical stopped-colima state, surfaced distinctly
- *  so the remediation can offer the auto-start path. */
-export async function checkDockerRuntime(): Promise<CheckResult> {
-  const version = probeVersion('docker', ['--version']);
-  if (version === null) {
-    return fail(
-      'docker',
-      'Container runtime (Docker)',
-      'docker CLI not found on PATH',
-      'Install a container runtime — Docker Desktop, OrbStack, or Colima (`brew install colima docker`).'
-    );
-  }
-  const daemon = await runtimeDaemonStatus();
-  if (daemon.running) {
-    return pass('docker', 'Container runtime (Docker)', version);
-  }
-  return fail(
-    'docker',
-    'Container runtime (Docker)',
-    `${version} — installed, but the daemon is not reachable`,
-    daemon.startable
-      ? 'Docker is installed but its colima VM is stopped. Run `colima start`.'
-      : 'Start your container runtime (Docker Desktop / OrbStack, or `colima start`), then re-run `appliance doctor`.'
-  );
-}
-
 // ---- toolchain ----------------------------------------------------------
 
 /** Rust toolchain (rustc + cargo). Only needed to build the
@@ -146,27 +104,27 @@ export function checkRust(): CheckResult {
   );
 }
 
-/** bun — used to compile the single-binary CLI distribution. A `warn`
- *  for the same reason as Rust: end users run a prebuilt binary. */
+/** bun — used to compile the CLI and the api-server guest binary from a
+ *  repo checkout. A `warn` for the same reason as Rust: end users run
+ *  prebuilt binaries. */
 export function checkBun(): CheckResult {
   const version = probeVersion('bun', ['--version']);
   if (version) {
-    return pass('bun', 'bun (CLI build toolchain)', `v${version}`);
+    return pass('bun', 'bun (build toolchain)', `v${version}`);
   }
   return warn(
     'bun',
-    'bun (CLI build toolchain)',
-    'bun not found — only needed to compile the CLI from source',
-    'Install bun: `curl -fsSL https://bun.sh/install | bash`. Skip if you only run the published `appliance` binary.'
+    'bun (build toolchain)',
+    'bun not found — only needed to compile the CLI / api-server guest binary from source',
+    'Install bun: `curl -fsSL https://bun.sh/install | bash`. Skip if you only run published binaries.'
   );
 }
 
 // ---- helper-managed binaries -------------------------------------------
 
-/** crane / kubectl from the helper provider registry. Probed via
- *  `runStatus` so the resolution order (managed bin dir → PATH) matches
- *  exactly what the rest of the CLI uses. `crane` is optional (microVM
- *  only) → `warn`; the required tools → `fail`. */
+/** kubectl (and any other helper-managed tools) from the provider
+ *  registry. Probed via `runStatus` so the resolution order (managed
+ *  bin dir → PATH) matches exactly what the rest of the CLI uses. */
 export async function checkHelperBinaries(): Promise<CheckResult[]> {
   let entries: StatusEntry[];
   try {
@@ -176,32 +134,30 @@ export async function checkHelperBinaries(): Promise<CheckResult[]> {
     return [
       fail(
         'helper-binaries',
-        'Helper binaries (crane, kubectl)',
+        'Helper binaries (kubectl)',
         `could not probe helper providers: ${message}`,
-        'Install the helper-managed binaries (kubectl, crane), then re-run `appliance doctor`.'
+        'Install the helper-managed binaries (kubectl), then re-run `appliance doctor`.'
       ),
     ];
   }
-  // The docker provider is covered by checkDockerRuntime; skip it here
-  // so the report doesn't list docker twice.
-  return entries
-    .filter((e) => e.provider.name !== 'docker')
-    .map((e) => {
-      const { provider, check } = e;
-      const label = `${provider.name} (${provider.description.replace(/\.$/, '')})`;
-      if (check.installed) {
-        return pass(`bin:${provider.name}`, label, check.version);
-      }
-      const remediation = provider.autoInstallable
-        ? `Install ${provider.name} under ${helperBinDir()} or via your package manager; the microVM runtime fetches it automatically on \`appliance vm up\` when missing.`
-        : provider.manualInstall({ binDir: helperBinDir(), platform: 'darwin', arch: 'arm64' }).instructions;
-      const detail = check.error ?? 'not installed';
-      // crane is microVM-only and not "required" — a missing crane only
-      // blocks the VM engine, so warn rather than fail the whole machine.
-      return provider.required
-        ? fail(`bin:${provider.name}`, label, detail, remediation)
-        : warn(`bin:${provider.name}`, label, detail, remediation);
-    });
+  return entries.map((e) => {
+    const { provider, check } = e;
+    const label = `${provider.name} (${provider.description.replace(/\.$/, '')})`;
+    if (check.installed) {
+      return pass(`bin:${provider.name}`, label, check.version);
+    }
+    const remediation = provider.autoInstallable
+      ? `Install ${provider.name} under ${helperBinDir()} or via your package manager (\`appliance doctor --fix\` installs it for you); the microVM runtime also fetches it on \`appliance vm up\` when missing.`
+      : provider.manualInstall({
+          binDir: helperBinDir(),
+          platform: process.platform as 'darwin' | 'linux' | 'win32',
+          arch: process.arch as 'x64' | 'arm64',
+        }).instructions;
+    const detail = check.error ?? 'not installed';
+    return provider.required
+      ? fail(`bin:${provider.name}`, label, detail, remediation)
+      : warn(`bin:${provider.name}`, label, detail, remediation);
+  });
 }
 
 // ---- ports --------------------------------------------------------------
@@ -274,58 +230,6 @@ export async function checkPorts(): Promise<CheckResult[]> {
   );
 }
 
-// ---- api-server image ---------------------------------------------------
-
-/** Host-resolved architecture of a local image, or null when it isn't
- *  in the docker daemon. Mirrors inspectArch in appliance-vm.ts. */
-function inspectArch(ref: string): string | null {
-  const r = spawnSync('docker', ['image', 'inspect', '--format', '{{.Architecture}}', ref], { encoding: 'utf8' });
-  if (r.status !== 0) return null;
-  return r.stdout.trim() || null;
-}
-
-/**
- * Is the api-server image resolvable for this host's architecture? The
- * runtimes can't emulate, so an image without a matching `linux/<arch>`
- * variant crashloops with `exec format error`. We treat "present
- * locally with the host arch" as a pass; "present but wrong arch" as a
- * fail; "absent" as a warn (the cluster pulls it from ghcr on first
- * deploy — `--fix` pre-pulls it so first-run is offline-safe and fast).
- *
- * Skipped entirely when docker is unreachable (the docker check already
- * failed and re-reporting the same daemon error here is noise).
- */
-export function checkApiServerImage(dockerReachable: boolean): CheckResult {
-  const id = 'api-server-image';
-  const label = 'api-server image resolvable';
-  if (!dockerReachable) {
-    return warn(
-      id,
-      label,
-      'skipped — Docker daemon is not reachable',
-      'Fix the container runtime above, then re-run `appliance doctor`.'
-    );
-  }
-  const arch = inspectArch(PUBLISHED_API_SERVER_IMAGE);
-  if (arch === null) {
-    return warn(
-      id,
-      label,
-      `${PUBLISHED_API_SERVER_IMAGE} not pulled locally`,
-      `The cluster pulls it on first deploy. To pre-pull (faster, offline-safe first run): \`docker pull ${PUBLISHED_API_SERVER_IMAGE}\` — or run \`appliance doctor --fix\`.`
-    );
-  }
-  if (arch !== HOST_ARCH) {
-    return fail(
-      id,
-      label,
-      `${PUBLISHED_API_SERVER_IMAGE} resolves to linux/${arch}, but this host needs linux/${HOST_ARCH}`,
-      `Re-pull for the host architecture: \`docker pull --platform linux/${HOST_ARCH} ${PUBLISHED_API_SERVER_IMAGE}\`. The runtime can't emulate, so a cross-arch image crashloops with "exec format error".`
-    );
-  }
-  return pass(id, label, `${PUBLISHED_API_SERVER_IMAGE} (linux/${arch})`);
-}
-
 // ---- macOS signing / keychain ------------------------------------------
 
 /**
@@ -370,20 +274,9 @@ export interface PreflightReport {
 /** Run the full preflight suite and return a structured report. The
  *  caller decides how to render (checklist, JSON) and how to exit. */
 export async function runPreflight(): Promise<PreflightReport> {
-  const docker = await checkDockerRuntime();
-  const dockerReachable = docker.status === 'pass';
-
   const [helperBinaries, ports] = await Promise.all([checkHelperBinaries(), checkPorts()]);
 
-  const results: CheckResult[] = [
-    docker,
-    ...helperBinaries,
-    checkRust(),
-    checkBun(),
-    ...ports,
-    checkApiServerImage(dockerReachable),
-    checkMacSigning(),
-  ];
+  const results: CheckResult[] = [...helperBinaries, checkRust(), checkBun(), ...ports, checkMacSigning()];
 
   return { results, ok: results.every((r) => r.status !== 'fail') };
 }
@@ -397,16 +290,10 @@ export interface FixOutcome {
 }
 
 /**
- * Run the safe, non-trust-forking auto-fixes for a preflight report, in
- * dependency order so each unblocks the next:
- *
- *   1. Container runtime — start a stopped-but-startable daemon (colima),
- *      so the image pull below has somewhere to land.
- *   2. Helper binaries (crane, kubectl) — drive the auto-installer for
- *      the providers that support it; crane is required to deliver images
- *      into the in-VM registry.
- *   3. api-server image — `docker pull --platform linux/<hostArch>` the
- *      pinned published image so first deploy is offline-safe and fast.
+ * Run the safe, non-trust-forking auto-fixes for a preflight report:
+ * install the missing helper-managed binaries (kubectl). Port conflicts
+ * and toolchain gaps stay with the operator — remediations already name
+ * the fix.
  *
  * The macOS dev-binary signing step is deliberately NOT here: it forks a
  * trust/identity decision and is therefore prompted by the caller
@@ -415,69 +302,19 @@ export interface FixOutcome {
 export async function runFixes(report: PreflightReport): Promise<FixOutcome[]> {
   const outcomes: FixOutcome[] = [];
 
-  // 1. Container runtime: start it when we safely can.
-  const dockerCheck = report.results.find((r) => r.id === 'docker');
-  let dockerReachable = dockerCheck?.status === 'pass';
-  if (dockerCheck && dockerCheck.status === 'fail') {
-    const fix = await startContainerRuntime();
-    outcomes.push(fix);
-    if (fix.status === 'fixed') dockerReachable = true;
-  }
-
-  // 2. Helper binaries: auto-install the ones the registry can install.
   const missingBins = report.results.filter((r) => r.id.startsWith('bin:') && r.status !== 'pass');
   if (missingBins.length > 0) {
     outcomes.push(...(await installHelperBinaries(missingBins)));
   }
 
-  // 3. api-server image: pull once docker is reachable.
-  const imageCheck = report.results.find((r) => r.id === 'api-server-image');
-  if (imageCheck && imageCheck.status !== 'pass') {
-    if (!dockerReachable) {
-      outcomes.push({
-        label: 'pull api-server image',
-        status: 'skipped',
-        detail: 'Docker daemon is not reachable — start it first.',
-      });
-    } else {
-      outcomes.push(pullApiServerImage());
-    }
-  }
-
   return outcomes;
 }
 
-/** Start the container runtime when appliance can do so without a user
- *  decision (an installed-but-stopped colima). Anything else — docker
- *  not installed, a GUI runtime that's simply not launched — is left to
- *  the operator with its existing remediation, so this never forks a
- *  trust/install decision. */
-async function startContainerRuntime(): Promise<FixOutcome> {
-  const label = 'start container runtime';
-  const status = await runtimeDaemonStatus();
-  if (status.running) {
-    return { label, status: 'skipped', detail: 'Docker daemon already running.' };
-  }
-  if (!status.startable) {
-    return {
-      label,
-      status: 'skipped',
-      detail: 'Docker is not installed or can’t be auto-started — start your runtime manually.',
-    };
-  }
-  try {
-    await ensureDockerRunning();
-    return { label, status: 'fixed', detail: 'started the colima container runtime' };
-  } catch (err) {
-    return { label, status: 'failed', detail: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-/** Drive the helper auto-installer for the missing managed binaries
- *  (crane, kubectl). The check id is `bin:<provider>`, so the provider
- *  name is the suffix. Providers that can't auto-install return guidance
- *  rather than failing — surfaced as a `skipped` so the report still
- *  carries the manual remediation. */
+/** Drive the helper auto-installer for the missing managed binaries.
+ *  The check id is `bin:<provider>`, so the provider name is the
+ *  suffix. Providers that can't auto-install return guidance rather
+ *  than failing — surfaced as a `skipped` so the report still carries
+ *  the manual remediation. */
 async function installHelperBinaries(missing: CheckResult[]): Promise<FixOutcome[]> {
   const tools = missing.map((r) => r.id.slice('bin:'.length)).filter(Boolean);
   let outcomes;
@@ -493,21 +330,4 @@ async function installHelperBinaries(missing: CheckResult[]): Promise<FixOutcome
     status: o.status === 'installed' || o.status === 'already' ? 'fixed' : o.status === 'failed' ? 'failed' : 'skipped',
     detail: o.message,
   }));
-}
-
-/** `docker pull --platform linux/<arch>` the published image — the
- *  identical pull pattern bootstrap relies on, pinned to the host arch
- *  so the runtime gets a runnable variant. */
-function pullApiServerImage(): FixOutcome {
-  const label = 'pull api-server image';
-  const args = ['pull', '--platform', `linux/${HOST_ARCH}`, PUBLISHED_API_SERVER_IMAGE];
-  const r = spawnSync('docker', args, { stdio: ['ignore', 'inherit', 'pipe'], encoding: 'utf8' });
-  if (r.status === 0) {
-    return { label, status: 'fixed', detail: `pulled ${PUBLISHED_API_SERVER_IMAGE} (linux/${HOST_ARCH})` };
-  }
-  return {
-    label,
-    status: 'failed',
-    detail: `\`docker ${args.join(' ')}\` failed: ${(r.stderr ?? '').trim() || 'unknown error'}`,
-  };
 }

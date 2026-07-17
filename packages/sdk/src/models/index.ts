@@ -6,5 +6,7 @@ export * from './env-var';
 export * from './environment-health';
 export * from './deployment';
 export * from './api-key';
+export * from './invite';
 export * from './build';
 export * from './workloads';
+export * from './stack';

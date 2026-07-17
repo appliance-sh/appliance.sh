@@ -3,6 +3,8 @@ import { Link, useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { createApplianceClient } from '@appliance.sh/sdk/client';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
+import { clearAuthFailure } from '@/lib/auth-signal';
 import { useHost } from '@/providers/host-provider';
 
 // Adds a cluster: probes the URL, then calls host.addCluster() which
@@ -59,6 +61,7 @@ export function ConnectPage() {
         apiKey: { id: trimmedKeyId, secret: trimmedSecret },
       });
       await queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
+      clearAuthFailure();
       navigate('/');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -107,7 +110,8 @@ export function ConnectPage() {
     if (!result.success) {
       throw new Error(
         `the server is reachable but rejected these credentials (${result.error.message}). ` +
-          'Check the access key ID and secret — `appliance whoami` shows the active key.'
+          'Double-check the access key ID and secret with whoever gave them to you. ' +
+          '(If you use the CLI, `appliance whoami` shows the active key.)'
       );
     }
   }
@@ -115,13 +119,13 @@ export function ConnectPage() {
   return (
     <div className="mx-auto max-w-md space-y-6 pt-16">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">Connect to a cluster</h1>
+        <h1 className="text-2xl font-semibold">Connect to your team&apos;s server</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Enter the URL of an Appliance api-server and an API key to add it to this shell.
+          Invited by a teammate? Just open the invite link they sent you and you&apos;re in — nothing to fill in here.
           {canBootstrap ? null : (
             <>
               {' '}
-              Don&apos;t have a cluster yet? Run{' '}
+              Setting up from scratch instead? Run{' '}
               <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance vm up</code> for a local
               runtime, or <code className="rounded bg-[var(--color-muted)] px-1.5 py-0.5">appliance bootstrap</code> for
               AWS.
@@ -130,71 +134,75 @@ export function ConnectPage() {
         </p>
       </div>
 
-      <form onSubmit={onSubmit} className="space-y-4">
-        <Field label="API server URL" hint="e.g. https://api.example.appliance.sh">
-          <input
-            type="url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://api.example.appliance.sh"
-            required
-            className={inputCls}
-          />
-        </Field>
+      {/* The manual form is the exception, not the lead — collapsed by
+          default so invite-link users aren't confronted with key fields. */}
+      <details className="rounded-md border border-[var(--color-border)] p-4">
+        <summary className="cursor-pointer select-none text-sm font-medium">Advanced: connect manually</summary>
+        <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
+          For connecting with a server address and access key an admin gave you.
+        </p>
+        <form onSubmit={onSubmit} className="mt-3 space-y-4">
+          <Field label="API server URL" hint="e.g. https://api.example.appliance.sh">
+            <input
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://api.example.appliance.sh"
+              className={inputCls}
+            />
+          </Field>
 
-        <Field label="Cluster name" hint="how this cluster appears in the sidebar">
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => {
-              userTouchedName.current = true;
-              setName(e.target.value);
-            }}
-            placeholder="production"
-            required
-            className={inputCls}
-          />
-        </Field>
+          <Field label="Cluster name" hint="how this cluster appears in the sidebar">
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => {
+                userTouchedName.current = true;
+                setName(e.target.value);
+              }}
+              placeholder="production"
+              className={inputCls}
+            />
+          </Field>
 
-        <Field label="Access key ID" hint="apikey_…">
-          <input
-            type="text"
-            value={keyId}
-            onChange={(e) => setKeyId(e.target.value)}
-            placeholder="apikey_…"
-            required
-            className={`${inputCls} font-mono`}
-          />
-        </Field>
+          <Field label="Access key ID" hint="apikey_…">
+            <input
+              type="text"
+              value={keyId}
+              onChange={(e) => setKeyId(e.target.value)}
+              placeholder="apikey_…"
+              className={`${inputCls} font-mono`}
+            />
+          </Field>
 
-        <Field label="Secret access key" hint="sk_…">
-          <input
-            type="password"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            placeholder="sk_…"
-            required
-            className={`${inputCls} font-mono`}
-          />
-        </Field>
+          <Field label="Secret access key" hint="sk_…">
+            <input
+              type="password"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              placeholder="sk_…"
+              className={`${inputCls} font-mono`}
+            />
+          </Field>
 
-        {error ? (
-          <div className="rounded-md border border-red-500/50 bg-red-500/5 p-3 text-xs text-red-400">{error}</div>
-        ) : null}
+          {error ? (
+            <FriendlyError error={error} fallbackHeadline="Couldn't connect to that server" hideReconnect />
+          ) : null}
 
-        <Button type="submit" disabled={!canSubmit} className="w-full">
-          {submitting ? 'Connecting…' : 'Add cluster'}
-        </Button>
-      </form>
+          <Button type="submit" disabled={!canSubmit} className="w-full">
+            {submitting ? 'Connecting…' : 'Add cluster'}
+          </Button>
+        </form>
+      </details>
 
       {canBootstrap ? (
         <div className="rounded-md border border-[var(--color-border)] p-4">
-          <div className="text-sm">No cluster yet?</div>
+          <div className="text-sm">Nothing to connect to yet?</div>
           <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-            Provision one from this machine — uses your current AWS credentials.
+            Provision a new installation from this machine — uses your current AWS credentials.
           </p>
           <Button asChild variant="outline" className="mt-3">
-            <Link to="/bootstrap">Bootstrap new installation</Link>
+            <Link to="/cloud/bootstrap">Bootstrap new installation</Link>
           </Button>
         </div>
       ) : null}

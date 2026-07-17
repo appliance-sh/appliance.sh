@@ -6,6 +6,7 @@
 
 use super::{error_text, QueueBound};
 use crate::guest::SHELL_VSOCK_PORT;
+use crate::shell::clock_set_command;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
@@ -54,6 +55,19 @@ pub fn spawn_relay(
     });
 }
 
+/// Interval between periodic clock pushes while the host stays awake.
+const CLOCK_RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+/// Granularity of the wake watcher: the resync wait sleeps in ticks
+/// this short so a macOS wake is noticed within ~one tick instead of
+/// the tail of a 30s sleep.
+const CLOCK_WATCH_TICK: Duration = Duration::from_secs(2);
+/// How much FURTHER than a tick the wall clock must have advanced to
+/// call it a sleep/wake jump. Guest skew becomes fatal at the 15s
+/// signature tolerance; 45s of slack keeps scheduler-induced oversleep
+/// (which is seconds, not tens of seconds) from false-positives while
+/// catching any nap long enough to matter.
+const WAKE_JUMP_SLACK: Duration = Duration::from_secs(45);
+
 /// Push the host's wall-clock time into the guest, at bring-up and
 /// periodically, over the same vsock shell channel.
 ///
@@ -62,9 +76,13 @@ pub fn spawn_relay(
 /// host clock ahead of the guest's makes host-signed requests look
 /// future-dated → opaque 401s. This thread is the host-authoritative
 /// fix: the first successful push corrects the boot offset; the periodic
-/// re-push corrects pause/resume jumps and keeps drift far under the
-/// signature tolerance. Detached and best-effort — any failure is logged,
-/// never fatal, exactly like `spawn_relay`.
+/// re-push corrects drift; and a wall-clock jump detector inside the
+/// wait catches macOS SLEEP/WAKE — the guest clock stops with the VM
+/// while the wall clock runs on, so a wake leaves the guest minutes or
+/// hours behind and every signed request 401ing until the next push.
+/// The detector cuts that window to ~one watch tick, with zero new
+/// ObjC notification plumbing. Detached and best-effort — any failure
+/// is logged, never fatal, exactly like `spawn_relay`.
 pub fn spawn_clock_sync(
     queue: &DispatchRetained<DispatchQueue>,
     vm: &Retained<VZVirtualMachine>,
@@ -83,13 +101,46 @@ pub fn spawn_clock_sync(
         };
         if let Err(e) = push_clock(fd) {
             eprintln!("clock sync: {e}");
-            // Fall through to the long sleep: a failed push is rare and
-            // the next iteration reconnects with a fresh time anyway.
+            // Fall through to the wait: a failed push is rare and the
+            // next iteration reconnects with a fresh time anyway.
         }
-        // Re-push periodically: corrects pause/resume jumps and keeps
-        // drift far below the signature tolerance (~15s).
-        std::thread::sleep(Duration::from_secs(30));
+        // Wait out the resync interval in short ticks, watching for a
+        // sleep/wake wall-clock jump — on one, loop immediately so the
+        // push above lands right after the wake.
+        if wait_watching_for_wake(CLOCK_RESYNC_INTERVAL, CLOCK_WATCH_TICK) {
+            eprintln!("clock sync: post-wake clock push");
+        }
     });
+}
+
+/// Sleep for `total`, in `tick`-sized slices, returning early with
+/// `true` when a wall-clock jump says the host slept and woke. `false`
+/// after an ordinary, fully-awake wait.
+fn wait_watching_for_wake(total: Duration, tick: Duration) -> bool {
+    // Instant on macOS is CLOCK_UPTIME_RAW: it does NOT advance while
+    // the machine sleeps, so it bounds the AWAKE time waited even when
+    // ticks straddle a nap.
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        let wall_before = SystemTime::now();
+        std::thread::sleep(tick);
+        let wall_elapsed = SystemTime::now()
+            .duration_since(wall_before)
+            .unwrap_or(tick);
+        if is_post_wake_jump(tick, wall_elapsed) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// Pure jump decision: a single `tick`-long sleep whose wall clock
+/// advanced more than `tick + WAKE_JUMP_SLACK` means the host slept
+/// through it — time to re-push the guest clock immediately.
+fn is_post_wake_jump(tick: Duration, wall_elapsed: Duration) -> bool {
+    wall_elapsed > tick + WAKE_JUMP_SLACK
 }
 
 /// The size-line handshake clock-sync sends before its `date -s` command.
@@ -128,46 +179,6 @@ fn push_clock(fd: RawFd) -> Result<(), String> {
     sock.read_to_end(&mut sink)
         .map_err(|e| format!("drain: {e}"))?;
     Ok(())
-}
-
-/// Build the busybox-compatible command that sets the guest clock to the
-/// given Unix epoch seconds. Tries the epoch form first; on the busybox
-/// builds where `date -s @EPOCH` isn't honoured, falls back to a
-/// `-D`-typed formatted UTC string built from the same instant. Both are
-/// UTC (`-u`) so the guest's timezone never enters into it.
-fn clock_set_command(epoch_secs: u64) -> String {
-    let formatted = format_utc(epoch_secs);
-    format!(
-        "date -u -s @{epoch_secs} 2>/dev/null \
-         || date -u -D '%Y-%m-%d %H:%M:%S' -s '{formatted}' 2>/dev/null \
-         || true"
-    )
-}
-
-/// Convert Unix epoch seconds to a `YYYY-MM-DD HH:MM:SS` UTC string, with
-/// no dependency: a Howard Hinnant civil-from-days calculation for the
-/// date plus plain modular arithmetic for the time of day.
-fn format_utc(epoch_secs: u64) -> String {
-    let days = (epoch_secs / 86_400) as i64;
-    let secs_of_day = epoch_secs % 86_400;
-    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
-}
-
-/// Days since 1970-01-01 → (year, month, day), proleptic Gregorian.
-/// Howard Hinnant's `civil_from_days` algorithm (public domain).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Open a fresh vsock connection to the guest shell port and hand back a
@@ -250,22 +261,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_known_epochs_as_utc() {
-        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
-        // 2009-02-13T23:31:30Z — the classic 1234567890 timestamp.
-        assert_eq!(format_utc(1_234_567_890), "2009-02-13 23:31:30");
-        // A leap day: 2020-02-29T12:00:00Z.
-        assert_eq!(format_utc(1_582_977_600), "2020-02-29 12:00:00");
-        // End-of-year boundary: 2023-12-31T23:59:59Z.
-        assert_eq!(format_utc(1_704_067_199), "2023-12-31 23:59:59");
+    fn wake_jump_detection_has_slack_for_oversleep_but_catches_naps() {
+        let tick = Duration::from_secs(2);
+        // An exact tick, scheduler jitter, even seconds of oversleep:
+        // not a wake — re-pushing on every hiccup would be noise.
+        assert!(!is_post_wake_jump(tick, Duration::from_secs(2)));
+        assert!(!is_post_wake_jump(tick, Duration::from_secs(5)));
+        assert!(!is_post_wake_jump(tick, Duration::from_secs(47))); // exactly tick+slack: boundary stays quiet
+        // Beyond tick + 45s of slack the host demonstrably slept: the
+        // guest clock is now behind by about that much and every signed
+        // request would 401 until a push.
+        assert!(is_post_wake_jump(tick, Duration::from_secs(48)));
+        assert!(is_post_wake_jump(tick, Duration::from_secs(3600)));
     }
 
     #[test]
-    fn command_tries_epoch_then_formatted_fallback() {
-        let cmd = clock_set_command(1_234_567_890);
-        assert!(cmd.contains("date -u -s @1234567890 2>/dev/null"));
-        assert!(cmd.contains("date -u -D '%Y-%m-%d %H:%M:%S' -s '2009-02-13 23:31:30' 2>/dev/null"));
-        assert!(cmd.ends_with("|| true"));
+    fn wake_watcher_ticks_are_much_finer_than_the_resync_interval() {
+        // The detector's whole point is cutting the post-wake 401
+        // window from "the tail of a 30s sleep" to ~one tick.
+        assert!(CLOCK_WATCH_TICK < CLOCK_RESYNC_INTERVAL / 10);
+        // And the slack must exceed the signature tolerance (15s) so a
+        // detected jump is always one that actually mattered.
+        assert!(WAKE_JUMP_SLACK >= Duration::from_secs(15));
     }
 
     #[test]

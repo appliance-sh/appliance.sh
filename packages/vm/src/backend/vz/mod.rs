@@ -77,7 +77,7 @@ impl VmBackend for VzBackend {
         crate::bringup::clear(&paths.dir);
         crate::bringup::set(&paths.dir, crate::bringup::Phase::Media, None);
         let image = crate::images::ensure_image(&spec.image)?;
-        eprintln!("assembling boot media");
+        crate::bringup::hostlog("assembling boot media");
         let boot_media = crate::guest::build_boot_media(
             &paths.dir,
             spec.registry_port,
@@ -86,6 +86,7 @@ impl VmBackend for VzBackend {
             spec.docker,
             spec.egress_port,
             spec.agent_only,
+            spec.host_port,
         )?;
 
         // The prebuilt agent image (Node ≥22 + the pinned CLIs) attaches as a
@@ -99,14 +100,66 @@ impl VmBackend for VzBackend {
             match crate::images::ensure_agent_image() {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    eprintln!(
+                    crate::bringup::hostlog(&format!(
                         "agent image unavailable ({e:#}); the guest will self-heal the CLIs via npm"
-                    );
+                    ));
                     None
                 }
             }
         } else {
             None
+        };
+
+        // k3s VMs: the pinned airgap-images tarball (hash-verified, FAT-
+        // wrapped) rides as another read-only virtio-blk so first boot
+        // imports its core images locally instead of pulling ~300 MB from
+        // docker.io. Best-effort by contract: any failure here falls back
+        // to today's network pulls — bring-up must never get WORSE. The
+        // guest finds the media by volume label, never a device node.
+        //
+        // The first-run download is BIG and used to be invisible-and-
+        // unbounded inside the Media phase: say what is happening (host
+        // log + phase detail, so `up`/desktop show it), and bound the
+        // synchronous wait to half the remaining bring-up budget — a slow
+        // link degrades to the network-pull fallback while the download
+        // keeps priming the shared cache in the background for the next
+        // boot (its .partial→rename staging is already crash-atomic).
+        // Cache-warm boots take the fast path through the same bound.
+        let platform_images: Option<std::path::PathBuf> = if spec.agent_only {
+            None
+        } else {
+            if !crate::images::k3s_airgap_images_cached() {
+                crate::bringup::hostlog("downloading k3s platform images (~300 MB, first run only)");
+                crate::bringup::set(
+                    &paths.dir,
+                    crate::bringup::Phase::Media,
+                    Some("downloading k3s platform images (first run only)".into()),
+                );
+            }
+            let bound = std::cmp::max(
+                std::time::Duration::from_secs(60),
+                crate::bringup::remaining_budget() / 2,
+            );
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::guest::ensure_k3s_airgap_media());
+            });
+            match rx.recv_timeout(bound) {
+                Ok(Ok(p)) => Some(p),
+                Ok(Err(e)) => {
+                    crate::bringup::hostlog(&format!(
+                        "k3s airgap images unavailable ({e:#}); first boot pulls from the network"
+                    ));
+                    None
+                }
+                Err(_) => {
+                    crate::bringup::hostlog(&format!(
+                        "k3s platform images still downloading after {}s — booting without the preload (network pulls); the download continues for the next boot",
+                        bound.as_secs()
+                    ));
+                    None
+                }
+            }
         };
 
         // The console log is the VM's primary observable output —
@@ -125,6 +178,7 @@ impl VmBackend for VzBackend {
             &image.initramfs,
             &boot_media.image,
             agent_image.as_deref(),
+            platform_images.as_deref(),
             &paths,
         )?;
         let config = built.config;
@@ -137,7 +191,7 @@ impl VmBackend for VzBackend {
         // guest its deterministic address and owns its only path off-box.
         // Behaviour-neutral in F1: every flow is forwarded, no filtering.
         let netstack: Option<Netstack> = built.host_fd.map(|fd| {
-            eprintln!("network: host-mediated smoltcp netstack (net_link=netstack)");
+            crate::bringup::hostlog("network: host-mediated smoltcp netstack (net_link=netstack)");
             crate::netstack::start(
                 fd,
                 crate::netstack::LinkConfig::for_guest_mac(&spec.name, &spec.mac),
@@ -155,7 +209,7 @@ impl VmBackend for VzBackend {
         }
 
         start_vm(&queue, &vm)?;
-        eprintln!("VM '{}' started", spec.name);
+        crate::bringup::hostlog(&format!("VM '{}' started", spec.name));
         // Guest is launching; host_services drives the rest of the phases.
         crate::bringup::set(&paths.dir, crate::bringup::Phase::Booting, None);
 
@@ -178,9 +232,14 @@ impl VmBackend for VzBackend {
             let spec = spec.clone();
             let paths_dir = paths.dir.clone();
             let netstack = netstack.clone();
+            // What THIS boot's media carries decides the readiness gate —
+            // captured at media build, never re-probed at readiness time.
+            let apiserver_staged = boot_media.apiserver_staged;
             std::thread::spawn(move || {
-                if let Err(err) = crate::guest::host_services(&spec, &paths_dir, netstack.as_ref()) {
-                    eprintln!("host services: {err:#}");
+                if let Err(err) =
+                    crate::guest::host_services(&spec, &paths_dir, netstack.as_ref(), apiserver_staged)
+                {
+                    crate::bringup::hostlog(&format!("host services: {err:#}"));
                     // Record the failure so `up` can stop waiting and
                     // report what broke instead of timing out blind.
                     crate::bringup::set(
@@ -221,6 +280,7 @@ struct BuiltConfig {
     host_fd: Option<std::os::fd::RawFd>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_configuration(
     spec: &VmSpec,
     kernel: &Path,
@@ -229,6 +289,10 @@ fn build_configuration(
     // The verified prebuilt agent image to attach read-only as `vdc`
     // (agent-only VMs only). `None` ⇒ no third disk.
     agent_image: Option<&Path>,
+    // The FAT-wrapped k3s airgap-images media, attached read-only on k3s
+    // VMs (mutually exclusive with `agent_image` — the caller gates each
+    // on `spec.agent_only`). The guest probes it by volume label.
+    platform_images: Option<&Path>,
     paths: &VmPaths,
 ) -> Result<BuiltConfig> {
     // The host end of the netstack link, set only on the Netstack path.
@@ -336,6 +400,23 @@ fn build_configuration(
                 &agent_attachment,
             );
             storage.push(Retained::into_super(agent_device));
+        }
+        if let Some(images_path) = platform_images {
+            // Read-only like the boot media: regenerated host-side from
+            // the hash-verified tarball (`ensure_k3s_airgap_media` re-
+            // verified the source bytes this same boot), never written
+            // by the guest.
+            let images_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &file_url(images_path),
+                true,
+            )
+            .map_err(|e| anyhow!("platform images attachment: {}", error_text(&e)))?;
+            let images_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &images_attachment,
+            );
+            storage.push(Retained::into_super(images_device));
         }
 
         let entropy = VZVirtioEntropyDeviceConfiguration::new();

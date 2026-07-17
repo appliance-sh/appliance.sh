@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { buildCreateInput, BuildType } from '@appliance.sh/sdk';
-import { buildUploadService } from '../../services/build-upload.service';
+import { buildUploadService, MissingBuilderError } from '../../services/build-upload.service';
 import { logger } from '../../logger';
 
 export const buildRoutes: Router = Router();
@@ -14,10 +14,14 @@ buildRoutes.post('/', async (req, res) => {
       return;
     }
 
+    // Kubernetes bases mint a self-URL for the content PUT — derive
+    // the origin from the request so the URL is reachable wherever
+    // the caller reached us (host-forwarded port, ingress hostname…).
+    const requestOrigin = `${req.protocol}://${req.get('host')}`;
     const result =
       parsed.data.type === BuildType.RemoteImage
         ? await buildUploadService.createRemoteImage(parsed.data.uploadUrl, parsed.data.port)
-        : await buildUploadService.createUpload();
+        : await buildUploadService.createUpload(requestOrigin);
 
     logger.info('build created', {
       requestId: req.requestId,
@@ -26,7 +30,25 @@ buildRoutes.post('/', async (req, res) => {
     });
     res.status(201).json(result);
   } catch (error) {
+    // Base precondition, not a fault: no builder is advertised on this
+    // base. 409 carries the remediation for clients to show verbatim.
+    if (error instanceof MissingBuilderError) {
+      logger.warn('build rejected: no builder on this base', {
+        requestId: req.requestId,
+        error: error.message,
+      });
+      res.status(409).json({ error: error.message, requestId: req.requestId });
+      return;
+    }
     logger.error('create build failed', error, { requestId: req.requestId });
-    res.status(500).json({ error: 'Failed to create build' });
+    // Unexpected faults stay opaque: raw error messages can carry
+    // internals (paths, bucket names, endpoints) that don't belong in a
+    // response body — `requestId` is the quotable handle into the
+    // server log. Known preconditions get their own status + message
+    // above.
+    res.status(500).json({
+      error: 'Failed to create build',
+      requestId: req.requestId,
+    });
   }
 });

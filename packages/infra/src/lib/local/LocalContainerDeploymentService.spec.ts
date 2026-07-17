@@ -10,6 +10,7 @@ import {
   applianceHostname,
   applianceHostnameUrl,
   deterministicNodePort,
+  isNodePortCollision,
   parseCpuToMillicores,
   parseMemoryToBytes,
   renderManifest,
@@ -90,6 +91,17 @@ describe('renderManifest', () => {
     expect(yaml).toContain('kind: Ingress');
     // Two document separators between the three resources.
     expect(yaml.split('---').length).toBe(3);
+  });
+
+  it('defaults to a single replica when none is supplied', () => {
+    const yaml = renderManifest(baseParams);
+    expect(yaml).toContain('replicas: 1');
+  });
+
+  it('renders the requested replica count', () => {
+    const yaml = renderManifest({ ...baseParams, replicas: 3 });
+    expect(yaml).toContain('replicas: 3');
+    expect(yaml).not.toContain('replicas: 1');
   });
 
   it('routes the Ingress to the appliance hostname via the configured ingress class', () => {
@@ -263,6 +275,28 @@ describe('summarizePod', () => {
       status: { phase: 'Pending' },
     } as never);
     expect(health).toEqual({ name: 'demo-prod-new', phase: 'Pending', ready: false, restarts: 0 });
+  });
+});
+
+describe('isNodePortCollision', () => {
+  it('matches the apiserver 422 whether the message rides .message or a JSON body', () => {
+    expect(
+      isNodePortCollision(
+        new Error(
+          'Service "x" is invalid: spec.ports[0].nodePort: Invalid value: 30009: provided port is already allocated'
+        )
+      )
+    ).toBe(true);
+    const apiException = Object.assign(new Error('Unsuccessful HTTP Request'), {
+      body: '{"kind":"Status","message":"Service \\"x\\" is invalid: spec.ports[0].nodePort: Invalid value: 30009: provided port is already allocated"}',
+    });
+    expect(isNodePortCollision(apiException)).toBe(true);
+  });
+
+  it('rejects other errors', () => {
+    expect(isNodePortCollision(new Error('connection refused'))).toBe(false);
+    expect(isNodePortCollision(null)).toBe(false);
+    expect(isNodePortCollision('provided port is already allocated')).toBe(false);
   });
 });
 

@@ -417,10 +417,36 @@ export function isMicroVmClusterId(clusterId: string): boolean {
   return microVmNameFromClusterId(clusterId) !== null;
 }
 
+/** Canonical user-facing name for a local VM: the default VM is THE
+ *  "Dev Machine"; extra VMs are qualified by name. Used wherever a
+ *  microVM-backed target is shown (switcher, machine page, wizard rows)
+ *  so the local target never drifts back to "local runtime" /
+ *  "sandboxed" / "MicroVM Runtime" wording. */
+export function devMachineLabel(vmName: string): string {
+  return vmName === DEFAULT_MICROVM_NAME ? 'Dev Machine' : `Dev Machine (${vmName})`;
+}
+
+// NOTE: alias detection for CLI profiles that point at a local VM's
+// forwarded api-server port lives in lib/dev-machine-targets.ts — that
+// module owns the whole dedupe/rebind policy (which entries fold into
+// which VM row, and what a stored alias selection resolves to).
+
 /** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
- *  Ordered: media → booting → network → cluster → ready (terminal), or
- *  failed (terminal). */
-export type MicroVmPhase = 'media' | 'booting' | 'network' | 'cluster' | 'ready' | 'failed';
+ *  Ordered: media → booting → network → cluster (sliced open by the
+ *  cluster-node / cluster-images / cluster-api / ingress sub-phases) →
+ *  ready (terminal), or failed (terminal). Engines may add phases; render
+ *  code must tolerate unknown strings (it ignores them). */
+export type MicroVmPhase =
+  | 'media'
+  | 'booting'
+  | 'network'
+  | 'cluster'
+  | 'cluster-node'
+  | 'cluster-images'
+  | 'cluster-api'
+  | 'ingress'
+  | 'ready'
+  | 'failed';
 
 export interface MicroVmStatus {
   /** appliance-vm binary present on this machine. */
@@ -436,6 +462,9 @@ export interface MicroVmStatus {
    *  when the engine predates phase reporting. Lets the badge show
    *  "starting (k3s)" / "failed" instead of a blunt "running". */
   phase?: MicroVmPhase;
+  /** Free-text context for `phase` (what the engine is waiting on) —
+   *  rendered as the live detail line under the in-flight rung. */
+  phaseDetail?: string;
   /** Whether this VM is provisioned as a development environment
    *  (`appliance vm dev up`) — drives the dev-shell affordance. */
   dev: boolean;
@@ -647,6 +676,19 @@ export interface MicroVmInstanceHost {
   /** Sweep the debugger pods a dev/host shell leaves behind. Called
    *  when a shell terminal closes; best-effort. */
   cleanupShell(): Promise<void>;
+  /** Recover from a rejected credential: re-mint via the VM's on-disk
+   *  bootstrap token and persist it everywhere the old key lived
+   *  (profiles.json, keychain, cluster registry). `failedKeyId` is the
+   *  key the server just rejected — the host skips minting when the
+   *  store already carries a different (fresher) key. `cause` is the
+   *  server's machine-readable 401 classification (AuthFailureCause)
+   *  when it sent one — it picks the recovery (mint vs guest clock
+   *  sync vs nothing); optional for old cause-less servers. Resolves
+   *  `true` when fresh credentials are in place and the caller should
+   *  retry; `false` when there's nothing to heal with (no bootstrap
+   *  token, attempt too recent). Optional: only hosts that own local
+   *  VM state (the desktop) can heal. */
+  healCredentials?(failedKeyId?: string, cause?: string): Promise<boolean>;
   stop(): Promise<void>;
   /** Delete the VM and its state (stops first if needed). */
   remove(): Promise<void>;
@@ -719,20 +761,18 @@ export interface LocalApplianceManifest {
   manifestPath: string;
 }
 
-export interface LocalBuildAndImportInput {
-  /** Build-context folder (parent of the Dockerfile + manifest). */
+export interface LocalPackageUploadInput {
+  /** App folder (manifest + source — the folder the picker returned). */
   path: string;
-  /** Image tag, e.g. "demo-node-container:latest". */
-  imageTag: string;
-  /** Optional docker --platform override (e.g. "linux/amd64"). */
-  platform?: string;
-  /** Host-side registry URL the cluster pulls through (e.g. the
-   *  microVM's forwarded in-VM registry `localhost:5052`). The image
-   *  is tagged `<registryUrl>/<imageTag>` and pushed via `docker
-   *  push`; the resolved Promise resolves with the registry-qualified
-   *  ref so callers can hand it straight to api-server. Resolved from
-   *  the selected cluster's `/cluster-info`. */
-  registryUrl?: string;
+  /** One-time upload URL minted by `client.createBuild()` (presigned
+   *  S3 on cloud bases, token self-URL on Kubernetes bases). The URL
+   *  itself carries the authorization, so the host bridge needs no
+   *  api-server credentials. */
+  uploadUrl: string;
+  /** Skip Lambda zip-runtime prep for framework apps — pass true when
+   *  the target base builds container images from source (mirrors the
+   *  CLI deploy pipeline's `lambdaPrep` decision). */
+  noLambdaPrep?: boolean;
 }
 
 /** Streaming log event emitted while a child process runs. */
@@ -868,10 +908,6 @@ export interface LocalRuntimeHost {
    *  `.cjs`) are evaluated through the CLI's QuickJS sandbox via the
    *  sidecar. Errors if no manifest is found or the sandbox rejects. */
   readApplianceManifest(path: string): Promise<LocalApplianceManifest>;
-  /** docker build → registry push, streaming each command's output to
-   *  onEvent. Resolves with the registry-qualified image ref on
-   *  success. */
-  buildAndImportImage(input: LocalBuildAndImportInput, onEvent: (event: LocalLogEvent) => void): Promise<string>;
   /** Shell the bundled `appliance deploy` for a BYO AWS / bundle cloud
    *  base: the CLI builds the manifest `appliance.zip` and uploads it via
    *  the SDK's base-URL-agnostic presigned PUT, authenticated by the
@@ -882,38 +918,13 @@ export interface LocalRuntimeHost {
    *  can shell the CLI; the web shell omits it and the wizard falls back
    *  to the copyable `appliance deploy` snippet. */
   deployToCloud?(input: LocalDeployToCloudInput, onEvent: (event: LocalLogEvent) => void): Promise<void>;
-  /** Apply the in-cluster api-server manifest to the local cluster
-   *  (Deployment + Service + Ingress + RBAC + PVC), wait for it to
-   *  become reachable at `api.appliance.localhost`, mint a first
-   *  API key via the bootstrap token. The api-server image must
-   *  already live in the cluster-attached registry (pushed via
-   *  `buildAndImportImage` with the appliance-api-server context).
-   *  Returns the resulting URL + key. Idempotent — safe to call
-   *  again to reconcile drift. */
-  bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult>;
-}
-
-export interface BootstrapInClusterInput {
-  /** Override the runtime input used to resolve cluster name / data
-   *  dir / namespace. Defaults to the baked-in runtime-config
-   *  defaults. */
-  runtime?: LocalRuntimeInput;
-  /** Override the api-server image reference. Defaults to
-   *  `ghcr.io/appliance-sh/api-server:latest` (pulled from ghcr on
-   *  first deploy). For local dev iteration, push a built image to
-   *  `<registryUrl>/appliance-api-server:<tag>` and pass that ref
-   *  through here. */
-  image?: string;
-}
-
-export interface BootstrapInClusterResult {
-  /** URL at which the in-cluster api-server is reachable
-   *  (`http://api.appliance.localhost[:port]`). */
-  apiServerUrl: string;
-  /** API key minted via the bootstrap token — caller persists it
-   *  alongside the cluster registration. Shape matches what
-   *  api-server's POST /bootstrap/create-key returns. */
-  apiKey: { id: string; secret: string };
+  /** Package the app folder as a source zip and PUT it to the one-time
+   *  upload URL minted by `client.createBuild()` — the desktop drives
+   *  the bundled CLI (`appliance build --upload-url …`) so the wizard
+   *  ships byte-identical artifacts to a terminal `appliance deploy`.
+   *  The image is then built server-side; no Docker on this machine.
+   *  Streams packaging/upload progress to onEvent. */
+  packageAndUploadBuild(input: LocalPackageUploadInput, onEvent: (event: LocalLogEvent) => void): Promise<void>;
 }
 
 export type {

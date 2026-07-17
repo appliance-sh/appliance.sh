@@ -4,6 +4,7 @@ import { createApplianceClient } from '@appliance.sh/sdk';
 import { loadCredentials, getActiveProfileOverride } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { writeLink, readLink } from './utils/link.js';
+import { printCliError } from './utils/errors.js';
 import chalk from 'chalk';
 
 const program = new Command();
@@ -25,6 +26,7 @@ program
     const client = createApplianceClient({
       baseUrl: credentials.apiUrl,
       credentials: { keyId: credentials.keyId, secret: credentials.secret },
+      product: 'cli',
     });
 
     try {
@@ -95,8 +97,7 @@ program
       }
       console.log(chalk.dim(`  ${linkPath}`));
     } catch (error) {
-      console.error(chalk.red(error instanceof Error ? error.message : String(error)));
-      process.exit(1);
+      printCliError(error, { apiUrl: credentials.apiUrl });
     }
   });
 

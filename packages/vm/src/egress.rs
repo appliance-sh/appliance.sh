@@ -709,7 +709,12 @@ fn default_no_proxy() -> &'static str {
 }
 
 fn which_kubectl() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // HOME on Unix; USERPROFILE for PowerShell/desktop launches on
+    // Windows, which don't set HOME (same fallback as store::vm_root).
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
         let managed = home.join(".appliance").join("bin").join("kubectl");
         if managed.is_file() {
             return Some(managed);

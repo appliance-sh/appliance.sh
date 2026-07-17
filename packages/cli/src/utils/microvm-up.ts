@@ -3,50 +3,67 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import {
-  bootstrapInClusterApiServer,
-  ensureDockerRunning,
-  waitForApiServerUrl,
-  apiServerUrlForHostPort,
-} from '@appliance.sh/helper';
-import type { ProgressEvent } from '@appliance.sh/helper';
-import { createApplianceClient, VERSION } from '@appliance.sh/sdk';
+import { fileURLToPath } from 'node:url';
+import { mintApiKey, waitForApiServerUrl, apiServerUrlForHostPort } from '@appliance.sh/helper';
+import { createApplianceClient, VERSION as SDK_VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './credentials.js';
-import { readProfiles } from './profile-store.js';
+import { readProfiles, removeProfile } from './profile-store.js';
+import { ensureApiServerArtifacts } from './api-server-artifact.js';
 
 // Shared microVM bring-up core.
 //
-// `runUp` boots the microVM, waits for its kubernetes endpoint + in-VM
-// registry, delivers + bootstraps the in-VM api-server, and adopts the
-// VM's credential profile. It is the single orchestration both
-// `appliance vm up` (the lower-level multi-VM command) and
-// `appliance init` (the one-tap onboarding front door) call, so the two
-// can never drift. The lower-level VM primitives it leans on — binary
-// resolution, the spec-derived ports, the per-VM profile name — live
-// here too so `appliance-vm.ts` and `appliance-init.ts` share one copy.
-//
-// The heavy lifting lives in the `appliance-vm` Rust binary; this drives
-// it and layers the Appliance control plane on top (in-VM api-server
-// bootstrap + credential registration).
+// `runUp` stages the api-server guest artifacts, boots the microVM
+// (whose boot media embeds them — the control plane runs as a plain
+// binary inside the guest, no docker anywhere), waits for the
+// ingress-routed api-server, and adopts the VM's credential profile.
+// It is the single orchestration both `appliance vm up` (the
+// lower-level multi-VM command) and `appliance init` (the one-tap
+// onboarding front door) call, so the two can never drift. The
+// lower-level VM primitives it leans on — binary resolution, the
+// spec-derived ports, the per-VM profile name — live here too so
+// `appliance-vm.ts` and `appliance-init.ts` share one copy.
 
 export const DEFAULT_VM_NAME = 'appliance';
 
 // Mirrors VmSpec defaults in packages/vm/src/spec.rs — keep in sync.
 // These are the *default* VM's canonical ports; additional VMs get an
 // allocated block, read per-VM from their persisted spec (vmPorts).
-const DEFAULT_VM_PORTS = { hostPort: 8081, apiPort: 6443, registryPort: 5052, egressPort: 5053 } as const;
+const DEFAULT_VM_PORTS = {
+  hostPort: 8081,
+  apiPort: 6443,
+  registryPort: 5052,
+  egressPort: 5053,
+  buildkitPort: 5054,
+} as const;
 
-// The microVM runs the host's CPU architecture — Virtualization.framework
-// doesn't emulate — so the api-server image we push must carry a matching
-// `linux/<arch>` variant or it crashloops with `exec format error`.
-const VM_HOST_ARCH: 'arm64' | 'amd64' = process.arch === 'arm64' ? 'arm64' : 'amd64';
+/** A VM's forwarded host ports. */
+export type VmPorts = { -readonly [K in keyof typeof DEFAULT_VM_PORTS]: number };
 
-/** The credentials profile a VM owns. The default VM keeps the plain
- *  `microvm` profile (back-compat + parity with the desktop); each
- *  additional VM gets its own `microvm-<name>` profile so multiple VMs
- *  coexist without clobbering each other's credentials. */
+/** What `ensureVmRuntime` hands back: enough for a host-side control
+ *  plane to drive the VM's cluster (kubeconfig + forwarded ports). */
+export interface VmRuntimeInfo {
+  name: string;
+  /** Host path of the VM's admin kubeconfig, already rewritten to the
+   *  forwarded 127.0.0.1:<apiPort> server address by the engine. */
+  kubeconfigPath: string;
+  ports: VmPorts;
+}
+
+/** The one local profile: the default VM's api-server. What `appliance
+ *  dev` / `deploy` resolve when no profile is pinned. */
+export const LOCAL_PROFILE = 'local';
+
+/** Pre-cutover name of the default VM's profile. Still dual-written
+ *  (and read as a verification fallback) for one release so existing
+ *  installs and the desktop's cluster registry keep working. */
+export const LEGACY_MICROVM_PROFILE = 'microvm';
+
+/** The credentials profile a VM owns. The default VM owns the `local`
+ *  profile (there is ONE local runtime); each additional VM gets its
+ *  own `microvm-<name>` profile so multiple VMs coexist without
+ *  clobbering each other's credentials. */
 export function profileForVm(name: string): string {
-  return name === DEFAULT_VM_NAME ? 'microvm' : `microvm-${name}`;
+  return name === DEFAULT_VM_NAME ? LOCAL_PROFILE : `microvm-${name}`;
 }
 
 export function vmDir(name: string): string {
@@ -55,13 +72,8 @@ export function vmDir(name: string): string {
 
 /** Read a VM's forwarded host ports from its persisted spec, falling
  *  back to the canonical defaults when the spec isn't written yet.
- *  Module-private: only `runUp` below consumes it. */
-function vmPorts(name: string): {
-  hostPort: number;
-  apiPort: number;
-  registryPort: number;
-  egressPort: number;
-} {
+ *  Module-private: only `ensureVmRuntime` below consumes it. */
+function vmPorts(name: string): VmPorts {
   try {
     const raw = fs.readFileSync(path.join(vmDir(name), 'vm.json'), 'utf8');
     const spec = JSON.parse(raw) as Partial<typeof DEFAULT_VM_PORTS>;
@@ -70,9 +82,28 @@ function vmPorts(name: string): {
       apiPort: spec.apiPort ?? DEFAULT_VM_PORTS.apiPort,
       registryPort: spec.registryPort ?? DEFAULT_VM_PORTS.registryPort,
       egressPort: spec.egressPort ?? DEFAULT_VM_PORTS.egressPort,
+      buildkitPort: spec.buildkitPort ?? DEFAULT_VM_PORTS.buildkitPort,
     };
   } catch {
     return { ...DEFAULT_VM_PORTS };
+  }
+}
+
+/** Repo-checkout builds of the engine binary, resolved relative to
+ *  this module's emitted file (dist/utils → the repo's packages dir) —
+ *  so `appliance dev`/`server start` find it from ANY working
+ *  directory, not just the repo root. Empty under the bun single
+ *  binary, whose import.meta.url is not a real file. */
+function repoVmBinaryCandidates(): string[] {
+  if (process.versions.bun) return [];
+  try {
+    const packagesDir = fileURLToPath(new URL('../../..', import.meta.url));
+    return [
+      path.join(packagesDir, 'vm', 'target', 'release', 'appliance-vm'),
+      path.join(packagesDir, 'vm', 'target', 'debug', 'appliance-vm'),
+    ];
+  } catch {
+    return [];
   }
 }
 
@@ -88,7 +119,9 @@ export function resolveVmBinary(): string | null {
     process.env.APPLIANCE_VM,
     path.join(os.homedir(), '.appliance', 'bin', 'appliance-vm'),
     'appliance-vm',
-    // Repo-checkout fallbacks, resolved from the working directory.
+    // Repo-checkout fallbacks: relative to this module first (works
+    // from any cwd), then the working directory (legacy behavior).
+    ...repoVmBinaryCandidates(),
     path.resolve('packages/vm/target/release/appliance-vm'),
     path.resolve('packages/vm/target/debug/appliance-vm'),
   ].filter((c): c is string => Boolean(c));
@@ -116,11 +149,154 @@ export function runVm(args: string[]): number {
   return r.status ?? 1;
 }
 
-// Module-private: only this file's bring-up steps render progress events.
-const printProgress = (event: ProgressEvent) => {
-  const prefix = event.type === 'error' ? chalk.red('✗') : event.type === 'done' ? chalk.green('✓') : chalk.cyan('»');
-  console.log(`${prefix} ${chalk.dim(event.tool)} ${event.message}`);
-};
+/** Best-effort engine invocation with output suppressed — for calls
+ *  that are allowed to fail quietly (e.g. `egress sync` before the
+ *  cluster namespace exists). Returns the exit code; never exits. */
+export function runVmQuiet(args: string[]): number {
+  const bin = resolveVmBinary();
+  if (!bin) return 1;
+  const r = spawnSync(bin, args, { stdio: 'ignore' });
+  return r.status ?? 1;
+}
+
+/** A VM's forwarded host ports, read from its persisted spec. Exported
+ *  for status displays; boot flows get the same data via
+ *  `ensureVmRuntime`. */
+export function readVmPorts(name: string = DEFAULT_VM_NAME): VmPorts {
+  return vmPorts(name);
+}
+
+/** Pure decision core for the engine fast-pass: the history must show an
+ *  `ingress` phase AND be at least as fresh as the kubeconfig. The
+ *  freshness guard closes the engine-downgrade hole — old engines clear
+ *  only `bringup.json`, never the history file, so a boot under a
+ *  downgraded engine leaves the NEW engine's stale history next to a
+ *  kubeconfig the old engine just wrote. History from this boot is
+ *  always written after (or in the same instant as) the kubeconfig: the
+ *  engine appends `ingress`/`ready` entries after persisting it.
+ *  Exported for tests. */
+export function historyGuaranteesPlatformReady(
+  historyRaw: string,
+  historyMtimeMs: number,
+  kubeconfigMtimeMs: number
+): boolean {
+  return historyRaw.includes('"phase":"ingress"') && historyMtimeMs >= kubeconfigMtimeMs;
+}
+
+/** True when the engine's bring-up history shows THIS boot gated `ready`
+ *  on the FULL platform (an `ingress` phase: registry /v2/ + the
+ *  api-server's traefik route answering) — the honest-readiness engine
+ *  contract. Old engines never write that phase (or the history file at
+ *  all), and a stale history left behind by an engine downgrade fails
+ *  the mtime freshness check — either way the CLI keeps the long,
+ *  load-bearing wait budgets below; against a new engine the same waits
+ *  shrink to fast-pass confirmations. */
+function engineGuaranteedPlatformReady(name: string): boolean {
+  try {
+    const historyPath = path.join(vmDir(name), 'bringup-history.jsonl');
+    const raw = fs.readFileSync(historyPath, 'utf8');
+    return historyGuaranteesPlatformReady(
+      raw,
+      fs.statSync(historyPath).mtimeMs,
+      fs.statSync(path.join(vmDir(name), 'kubeconfig.yaml')).mtimeMs
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Deleting a microVM is not a plain engine passthrough. The Rust engine
+// removes the VM and its on-disk state, but the credential profile that
+// `vm up` minted (`microvm` for the default VM, `microvm-<name>`
+// otherwise) lives in the CLI profile store — which the engine knows
+// nothing about. Without pruning it, a deleted VM leaves an orphan
+// cluster behind in both the CLI and the desktop (both read
+// ~/.appliance/profiles.json). So both `appliance vm delete` and
+// `appliance cluster rm --delete-vm` route through this one helper.
+
+/** Delete a microVM via the engine, then prune its CLI credential
+ *  profile. The profile is only removed once the engine confirms the VM
+ *  is gone (exit 0), so a failed delete never strips a usable profile.
+ *  Returns the engine's exit code. */
+export function deleteVmAndProfile(name: string): number {
+  const code = runVm(['delete', name]);
+  if (code === 0) {
+    const profiles = name === DEFAULT_VM_NAME ? [profileForVm(name), LEGACY_MICROVM_PROFILE] : [profileForVm(name)];
+    for (const profile of profiles) {
+      if (removeProfile(profile)) {
+        console.log(chalk.dim(`removed credential profile '${profile}'`));
+      }
+    }
+  }
+  return code;
+}
+
+/**
+ * Boot (or reuse) the microVM and wait until its cluster endpoint and
+ * in-VM registry answer. Does NOT deliver or bootstrap the in-cluster
+ * api-server — callers that run the control plane host-side
+ * (`appliance server start`, `appliance dev`) stop here; `runUp`
+ * continues on to the in-VM api-server.
+ *
+ * Throws (instead of exiting) on failure so programmatic callers can
+ * catch and render their own remediation.
+ */
+export async function ensureVmRuntime(
+  name: string = DEFAULT_VM_NAME,
+  opts: {
+    timeout?: number;
+    resources?: { cpus?: number; memory?: number; dev?: boolean; mount?: string };
+  } = {}
+): Promise<VmRuntimeInfo> {
+  // New engines gate `vm up` on the WHOLE platform (kubeconfig +
+  // registry + api-server ingress), which folds the waits below into the
+  // engine's own budget — so `up` needs headroom beyond the old
+  // kubeconfig-only 600s for a cold, network-pulling first boot.
+  const timeout = opts.timeout ?? 900;
+  const resources = opts.resources ?? {};
+  // Boot the VM + wait for its kubernetes endpoint. Per-VM resource
+  // overrides are persisted into the spec by the engine, so they
+  // survive restarts; omitting them keeps the VM's current sizing.
+  // `--dev` provisions the VM as a development environment (persisted
+  // one-way, so a later plain `up` keeps it a dev VM).
+  const upArgs = ['up', name, '--timeout', String(timeout)];
+  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
+  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
+  if (resources.dev) upArgs.push('--dev');
+  // Resolve --mount to an absolute path so it's unambiguous to the
+  // engine regardless of its working directory (it canonicalizes too).
+  if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
+  const status = runVm(upArgs);
+  if (status !== 0) {
+    throw new Error(
+      `microVM '${name}' failed to come up (appliance-vm exited ${status}). ` +
+        'Inspect the boot log with `appliance vm console`, or run `appliance doctor`.'
+    );
+  }
+  // Read ports AFTER `vm up`: it creates the spec (with allocated
+  // ports) when it didn't exist, so an earlier read may be stale.
+  const ports = vmPorts(name);
+  const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
+  const kubeconfigDeadline = Date.now() + 30_000;
+  while (!fs.existsSync(kubeconfigPath)) {
+    if (Date.now() >= kubeconfigDeadline) {
+      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vm up`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+
+  // Confirm the in-VM registry forward — image delivery for the
+  // in-cluster api-server and every `appliance deploy` rides this. A T2
+  // engine already gated `ready` on it, so this is a fast-pass check;
+  // against an older engine (no `ingress` phase in its history) it stays
+  // the load-bearing wait it always was — first boot includes the
+  // registry:2 image pull.
+  const engineReady = engineGuaranteedPlatformReady(name);
+  console.log(chalk.cyan(engineReady ? '» confirming the in-VM registry' : '» waiting for the in-VM registry'));
+  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, engineReady ? 30_000 : 240_000);
+
+  return { name, kubeconfigPath, ports };
+}
 
 export async function runUp(
   name: string,
@@ -133,93 +309,81 @@ export async function runUp(
   opts: { showDeployHint?: boolean } = {}
 ): Promise<void> {
   const profile = profileForVm(name);
-  const ports = vmPorts(name);
-  // 1. Boot the VM + wait for its kubernetes endpoint. Per-VM resource
-  //    overrides are persisted into the spec by the engine, so they
-  //    survive restarts; omitting them keeps the VM's current sizing.
-  //    `--dev` provisions the VM as a development environment (persisted
-  //    one-way, so a later plain `up` keeps it a dev VM).
-  const upArgs = ['up', name, '--timeout', String(timeout)];
-  if (resources.cpus !== undefined) upArgs.push('--cpus', String(resources.cpus));
-  if (resources.memory !== undefined) upArgs.push('--memory', String(resources.memory));
-  if (resources.dev) upArgs.push('--dev');
-  // Resolve --mount to an absolute path so it's unambiguous to the
-  // engine regardless of its working directory (it canonicalizes too).
-  if (resources.mount) upArgs.push('--mount', path.resolve(resources.mount));
-  const status = runVm(upArgs);
-  if (status !== 0) process.exit(status);
-  // Re-read ports: `vm up` creates the spec (with allocated ports) if
-  // it didn't exist, so the canonical-fallback above may be stale now.
-  Object.assign(ports, vmPorts(name));
-  const kubeconfigPath = path.join(vmDir(name), 'kubeconfig.yaml');
-  const kubeconfigDeadline = Date.now() + 30_000;
-  while (!fs.existsSync(kubeconfigPath)) {
-    if (Date.now() >= kubeconfigDeadline) {
-      throw new Error(`expected kubeconfig at ${kubeconfigPath} after appliance-vm up`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  if (imageOverride) {
+    console.log(
+      chalk.yellow(
+        '--image is no longer used: the api-server runs as a guest binary, not a container. ' +
+          'Point APPLIANCE_API_SERVER_BINARY at a prebuilt linux binary to override it.'
+      )
+    );
   }
 
-  // 2. Wait for the in-VM registry forward — image delivery for both
-  //    the api-server below and every later `appliance deploy` rides
-  //    this. First boot includes the registry:2 image pull.
-  console.log(chalk.cyan('» waiting for the in-VM registry'));
-  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
+  // 1. Stage the api-server guest artifacts BEFORE the boot so the
+  //    engine embeds them into the boot media. No docker anywhere.
+  try {
+    await ensureApiServerArtifacts();
+  } catch (err) {
+    console.error(chalk.red((err as Error).message));
+    process.exit(1);
+  }
 
-  // 3. Deliver the api-server image into the VM's registry. The image
-  //    must be present in the local docker daemon (built via
-  //    packages/api-server's docker-prep.sh); docker is needed for
-  //    image *builds* anyway — the cluster itself no longer depends on
-  //    it. `docker save --platform` selects the VM's architecture from
-  //    a single-arch *or* multi-arch image, so a multi-arch build is
-  //    delivered correctly and a pure cross-arch image fails fast with
-  //    an actionable message rather than an `exec format error`.
-  await ensureDockerRunning({ onProgress: printProgress });
-  // Deploy by digest: pushing a different image under a reused tag
-  // would leave the Deployment spec unchanged (no rollout) and
-  // IfNotPresent would keep serving the stale cached image.
-  const vmImage = await deliverApiServerImage(
-    imageOverride,
-    `localhost:${ports.registryPort}/appliance-api-server:latest`
-  );
+  // 2. Boot + wait for the cluster and registry.
+  let vm: VmRuntimeInfo;
+  try {
+    vm = await ensureVmRuntime(name, { timeout, resources });
+  } catch (err) {
+    console.error(chalk.red((err as Error).message));
+    process.exit(1);
+  }
+  const ports = vm.ports;
 
-  // 4. In-VM api-server: the shared in-cluster bootstrap, pointed at the
-  //    VM's kubeconfig and registry.
-  const existing = readProfiles().profiles[profile];
+  // 3. Wait for the guest api-server via its ingress route and adopt
+  //    the VM's credential profile. First boot includes traefik's own
+  //    install, so the cold budget is generous; credentials are minted
+  //    with the VM's bootstrap token and kept when they still
+  //    authenticate — no-key-sprawl behavior.
+  // Existing credentials: the VM's own profile first, then (default VM
+  // only) the legacy `microvm` profile from pre-cutover installs — a
+  // verified legacy key is adopted into `local` rather than re-minted.
+  const profiles = readProfiles().profiles;
+  const existing = profiles[profile] ?? (name === DEFAULT_VM_NAME ? profiles[LEGACY_MICROVM_PROFILE] : undefined);
   const apiServerUrl = apiServerUrlForHostPort(ports.hostPort);
-  const runtime = {
-    dataDir: '/persist/appliance-data',
-    hostPort: ports.hostPort,
-    registryUrl: `localhost:${ports.registryPort}`,
-  };
   let verified = false;
   if (existing) {
-    // Reconcile manifests, then keep existing credentials when they
-    // still authenticate — no-key-sprawl behavior.
     try {
-      await waitForApiServerUrl(apiServerUrl, 30_000);
+      await waitForApiServerUrl(apiServerUrl, 60_000);
       const client = createApplianceClient({
         baseUrl: apiServerUrl,
         credentials: { keyId: existing.keyId, secret: existing.secret },
+        product: 'cli',
       });
       verified = (await client.listProjects()).success;
     } catch {
       verified = false;
     }
   }
-  if (verified) {
+  if (verified && existing) {
     console.log(`${chalk.green('✓')} api-server reachable; profile ${chalk.bold(profile)} already authenticated`);
+    persistVmCredentials(name, profile, { apiUrl: apiServerUrl, keyId: existing.keyId, secret: existing.secret });
   } else {
-    const result = await bootstrapInClusterApiServer({
-      runtime,
-      image: vmImage,
-      kubeconfigPath,
-      keyName: name === DEFAULT_VM_NAME ? 'MicroVM Runtime' : `MicroVM Runtime (${name})`,
-      onProgress: printProgress,
-    });
-    saveCredentials({ apiUrl: result.apiServerUrl, keyId: result.apiKey.id, secret: result.apiKey.secret }, profile);
-    console.log(`${chalk.green('✓')} api-server bootstrapped; credentials saved to profile ${chalk.bold(profile)}`);
+    // Fast-pass against a T2 engine (which already gated `ready` on the
+    // api-server's ingress route); the long cold budget stays for older
+    // engines, whose first boot installs traefik inside this window.
+    const engineReady = engineGuaranteedPlatformReady(name);
+    console.log(chalk.cyan(engineReady ? '» confirming the in-VM api-server' : '» waiting for the in-VM api-server'));
+    await waitForApiServerUrl(apiServerUrl, engineReady ? 60_000 : 600_000);
+    const token = readVmBootstrapToken(name);
+    const keyName = name === DEFAULT_VM_NAME ? 'Dev Machine' : `Dev Machine (${name})`;
+    const apiKey = await mintApiKey(apiServerUrl, token, keyName);
+    persistVmCredentials(name, profile, { apiUrl: apiServerUrl, keyId: apiKey.id, secret: apiKey.secret });
+    console.log(`${chalk.green('✓')} api-server ready; credentials saved to profile ${chalk.bold(profile)}`);
   }
+
+  // Version-skew preflight: compare the guest api-server's reported
+  // version with this CLI's SDK. Purely advisory (a one-line warn with
+  // the fix), and best-effort — an older guest binary without
+  // cluster-info must never fail a successful bring-up.
+  await warnOnServerVersionSkew(profile, apiServerUrl);
 
   // Publish the egress policy into the cluster now that the namespace
   // exists, so the api-server can confine workloads per policy. Best-
@@ -245,6 +409,39 @@ export async function runUp(
   }
 }
 
+/** One-line advisory when the guest api-server's version ≠ this CLI's
+ *  SDK version (they release in lockstep, so skew means the guest
+ *  binary — baked into boot media — lags the CLI, or vice versa).
+ *  Best-effort: pre-cluster-info guests and transient errors warn
+ *  nothing and never fail the bring-up. */
+async function warnOnServerVersionSkew(profile: string, apiServerUrl: string): Promise<void> {
+  try {
+    const entry = readProfiles().profiles[profile];
+    if (!entry) return;
+    const client = createApplianceClient({
+      baseUrl: apiServerUrl,
+      credentials: { keyId: entry.keyId, secret: entry.secret },
+      product: 'cli',
+    });
+    const info = await client.getClusterInfo();
+    if (!info.success) return;
+    // Normalize the optional v-prefix (the SDK stamps "v1.x.y").
+    const server = info.data.serverVersion?.replace(/^v/, '');
+    const cli = SDK_VERSION.replace(/^v/, '');
+    // Unstamped dev builds ('0.0.0-…') can't be meaningfully compared.
+    if (!server || cli.startsWith('0.0.0') || server.startsWith('0.0.0')) return;
+    if (server !== cli) {
+      console.log(
+        chalk.yellow(
+          `⚠ control plane is v${server} but this CLI is v${cli} — run \`appliance upgrade\` for how to update.`
+        )
+      );
+    }
+  } catch {
+    // advisory only
+  }
+}
+
 async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -258,167 +455,55 @@ async function waitForRegistry(url: string, timeoutMs: number): Promise<void> {
       throw new Error(
         `in-VM registry not reachable at ${url} after ${Math.round(timeoutMs / 1000)}s.\n` +
           'The VM booted but its registry forward never came up. Inspect the boot log with `appliance vm console`, ' +
-          'and run `appliance doctor` to confirm the host prerequisites (Docker, free ports) are healthy.'
+          'and run `appliance doctor` to confirm the host prerequisites (free ports, virtualization) are healthy.'
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
 }
 
+/** Save a VM's credentials to its profile — dual-written to the legacy
+ *  `microvm` name for the default VM (one release of back-compat: the
+ *  desktop's cluster registry and existing scripts read it). */
+function persistVmCredentials(
+  name: string,
+  profile: string,
+  creds: { apiUrl: string; keyId: string; secret: string }
+): void {
+  saveCredentials(creds, profile);
+  if (name === DEFAULT_VM_NAME) {
+    saveCredentials(creds, LEGACY_MICROVM_PROFILE);
+  }
+}
+
 /**
- * Deliver the api-server image into the VM's host-loopback registry,
- * extracting the VM's architecture (= the host's). The delivery is
- * host-side — `docker save` + `crane push` — because a plain `docker
- * push` executes inside the docker VM (colima/Docker Desktop), where
- * the host's 127.0.0.1 (and therefore the microVM's forwarded
- * registry) doesn't exist.
- *
- * `docker save --platform linux/<arch>` is the source of truth for
- * architecture: it pulls exactly that platform out of a single-arch
- * *or* multi-arch image, and fails cleanly when the image carries no
- * matching variant — so a multi-arch build "just works" and a pure
- * cross-arch image is rejected with guidance instead of crashlooping.
- * Returns the digest-qualified ref crane pushes (deploy by digest so a
- * reused tag still triggers a rollout).
+ * Bring the ONE local runtime (the default VM + its guest api-server)
+ * up and adopt the `local` profile — the front door `appliance dev`
+ * (and the `server start` shim) call. Thin alias over `runUp` so every
+ * entry point shares the exact same bring-up.
  */
-async function deliverApiServerImage(imageOverride: string | undefined, targetRef: string): Promise<string> {
-  const candidates = imageOverride
-    ? [imageOverride]
-    : [`appliance-api-server:${VM_HOST_ARCH}`, 'appliance-api-server:latest'];
-  // Keep only refs that actually exist locally, remembering each one's
-  // host-resolved architecture for diagnostics + ordering.
-  let present = candidates
-    .map((ref) => ({ ref, arch: inspectArch(ref) }))
-    .filter((c): c is { ref: string; arch: string } => c.arch !== null);
+export async function ensureLocalRuntime(
+  resources: { cpus?: number; memory?: number; dev?: boolean; mount?: string } = {}
+): Promise<void> {
+  await runUp(DEFAULT_VM_NAME, undefined, 900, resources, { showDeployHint: false });
+}
 
-  // Nothing local and no explicit --image: pull the pinned published
-  // image so a fresh machine boots a VM without a manual build or
-  // `docker tag`. Mirrors the bootstrap default (phases/phase2.ts) — the
-  // same versioned ghcr ref every surface uses.
-  if (present.length === 0 && !imageOverride) {
-    const pulled = pullPublishedApiServer();
-    if (pulled) present = [pulled];
-  }
-
-  if (present.length === 0) throw new Error(missingImageMessage(imageOverride));
-
-  // Try a ref whose host-resolved arch already matches first (a
-  // properly-loaded multi-arch image resolves to the host platform),
-  // then any other present ref. `docker save --platform` decides
-  // success either way; this only affects which tar we attempt first.
-  const ordered = [
-    ...present.filter((c) => c.arch === VM_HOST_ARCH),
-    ...present.filter((c) => c.arch !== VM_HOST_ARCH),
-  ];
-
-  const crane = await ensureCrane();
-  const tarPath = path.join(os.tmpdir(), `appliance-image-${process.pid}.tar`);
+/**
+ * Read the VM's bootstrap token — generated once by the engine
+ * (`appliance-vm up`) and persisted both host-side (here) and inside
+ * the guest, where the api-server binary verifies create-key calls
+ * against it.
+ */
+function readVmBootstrapToken(name: string): string {
+  const tokenPath = path.join(vmDir(name), 'bootstrap-token');
   try {
-    let lastSaveErr = '';
-    for (const { ref, arch } of ordered) {
-      console.log(chalk.cyan(`» delivering ${ref} (linux/${VM_HOST_ARCH}) into the VM registry`));
-      let save = spawnSync('docker', ['save', '--platform', `linux/${VM_HOST_ARCH}`, '-o', tarPath, ref], {
-        encoding: 'utf8',
-      });
-      // Fallback for docker builds without `save --platform`: when the
-      // image already resolves to the host arch, a plain save delivers
-      // the right variant.
-      if (save.status !== 0 && arch === VM_HOST_ARCH) {
-        save = spawnSync('docker', ['save', '-o', tarPath, ref], { encoding: 'utf8' });
-      }
-      if (save.status === 0) return cranePush(crane, tarPath, targetRef);
-      lastSaveErr = (save.stderr ?? '').trim();
-      // The ref exists but doesn't carry our arch — try the next
-      // candidate; the throw below explains the fix if none do.
-    }
-    throw new Error(wrongArchMessage(present, lastSaveErr));
-  } finally {
-    fs.rmSync(tarPath, { force: true });
+    const token = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (token) return token;
+  } catch {
+    // fall through to the error below
   }
-}
-
-/** The published api-server image for this CLI's release. Pinned to the
- *  SDK VERSION exactly like the cloud bootstrap default
- *  (packages/bootstrap/src/phases/phase2.ts) so every surface seeds the
- *  same versioned image. */
-const PUBLISHED_API_SERVER_IMAGE = `ghcr.io/appliance-sh/api-server:${VERSION.replace(/^v/, '')}`;
-
-/** Pull the pinned published api-server image into the local docker
- *  daemon as a last resort when nothing matching is present, selecting
- *  the VM's arch out of the multi-arch manifest. Returns the ref + its
- *  host-resolved arch on success, or null when the pull fails (offline,
- *  no ghcr access, or an unreleased VERSION with no matching tag) — the
- *  caller then surfaces the build/--image guidance. */
-function pullPublishedApiServer(): { ref: string; arch: string } | null {
-  const ref = PUBLISHED_API_SERVER_IMAGE;
-  console.log(chalk.cyan(`» no local api-server image — pulling ${ref}`));
-  const pull = spawnSync('docker', ['pull', '--platform', `linux/${VM_HOST_ARCH}`, ref], { stdio: 'inherit' });
-  if (pull.status !== 0) return null;
-  const arch = inspectArch(ref);
-  return arch ? { ref, arch } : null;
-}
-
-/** Host-resolved architecture of a local image, or null when it isn't
- *  in the docker daemon. With the containerd image store a multi-arch
- *  image resolves to the host platform whenever it carries one. */
-function inspectArch(ref: string): string | null {
-  const r = spawnSync('docker', ['image', 'inspect', '--format', '{{.Architecture}}', ref], { encoding: 'utf8' });
-  if (r.status !== 0) return null;
-  return r.stdout.trim() || null;
-}
-
-/** `crane push` an already-saved image tar to the host-loopback
- *  registry, returning the digest-qualified ref crane prints last. */
-function cranePush(crane: string, tarPath: string, targetRef: string): string {
-  const r = spawnSync(crane, ['push', '--insecure', tarPath, targetRef], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  if (r.status !== 0) throw new Error(`crane push to ${targetRef} failed`);
-  const lines = r.stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const digestRef = lines[lines.length - 1];
-  if (!digestRef || !digestRef.includes('@sha256:')) {
-    throw new Error(`could not parse digest from crane push output: ${r.stdout.slice(-300)}`);
-  }
-  console.log(chalk.dim(`pushed ${digestRef}`));
-  return digestRef;
-}
-
-function missingImageMessage(imageOverride: string | undefined): string {
-  if (imageOverride) {
-    return `image ${imageOverride} not found in the local docker daemon — build or pull it first, or pass a different --image.`;
-  }
-  return (
-    `no local appliance-api-server image, and pulling ${PUBLISHED_API_SERVER_IMAGE} failed\n` +
-    '(check network / ghcr access, or that this CLI version has a published image — `appliance doctor` diagnoses these).\n' +
-    `Build one for the VM's architecture (linux/${VM_HOST_ARCH}):\n` +
-    `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
-    '(docker-prep.sh stages the build context; its default image targets Lambda/amd64.) Or pass --image <ref>.'
+  throw new Error(
+    `no bootstrap token at ${tokenPath} — the VM booted without the api-server staged. ` +
+      'Re-run `appliance vm up` (the CLI stages the guest binary first), or check `appliance vm console` for boot errors.'
   );
-}
-
-function wrongArchMessage(present: { ref: string; arch: string }[], saveErr: string): string {
-  const found = present.map((c) => `${c.ref} (${c.arch})`).join(', ');
-  return (
-    `no appliance-api-server image provides the VM's architecture (linux/${VM_HOST_ARCH}).\n` +
-    `Found: ${found}.\n` +
-    `The microVM runs ${VM_HOST_ARCH} (Virtualization.framework doesn't emulate), so the image must carry a linux/${VM_HOST_ARCH} variant.\n` +
-    'Build one:\n' +
-    `  cd packages/api-server && docker build --platform linux/${VM_HOST_ARCH} -t appliance-api-server:${VM_HOST_ARCH} .\n` +
-    'A multi-arch build only counts when loaded into the docker image store (buildx --load with the containerd image store), not just the build cache. Or pass --image <ref>.' +
-    (saveErr ? `\n(docker save: ${saveErr})` : '')
-  );
-}
-
-async function ensureCrane(): Promise<string> {
-  const { runInstall, helperBinDir } = await import('@appliance.sh/helper');
-  const outcomes = await runInstall({ tools: ['crane'], onProgress: printProgress });
-  const failed = outcomes.find((o) => o.status === 'failed');
-  if (failed) throw new Error(`crane install failed: ${failed.message}`);
-  const managed = path.join(helperBinDir(), 'crane');
-  return fs.existsSync(managed) ? managed : 'crane';
 }

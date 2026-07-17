@@ -1,29 +1,66 @@
 # Control-plane: one api-server, two base URLs
 
-**Status:** Design (SPIKE E4.0). The decision E4.1–E4.4 implement. No code changes here.
+**Status:** Implemented (E4.x shipped; placement + build pipeline since overhauled — see "Placement & builds" below).
 
 ## Goal & invariant
 
 Desktop console and CLI manage all cluster state through **one** appliance
-api-server. The local server already runs _inside_ the microVM's k3s; the
-cloud server is the _same image_ deployed remotely. A client picks which one
-by **base URL** — nothing else differs.
+api-server. The local server runs as a **plain binary inside the microVM**;
+the cloud server is the _same api-server code_ running on the installation's
+cloud compute. A client picks which one by **base URL** — nothing else
+differs.
 
 ```
-  desktop console ─┐                         ┌─ in-VM api-server  (FilesystemObjectStore /persist/appliance-data)
+  desktop console ─┐                         ┌─ in-VM api-server  (guest binary; FilesystemObjectStore /persist/appliance-data)
                    ├─ ApplianceClient(baseUrl, creds, RFC 9421) ─┤
   CLI ─────────────┘                         └─ cloud api-server (S3ObjectStore)
 ```
 
-This is already true for projects / environments / deployments / health. The
-remaining divergence is the desktop's **kubectl shell-outs** for workloads and
-pod logs, which bypass the server entirely. E4.x closes that gap.
+This holds for projects / environments / deployments / health / workloads /
+logs. The E4.x work below closed the last divergence (the desktop's kubectl
+shell-outs).
+
+## Placement & builds (current state)
+
+**Local placement — a guest binary, not a pod.** The api-server ships as a
+bun-compiled linux-musl executable. `appliance vm up` stages it (plus the web
+console bundle) into `~/.appliance/vm/images/guest-assets/`; `appliance-vm`
+embeds them in the boot media; the guest bootstrap launches the binary on
+guest port `9091` under a respawn loop. It is reached through the existing
+Traefik ingress at `http://api.appliance.localhost:8081` via a selector-less
+Service + Endpoints that point at the guest process. It authenticates to k3s
+with its own ServiceAccount token (created by the auto-applied manifest —
+bun's fetch cannot do kubeconfig client-cert auth) and trusts the k3s CA via
+`NODE_EXTRA_CA_CERTS`. There is **no in-cluster api-server pod, no image
+delivery at `vm up`, and no host-side daemon** (`appliance server start` is a
+deprecation shim that boots the VM). Credentials: `appliance-vm` generates a
+bootstrap token persisted at `~/.appliance/vm/<name>/bootstrap-token` and
+injected into the guest at `/etc/appliance/bootstrap-token`; the CLI mints an
+API key from it automatically.
+
+**One fork point.** The api-server's base-type branch lives in exactly one
+place — `packages/api-server/src/services/deployment-backend.ts`: Kubernetes
+bases (the microVM + BYO clusters) resolve to the container backend
+(`LocalContainerDeploymentService`); cloud (AWS/Lambda) bases resolve to
+`null` and take the Pulumi path; the removed docker base throws
+`RemovedDockerBaseError` naming the migration (`appliance dev`).
+
+**Server-side builds.** The CLI never runs docker/buildctl/crane.
+`appliance deploy` uploads a **source zip** (manifest + tree) and the
+api-server builds the container image server-side with BuildKit — the in-VM
+buildkitd + in-VM registry locally, the installation's builder + ECR on
+cloud. `framework` apps (node/python/auto) get a server-generated Dockerfile
+and are first-class on every base; `container` apps ship their Dockerfile +
+context in the zip. On Kubernetes bases the upload lands via
+`PUT /api/v1/builds/:id/content?token=…` — a **one-time token** minted by
+`POST /api/v1/builds`, the self-hosted analogue of a presigned S3 URL; on
+cloud bases it is still a presigned S3 PUT.
 
 ### Verified facts (file:line)
 
-- In-VM server: `packages/helper/src/api-server.ts:24` (`IN_CLUSTER_API_SERVER_HOSTNAME = 'api.appliance.localhost'`), `:126` (Service + Ingress fronted by Traefik → container `:3000`), `:455` `bootstrapInClusterApiServer`. Reachable at `http://api.appliance.localhost:8081` (`api-server.spec.ts:16`, `:88`). VM data dir `/persist/appliance-data` (`packages/cli/src/appliance-vm.ts:223`). The microVM is the sole local runtime; the former host-side k3d bootstrap has been removed.
+- In-VM server: `packages/helper/src/api-server.ts:11` (`IN_CLUSTER_API_SERVER_HOSTNAME = 'api.appliance.localhost'`), `mintApiKey` (`:46`). Guest binary provisioning: `packages/vm/src/guest.rs` (`APISERVER_MEDIA_COPY` / `APISERVER_COMMON`, `API_SERVER_GUEST_PORT = 9091`); CLI staging in `packages/cli/src/utils/api-server-artifact.ts`; key minting in `packages/cli/src/utils/microvm-up.ts`. Reachable at `http://api.appliance.localhost:8081`. VM data dir `/persist/appliance-data`. The microVM is the sole local runtime; the former host-side k3d bootstrap and the host-daemon runtime have been removed.
 - **Single ObjectStore per server (confirmed):** `packages/api-server/src/services/storage.service.ts` builds exactly one store — `FilesystemObjectStore(k8s.dataDir)` for k8s bases (`:66`) or one `S3ObjectStore` for cloud (`:72`) — behind a process singleton (`:76-83`). All services go through `getStorageService()`. "Unified state" follows automatically. See [§6](#6-one-objectstore-per-server-confirmed) for the _only_ place a second store sneaks in.
-- Auth: clients resolve `apiUrl` via `APPLIANCE_API_URL` → `~/.appliance/profiles.json` profile (`packages/cli/src/utils/credentials.ts:45-52`), then sign with RFC 9421 (`packages/sdk/src/client/appliance-client.ts:35-49`; verify `packages/api-server/src/middleware/auth.ts`). microVM uses `profileForVm(name)` (`packages/cli/src/appliance-vm.ts:53`).
+- Auth: clients resolve `apiUrl` via `APPLIANCE_API_URL` → `~/.appliance/profiles.json` profile (`packages/cli/src/utils/credentials.ts:45-52`), then sign with RFC 9421 (`packages/sdk/src/client/appliance-client.ts:35-49`; verify `packages/api-server/src/middleware/auth.ts`). The microVM uses `profileForVm(name)` (`packages/cli/src/utils/microvm-up.ts`) — `local` for the default VM, `microvm-<name>` otherwise.
 - Desktop frontend **already** drives the server via the SDK: `packages/app/src/hooks/use-appliance-client.ts:26-29` builds an `ApplianceClient` from `selected.apiServerUrl` + `config.apiKey.{id,secret}`. The migration reuses this exact wiring.
 
 ## 1. Migrate-to-HTTP vs stay-host-local
@@ -43,7 +80,7 @@ expressed as a base-URL-selected HTTP call.
 | `microvm_*` — install/up/stop/delete/status (`:3187`–`:3709`)                                      | **STAY**           | VM lifecycle on the host hypervisor. Distinct from cluster-ready (`microvm_status` reports VM phases).                                                       |
 | `terminal_*` / PTY (`:4267`+)                                                                      | **STAY**           | Interactive `kubectl exec` / `kubectl debug node` + chroot into the VM host — a bidirectional PTY, not a request/response; host-only `debug node` semantics. |
 | egress / MITM — `microvm_egress_*` (`:3772`+)                                                      | **STAY**           | Host-side proxy + CA injection on the VM's network edge.                                                                                                     |
-| code-signing, AWS profile reading, `docker build`, image push                                      | **STAY**           | Local toolchain / host credentials; no cluster-state meaning.                                                                                                |
+| code-signing, AWS profile reading                                                                  | **STAY**           | Local toolchain / host credentials; no cluster-state meaning. (Image builds moved server-side entirely — neither surface runs docker.)                       |
 | `promote_state` / `demote_state` (`:1181` / `:1206`), `update_baseline`                            | **STAY**           | Operate on Pulumi **installer** state (a _separate_ backend, see §6), need docker + host AWS creds. Not app state.                                           |
 
 Net: exactly two reads (`list_local_workloads`, `tail_local_pod_logs`) plus the
@@ -54,7 +91,7 @@ host-local.
 ## 2. New api-server endpoints (E4.1)
 
 The server already talks to the cluster via `@kubernetes/client-node`
-(`CoreV1Api` + `AppsV1Api`, `loadFromCluster()` in-cluster) inside
+(`CoreV1Api` + `AppsV1Api`, authed with its ServiceAccount token) inside
 `packages/infra/src/lib/local/LocalContainerDeploymentService.ts:141-158,642`,
 and already lists pods for health (`listNamespacedPod` `:390`). RBAC for
 `pods`, `services`, `deployments`, `replicasets`, `ingresses`, **and
@@ -185,6 +222,22 @@ old "security fork", not (a)).
 
 Both surfaces still share **one** `profiles.json` for metadata + cluster
 discovery, so desktop and CLI see the same set of clusters everywhere.
+
+**Forgetting a cluster (distinct from teardown).** Dropping a cluster from that
+shared set is a pure local-registry op — the inverse of _registering_ it, not of
+_bootstrapping_ it — and never touches any infrastructure. On the CLI it's
+`appliance cluster rm <name>` (the `appliance cluster` group is the user-facing
+view of the profile store, framed as clusters to match the desktop; `appliance
+profile` remains the lower-level alias). It removes the profile via
+`removeProfile` (which re-points `activeProfile` to a surviving cluster) and, on
+macOS, the desktop mirror's Keychain entry ages out on the next reconcile. For a
+local microVM cluster, `--delete-vm` additionally removes the backing VM + its
+state (sharing the `deleteVmAndProfile` helper `appliance vm delete` uses); the
+default leaves the VM on disk. On the desktop the same forget is the per-row
+**Remove** action on a connected cluster (`host.removeCluster`, a non-destructive
+confirm), visually distinct from the red **Destroy** panel. Destroying the actual
+cloud infrastructure stays `appliance teardown` / the Destroy panel (`pulumi
+destroy`), never `cluster rm`.
 
 ### Implementation
 

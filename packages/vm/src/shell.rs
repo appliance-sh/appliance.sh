@@ -1,22 +1,39 @@
-//! `appliance-vm shell` client: connects to a VM's per-VM Unix socket
-//! (served by the resident host process, bridged to a guest vsock PTY),
-//! puts the local terminal in raw mode, and relays bytes both ways —
-//! an interactive shell with no SSH and no dependency on k3s.
+//! `appliance-vm shell` client.
 //!
-//! The guest agent reads one leading `rows R cols C` line and applies it
-//! as the PTY size before exec'ing the login shell, so the shell starts
-//! at the caller's terminal size.
+//! Unix: connects to a VM's per-VM Unix socket (served by the resident
+//! host process, bridged to a guest vsock PTY), puts the local terminal
+//! in raw mode, and relays bytes both ways — an interactive shell with
+//! no SSH and no dependency on k3s. The guest agent reads one leading
+//! `rows R cols C` line and applies it as the PTY size before exec'ing
+//! the login shell, so the shell starts at the caller's terminal size.
+//!
+//! Windows: the WSL2 backend's guest *is* a WSL distro, and `wsl.exe`
+//! already provides a ConPTY-backed interactive channel into it — so
+//! the client drives `wsl.exe -d <distro>` directly (no relay socket,
+//! no raw-mode handling of our own). Sessions ride the same in-guest
+//! tmux sockets the vsock agent uses, so semantics match.
 
-use crate::spec::VmPaths;
-use anyhow::{anyhow, bail, Result};
-use std::fs::File;
+use anyhow::{bail, Result};
 use std::io::{Read, Write};
+
+#[cfg(unix)]
+use crate::spec::VmPaths;
+#[cfg(unix)]
+use anyhow::anyhow;
+#[cfg(windows)]
+use anyhow::Context;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 /// Connect to a VM's shell socket, or a clear error when the relay isn't
 /// up (VM down, or booted by a non-vsock engine).
+#[cfg(unix)]
 fn connect(name: &str) -> Result<UnixStream> {
     let sock = VmPaths::for_name(name).shell_sock();
     UnixStream::connect(&sock).map_err(|e| {
@@ -35,6 +52,7 @@ fn connect(name: &str) -> Result<UnixStream> {
 /// interactive-only addition, so it's silently dropped when a one-shot
 /// `command` is given (that path must stay the byte-for-byte sentinel
 /// shell). Returns the process exit code to propagate.
+#[cfg(unix)]
 pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option<&str>) -> Result<i32> {
     let mut stream = connect(name)?;
 
@@ -95,6 +113,40 @@ pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option
     Ok(0)
 }
 
+/// Run a one-shot command over the shell channel with the output
+/// CAPTURED instead of streamed to stdout — for host-internal callers
+/// (the bring-up credential mint) that need to parse what the guest
+/// said. Same protocol as `run_client`'s one-shot path: handshake,
+/// command + exit-code sentinel, half-close, drain. `root` keeps the
+/// root shell (also the path that works before the appliance user is
+/// fully provisioned). Returns the guest command's exit code and the
+/// raw PTY output (echo included — callers delimit their payload).
+#[cfg(unix)]
+pub fn run_captured(name: &str, command: &str, root: bool) -> Result<(i32, String)> {
+    let mut stream = connect(name)?;
+    writeln!(stream, "rows 24 cols 80{}", if root { " root" } else { "" })?;
+    writeln!(stream, "{}; printf '\\n{}%d__END__\\n' \"$?\"\nexit", command, RC_MARK)?;
+    // Half-close so the guest shell sees EOF on stdin once the command
+    // and `exit` are consumed; then drain its output to the sentinel.
+    stream.shutdown(Shutdown::Write)?;
+    let mut out: Vec<u8> = Vec::new();
+    let code = pump_until_sentinel(&mut stream, &mut out);
+    Ok((code, String::from_utf8_lossy(&out).to_string()))
+}
+
+/// Windows: `wsl.exe` is the channel and propagates the exit code
+/// natively, so capture is a plain piped `sh -lc`.
+#[cfg(windows)]
+pub fn run_captured(name: &str, command: &str, root: bool) -> Result<(i32, String)> {
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args(["--cd", "~", "--", "sh", "-lc", command]);
+    let out = cmd.output().context("run wsl.exe")?;
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(255), text))
+}
+
 /// A reattachable tmux session, as reported by `sessions list`.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SessionInfo {
@@ -109,6 +161,7 @@ pub struct SessionInfo {
 /// real outcome over the status-less byte pipe: `KILL_MARK` when `tmux
 /// kill-session` actually removed a session (exit 0), the no-session
 /// marker otherwise. Kept in sync with `guest.rs`'s SHELL_AGENT.
+#[cfg(unix)]
 const KILL_MARK: &str = "__APPLIANCE_VM_KILLED__";
 
 /// List the VM's reattachable sessions. `root` enumerates the separate
@@ -118,6 +171,7 @@ const KILL_MARK: &str = "__APPLIANCE_VM_KILLED__";
 /// connection: send the `[root] list` verb, read the agent's
 /// `appliance-<id> <activity>` lines to EOF, parse them clean. No raw
 /// mode, no sentinel — the connection closing is the whole protocol.
+#[cfg(unix)]
 pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
     let mut stream = connect(name)?;
     let (rows, cols) = term_size();
@@ -136,6 +190,7 @@ pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
 /// `tmux kill-session` and echoes a marker keyed on its exit status, so
 /// killing a non-existent id reports honestly rather than a blanket
 /// success.
+#[cfg(unix)]
 pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
     validate_session_id(id)?;
     let mut stream = connect(name)?;
@@ -193,6 +248,10 @@ fn validate_session_id(id: &str) -> Result<()> {
 }
 
 /// Marker the one-shot command appends as `\n<RC_MARK><n>__END__\n`.
+/// (Unix relay only — on Windows `wsl.exe` propagates the guest exit
+/// code natively — but compiled everywhere so the parser tests run on
+/// every platform.)
+#[cfg_attr(windows, allow(dead_code))]
 const RC_MARK: &str = "__APPLIANCE_VM_RC__";
 
 /// Stream guest output to `w`, watching for the exit-code sentinel. Lines
@@ -206,6 +265,7 @@ const RC_MARK: &str = "__APPLIANCE_VM_RC__";
 /// command's exit code could be reported — e.g. the `su -l appliance`
 /// drop failed — so return a non-zero code (255) rather than a silent
 /// success-with-empty-output that would mask such breakage.
+#[cfg_attr(windows, allow(dead_code))]
 fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -244,6 +304,7 @@ fn pump_until_sentinel(r: &mut impl Read, w: &mut impl Write) -> i32 {
 
 /// Parse `<RC_MARK><digits>__END__` out of a line, if the code is present
 /// and expanded (the echoed command keeps a literal `%d` and won't parse).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_rc(line: &str) -> Option<i32> {
     let start = line.find(RC_MARK)? + RC_MARK.len();
     let rest = &line[start..];
@@ -253,6 +314,7 @@ fn parse_rc(line: &str) -> Option<i32> {
 
 /// dup a std fd into an owned `File` (unbuffered, and closing it never
 /// touches the original descriptor).
+#[cfg(unix)]
 fn dup_file(fd: RawFd) -> Result<File> {
     let dup = unsafe { libc::dup(fd) };
     if dup < 0 {
@@ -261,12 +323,14 @@ fn dup_file(fd: RawFd) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(dup) })
 }
 
+#[cfg(unix)]
 fn is_tty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
 /// The controlling terminal's size, or a sane 24x80 fallback when stdout
 /// isn't a tty (piped/CI).
+#[cfg(unix)]
 fn term_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -279,11 +343,13 @@ fn term_size() -> (u16, u16) {
 
 /// RAII raw-mode guard for the local terminal: restores the saved
 /// termios on drop (clean exit, error, or panic).
+#[cfg(unix)]
 struct RawMode {
     fd: RawFd,
     orig: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enable() -> Result<Self> {
         let fd = libc::STDIN_FILENO;
@@ -300,10 +366,174 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
     }
+}
+
+/// Base `wsl.exe -d <distro> -u <user>` invocation for the named VM,
+/// with the same "is it even running?" gate the Unix client gets from
+/// its socket connect.
+#[cfg(windows)]
+fn wsl_command(name: &str, root: bool) -> Result<std::process::Command> {
+    if crate::store::read_live_pid(name).is_none() {
+        bail!(
+            "no shell channel for VM '{name}' — is it running? (appliance vm up)"
+        );
+    }
+    let distro = crate::backend::wsl::distro_name(name);
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-d", &distro, "-u", if root { "root" } else { "appliance" }]);
+    Ok(cmd)
+}
+
+/// The tmux socket for a privilege level — matches the vsock agent's
+/// `appliance` / `appliance-root` split so the two privilege levels
+/// never cross-attach, whichever client created the session.
+#[cfg(windows)]
+fn tmux_socket(root: bool) -> &'static str {
+    if root {
+        "appliance-root"
+    } else {
+        "appliance"
+    }
+}
+
+/// Windows client: `wsl.exe` IS the PTY channel (ConPTY + exit-code
+/// propagation for free), so the shell runs the same in-guest shapes
+/// the vsock agent would — a login shell as the `appliance` user, a
+/// one-shot `sh -lc`, or an attach-or-create tmux session.
+#[cfg(windows)]
+pub fn run_client(name: &str, command: Option<&str>, root: bool, session: Option<&str>) -> Result<i32> {
+    let mut cmd = wsl_command(name, root)?;
+    match (command, session) {
+        (Some(one_shot), _) => {
+            // One-shot: session is interactive-only (dropped, like the
+            // Unix client); wsl.exe returns the guest command's code.
+            cmd.args(["--cd", "~", "--", "sh", "-lc", one_shot]);
+        }
+        (None, Some(id)) => {
+            validate_session_id(id)?;
+            cmd.args([
+                "--cd", "~", "--",
+                "tmux", "-L", tmux_socket(root), "-f", "/etc/appliance/tmux.conf",
+                "new-session", "-A", "-s",
+            ]);
+            cmd.arg(format!("appliance-{id}"));
+        }
+        (None, None) => {
+            // Login shell: bash if the dev toolchain installed it, else sh.
+            cmd.args([
+                "--cd", "~", "--",
+                "sh", "-lc", "command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
+            ]);
+        }
+    }
+    let status = cmd.status().context("run wsl.exe")?;
+    Ok(status.code().unwrap_or(255))
+}
+
+/// Piped (non-interactive) wsl.exe call: never pop a console window —
+/// the desktop calls these with no console of its own.
+#[cfg(windows)]
+fn hide_console(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Windows session list: ask the in-guest tmux directly. A missing tmux
+/// server (no sessions yet) exits non-zero — that is an empty list, not
+/// an error; `parse_session_list` drops the noise either way.
+#[cfg(windows)]
+pub fn list_sessions(name: &str, root: bool) -> Result<Vec<SessionInfo>> {
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args([
+        "--",
+        "tmux", "-L", tmux_socket(root), "-f", "/etc/appliance/tmux.conf",
+        "list-sessions", "-F", "#{session_name} #{session_activity}",
+    ]);
+    let out = cmd.output().context("run wsl.exe")?;
+    Ok(parse_session_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Windows session kill: tmux's own exit status is the honest outcome
+/// (`kill-session` exits non-zero when the id doesn't exist), so no
+/// marker protocol is needed here.
+#[cfg(windows)]
+pub fn kill_session(name: &str, id: &str, root: bool) -> Result<bool> {
+    validate_session_id(id)?;
+    let mut cmd = wsl_command(name, root)?;
+    hide_console(&mut cmd);
+    cmd.args(["--", "tmux", "-L", tmux_socket(root), "kill-session", "-t"]);
+    cmd.arg(format!("appliance-{id}"));
+    let out = cmd.output().context("run wsl.exe")?;
+    Ok(out.status.success())
+}
+
+// ---------------------------------------------------------------------
+// Guest clock-set command. Platform-neutral (the guest is Linux under
+// every backend): shared by the vz backend's resident clock-sync thread
+// and the one-shot `appliance-vm sync-clock` subcommand.
+// ---------------------------------------------------------------------
+
+/// Build the busybox-compatible command that sets the guest clock to the
+/// given Unix epoch seconds. Tries the epoch form first; on the busybox
+/// builds where `date -s @EPOCH` isn't honoured, falls back to a
+/// `-D`-typed formatted UTC string built from the same instant. Both are
+/// UTC (`-u`) so the guest's timezone never enters into it.
+pub fn clock_set_command(epoch_secs: u64) -> String {
+    let formatted = format_utc(epoch_secs);
+    format!(
+        "date -u -s @{epoch_secs} 2>/dev/null \
+         || date -u -D '%Y-%m-%d %H:%M:%S' -s '{formatted}' 2>/dev/null \
+         || true"
+    )
+}
+
+/// Parse the guest's reply to `date -u +%s` out of raw one-shot PTY
+/// output (echo included): the last line that is purely ASCII digits.
+/// The echoed command line contains `+%s` (non-digit) so it can never
+/// match; shell banners/logout lines are skipped the same way. `None`
+/// when no such line exists — callers must treat that as "clock state
+/// unknown", i.e. failure, not success.
+pub fn parse_epoch_output(raw: &str) -> Option<u64> {
+    raw.lines().rev().find_map(|line| {
+        let t = line.trim_end_matches('\r').trim();
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<u64>().ok()
+    })
+}
+
+/// Convert Unix epoch seconds to a `YYYY-MM-DD HH:MM:SS` UTC string, with
+/// no dependency: a Howard Hinnant civil-from-days calculation for the
+/// date plus plain modular arithmetic for the time of day.
+fn format_utc(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let secs_of_day = epoch_secs % 86_400;
+    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
+}
+
+/// Days since 1970-01-01 → (year, month, day), proleptic Gregorian.
+/// Howard Hinnant's `civil_from_days` algorithm (public domain).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -399,5 +629,45 @@ mod tests {
         for bad in ["", "has space", "two\nlines", "a/b", "a:b", "semi;rm"] {
             assert!(validate_session_id(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn formats_known_epochs_as_utc() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00");
+        // 2009-02-13T23:31:30Z — the classic 1234567890 timestamp.
+        assert_eq!(format_utc(1_234_567_890), "2009-02-13 23:31:30");
+        // A leap day: 2020-02-29T12:00:00Z.
+        assert_eq!(format_utc(1_582_977_600), "2020-02-29 12:00:00");
+        // End-of-year boundary: 2023-12-31T23:59:59Z.
+        assert_eq!(format_utc(1_704_067_199), "2023-12-31 23:59:59");
+    }
+
+    #[test]
+    fn command_tries_epoch_then_formatted_fallback() {
+        let cmd = clock_set_command(1_234_567_890);
+        assert!(cmd.contains("date -u -s @1234567890 2>/dev/null"));
+        assert!(cmd.contains("date -u -D '%Y-%m-%d %H:%M:%S' -s '2009-02-13 23:31:30' 2>/dev/null"));
+        assert!(cmd.ends_with("|| true"));
+    }
+
+    #[test]
+    fn parses_epoch_from_echoed_pty_output() {
+        // Real one-shot shape: echoed command, the reply, a logout line —
+        // with PTY \r\n endings throughout.
+        let raw = "date -u +%s\r\n1234567890\r\nlogout\r\n";
+        assert_eq!(parse_epoch_output(raw), Some(1_234_567_890));
+        // Bare reply, no echo.
+        assert_eq!(parse_epoch_output("42\n"), Some(42));
+        // The LAST digit line wins (a banner containing digits+text is
+        // skipped; an earlier stray number is superseded by the reply).
+        assert_eq!(parse_epoch_output("999\nWelcome to VM 3\n1000\n"), Some(1000));
+    }
+
+    #[test]
+    fn epoch_parse_fails_closed_without_a_digit_line() {
+        // The read-back verifying a clock set must not fabricate success.
+        assert_eq!(parse_epoch_output(""), None);
+        assert_eq!(parse_epoch_output("date -u +%s\r\nsh: date: not found\r\n"), None);
+        assert_eq!(parse_epoch_output("date: invalid option\n"), None);
     }
 }

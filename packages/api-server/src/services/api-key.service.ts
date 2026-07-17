@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
 import { getStorageService } from './storage.service';
-import { ApiKeyCreateResponse, generateId } from '@appliance.sh/sdk';
+import { ApiKeyCreateResponse, ApiKeyRole, ApiKeySummary, generateId } from '@appliance.sh/sdk';
 import { DEFAULT_TENANT, getCurrentTenant } from './tenant-context';
 
 const COLLECTION = 'api-keys';
@@ -13,6 +13,9 @@ export interface StoredApiKey {
   secret: string;
   createdAt: string;
   lastUsedAt?: string;
+  // Absent on keys stored before roles existed — read as 'admin', since
+  // every pre-role key was full-access.
+  role?: ApiKeyRole;
   /**
    * Owning principal. Bound at mint time from the SERVER-derived
    * principal (the ambient tenant, or the default tenant when none) —
@@ -20,6 +23,11 @@ export interface StoredApiKey {
    * inherits it. Absent on legacy keys ⇒ resolves to the default tenant.
    */
   tenantId?: string;
+}
+
+/** Pre-role keys were all full-access, so absence reads as admin. */
+export function roleOf(key: { role?: ApiKeyRole }): ApiKeyRole {
+  return key.role ?? 'admin';
 }
 
 export class ApiKeyService {
@@ -30,7 +38,7 @@ export class ApiKeyService {
    * to the default tenant. There is deliberately no path for a client to
    * assert the tenant of a key it is minting.
    */
-  async create(name: string, tenantId?: string): Promise<ApiKeyCreateResponse> {
+  async create(name: string, role: ApiKeyRole = 'admin', tenantId?: string): Promise<ApiKeyCreateResponse> {
     const storage = getStorageService();
     const id = generateId('apikey');
     const secret = `sk_${randomBytes(32).toString('hex')}`;
@@ -41,12 +49,28 @@ export class ApiKeyService {
       name,
       secret,
       createdAt: now,
+      role,
       tenantId: tenantId ?? getCurrentTenant() ?? DEFAULT_TENANT,
     };
 
     await storage.set(COLLECTION, id, stored);
 
-    return { id, name, secret, createdAt: now };
+    return { id, name, secret, createdAt: now, role };
+  }
+
+  /** All keys, secrets stripped — safe to return to admins. */
+  async list(): Promise<ApiKeySummary[]> {
+    const storage = getStorageService();
+    const keys = await storage.getAll<StoredApiKey>(COLLECTION);
+    return keys
+      .map((k) => ({
+        id: k.id,
+        name: k.name,
+        role: roleOf(k),
+        createdAt: k.createdAt,
+        ...(k.lastUsedAt ? { lastUsedAt: k.lastUsedAt } : {}),
+      }))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async getByKeyId(keyId: string): Promise<StoredApiKey | null> {
@@ -115,8 +139,9 @@ export class ApiKeyService {
     if (!existing) return null;
     // The principal is immutable across rotation: the replacement
     // inherits the prior key's tenant (default when the old key predates
-    // the tenant dimension), never re-derives it from the caller.
-    const replacement = await this.create(existing.name, existing.tenantId ?? DEFAULT_TENANT);
+    // the tenant dimension), never re-derives it from the caller. The
+    // role rides along the same way.
+    const replacement = await this.create(existing.name, roleOf(existing), existing.tenantId ?? DEFAULT_TENANT);
     // Revoke last: the replacement is already persisted and returned.
     await this.delete(keyId);
     return replacement;

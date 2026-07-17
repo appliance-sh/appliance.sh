@@ -1,6 +1,6 @@
 import { uuidv7 } from 'uuidv7';
 
-export type IdPrefix = 'project' | 'environment' | 'deployment' | 'apikey' | 'build';
+export type IdPrefix = 'project' | 'environment' | 'deployment' | 'apikey' | 'build' | 'invite';
 
 /**
  * Generate a type-prefixed UUIDv7 identifier.

@@ -1,12 +1,25 @@
 mod backend;
 mod bringup;
 mod creds;
+mod doctor;
 mod egress;
+mod guest_exec;
+// guest/images/net/netstack carry the vz/kvm boot-media and
+// host-networking surfaces. They compile everywhere (their pure parts
+// are unit-tested on every platform, and the WSL backend reuses several
+// fragments), but only the macOS backend exercises all of them — so the
+// dead-code lint is scoped off on Windows and stays live on macOS.
+#[cfg_attr(windows, allow(dead_code))]
 mod guest;
+#[cfg_attr(windows, allow(dead_code))]
 mod images;
+mod mint;
 mod mitm;
+#[cfg_attr(windows, allow(dead_code))]
 mod net;
+#[cfg_attr(windows, allow(dead_code))]
 mod netstack;
+mod profiles;
 mod shell;
 mod spec;
 mod store;
@@ -33,8 +46,25 @@ const DEFAULT_VM: &str = "appliance";
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Probe whether this machine can run microVMs.
-    Doctor,
+    /// Probe whether this machine can run microVMs. With --vm-checks,
+    /// run runtime checks against a VM instead (clock skew, guest
+    /// api-server reachability) and print a JSON findings report.
+    Doctor {
+        /// VM to run runtime checks against (JSON report on stdout).
+        #[arg(long, value_name = "VM")]
+        vm_checks: Option<String>,
+        /// Print the named VM's guest api-server log tail, scrubbed of
+        /// secret-shaped tokens — the support-bundle feed.
+        #[arg(long, value_name = "VM", conflicts_with = "vm_checks")]
+        apiserver_log: Option<String>,
+        /// Byte budget for --apiserver-log.
+        #[arg(long, default_value_t = 512 * 1024)]
+        tail_bytes: usize,
+        /// Emit JSON (the default for --vm-checks; opts the plain
+        /// backend probe into a machine-readable verdict too).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// List all defined VMs with their ports and running state (JSON).
     List,
     /// Create (or update) a VM definition and its data disk.
@@ -68,13 +98,16 @@ enum Cmd {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
-    /// Start the VM and wait until its Kubernetes endpoint is ready:
-    /// kubeconfig fetched and the API answering on the forwarded port.
+    /// Start the VM and wait until its platform is actually ready:
+    /// kubeconfig fetched, the in-VM registry answering, and (when
+    /// staged) the api-server reachable through its ingress route.
     Up {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
-        /// Seconds to wait for readiness before giving up.
-        #[arg(long, default_value_t = 600)]
+        /// Seconds to wait for readiness before giving up. Readiness now
+        /// covers the whole platform (not just the kubernetes endpoint),
+        /// so the budget carries what used to be the CLI's serial waits.
+        #[arg(long, default_value_t = 900)]
         timeout: u64,
         /// Virtual CPUs (persisted; defaults to the VM's current value,
         /// or 2 for a new VM). Takes effect on the next boot.
@@ -111,6 +144,12 @@ enum Cmd {
         /// one-way, applies on the next boot; never silently turned off.
         #[arg(long, default_value_t = false)]
         agent_only: bool,
+        /// Fail (exit non-zero) if the whole bring-up takes longer than
+        /// this many seconds, even when it eventually succeeds. A
+        /// regression tripwire for CI / perf work — readiness itself is
+        /// unaffected.
+        #[arg(long)]
+        time_budget: Option<u64>,
     },
     /// Host a VM in the foreground until it stops. Used internally by
     /// `start`; handy directly when debugging a guest boot.
@@ -125,6 +164,11 @@ enum Cmd {
     },
     /// Report VM state as JSON.
     Status {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Print per-phase timings from the last boot's bring-up history.
+    Timings {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
@@ -162,6 +206,14 @@ enum Cmd {
     },
     /// Delete a VM definition, its disk, and logs.
     Delete {
+        #[arg(default_value = DEFAULT_VM)]
+        name: String,
+    },
+    /// Push the host's wall-clock time into a running guest, once. The
+    /// resident clock-sync keeps drift down while the VM runs; this is
+    /// the on-demand recovery when a client still sees clock-skew 401s
+    /// (e.g. after host sleep/resume).
+    SyncClock {
         #[arg(default_value = DEFAULT_VM)]
         name: String,
     },
@@ -374,11 +426,48 @@ fn run() -> Result<()> {
     let backend = backend::platform_backend();
 
     match cli.command {
-        Cmd::Doctor => {
+        Cmd::Doctor { vm_checks, apiserver_log, tail_bytes, json } => {
+            // Support-bundle feed: the scrubbed guest api-server log.
+            if let Some(name) = apiserver_log {
+                match doctor::apiserver_log_tail(&name, tail_bytes) {
+                    Ok(text) => {
+                        print!("{text}");
+                        if !text.ends_with('\n') {
+                            println!();
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => bail!("apiserver log tail for '{name}': {e}"),
+                }
+            }
+            // Runtime checks against one VM — always JSON (the CLI's
+            // runtime doctor folds the findings in verbatim).
+            if let Some(name) = vm_checks {
+                let report = doctor::run_vm_checks(&name);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            // Legacy backend probe, unchanged (plus an opt-in JSON form).
             match backend.availability() {
-                Ok(()) => println!("ok: backend '{}' is available", backend.name()),
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ok": true, "backend": backend.name() })
+                        );
+                    } else {
+                        println!("ok: backend '{}' is available", backend.name());
+                    }
+                }
                 Err(err) => {
-                    println!("unavailable: {err:#}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ok": false, "backend": backend.name(), "error": format!("{err:#}") })
+                        );
+                    } else {
+                        println!("unavailable: {err:#}");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -406,7 +495,8 @@ fn run() -> Result<()> {
             // Allocate a non-colliding port block so this VM can run
             // alongside others (the default VM keeps the canonical
             // 8081/6443/5052/5053; an existing VM keeps its ports).
-            let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(&name);
+            let (host_port, api_port, registry_port, egress_port, buildkit_port) =
+                VmSpec::allocate_ports(&name);
             let spec = VmSpec {
                 cpus,
                 memory_mib: memory,
@@ -415,6 +505,7 @@ fn run() -> Result<()> {
                 api_port,
                 registry_port,
                 egress_port,
+                buildkit_port,
                 dev,
                 dev_mount,
                 docker,
@@ -423,12 +514,12 @@ fn run() -> Result<()> {
             };
             store::save_spec(&spec)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
             println!(
                 "created VM '{name}' ({cpus} cpus, {memory} MiB, {disk} GiB disk{})",
                 if dev { ", dev environment" } else { "" }
             );
-            println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}");
+            println!("  ingress :{host_port}  kubernetes :{api_port}  registry :{registry_port}  egress :{egress_port}  buildkit :{buildkit_port}");
             Ok(())
         }
 
@@ -440,14 +531,14 @@ fn run() -> Result<()> {
             }
             let spec = ensure_spec(&name)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
 
             // Re-exec ourselves detached to host the VM: the hypervisor
             // session lives inside a process, so something must stay
             // resident. Spawning the same binary keeps it to one
             // executable, and gives every backend identical daemon
             // semantics.
-            let child = spawn_host_process(&name)?;
+            let child = spawn_host_process(&name, bringup::DEFAULT_BUDGET_SECS)?;
             println!("starting VM '{name}' (host pid {})", child.id());
             println!("console: appliance-vm console {name} -f");
             Ok(())
@@ -463,7 +554,9 @@ fn run() -> Result<()> {
             no_mount,
             docker,
             agent_only,
+            time_budget,
         } => {
+            let up_started = std::time::Instant::now();
             backend.availability()?;
             let mut spec = ensure_spec(&name)?;
             // Persist resource overrides into the spec *before* spawning
@@ -559,30 +652,33 @@ fn run() -> Result<()> {
                 let _ = std::fs::remove_file(paths.agent_ready());
                 let _ = std::fs::remove_file(paths.guest_ip());
                 bringup::clear(&paths.dir);
-                let child = spawn_host_process(&name)?;
+                let child = spawn_host_process(&name, timeout)?;
                 println!("starting VM '{name}' (host pid {})", child.id());
             }
 
             // The resident host process publishes its bring-up phase as it
-            // goes (boot media → booting → network → k3s → ready) and writes
-            // kubeconfig.yaml once the cluster answers. Render the phases as
-            // live progress, surface a failed stage immediately rather than
-            // waiting out the timeout, and confirm the forwarded API endpoint.
+            // goes (boot media → booting → network → k3s → ingress → ready)
+            // and writes kubeconfig.yaml as soon as the cluster answers —
+            // deliberately BEFORE the last-mile registry/ingress waits, so a
+            // last-mile failure still leaves kubectl usable for debugging.
+            // Readiness is therefore the marker file AND the terminal Ready
+            // phase (`up_bringup_ready`), with Failed checked FIRST each
+            // poll: the marker alone no longer implies success.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             println!("bringing up VM '{name}'…");
             // The spawned host process needs a beat to write its
             // pidfile — only treat "no live pid" as fatal after the
             // grace period, or `up` races its own child.
             let liveness_grace = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut shown: Option<bringup::Phase> = None;
+            let mut shown: Option<(bringup::Phase, Option<String>)> = None;
             loop {
-                if ready_marker.exists() {
-                    break;
-                }
-                // Reflect the current phase: a new stage starts a fresh
-                // line; staying in one appends dots so progress is visible.
-                if let Some(b) = bringup::read(&paths.dir) {
-                    if shown != Some(b.phase) {
+                let b = bringup::read(&paths.dir);
+                if let Some(b) = &b {
+                    // Reflect the current phase: a new stage OR a new detail
+                    // (the Ingress sub-steps reuse one phase) starts a fresh
+                    // line; staying put appends dots so progress is visible.
+                    let key = (b.phase, b.detail.clone());
+                    if shown.as_ref() != Some(&key) {
                         if shown.is_some() {
                             println!();
                         }
@@ -593,8 +689,11 @@ fn run() -> Result<()> {
                             .unwrap_or_default();
                         print!("  {}{}", b.phase.label(), detail);
                         std::io::Write::flush(&mut std::io::stdout())?;
-                        shown = Some(b.phase);
+                        shown = Some(key);
                     }
+                    // Failed BEFORE the readiness break: a failed last mile
+                    // leaves kubeconfig.yaml on disk by design, so the error
+                    // must win over any marker.
                     if b.phase == bringup::Phase::Failed {
                         println!();
                         bail!(
@@ -602,6 +701,9 @@ fn run() -> Result<()> {
                             b.detail.as_deref().unwrap_or("see host log"),
                         );
                     }
+                }
+                if up_bringup_ready(b.as_ref().map(|b| b.phase), ready_marker.exists()) {
+                    break;
                 }
                 if std::time::Instant::now() > liveness_grace && store::read_live_pid(&name).is_none() {
                     println!();
@@ -612,7 +714,13 @@ fn run() -> Result<()> {
                 }
                 if std::time::Instant::now() >= deadline {
                     println!();
-                    let stuck = shown.map(|p| p.label()).unwrap_or("starting up");
+                    let stuck = shown
+                        .as_ref()
+                        .map(|(p, d)| match d {
+                            Some(d) => format!("{} ({d})", p.label()),
+                            None => p.label().to_string(),
+                        })
+                        .unwrap_or_else(|| "starting up".to_string());
                     bail!(
                         "timed out after {timeout}s — still {stuck}.\nHost log tail:\n{}\n(boot log: `appliance-vm console {name}`)",
                         tail_of(&paths.host_log(), 8)
@@ -623,6 +731,20 @@ fn run() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             println!();
+            // Regression tripwire: readiness was reached, but did it fit
+            // the budget? Checked on BOTH readiness shapes (k3s and
+            // agent-only); failures already exit non-zero above.
+            let check_time_budget = |budget: Option<u64>| -> Result<()> {
+                let Some(budget) = budget else { return Ok(()) };
+                let elapsed = up_started.elapsed().as_secs_f64();
+                if elapsed > budget as f64 {
+                    bail!(
+                        "VM '{name}' is up, but bring-up took {elapsed:.1}s — over the --time-budget of {budget}s.\nSee `appliance-vm timings {name}` for the per-phase breakdown."
+                    );
+                }
+                println!("  bring-up:    {elapsed:.1}s (within the {budget}s budget)");
+                Ok(())
+            };
             if spec.agent_only {
                 // No k3s API to confirm — readiness is the agent runtime,
                 // already proven by the agent-ready marker above. Reach the
@@ -630,6 +752,7 @@ fn run() -> Result<()> {
                 println!("VM '{name}' is up (agent-only)");
                 println!("  agent runtime: node + vsock shell ready");
                 println!("  shell: appliance-vm shell {name}");
+                check_time_budget(time_budget)?;
                 return Ok(());
             }
             net::wait_tcp(
@@ -640,16 +763,32 @@ fn run() -> Result<()> {
             println!("  kubeconfig:  {}", paths.kubeconfig().display());
             println!("  kubernetes:  https://127.0.0.1:{}", spec.api_port);
             println!("  ingress:     http://*.appliance.localhost:{}", spec.host_port);
+            check_time_budget(time_budget)?;
             println!();
             println!("try: KUBECONFIG={} kubectl get nodes", paths.kubeconfig().display());
             Ok(())
         }
 
+        Cmd::Timings { name } => {
+            let paths = VmPaths::for_name(&name);
+            let history = bringup::read_history(&paths.dir);
+            if history.is_empty() {
+                bail!(
+                    "no bring-up history for VM '{name}' — it hasn't booted under this engine version yet (boot it with `appliance-vm up {name}`)"
+                );
+            }
+            print!("{}", bringup::render_timings(&history));
+            Ok(())
+        }
+
         Cmd::Run { name } => {
+            // Pin the bring-up clock before anything slow so hostlog
+            // prefixes measure from the very top of the host process.
+            bringup::init_host_clock();
             backend.availability()?;
             let spec = ensure_spec(&name)?;
             store::ensure_disk(&spec)?;
-            images::ensure_image(&spec.image)?;
+            prefetch_boot_artifacts(&spec)?;
             store::write_pidfile(&name)?;
             // Start the egress proxy alongside the VM so the desktop's
             // outbound-traffic policy takes effect without a separate
@@ -661,6 +800,12 @@ fn run() -> Result<()> {
             if let Err(e) = egress::spawn(&name, egress_addr, false) {
                 eprintln!("warn: egress proxy not started ({e:#}); `appliance vm egress proxy` still works");
             }
+            // The engine owns the FIRST api key: mint one at bring-up
+            // (over the vsock shell, before k3s is even up) whenever the
+            // guest key store or the host profile is missing, so an
+            // engine-only start never strands clients on a dead
+            // credential. No-op when the api-server isn't staged.
+            mint::spawn_bringup_mint(&spec);
             let result = backend.run_foreground(&spec);
             store::clear_pidfile(&name);
             result
@@ -669,12 +814,7 @@ fn run() -> Result<()> {
         Cmd::Stop { name } => {
             match store::read_live_pid(&name) {
                 Some(pid) => {
-                    // SIGTERM → the host process's signal handler asks the
-                    // hypervisor for a guest stop, then exits.
-                    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-                    if rc != 0 {
-                        bail!("failed to signal pid {pid}");
-                    }
+                    request_stop(&name, pid)?;
                     println!("stop requested for VM '{name}' (pid {pid})");
                 }
                 None => println!("VM '{name}' is not running"),
@@ -696,11 +836,7 @@ fn run() -> Result<()> {
                 _ => paths.kubeconfig(),
             };
             let cluster_ready = pid.is_some() && ready_marker.exists();
-            let phase = if pid.is_some() {
-                bringup::read(&paths.dir).map(|b| b.phase)
-            } else {
-                None
-            };
+            let bringup = if pid.is_some() { bringup::read(&paths.dir) } else { None };
             let status = VmStatus {
                 name: name.clone(),
                 exists: spec.is_some(),
@@ -708,12 +844,14 @@ fn run() -> Result<()> {
                 pid,
                 backend: backend.name(),
                 cluster_ready,
-                phase,
+                phase: bringup.as_ref().map(|b| b.phase),
+                phase_detail: bringup.and_then(|b| b.detail),
                 message: backend.availability().err().map(|e| format!("{e:#}")),
                 host_port: spec.as_ref().map(|s| s.host_port),
                 api_port: spec.as_ref().map(|s| s.api_port),
                 registry_port: spec.as_ref().map(|s| s.registry_port),
                 egress_port: spec.as_ref().map(|s| s.egress_port),
+                buildkit_port: spec.as_ref().map(|s| s.buildkit_port),
                 dev: spec.as_ref().map(|s| s.dev).unwrap_or(false),
             };
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -731,6 +869,8 @@ fn run() -> Result<()> {
                 cluster_ready: bool,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 phase: Option<bringup::Phase>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                phase_detail: Option<String>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 pid: Option<i32>,
                 host_port: u16,
@@ -752,15 +892,12 @@ fn run() -> Result<()> {
                         paths.kubeconfig()
                     };
                     let cluster_ready = pid.is_some() && ready_marker.exists();
-                    let phase = if pid.is_some() {
-                        bringup::read(&paths.dir).map(|b| b.phase)
-                    } else {
-                        None
-                    };
+                    let bringup = if pid.is_some() { bringup::read(&paths.dir) } else { None };
                     VmEntry {
                         running: pid.is_some(),
                         cluster_ready,
-                        phase,
+                        phase: bringup.as_ref().map(|b| b.phase),
+                        phase_detail: bringup.and_then(|b| b.detail),
                         pid,
                         host_port: spec.host_port,
                         api_port: spec.api_port,
@@ -812,8 +949,59 @@ fn run() -> Result<()> {
             if let Some(pid) = store::read_live_pid(&name) {
                 bail!("VM '{name}' is running (pid {pid}) — stop it first");
             }
+            // Backend-owned state first (e.g. the WSL2 backend's registered
+            // distro), then the on-disk VM dir.
+            backend.destroy(&name)?;
             store::delete_vm_dir(&name)?;
             println!("deleted VM '{name}'");
+            // Prune the credential profiles this VM owned — previously
+            // only the CLI's deleteVmAndProfile did this, so an
+            // engine-side delete left orphan clusters behind in both
+            // the CLI and the desktop (they read the same
+            // ~/.appliance/profiles.json). Best-effort: a store hiccup
+            // must not fail a delete that already happened.
+            for profile in profiles::vm_profile_ids(&name) {
+                match profiles::remove_profile(&profile) {
+                    Ok(true) => println!("removed credential profile '{profile}'"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("warn: could not remove credential profile '{profile}': {e}"),
+                }
+            }
+            Ok(())
+        }
+
+        Cmd::SyncClock { name } => {
+            fn host_epoch() -> Result<u64> {
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .context("host clock is before the Unix epoch")?
+                    .as_secs())
+            }
+            // Root shell: setting the clock needs root, and the root path
+            // works before the appliance user is provisioned — mirrors
+            // the resident clock-sync thread (backend/vz/shell.rs).
+            let (code, _out) = shell::run_captured(&name, &shell::clock_set_command(host_epoch()?), true)?;
+            if code != 0 {
+                bail!("clock-sync shell exited with code {code}");
+            }
+            // clock_set_command ends `|| true` (it is shared with the
+            // resident sync loop, which must never die on a failed set),
+            // so exit 0 proves nothing. This one-shot is the heal path —
+            // callers clear the auth banner when it succeeds — so verify
+            // by read-back: the guest clock must actually be within a few
+            // seconds of the host now, or this run must fail loudly.
+            let (code, out) = shell::run_captured(&name, "date -u +%s", true)?;
+            if code != 0 {
+                bail!("clock read-back shell exited with code {code}");
+            }
+            let guest = shell::parse_epoch_output(&out).ok_or_else(|| {
+                anyhow::anyhow!("clock read-back returned no epoch (output: {})", out.trim())
+            })?;
+            let host_now = host_epoch()?;
+            if guest.abs_diff(host_now) > 5 {
+                bail!("clock sync did not take: guest reports {guest}, host is {host_now}");
+            }
+            println!("VM '{name}' clock set to host time");
             Ok(())
         }
 
@@ -1066,16 +1254,50 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
     }
     // A VM started without an explicit `create` still needs a
     // non-colliding port block so it can run beside existing VMs.
-    let (host_port, api_port, registry_port, egress_port) = VmSpec::allocate_ports(name);
+    let (host_port, api_port, registry_port, egress_port, buildkit_port) = VmSpec::allocate_ports(name);
     let spec = VmSpec {
         host_port,
         api_port,
         registry_port,
         egress_port,
+        buildkit_port,
         ..VmSpec::defaults(name)
     };
     store::save_spec(&spec)?;
     Ok(spec)
+}
+
+/// Ask a resident host process to stop its VM. Unix: SIGTERM — the
+/// host's signal handler requests a guest stop and exits. Windows has
+/// no SIGTERM, so drop the stop-request file the host's parking loop
+/// polls (the WSL backend clears it on every boot).
+#[cfg(unix)]
+fn request_stop(_name: &str, pid: i32) -> Result<()> {
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        bail!("failed to signal pid {pid}");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn request_stop(name: &str, _pid: i32) -> Result<()> {
+    let paths = VmPaths::for_name(name);
+    std::fs::write(paths.stop_request(), b"stop\n")
+        .with_context(|| format!("write {}", paths.stop_request().display()))?;
+    Ok(())
+}
+
+/// Pre-fetch the boot artifacts a backend needs before the VM can run.
+/// The vz/kvm backends boot a pinned kernel + initramfs pair; the WSL2
+/// backend imports a distro instead and fetches its own tarball inside
+/// `run_foreground`, so on Windows there is nothing to prefetch here.
+fn prefetch_boot_artifacts(spec: &VmSpec) -> Result<()> {
+    #[cfg(not(windows))]
+    images::ensure_image(&spec.image)?;
+    #[cfg(windows)]
+    let _ = spec;
+    Ok(())
 }
 
 /// Spawn the resident VM host process (this same binary, `run`),
@@ -1083,19 +1305,47 @@ fn ensure_spec(name: &str) -> Result<VmSpec> {
 /// silently discarded stderr turns every host-side failure (a proxy
 /// port already taken, a lease that never appears) into an
 /// undebuggable timeout.
-fn spawn_host_process(name: &str) -> Result<std::process::Child> {
+fn spawn_host_process(name: &str, budget_secs: u64) -> Result<std::process::Child> {
     let paths = VmPaths::for_name(name);
     std::fs::create_dir_all(&paths.dir)?;
     let log = std::fs::File::create(paths.host_log()).context("create host.log")?;
     let log_err = log.try_clone()?;
     let exe = std::env::current_exe().context("resolve current executable")?;
-    Command::new(exe)
-        .args(["run", name])
+    let mut cmd = Command::new(exe);
+    cmd.args(["run", name])
+        // Thread the caller's bring-up budget (`up --timeout`; the
+        // default for `start`) into the resident host process, so its
+        // internal readiness waits size themselves off the SAME budget
+        // the caller polls against instead of fixed worst-case sums.
+        .env(bringup::BUDGET_ENV, budget_secs.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(log_err))
-        .spawn()
-        .context("spawn VM host process")
+        .stderr(std::process::Stdio::from(log_err));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: the host must outlive the launching terminal
+        // (a console child dies with its console on Windows).
+        // CREATE_NEW_PROCESS_GROUP: Ctrl-C in that terminal never
+        // reaches it.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().context("spawn VM host process")
+}
+
+/// One `up` poll's readiness verdict, pure so the ordering contract is
+/// unit-testable: the engine writes the marker file (kubeconfig.yaml /
+/// agent-ready) BEFORE it finishes the last-mile waits, so the marker
+/// alone means "k3s answered", not "platform ready". Readiness needs the
+/// marker AND the engine's terminal `Ready` phase. `None` (no readable
+/// bring-up state — e.g. a VM booted by an engine predating phase
+/// reporting, still running across an engine upgrade) falls back to the
+/// marker alone, exactly the old contract. Failed is handled by the loop
+/// BEFORE this is consulted; it returns false here regardless.
+fn up_bringup_ready(phase: Option<bringup::Phase>, marker_exists: bool) -> bool {
+    marker_exists && matches!(phase, Some(bringup::Phase::Ready) | None)
 }
 
 /// Last `n` lines of a log file, or a placeholder when unreadable.
@@ -1107,5 +1357,30 @@ fn tail_of(path: &std::path::Path, n: usize) -> String {
             lines[start..].join("\n")
         }
         Err(_) => format!("(no host log at {})", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn up_readiness_needs_marker_and_terminal_ready_phase() {
+        use bringup::Phase;
+        // The happy exit: Ready phase + marker on disk.
+        assert!(up_bringup_ready(Some(Phase::Ready), true));
+        // F1 contract: kubeconfig.yaml now lands at ClusterApi, BEFORE the
+        // last-mile waits — the marker alone (mid-Ingress, or after a
+        // last-mile failure) must NOT read as ready.
+        assert!(!up_bringup_ready(Some(Phase::ClusterApi), true));
+        assert!(!up_bringup_ready(Some(Phase::Ingress), true));
+        assert!(!up_bringup_ready(Some(Phase::Failed), true));
+        // Ready phase without the marker isn't ready either (the marker is
+        // the file the rest of the CLI consumes).
+        assert!(!up_bringup_ready(Some(Phase::Ready), false));
+        // No readable bring-up state (pre-phase-reporting engine still
+        // hosting the VM): the marker alone decides, the old contract.
+        assert!(up_bringup_ready(None, true));
+        assert!(!up_bringup_ready(None, false));
     }
 }

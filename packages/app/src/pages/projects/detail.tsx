@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Link, Navigate, useNavigate, useParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronLeft, ExternalLink, Trash2 } from 'lucide-react';
+import { ChevronLeft, ExternalLink, Rocket, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatusDot } from '@/components/ui/status-dot';
 import { EntityLabel } from '@/components/ui/entity-label';
@@ -80,7 +80,7 @@ export function ProjectDetailPage() {
     onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['projects'] });
-      toast(`Project "${projectQuery.data?.name ?? id}" deleted`);
+      toast(`App "${projectQuery.data?.name ?? id}" deleted`);
       navigate('/projects');
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : String(err)),
@@ -91,7 +91,7 @@ export function ProjectDetailPage() {
   const onDelete = async () => {
     if (!projectQuery.data) return;
     const ok = await confirm({
-      title: `Delete project "${projectQuery.data.name}"?`,
+      title: `Delete app "${projectQuery.data.name}"?`,
       description: 'Its environments must already be destroyed.',
       confirmLabel: 'Delete',
     });
@@ -106,7 +106,7 @@ export function ProjectDetailPage() {
       <div>
         <Button asChild variant="ghost" size="sm" className="-ml-2">
           <Link to="/projects">
-            <ChevronLeft className="h-4 w-4" /> Projects
+            <ChevronLeft className="h-4 w-4" /> Apps
           </Link>
         </Button>
       </div>
@@ -131,6 +131,14 @@ export function ProjectDetailPage() {
               ) : null}
             </div>
             <div className="flex gap-2">
+              {/* Deploy via the wizard with this app preset — same
+                  `?project=<name>` param the environment detail page
+                  sends (the wizard reads it via useSearchParams). */}
+              <Button asChild>
+                <Link to={`/projects/deploy?project=${encodeURIComponent(project.name)}`}>
+                  <Rocket className="h-4 w-4" /> Deploy
+                </Link>
+              </Button>
               <Button variant="destructive" onClick={onDelete} disabled={deleteMutation.isPending}>
                 <Trash2 className="h-4 w-4" />
                 {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
@@ -152,11 +160,11 @@ export function ProjectDetailPage() {
           </section>
 
           <section className="rounded-md border border-[var(--color-border)]">
+            {/* Environments manage inline — each row opens its nested
+                detail (deploy / destroy live there). The old "Manage"
+                jump to the flat /environments list is gone with the list. */}
             <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
               <h2 className="text-sm font-semibold">Environments</h2>
-              <Button asChild variant="outline" size="sm">
-                <Link to="/environments">Manage</Link>
-              </Button>
             </div>
             {environmentsQuery.isLoading && !environmentsQuery.data ? (
               <div className="px-4 py-3 text-xs text-[var(--color-muted-foreground)]">Loading…</div>
@@ -171,12 +179,12 @@ export function ProjectDetailPage() {
                       key={env.id}
                       className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-2 hover:bg-[var(--color-muted)]"
                     >
-                      <Link to={`/environments/${env.projectId}/${env.id}`} aria-label={`Open ${env.name}`}>
+                      <Link to={`/projects/${env.projectId}/environments/${env.id}`} aria-label={`Open ${env.name}`}>
                         <StatusDot status={env.status} />
                       </Link>
                       <div className="min-w-0">
                         <Link
-                          to={`/environments/${env.projectId}/${env.id}`}
+                          to={`/projects/${env.projectId}/environments/${env.id}`}
                           className="block text-sm font-medium hover:underline"
                         >
                           {env.name}

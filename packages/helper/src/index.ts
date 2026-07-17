@@ -4,6 +4,7 @@
 
 export * from './types.js';
 export { createContext, detectArch, detectPlatform, ensureHelperBinOnPath, helperBinDir } from './context.js';
+export { ensureLocalhostFetch } from './localhost-fetch.js';
 export { defaultProviders, findProvider } from './registry.js';
 export { runInstall, runStatus } from './install.js';
 export type { InstallOptions, InstallOutcome, StatusEntry } from './install.js';
@@ -22,26 +23,9 @@ export {
   DEFAULT_LOCAL_REGISTRY_PORT,
 } from './cluster.js';
 export {
-  IN_CLUSTER_API_SERVER_DEFAULT_IMAGE,
   IN_CLUSTER_API_SERVER_HOSTNAME,
-  IN_CLUSTER_API_SERVER_NAME,
-  IN_CLUSTER_API_SERVER_NAMESPACE,
-  IN_CLUSTER_API_SERVER_PORT,
   apiServerUrlForHostPort,
-  bootstrapInClusterApiServer,
-  buildInClusterBaseConfig,
-  defaultLocalRuntimeDir,
   mintApiKey,
-  readExistingBootstrapToken,
-  renderInClusterApiServerManifest,
-  resolveRuntimeConfig,
   waitForApiServerUrl,
-  yamlDoubleQuoted,
 } from './api-server.js';
-export type {
-  BootstrapInClusterOptions,
-  BootstrapInClusterResult,
-  LocalRuntimeOptions,
-  MintedApiKey,
-  ResolvedRuntimeConfig,
-} from './api-server.js';
+export type { MintedApiKey } from './api-server.js';

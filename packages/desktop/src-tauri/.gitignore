@@ -8,3 +8,7 @@ binaries
 # Bundle-resource staging for the microVM engine binary. Populated
 # by ../scripts/copy-vm.mjs when packages/vm has a release build.
 vm-bin
+# Bundle-resource staging for the repo-built guest api-server.
+# Populated by ../scripts/stage-apiserver.mjs in dev/debug pipelines,
+# cleared (dir kept) for release builds.
+apiserver-bin

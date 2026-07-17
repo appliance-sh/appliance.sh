@@ -1403,7 +1403,10 @@ const DEFAULT_LOCAL_HOST_PORT: u16 = 8081;
 // flag and the shared profiles.json key. Survives as the id the
 // pre-Phase-4 URL migration rewrites in place.
 const LOCAL_RUNTIME_CLUSTER_ID: &str = "local-runtime";
-const MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
+const MICROVM_CLUSTER_NAME: &str = "Dev Machine";
+// Pre-rename cluster label; sync_microvm_cluster migrates persisted
+// entries carrying it (bare or "(name)"-qualified) to the current one.
+const LEGACY_MICROVM_CLUSTER_NAME: &str = "MicroVM Runtime";
 // Mirrors MICROVM_PROFILE in packages/cli/src/appliance-vm.ts — the
 // CLI's `vm up` writes this profile; the desktop adopts it as a
 // cluster with the same stable id.
@@ -1429,7 +1432,7 @@ struct PrereqTool {
 const LOCAL_PREREQS: &[PrereqTool] = &[
     PrereqTool {
         name: "docker",
-        purpose: "Container runtime Appliance shells out to for `docker build` / `docker save`.",
+        purpose: "Container runtime for the deprecated host-Docker local runtime. App deploys no longer need it — images build server-side.",
         version_args: &["--version"],
         // Container runtimes are an OS-level install (kernel
         // features, privileged daemon, GUI on macOS); we can't ship
@@ -2413,15 +2416,16 @@ async fn wait_for_api_server_url(url: &str, max_wait: Duration) -> Result<(), St
     }
 }
 
-/// Mint an initial api key against the in-cluster api-server. Mirrors
+/// Mint an api key against an api-server's bootstrap route. Mirrors
 /// the host-side `mint_api_key` but takes the full URL instead of a
 /// loopback port — same `/bootstrap/create-key` route, same payload.
-async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, String> {
+/// `key_name` is the human label stored with the key.
+async fn mint_api_key_url(api_server_url: &str, token: &str, key_name: &str) -> Result<ApiKey, String> {
     let url = format!(
         "{}/bootstrap/create-key",
         api_server_url.trim_end_matches('/')
     );
-    let body = serde_json::json!({"name": "Local Runtime"}).to_string();
+    let body = serde_json::json!({ "name": key_name }).to_string();
     let (ok, stdout, stderr) = run_status_command(&[
         "curl",
         "-fsS",
@@ -2445,10 +2449,10 @@ async fn mint_api_key_url(api_server_url: &str, token: &str) -> Result<ApiKey, S
 /// Apply the in-cluster api-server manifests to the running
 /// cluster, wait for the deployment to become reachable, and mint
 /// the first API key. The api-server image must already be present
-/// in the cluster-attached registry (push via the desktop's
-/// build_and_import_image with `image_tag: appliance-api-server:latest`,
-/// or pre-pull from a remote registry). Idempotent: applying twice
-/// reconciles the manifest in place and mints a fresh key.
+/// in the cluster-attached registry (pushed by `appliance vm up`'s
+/// provisioning, or pre-pulled from a remote registry). Idempotent:
+/// applying twice reconciles the manifest in place and mints a
+/// fresh key.
 #[tauri::command]
 async fn bootstrap_in_cluster_api_server(
     app: AppHandle,
@@ -2487,7 +2491,7 @@ async fn bootstrap_in_cluster_api_server(
         )
     };
     wait_for_api_server_url(&api_server_url, Duration::from_secs(60)).await?;
-    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token).await?;
+    let api_key = mint_api_key_url(&api_server_url, &bootstrap_token, "Local Runtime").await?;
     Ok(BootstrapInClusterResult {
         api_server_url,
         api_key,
@@ -2508,29 +2512,36 @@ async fn bootstrap_in_cluster_api_server(
 // the repo's cargo output, and `microvm_install` places it in
 // ~/.appliance/bin — the shared managed location the CLI resolves too.
 
+/// Platform file name of the microVM engine binary (cargo emits
+/// `appliance-vm.exe` on Windows, `appliance-vm` elsewhere). Every
+/// path that stores, stages, or resolves the engine must use this —
+/// a bare `appliance-vm` never matches on Windows.
+const VM_BIN_NAME: &str = if cfg!(windows) {
+    "appliance-vm.exe"
+} else {
+    "appliance-vm"
+};
+
 /// Locate the appliance-vm binary: the helper-managed bin dir first
 /// (the CLI's `appliance vm` resolves the same path), then PATH.
 fn vm_binary() -> Option<PathBuf> {
     if let Some(home) = home_dir() {
-        let managed = home
-            .join(SHARED_PROFILES_DIR)
-            .join("bin")
-            .join("appliance-vm");
+        let managed = home.join(SHARED_PROFILES_DIR).join("bin").join(VM_BIN_NAME);
         if managed.exists() {
             return Some(managed);
         }
     }
-    which_path("appliance-vm")
+    which_path(VM_BIN_NAME)
 }
 
 /// Where an installable appliance-vm binary can come from: the
 /// bundled resource (packaged builds; placed by scripts/copy-vm.mjs),
 /// or — in dev builds — the repo checkout's cargo output.
 fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
-    if let Ok(resource) = app
-        .path()
-        .resolve("vm-bin/appliance-vm", tauri::path::BaseDirectory::Resource)
-    {
+    if let Ok(resource) = app.path().resolve(
+        &format!("vm-bin/{VM_BIN_NAME}"),
+        tauri::path::BaseDirectory::Resource,
+    ) {
         if resource.is_file() {
             return Some(resource);
         }
@@ -2539,10 +2550,67 @@ fn vm_install_source(app: &AppHandle) -> Option<PathBuf> {
     {
         let vm_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vm/target");
         for profile in ["release", "debug"] {
-            let candidate = vm_target.join(profile).join("appliance-vm");
+            let candidate = vm_target.join(profile).join(VM_BIN_NAME);
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+    }
+    None
+}
+
+/// Repo-built guest api-server staged as a bundle resource by
+/// scripts/stage-apiserver.mjs (dev/debug pipelines only; the release
+/// pipeline clears the dir). When present, the CLI spawns that stage
+/// guest artifacts (`vm up` / `agent start`) export it as
+/// APPLIANCE_API_SERVER_BINARY so the bundled CLI stages this build
+/// instead of its version-pinned release download — a desktop built
+/// from unreleased main can be schema-skewed against the released
+/// guest binary.
+fn bundled_api_server_binary(app: &AppHandle) -> Option<PathBuf> {
+    let (arch, other_arch) = if cfg!(target_arch = "aarch64") {
+        ("arm64", "x64")
+    } else {
+        ("x64", "arm64")
+    };
+    let name = format!("appliance-api-server-linux-{arch}");
+    let other_name = format!("appliance-api-server-linux-{other_arch}");
+
+    let mut staging_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(resource_dir) = app
+        .path()
+        .resolve("apiserver-bin", tauri::path::BaseDirectory::Resource)
+    {
+        staging_dirs.push(resource_dir);
+    }
+    // Dev runs can outrace the resource copy tauri-build does at
+    // compile time — fall back to the checkout's staging dir.
+    #[cfg(debug_assertions)]
+    staging_dirs.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("apiserver-bin"));
+
+    for dir in &staging_dirs {
+        let staged = dir.join(&name);
+        if staged.is_file() {
+            return Some(staged);
+        }
+    }
+    // A wrong-arch staging (e.g. a Rosetta x64 Node staged `-x64` into
+    // an arm64 app) is genuinely unusable: the guest VM runs the host's
+    // arch, so a linux-x64 binary cannot boot in an arm64 VM. Never
+    // export it — warn loudly instead so the developer knows staging
+    // misfired rather than letting the release download silently
+    // resurrect the schema skew this staging exists to prevent.
+    for dir in &staging_dirs {
+        let other = dir.join(&other_name);
+        if other.is_file() {
+            eprintln!(
+                "[appliance] apiserver-bin arch mismatch: staging produced {} but this {arch} build \
+                 needs {} — ignoring it (the CLI falls back to its release download). \
+                 Re-run stage-apiserver.mjs with a {arch}-native toolchain.",
+                other.display(),
+                dir.join(&name).display()
+            );
+            return None;
         }
     }
     None
@@ -2589,7 +2657,7 @@ async fn microvm_install(app: AppHandle) -> Result<String, String> {
     let home = home_dir().ok_or("cannot resolve the home directory")?;
     let bin_dir = home.join(SHARED_PROFILES_DIR).join("bin");
     fs::create_dir_all(&bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
-    let dest = bin_dir.join("appliance-vm");
+    let dest = bin_dir.join(VM_BIN_NAME);
     // Unlink first: overwriting in place would truncate the inode a
     // still-running VM host process executes from.
     let _ = fs::remove_file(&dest);
@@ -2624,7 +2692,7 @@ async fn ensure_vm_installed(
     let Some(source) = vm_install_source(app) else {
         return Ok(());
     };
-    let dest = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join("appliance-vm"));
+    let dest = home_dir().map(|h| h.join(SHARED_PROFILES_DIR).join("bin").join(VM_BIN_NAME));
     let up_to_date = dest.as_ref().is_some_and(|dest| {
         dest.is_file()
             // Cheap length gate before reading both binaries in full.
@@ -2684,8 +2752,9 @@ fn sync_microvm_cluster(app: &AppHandle, name: &str) -> Result<(), HostError> {
                 changed = true;
             }
             // A bare ingest from profiles.json labels the cluster with
-            // its slug; upgrade it to the human name.
-            if cluster.name == cluster_id {
+            // its slug; upgrade it to the human name. Entries persisted
+            // before the "Dev Machine" rename migrate the same way.
+            if cluster.name == cluster_id || cluster.name.starts_with(LEGACY_MICROVM_CLUSTER_NAME) {
                 cluster.name = cluster_label.clone();
                 changed = true;
             }
@@ -2778,10 +2847,15 @@ struct MicroVmStatus {
     /// file lingers on disk) doesn't read as ready.
     kubeconfig_ready: bool,
     /// Current bring-up stage while starting: media | booting | network |
-    /// cluster | ready | failed. `None` when not running. Lets the UI
+    /// cluster (+ cluster-node/cluster-images/cluster-api/ingress
+    /// sub-phases) | ready | failed. `None` when not running. Lets the UI
     /// show "starting (k3s)" / "failed" instead of a blunt "running".
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
+    /// Free-text context for `phase` (what the engine is waiting on) —
+    /// rendered as the live detail under the in-flight bring-up rung.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_detail: Option<String>,
     /// Whether this VM is provisioned as a development environment
     /// (`appliance vm dev up`). Drives the dev-shell affordance.
     dev: bool,
@@ -2909,6 +2983,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             running: false,
             kubeconfig_ready: false,
             phase: None,
+            phase_detail: None,
             dev: false,
             dev_mount: None,
             api_server_url,
@@ -2933,6 +3008,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
                 running: false,
                 kubeconfig_ready: false,
                 phase: None,
+                phase_detail: None,
                 dev: false,
                 dev_mount: None,
                 api_server_url,
@@ -2948,6 +3024,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             running: false,
             kubeconfig_ready: false,
             phase: None,
+            phase_detail: None,
             dev: false,
             dev_mount: None,
             api_server_url,
@@ -2989,6 +3066,10 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         .get("phase")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let phase_detail = parsed
+        .get("phaseDetail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if running && kubeconfig_ready {
         // Keep the desktop's cluster registration in step with the
         // CLI-owned profile while the engine is up — this also catches
@@ -3007,6 +3088,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         running,
         kubeconfig_ready,
         phase,
+        phase_detail,
         dev: parsed.get("dev").and_then(|v| v.as_bool()).unwrap_or(false),
         dev_mount: vm_dev_mount(&name),
         api_server_url,
@@ -3014,6 +3096,345 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             .get("message")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+    }
+}
+
+// ============================================================
+// MicroVM credential self-heal
+//
+// A microVM's api-server keeps its key store on the VM's data disk, so
+// recreating the VM silently invalidates every credential a client
+// holds — the desktop would 401 forever with no recovery path (the
+// CLI's `vm up` re-mints, but only when it runs). This command is the
+// desktop's counterpart: when the frontend sees an auth-shaped error
+// from a microVM cluster, it asks the host to verify-and-re-mint using
+// the VM's on-disk bootstrap token (~/.appliance/vm/<name>/bootstrap-token
+// — its presence proves this host owns the VM). The fresh key is
+// written to profiles.json (the CLI-shared store) and propagated to
+// the keychain + cluster registry via the existing sync path.
+// ============================================================
+
+/// Minimum spacing between mint attempts per VM. One heal per window;
+/// if the freshly minted key still fails, the banner fallback shows
+/// instead of minting in a loop.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(60);
+/// If the key WE minted is the one being rejected, the failure isn't
+/// credential-shaped (clock skew, digest mismatch, server bug) —
+/// refuse to mint again for this long so heal can't mask a real bug
+/// behind an ever-growing key store.
+const HEAL_REMINT_GUARD: Duration = Duration::from_secs(600);
+
+/// CLI-canonical profile the default VM owns. Mirrors LOCAL_PROFILE /
+/// profileForVm in packages/cli/src/utils/microvm-up.ts.
+const LOCAL_CLI_PROFILE: &str = "local";
+
+#[derive(Default, Clone)]
+struct HealRecord {
+    /// A mint is currently running for this VM.
+    in_flight: bool,
+    /// When the last mint attempt finished (success or failure).
+    last_attempt: Option<std::time::Instant>,
+    /// Key id of the last successful mint.
+    last_minted_key: Option<String>,
+    /// When a clock sync was last attempted for a `clock_skew` cause.
+    /// A second clock_skew inside HEAL_REMINT_GUARD means the sync
+    /// didn't fix it — banner instead of syncing in a loop (the guest
+    /// engine's `sync-clock` verifies by read-back, but a persistent
+    /// skew source would otherwise flap heal→retry→401 forever).
+    last_clock_sync: Option<std::time::Instant>,
+}
+
+fn heal_state() -> &'static std::sync::Mutex<BTreeMap<String, HealRecord>> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, HealRecord>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[derive(Debug, PartialEq)]
+enum HealDecision {
+    /// Mint a fresh key via the bootstrap token.
+    Proceed,
+    /// The shared profile already carries a different key than the one
+    /// that failed (the CLI re-keyed) — sync it instead of minting.
+    AlreadyRekeyed,
+    /// The server said `clock_skew`: push the host clock into the guest
+    /// (`appliance-vm sync-clock`) instead of minting — a fresh key
+    /// would be rejected exactly the same way.
+    SyncClock,
+    /// Do nothing; the caller falls back to the auth-expired banner.
+    Skip(&'static str),
+}
+
+/// Decide whether a heal request should mint. Pure: all clock/store
+/// reads are resolved by the caller and passed in. `cause` is the
+/// server's machine-readable 401 classification (AuthFailureCause) when
+/// it sent one; cause-less (older) servers keep the local heuristics.
+fn decide_heal(
+    record: &HealRecord,
+    now: std::time::Instant,
+    failed_key_id: Option<&str>,
+    stored_key_id: Option<&str>,
+    cause: Option<&str>,
+) -> HealDecision {
+    if record.in_flight {
+        return HealDecision::Skip("heal already in flight");
+    }
+    match cause {
+        Some("clock_skew") => {
+            // One sync per guard window: if a clock push already ran and
+            // clock_skew is back, syncing again can't help (the skew is
+            // persistent or the sync path is broken) — banner instead of
+            // an infinite heal→invalidate→401 flap.
+            if record
+                .last_clock_sync
+                .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
+            {
+                return HealDecision::Skip("clock already synced recently — skew persists");
+            }
+            return HealDecision::SyncClock;
+        }
+        // Not credential-shaped: the request itself is what the server
+        // rejects (body digest, signature structure). Minting can't fix
+        // it and would only grow the key store — banner instead.
+        Some("digest_mismatch") | Some("malformed_signature") => {
+            return HealDecision::Skip("server says the failure is not credential-shaped");
+        }
+        // unknown_key / signature_mismatch are credential-shaped —
+        // today's mint path below. Unrecognized future causes fall
+        // through to the cause-less heuristics too.
+        _ => {}
+    }
+    // Someone (CLI `vm up`, another window) already replaced the key
+    // the caller failed with — adopt it rather than minting yet
+    // another. Checked before the cooldown so a stale caller converges
+    // on the fresh key immediately.
+    if let (Some(failed), Some(stored)) = (failed_key_id, stored_key_id) {
+        if failed != stored {
+            return HealDecision::AlreadyRekeyed;
+        }
+    }
+    // The blunt remint guard exists to infer exactly what a cause now
+    // states outright ("would a fresh key help?") — a cause-carrying
+    // credential-shaped 401 supersedes it; cause-less servers keep it.
+    let credential_shaped = matches!(cause, Some("unknown_key") | Some("signature_mismatch"));
+    if !credential_shaped {
+        if let (Some(failed), Some(minted)) = (failed_key_id, record.last_minted_key.as_deref()) {
+            if failed == minted
+                && record
+                    .last_attempt
+                    .is_some_and(|at| now.duration_since(at) < HEAL_REMINT_GUARD)
+            {
+                return HealDecision::Skip(
+                    "freshly minted key still rejected — not credential-shaped",
+                );
+            }
+        }
+    }
+    if record
+        .last_attempt
+        .is_some_and(|at| now.duration_since(at) < HEAL_COOLDOWN)
+    {
+        return HealDecision::Skip("cooldown");
+    }
+    HealDecision::Proceed
+}
+
+/// Resolve the VM's api-server URL: the engine's reported ingress port
+/// is authoritative (ports can be reallocated across recreates), the
+/// registered cluster record is the fallback, the default-VM port the
+/// last resort.
+async fn microvm_api_url(app: &AppHandle, name: &str, cluster_id: &str) -> String {
+    if let Some(bin) = vm_binary() {
+        let bin = bin.to_string_lossy().to_string();
+        if let Ok((true, stdout, _stderr)) = run_status_command(&[&bin, "status", name]).await {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+            if let Some(port) = parsed.get("hostPort").and_then(|v| v.as_u64()) {
+                return format!("http://{}:{}", IN_CLUSTER_API_SERVER_HOSTNAME, port);
+            }
+        }
+    }
+    read_persisted_config(app)
+        .ok()
+        .and_then(|cfg| {
+            cfg.clusters
+                .into_iter()
+                .find(|c| c.id == cluster_id)
+                .map(|c| c.api_server_url)
+        })
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                IN_CLUSTER_API_SERVER_HOSTNAME, MICROVM_HOST_PORT
+            )
+        })
+}
+
+/// Write a freshly minted VM credential into profiles.json. The
+/// default VM dual-writes the CLI-canonical `local` profile and the
+/// legacy `microvm` id the desktop's cluster registry reads — mirrors
+/// persistVmCredentials in packages/cli/src/utils/microvm-up.ts.
+/// Non-secret metadata on an existing entry is carried forward.
+fn persist_vm_profile_entry(
+    name: &str,
+    cluster_id: &str,
+    api_url: &str,
+    key: &ApiKey,
+) -> Result<(), HostError> {
+    let _guard = config_lock();
+    let mut file = read_shared_profiles().unwrap_or_default();
+    let ids: Vec<&str> = if name == MICROVM_NAME {
+        vec![LOCAL_CLI_PROFILE, MICROVM_CLUSTER_ID]
+    } else {
+        vec![cluster_id]
+    };
+    for id in ids {
+        let prev = file.profiles.get(id).cloned().unwrap_or_default();
+        file.profiles.insert(
+            id.to_string(),
+            SharedProfileEntry {
+                api_url: api_url.to_string(),
+                key_id: key.id.clone(),
+                secret: key.secret.clone(),
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+                state_backend_url: prev.state_backend_url,
+                last_bootstrap_input: prev.last_bootstrap_input,
+                managed: prev.managed.or_else(|| Some("desktop".to_string())),
+                name: prev.name,
+            },
+        );
+    }
+    write_shared_profiles(&file)
+}
+
+/// Mint + persist + propagate. Returns the new key id.
+async fn heal_mint(
+    app: &AppHandle,
+    name: &str,
+    cluster_id: &str,
+    token: &str,
+) -> Result<String, String> {
+    let api_url = microvm_api_url(app, name, cluster_id).await;
+    let key = mint_api_key_url(&api_url, token, &microvm_cluster_label(name)).await?;
+    persist_vm_profile_entry(name, cluster_id, &api_url, &key)
+        .map_err(|e| format!("persist healed credentials: {e}"))?;
+    sync_microvm_cluster(app, name).map_err(|e| format!("sync healed cluster: {e}"))?;
+    Ok(key.id)
+}
+
+/// Recover from a rejected microVM credential: re-mint via the VM's
+/// on-disk bootstrap token and persist everywhere the old key lived.
+/// Returns `true` when fresh credentials are in place (retry now),
+/// `false` when there is nothing to heal with or an attempt was made
+/// too recently (show the normal auth-expired UI).
+#[tauri::command]
+async fn microvm_heal_credentials(
+    app: AppHandle,
+    name: Option<String>,
+    failed_key_id: Option<String>,
+    cause: Option<String>,
+) -> Result<bool, String> {
+    let name = vm_name(name);
+    let cluster_id = microvm_cluster_id(&name);
+
+    // The bootstrap token is the heal credential; no token, no heal.
+    let token = home_dir()
+        .map(|h| {
+            h.join(SHARED_PROFILES_DIR)
+                .join("vm")
+                .join(&name)
+                .join("bootstrap-token")
+        })
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let Some(token) = token else {
+        return Ok(false);
+    };
+
+    let stored_key_id = read_shared_profiles()
+        .and_then(|f| f.profiles.get(&cluster_id).map(|e| e.key_id.clone()))
+        .filter(|k| !k.is_empty());
+
+    let decision = {
+        let mut st = heal_state().lock().unwrap();
+        let record = st.entry(name.clone()).or_default();
+        let decision = decide_heal(
+            record,
+            std::time::Instant::now(),
+            failed_key_id.as_deref(),
+            stored_key_id.as_deref(),
+            cause.as_deref(),
+        );
+        if decision == HealDecision::Proceed {
+            record.in_flight = true;
+        }
+        if decision == HealDecision::SyncClock {
+            // Recorded at attempt time (success or failure): decide_heal
+            // banners a recurring clock_skew inside the guard window
+            // either way, so a broken sync can't flap the banner.
+            record.last_clock_sync = Some(std::time::Instant::now());
+        }
+        decision
+    };
+    match decision {
+        HealDecision::Skip(reason) => {
+            eprintln!("microvm heal skipped for '{name}': {reason}");
+            return Ok(false);
+        }
+        HealDecision::AlreadyRekeyed => {
+            sync_microvm_cluster(&app, &name).map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        HealDecision::SyncClock => {
+            // One-shot host→guest clock push via the engine binary
+            // (which verifies by read-back and exits non-zero when the
+            // set didn't take); the resident 30s sync thread keeps it
+            // corrected after. Not recorded as a mint attempt — a later
+            // credential-shaped heal isn't cooldown-blocked by a clock
+            // fix — but it IS recorded as `last_clock_sync` above, so a
+            // clock_skew recurring inside the guard window banners
+            // instead of looping.
+            let Some(bin) = vm_binary() else {
+                eprintln!("microvm heal: clock_skew reported but no engine binary to sync with");
+                return Ok(false);
+            };
+            let bin = bin.to_string_lossy().to_string();
+            return match run_status_command(&[&bin, "sync-clock", &name]).await {
+                Ok((true, _, _)) => {
+                    eprintln!("microvm heal: pushed host clock into VM '{name}' (cause=clock_skew)");
+                    Ok(true)
+                }
+                Ok((false, _, stderr)) => {
+                    eprintln!("microvm heal: clock sync failed for '{name}': {}", stderr.trim());
+                    Ok(false)
+                }
+                Err(e) => {
+                    eprintln!("microvm heal: clock sync failed for '{name}': {e}");
+                    Ok(false)
+                }
+            };
+        }
+        HealDecision::Proceed => {}
+    }
+
+    let result = heal_mint(&app, &name, &cluster_id, &token).await;
+
+    {
+        let mut st = heal_state().lock().unwrap();
+        let record = st.entry(name.clone()).or_default();
+        record.in_flight = false;
+        record.last_attempt = Some(std::time::Instant::now());
+        if let Ok(key_id) = &result {
+            record.last_minted_key = Some(key_id.clone());
+        }
+    }
+    match result {
+        Ok(key_id) => {
+            eprintln!("microvm heal minted fresh credentials for '{name}' ({key_id})");
+            Ok(true)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -3072,11 +3493,17 @@ async fn run_microvm_up(
     if let Some(m) = mount.as_deref() {
         argv.extend(["--mount", m]);
     }
-    let sidecar = app
+    let mut sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .args(argv);
+    // Prefer the bundle's repo-built guest api-server over the CLI's
+    // version-pinned release download (dev/debug builds only — release
+    // bundles carry no staged binary).
+    if let Some(bin) = bundled_api_server_binary(&app) {
+        sidecar = sidecar.env("APPLIANCE_API_SERVER_BINARY", bin.to_string_lossy().to_string());
+    }
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -4013,11 +4440,16 @@ async fn microvm_agent_start(app: AppHandle, input: AgentStartInput) -> Result<(
         args.push("--task".into());
         args.push(task.to_string());
     }
-    let sidecar = app
+    let mut sidecar = app
         .shell()
         .sidecar("appliance")
         .map_err(|e| format!("Bundled appliance CLI is unavailable: {e}"))?
         .args(args);
+    // `agent start` can boot the VM itself (ensureSandboxVm) and stage
+    // guest artifacts — same repo-built preference as run_microvm_up.
+    if let Some(bin) = bundled_api_server_binary(&app) {
+        sidecar = sidecar.env("APPLIANCE_API_SERVER_BINARY", bin.to_string_lossy().to_string());
+    }
     let (mut rx, _child) = sidecar
         .spawn()
         .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
@@ -4662,8 +5094,10 @@ fn manifest_info_from_value(
 /// Spawn the bundled `appliance` CLI sidecar with the `manifest read`
 /// subcommand. The CLI emits exactly one JSON line on stdout:
 ///
-///     {ok: true, path, manifest}                       (success)
-///     {ok: false, kind: 'runtime' | 'validation', error, path?}  (failure)
+/// ```text
+/// {ok: true, path, manifest}                       (success)
+/// {ok: false, kind: 'runtime' | 'validation', error, path?}  (failure)
+/// ```
 ///
 /// We surface the failure as a plain string so the wizard can display
 /// it next to the folder picker without any further unwrapping.
@@ -4753,214 +5187,137 @@ async fn evaluate_manifest_via_sidecar(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BuildAndImportInput {
-    /// Absolute path of the build context (the folder containing the Dockerfile).
+struct PackageAndUploadInput {
+    /// Absolute path of the app folder (manifest + source — the same
+    /// folder the wizard's folder picker returned).
     path: String,
-    /// Image tag to build with, e.g. "demo-node-container:latest".
-    image_tag: String,
-    /// Requested `--platform` (e.g. "linux/amd64"). Overridden to the
-    /// host arch for these local-cluster builds — the cluster can't run
-    /// anything else — so a cross-arch manifest value never crashloops.
+    /// One-time upload URL minted by the api-server's `POST
+    /// /api/v1/builds` (presigned S3 on cloud bases, token self-URL on
+    /// Kubernetes bases). Authorization travels in the URL, so this
+    /// command needs no api-server credentials of its own.
+    upload_url: String,
+    /// Skip Lambda zip-runtime prep for framework apps. The wizard
+    /// passes true when the target base builds container images from
+    /// source (mirrors the `lambdaPrep` decision in the CLI's
+    /// deploy-core).
     #[serde(default)]
-    platform: Option<String>,
-    /// Host-side registry URL to push to (e.g. the microVM's forwarded
-    /// in-VM registry `localhost:5052`). The image is tagged
-    /// `<registry_url>/<image_tag>` and pushed via `docker push` (with
-    /// a host-side `docker save` + `crane push` fallback). The returned
-    /// image URI references the registry path so the cluster pulls
-    /// through the mirror. Required — local image delivery is
-    /// registry-only.
-    #[serde(default)]
-    registry_url: Option<String>,
+    no_lambda_prep: bool,
 }
 
-/// Stream stdout+stderr from a child process onto the channel as
-/// `{type:"log", stream:"stdout"|"stderr", message: <line>}` events.
-async fn stream_child_to_channel(
-    program: &str,
-    args: &[String],
-    on_event: &Channel<serde_json::Value>,
-) -> Result<(), String> {
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": format!("$ {} {}", program, args.join(" ")),
-    }));
-
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", program))?;
-
-    let stdout = child.stdout.take().ok_or("stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("stderr unavailable")?;
-
-    let ch_out = on_event.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = ch_out.send(serde_json::json!({
-                "type": "log",
-                "stream": "stdout",
-                "message": line,
-            }));
-        }
-    });
-    let ch_err = on_event.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = ch_err.send(serde_json::json!({
-                "type": "log",
-                "stream": "stderr",
-                "message": line,
-            }));
-        }
-    });
-
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    if !status.success() {
-        return Err(format!("{} exited with status {}", program, status));
-    }
-    Ok(())
-}
-
-/// Build the image with docker, then push it to the cluster's
-/// host-side registry. Streams raw command output to the frontend so
-/// the wizard can show a live terminal-style log pane.
+/// Package the picked app folder as a source zip and upload it to the
+/// api-server, by driving the bundled `appliance` CLI sidecar
+/// (`appliance build --json --upload-url …`). The CLI owns packaging
+/// (resolved manifest + project tree, .dockerignore honored), so the
+/// wizard ships byte-identical artifacts to a terminal `appliance
+/// deploy`; the upload itself is a raw PUT because the URL carries a
+/// one-time token / S3 presignature. NDJSON progress is forwarded to
+/// the frontend channel; the final `result` line resolves the call.
 ///
-/// Returns the registry-qualified image reference
-/// (`<registry_url>/<image_tag>`) the cluster pulls through its mirror,
-/// which the caller (the deploy wizard) hands straight to api-server's
-/// build resolver. Local image delivery is registry-only.
+/// APPLIANCE_TRUST_MANIFEST=1: programmatic (.ts/.js) manifests
+/// normally require an interactive trust prompt. In the wizard the
+/// user explicitly picked this folder in a native dialog and clicked
+/// Deploy after reviewing the evaluated manifest — that is the trust
+/// gesture, and the sidecar has no TTY to re-ask on.
 #[tauri::command]
-async fn build_and_import_image(
-    input: BuildAndImportInput,
+async fn package_and_upload_build(
+    app: AppHandle,
+    input: PackageAndUploadInput,
     on_event: Channel<serde_json::Value>,
-) -> Result<String, String> {
-    // Local image delivery is registry-only now that bare k3d (and its
-    // `k3d image import` path) is gone. The deploy wizard resolves the
-    // registry from the cluster's /cluster-info before calling here.
-    let registry_url = input.registry_url.as_deref().ok_or(
-        "no registry configured for this cluster — local image delivery is registry-only \
-         (run \"appliance vm up\" to reconcile the in-VM registry)",
-    )?;
-    // Tag the build with the registry-qualified ref up front so the
-    // single `docker build` produces an image already named the way
-    // we'll push it. Avoids a separate `docker tag` step.
-    let pushable = format!("{}/{}", registry_url, input.image_tag);
-
-    // This command only ever targets a local cluster, which runs this
-    // machine's architecture and can't emulate (the microVM has no
-    // binfmt). Build for the host arch regardless of any requested
-    // platform — a cross-arch image would just crashloop with `exec
-    // format error` after an opaque rollout timeout.
-    let host_platform = format!(
-        "linux/{}",
-        if std::env::consts::ARCH == "aarch64" {
-            "arm64"
-        } else {
-            "amd64"
-        }
-    );
-    if let Some(p) = input.platform.as_deref() {
-        if p != host_platform.as_str() {
-            let _ = on_event.send(serde_json::json!({
-                "type": "log",
-                "stream": "meta",
-                "message": format!(
-                    "requested platform {p} can't run on this local cluster ({host_platform}) — building {host_platform} instead"
-                ),
-            }));
-        }
+) -> Result<serde_json::Value, String> {
+    let dir = PathBuf::from(&input.path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
     }
-    let build_args: Vec<String> = vec![
+
+    let mut args: Vec<String> = vec![
         "build".into(),
-        "-t".into(),
-        pushable.clone(),
-        "--platform".into(),
-        host_platform,
-        input.path.clone(),
+        "--json".into(),
+        "--upload-url".into(),
+        input.upload_url.clone(),
     ];
-    stream_child_to_channel("docker", &build_args, &on_event).await?;
-
-    // Push, then return the registry-qualified reference so the cluster
-    // pulls through its mirror. A plain `docker push` executes inside
-    // the docker provider's VM (colima/Docker Desktop), where
-    // host-loopback registries (the microVM's forwarded 5052) don't
-    // exist — fall back to a host-side `docker save` + `crane push` in
-    // that case, exactly like the CLI deploy pipeline.
-    let push_args: Vec<String> = vec!["push".into(), pushable.clone()];
-    if stream_child_to_channel("docker", &push_args, &on_event)
-        .await
-        .is_ok()
-    {
-        return Ok(pushable);
+    if input.no_lambda_prep {
+        args.push("--no-lambda-prep".into());
     }
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": "docker push failed — retrying host-side with crane",
-    }));
-    crane_push_fallback(&pushable, &on_event).await
-}
 
-/// Host-side image delivery for registries the docker daemon cannot
-/// reach: `docker save` to a temp tarball, then `crane push
-/// --insecure` from this process. Returns the digest-qualified ref so
-/// redeploys roll even under a reused tag. crane comes from the
-/// helper-managed bin dir (`appliance local install crane`) or PATH.
-async fn crane_push_fallback(
-    image_ref: &str,
-    on_event: &Channel<serde_json::Value>,
-) -> Result<String, String> {
-    let crane = helper_bin_dir()
-        .map(|d| d.join("crane"))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "crane".to_string());
+    let sidecar = app
+        .shell()
+        .sidecar("appliance")
+        .map_err(|e| {
+            format!(
+                "Bundled appliance CLI is unavailable: {e}. Rebuild with `pnpm --filter @appliance.sh/desktop build` so the CLI binary lands in src-tauri/binaries/."
+            )
+        })?
+        .args(&args)
+        .current_dir(dir)
+        .env("APPLIANCE_TRUST_MANIFEST", "1");
 
-    let tar_path = std::env::temp_dir().join(format!("appliance-image-{}.tar", std::process::id()));
-    let tar_str = tar_path.to_string_lossy().to_string();
-    let save_args: Vec<String> = vec![
-        "save".into(),
-        "-o".into(),
-        tar_str.clone(),
-        image_ref.into(),
-    ];
-    stream_child_to_channel("docker", &save_args, on_event).await?;
+    let (mut rx, _child) = sidecar
+        .spawn()
+        .map_err(|e| format!("failed to spawn appliance CLI: {e}"))?;
 
-    let result = run_status_command(&[&crane, "push", "--insecure", &tar_str, image_ref]).await;
-    let _ = std::fs::remove_file(&tar_path);
-    let (ok, stdout, stderr) = result?;
-    if !ok {
-        return Err(format!(
-            "crane push failed: {} (install crane with `appliance local install crane`)",
-            stderr.trim()
-        ));
+    let mut final_result: Option<serde_json::Value> = None;
+    let mut error: Option<String> = None;
+    let mut exit_code: Option<i32> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                let line = String::from_utf8_lossy(&bytes);
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(parsed) => match parsed.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        "result" => final_result = parsed.get("result").cloned(),
+                        "error" => {
+                            error = parsed
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        _ => {
+                            let _ = on_event.send(parsed);
+                        }
+                    },
+                    // A user `scripts.build` runs with inherited stdio,
+                    // so its output isn't NDJSON — forward it as a log
+                    // line instead of dropping it.
+                    Err(_) => {
+                        let _ = on_event.send(serde_json::json!({
+                            "type": "log",
+                            "stream": "stdout",
+                            "message": trimmed,
+                        }));
+                    }
+                }
+            }
+            CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                if !line.is_empty() {
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "log",
+                        "stream": "stderr",
+                        "message": line,
+                    }));
+                }
+            }
+            CommandEvent::Error(msg) => error = Some(msg),
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
+        }
     }
-    // crane prints the digest-qualified reference as its final line.
-    let digest_ref = stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .unwrap_or(image_ref)
-        .to_string();
-    if !digest_ref.contains("@sha256:") {
-        return Ok(image_ref.to_string());
+
+    if let Some(msg) = error {
+        return Err(msg);
     }
-    let _ = on_event.send(serde_json::json!({
-        "type": "log",
-        "stream": "meta",
-        "message": format!("pushed {digest_ref}"),
-    }));
-    Ok(digest_ref)
+    match final_result {
+        Some(result) => Ok(result),
+        None => Err(format!(
+            "appliance build exited with code {} before reporting a result",
+            exit_code.map_or_else(|| "?".to_string(), |c| c.to_string())
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -5299,11 +5656,12 @@ pub fn run() {
             local_preflight,
             start_container_runtime,
             read_appliance_manifest,
-            build_and_import_image,
+            package_and_upload_build,
             deploy_to_cloud,
             bootstrap_in_cluster_api_server,
             microvm_list,
             microvm_status,
+            microvm_heal_credentials,
             microvm_install,
             microvm_up,
             microvm_dev_up,
@@ -5499,6 +5857,276 @@ mod tests {
         assert_eq!(
             decide_seed(&cluster, Some(&no_id), None),
             SeedDecision::NothingToSeed
+        );
+    }
+
+    // ---- microVM credential self-heal (decide_heal) --------------
+
+    use std::time::Instant;
+
+    #[test]
+    fn heal_proceeds_on_first_failure() {
+        // The core case: a dead key (matches the stored one), no prior
+        // attempt — mint.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-dead"), Some("key-dead"), None),
+            HealDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn heal_proceeds_without_a_stored_key() {
+        // Empty/absent profile entry (the VM-recreate case) — nothing
+        // to compare, mint.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-dead"), None, None),
+            HealDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn heal_adopts_an_existing_rekey_instead_of_minting() {
+        // The CLI already re-minted (stored ≠ failed): sync, don't
+        // mint — even while the cooldown from our own last mint is
+        // still running.
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(Instant::now()),
+            last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("key-old"), Some("key-new"), None),
+            HealDecision::AlreadyRekeyed
+        );
+    }
+
+    #[test]
+    fn heal_skips_while_in_flight() {
+        let record = HealRecord {
+            in_flight: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("k"), Some("k"), None),
+            HealDecision::Skip("heal already in flight")
+        );
+    }
+
+    #[test]
+    fn heal_skips_during_cooldown() {
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(Instant::now()),
+            last_minted_key: None,
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(&record, Instant::now(), Some("k"), Some("k"), None),
+            HealDecision::Skip("cooldown")
+        );
+    }
+
+    #[test]
+    fn heal_refuses_when_its_own_minted_key_is_rejected() {
+        // We minted key-new and the server rejected key-new: the 401
+        // isn't credential-shaped (clock skew, digest, server bug) —
+        // don't feed the key store.
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            // Past the 60s cooldown but inside the 10min re-mint guard.
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-new"), Some("key-new"), None),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn heal_proceeds_again_after_cooldown() {
+        // A later, different dead key after the windows expire (e.g.
+        // the VM was recreated twice) heals again.
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(now - HEAL_REMINT_GUARD),
+            last_minted_key: Some("key-a".into()),
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-a"), Some("key-a"), None),
+            HealDecision::Proceed
+        );
+    }
+
+    // ---- cause-carrying servers (V3 distinguishable 401s) ---------
+
+    #[test]
+    fn heal_syncs_clock_on_clock_skew() {
+        // The server said the timestamp is out of window: push the host
+        // clock instead of minting a key that would fail the same way.
+        let record = HealRecord::default();
+        assert_eq!(
+            decide_heal(
+                &record,
+                Instant::now(),
+                Some("k"),
+                Some("k"),
+                Some("clock_skew")
+            ),
+            HealDecision::SyncClock
+        );
+    }
+
+    #[test]
+    fn clock_skew_banners_when_it_recurs_within_the_guard() {
+        // First clock_skew → sync. A second one while the guard window
+        // is still open means the sync didn't fix it (persistent skew or
+        // a broken sync path) — banner, never an infinite sync loop.
+        let now = Instant::now();
+        let first = HealRecord::default();
+        assert_eq!(
+            decide_heal(&first, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::SyncClock
+        );
+        let synced = HealRecord {
+            last_clock_sync: Some(now - Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&synced, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::Skip("clock already synced recently — skew persists")
+        );
+    }
+
+    #[test]
+    fn clock_skew_syncs_again_after_the_guard_expires() {
+        // A genuinely new skew episode (guest paused/slept again long
+        // after the last fix) heals again once the window has passed.
+        let now = Instant::now();
+        let record = HealRecord {
+            last_clock_sync: Some(now - HEAL_REMINT_GUARD),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("k"), Some("k"), Some("clock_skew")),
+            HealDecision::SyncClock
+        );
+    }
+
+    #[test]
+    fn a_prior_clock_sync_does_not_block_credential_heals() {
+        // The clock guard is cause-scoped: a mint for a dead key must
+        // proceed even seconds after a clock fix (and vice versa — the
+        // SyncClock path never sets the mint cooldown).
+        let now = Instant::now();
+        let record = HealRecord {
+            last_clock_sync: Some(now - Duration::from_secs(5)),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(&record, now, Some("key-dead"), Some("key-dead"), Some("unknown_key")),
+            HealDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn heal_refuses_non_credential_causes() {
+        let record = HealRecord::default();
+        for cause in ["digest_mismatch", "malformed_signature"] {
+            assert_eq!(
+                decide_heal(&record, Instant::now(), Some("k"), Some("k"), Some(cause)),
+                HealDecision::Skip("server says the failure is not credential-shaped")
+            );
+        }
+    }
+
+    #[test]
+    fn heal_mints_on_credential_shaped_causes() {
+        let record = HealRecord::default();
+        for cause in ["unknown_key", "signature_mismatch"] {
+            assert_eq!(
+                decide_heal(&record, Instant::now(), Some("k"), Some("k"), Some(cause)),
+                HealDecision::Proceed
+            );
+        }
+    }
+
+    #[test]
+    fn credential_shaped_cause_supersedes_the_remint_guard() {
+        // A cause-carrying server rejected OUR freshly minted key as
+        // unknown (e.g. the VM was recreated again right away): the
+        // explicit cause replaces the blunt "same key ⇒ not
+        // credential-shaped" heuristic, so we mint (cooldown permitting).
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            // Past the 60s cooldown but inside the 10min re-mint guard.
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                now,
+                Some("key-new"),
+                Some("key-new"),
+                Some("unknown_key")
+            ),
+            HealDecision::Proceed
+        );
+        // …while a cause-less 401 on the same state keeps the guard.
+        assert_eq!(
+            decide_heal(&record, now, Some("key-new"), Some("key-new"), None),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn unrecognized_causes_fall_back_to_cause_less_heuristics() {
+        // Future cause values must not break old desktops: treat them
+        // exactly like a cause-less server (guard + cooldown apply).
+        let now = Instant::now();
+        let record = HealRecord {
+            in_flight: false,
+            last_attempt: Some(now - Duration::from_secs(120)),
+            last_minted_key: Some("key-new".into()),
+            last_clock_sync: None,
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                now,
+                Some("key-new"),
+                Some("key-new"),
+                Some("some_future_cause")
+            ),
+            HealDecision::Skip("freshly minted key still rejected — not credential-shaped")
+        );
+    }
+
+    #[test]
+    fn clock_skew_still_defers_to_an_in_flight_heal() {
+        let record = HealRecord {
+            in_flight: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_heal(
+                &record,
+                Instant::now(),
+                Some("k"),
+                Some("k"),
+                Some("clock_skew")
+            ),
+            HealDecision::Skip("heal already in flight")
         );
     }
 }

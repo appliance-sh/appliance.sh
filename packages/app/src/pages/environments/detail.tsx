@@ -33,7 +33,7 @@ export function EnvironmentDetailPage() {
   const queryClient = useQueryClient();
   const host = useHost();
   const confirm = useConfirm();
-  const canRunDeployWizard = Boolean(host.local?.buildAndImportImage);
+  const canRunDeployWizard = Boolean(host.local?.packageAndUploadBuild);
   // ③ env-detail absorbs the runtime Workloads surface (move-map 4a). It
   // reads through the selected cluster's in-VM api-server, so it's only
   // meaningful when the env's cluster is a local microVM runtime this shell
@@ -138,11 +138,11 @@ export function EnvironmentDetailPage() {
   return (
     <div className="space-y-6">
       <div>
-        {/* Nested under ③ Projects — back goes to the parent project, not the
-            flat /environments list, so the area reads coherently. */}
+        {/* Nested under ③ Apps — back goes to the parent app, not a flat
+            environments list, so the area reads coherently. */}
         <Button asChild variant="ghost" size="sm" className="-ml-2">
           <Link to={`/projects/${projectId}`}>
-            <ChevronLeft className="h-4 w-4" /> {projectQuery.data?.name ?? 'Project'}
+            <ChevronLeft className="h-4 w-4" /> {projectQuery.data?.name ?? 'App'}
           </Link>
         </Button>
       </div>
@@ -272,7 +272,7 @@ export function EnvironmentDetailPage() {
             <WorkloadsPanel
               clusterId={selectedCluster.id}
               vmName={workloadsVmName}
-              scopeNote="All workloads on this runtime — across every project, not just this environment."
+              scopeNote="All workloads on the Dev Machine — across every app, not just this environment."
             />
           ) : null}
 

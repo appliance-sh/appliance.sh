@@ -5,6 +5,7 @@ import { createApplianceClient } from '@appliance.sh/sdk';
 import type { Project, Environment } from '@appliance.sh/sdk';
 import { loadCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
+import { printCliError } from './utils/errors.js';
 
 // `appliance env` — per-environment variables ("environment secrets").
 //
@@ -27,6 +28,7 @@ function client() {
   return createApplianceClient({
     baseUrl: credentials.apiUrl,
     credentials: { keyId: credentials.keyId, secret: credentials.secret },
+    product: 'cli',
   });
 }
 
@@ -81,8 +83,7 @@ program
       console.log(`${chalk.green('✓')} Set ${chalk.bold(key)} on ${projectName}/${environmentName}.`);
       console.log(chalk.dim('  Applied on the next deploy.'));
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
     }
   });
 
@@ -110,8 +111,7 @@ program
         console.log(`  ${key}`);
       }
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
     }
   });
 
@@ -133,8 +133,7 @@ program
       console.log(`${chalk.green('✓')} Removed ${chalk.bold(key)} from ${projectName}/${environmentName}.`);
       console.log(chalk.dim('  Applied on the next deploy.'));
     } catch (err) {
-      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-      process.exit(1);
+      printCliError(err);
     }
   });
 

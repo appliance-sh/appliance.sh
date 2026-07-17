@@ -47,6 +47,9 @@ export interface LocalResolvedBuild {
   /** Container port to expose. Falls back to 8080 if unset. */
   port?: number;
   environment?: Record<string, string>;
+  /** Desired pod count. When unset, a redeploy preserves the live
+   *  Deployment's scale (first deploy: 1). */
+  replicas?: number;
 }
 
 export interface LocalDeploymentResult {
@@ -254,6 +257,10 @@ export class KubernetesDeploymentService {
     const nodePort = deterministicNodePort(stackName);
     const hostname = applianceHostname(stackName, this.cluster.hostnameSuffix);
     const egress = await this.resolveEgress();
+    // No explicit replica count → keep the environment's current scale
+    // so a redeploy (or a manual `kubectl scale`) isn't silently reset
+    // to 1 by the re-rendered manifest.
+    const replicas = build.replicas ?? (await this.getDeploymentReplicas(stackName)) ?? 1;
     const manifest = renderManifest({
       name: stackName,
       namespace: this.cluster.namespace,
@@ -261,6 +268,7 @@ export class KubernetesDeploymentService {
       port: build.port ?? 8080,
       nodePort,
       env: build.environment ?? {},
+      replicas,
       metadata,
       hostname,
       ingressClassName: this.cluster.ingressClassName,
@@ -270,12 +278,24 @@ export class KubernetesDeploymentService {
     const before = await this.getDeploymentImage(stackName);
     const objects = k8s.loadAllYaml(manifest) as k8s.KubernetesObject[];
     for (const obj of objects) {
-      await this.applyObject(obj);
+      try {
+        await this.applyObject(obj);
+      } catch (err) {
+        // The deterministic NodePort pin can collide with a port the
+        // cluster already allocated — two stack names can hash to the
+        // same value. Mirror the docker backend's fallback: drop the
+        // pin and let the cluster pick a free port; the read-back
+        // below reports whatever it chose.
+        if (obj.kind !== 'Service' || !isNodePortCollision(err)) throw err;
+        const ports = ((obj as k8s.V1Service).spec?.ports ?? []) as Array<{ nodePort?: number }>;
+        for (const p of ports) delete p.nodePort;
+        await this.applyObject(obj);
+      }
     }
     await this.waitForRollout(stackName);
-    // Read back the live NodePort — if k8s accepted our pinned value
-    // it'll match `nodePort`; if not (e.g. collision), it picks one
-    // and we report whatever the cluster recorded.
+    // Read back the live NodePort — when the pin survived it matches
+    // `nodePort`; after a collision fallback the cluster picked one
+    // and we report whatever it recorded.
     const liveNodePort = (await this.getServiceNodePort(stackName)) ?? nodePort;
 
     // Primary URL goes through the cluster's Ingress (Traefik), so it
@@ -402,6 +422,19 @@ export class KubernetesDeploymentService {
     try {
       const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
       return dep.spec?.template?.spec?.containers?.[0]?.image ?? undefined;
+    } catch (err) {
+      if (isNotFoundError(err)) return undefined;
+      throw err;
+    }
+  }
+
+  /** The live Deployment's desired replica count, or undefined when the
+   *  stack has never been deployed. Lets a deploy without an explicit
+   *  `replicas` preserve the current scale instead of resetting it. */
+  async getDeploymentReplicas(stackName: string): Promise<number | undefined> {
+    try {
+      const dep = await this.apps.readNamespacedDeployment({ name: stackName, namespace: this.cluster.namespace });
+      return dep.spec?.replicas ?? undefined;
     } catch (err) {
       if (isNotFoundError(err)) return undefined;
       throw err;
@@ -648,19 +681,23 @@ export const LocalContainerDeploymentService = KubernetesDeploymentService;
 export type LocalContainerDeploymentService = KubernetesDeploymentService;
 
 /**
- * Build a KubeConfig from the base config. Four supported modes,
+ * Build a KubeConfig from the base config. Five supported modes,
  * in priority order:
  *   1. `appliance-base-kubernetes` with inline `kubeconfig` — parsed
  *      verbatim. Covers BYO clusters where the operator already has
  *      a working kubeconfig.
- *   2. `appliance-base-kubernetes` with `server` + `token` — built
+ *   2. `appliance-base-kubernetes` with `kubeconfigPath` — read from
+ *      disk lazily at deploy time. The guest api-server binary points
+ *      this at its local k3s (`/etc/rancher/k3s/k3s.yaml`), which may
+ *      not exist yet when the server process starts.
+ *   3. `appliance-base-kubernetes` with `server` + `token` — built
  *      programmatically. The common path for in-cluster API tokens
  *      and ServiceAccount-issued credentials supplied out of band.
- *   3. `appliance-base-kubernetes` with none of the above — falls
+ *   4. `appliance-base-kubernetes` with none of the above — falls
  *      back to `loadFromCluster()`, which reads the pod's mounted
  *      ServiceAccount token + CA. The expected path when api-server
  *      itself runs inside the cluster it manages.
- *   4. `appliance-base-local` — loads the host's default kubeconfig
+ *   5. `appliance-base-local` — loads the host's default kubeconfig
  *      (preserves prior behaviour for k3d-on-laptop dev).
  */
 function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
@@ -672,6 +709,10 @@ function createKubeConfig(baseConfig: ApplianceBaseConfig): k8s.KubeConfig {
     }
     if (cfg.kubeconfig) {
       kc.loadFromString(cfg.kubeconfig);
+      return kc;
+    }
+    if (cfg.kubeconfigPath) {
+      kc.loadFromFile(cfg.kubeconfigPath);
       return kc;
     }
     if (cfg.server && cfg.token) {
@@ -763,6 +804,16 @@ function isNotFoundError(err: unknown): boolean {
     return /not\s*found/i.test(e.message) || /Error from server \(NotFound\)/i.test(e.message);
   }
   return false;
+}
+
+/** True when the apiserver rejected a Service because its pinned
+ *  `nodePort` is already taken. The 422's message is stable across
+ *  k8s versions: `provided port is already allocated`. */
+export function isNodePortCollision(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { message?: string; body?: unknown };
+  const text = `${e.message ?? ''} ${typeof e.body === 'string' ? e.body : JSON.stringify(e.body ?? '')}`;
+  return /provided port is already allocated/i.test(text);
 }
 
 /**
@@ -926,6 +977,8 @@ export interface ManifestParams {
    *  deterministically per stack via deterministicNodePort(). */
   nodePort?: number;
   env: Record<string, string>;
+  /** Desired pod count. Defaults to 1 when omitted. */
+  replicas?: number;
   metadata: LocalDeploymentMetadata;
   /** Public hostname Traefik routes to this appliance via the
    *  generated Ingress. Typically `<stackName>.appliance.localhost`. */
@@ -1005,6 +1058,7 @@ export function deterministicNodePort(stackName: string): number {
 
 export function renderManifest(params: ManifestParams): string {
   const { name, namespace, image, port, nodePort, metadata, hostname, ingressClassName, egress } = params;
+  const replicas = params.replicas ?? 1;
   // Egress confinement overlays proxy/CA vars on the user env (egress
   // wins) and, when intercepting, mounts the CA the proxy signs with.
   const env: Record<string, string> = egress ? { ...params.env, ...egressEnv(egress) } : params.env;
@@ -1045,7 +1099,7 @@ metadata:
     appliance.sh/project-id: ${yamlString(metadata.projectId)}
     appliance.sh/environment-id: ${yamlString(metadata.environmentId)}
 spec:
-  replicas: 1
+  replicas: ${replicas}
   selector:
     matchLabels:
       app.kubernetes.io/name: ${yamlString(name)}

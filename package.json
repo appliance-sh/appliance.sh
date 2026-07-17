@@ -1,6 +1,6 @@
 {
   "name": "appliance.sh",
-  "version": "1.50.0",
+  "version": "1.51.2",
   "description": "Appliance is a platform to install and run applications on the cloud",
   "homepage": "https://github.com/appliance-sh/appliance.sh#readme",
   "bugs": {
@@ -18,7 +18,7 @@
       "prettier --write --ignore-unknown"
     ]
   },
-  "packageManager": "pnpm@10.28.2",
+  "packageManager": "pnpm@10.34.4+sha512.8768be55200ae3f2226b6527fcca2687e14bc4e5f12d7721a0f25da3df47915177058648db4177baf348120fa0ba2752d8d8d93f6beaf1fe64ae18da8de961af",
   "engines": {
     "node": ">=24.14.1 <25"
   },

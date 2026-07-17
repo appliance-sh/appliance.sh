@@ -1,13 +1,22 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
-import { applianceBaseConfig, applianceInput, BuildType, isKubernetesBase } from '@appliance.sh/sdk';
-import type { ApplianceBaseConfig, ApplianceFrameworkApp } from '@appliance.sh/sdk';
+import { applianceBaseConfig, BuildType, isKubernetesBase } from '@appliance.sh/sdk';
+import type { ApplianceBaseConfig, ApplianceContainer, ApplianceFrameworkApp } from '@appliance.sh/sdk';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { buildUploadService } from './build-upload.service';
 import { scopePath } from './tenant-context';
+import { assertSupportedBase } from './deployment-backend';
+import {
+  buildImageWithBuildKit,
+  ensureDockerfile,
+  extractZipSafely,
+  readBuildManifest,
+  resolveKubernetesUpload,
+} from './image-build.service';
+import { logger } from '../logger';
 
 export interface ResolvedBuild {
   imageUri?: string;
@@ -50,6 +59,11 @@ const LAMBDA_ADAPTER_LAYER: Record<string, string> = {
   'linux/arm64': 'arn:aws:lambda:${region}:753240598075:layer:LambdaAdapterLayerArm64:26',
 };
 
+// AWS-specific: the Lambda Web Adapter image whose extension gets
+// grafted onto container builds targeting Lambda. Lives here — in the
+// cloud resolver — so generic packaging carries no AWS coupling.
+const LWA_IMAGE = 'public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1';
+
 const FRAMEWORK_RUNTIMES: Record<string, string> = {
   node: 'nodejs22.x',
   python: 'python3.13',
@@ -65,22 +79,38 @@ const FRAMEWORK_ARCHITECTURES: Record<string, string> = {
 export class BuildService {
   async resolve(buildId: string, tag: string): Promise<ResolvedBuild> {
     const config = getBaseConfig();
+    // The single base fork (deployment-backend.ts) rejects the
+    // removed docker base with migration guidance.
+    assertSupportedBase(config);
 
-    // Kubernetes-base shortcut (local microVM + generic k8s): only
-    // `remote-image` builds are supported (uploads have no S3 path).
-    // Pass the stored source through as imageUri verbatim — the
-    // KubernetesDeploymentService consumes the image reference
-    // directly (image delivery is registry-only).
+    // Kubernetes bases (the microVM local runtime and generic k8s
+    // clusters): remote-image builds pass through verbatim, and
+    // upload builds are built server-side — extract source, generate
+    // a Dockerfile if needed, build with the base's buildkitd, push
+    // to the base's registry. The same mechanism as the cloud path:
+    // the CLI uploads source, the server produces the image.
     if (isKubernetesBase(config)) {
       const stored = await buildUploadService.get(buildId);
       if (!stored) throw new Error(`Build not found: ${buildId}`);
-      if (stored.type !== BuildType.RemoteImage) {
-        throw new Error(`${config.type} bases only support remote-image builds`);
+      if (stored.type === BuildType.RemoteImage) {
+        // The declared port rides on the build record (remote images
+        // have no manifest to read it from) and becomes the Service
+        // target port.
+        return { imageUri: stored.source, localPort: stored.port };
       }
-      // The declared port rides on the build record (remote images
-      // have no manifest to read it from) and becomes the Service
-      // target port.
-      return { imageUri: stored.source, localPort: stored.port };
+      const k8s = config.kubernetes;
+      if (!k8s?.registry?.url || !k8s.buildkit?.addr) {
+        throw new Error(
+          'This base cannot build uploads server-side (kubernetes.registry + kubernetes.buildkit required). ' +
+            'Use a remote-image build referencing a container image.'
+        );
+      }
+      return resolveKubernetesUpload({
+        buildId,
+        dataDir: k8s.dataDir,
+        registry: k8s.registry,
+        buildkitAddr: k8s.buildkit.addr,
+      });
     }
 
     if (!config.aws?.dataBucketName) throw new Error('Data bucket not configured');
@@ -114,30 +144,8 @@ export class BuildService {
     fs.writeFileSync(zipPath, body);
 
     try {
-      // List zip contents and validate paths before extracting
-      // Validate zip contents before extracting
-      const entries = execFileSync('zipinfo', ['-1', zipPath], { encoding: 'utf-8' }).trim().split('\n');
-      for (const entryPath of entries) {
-        const resolved = path.resolve(tmpDir, entryPath);
-        if (!resolved.startsWith(tmpDir + path.sep) && resolved !== tmpDir) {
-          throw new Error(`Zip contains path traversal: ${entryPath}`);
-        }
-      }
-
-      execFileSync('unzip', ['-o', '-q', zipPath, '-d', tmpDir], { stdio: 'pipe' });
-
-      // Reject symlinks after extraction
-      for (const entryPath of entries) {
-        const fullPath = path.join(tmpDir, entryPath);
-        if (fs.existsSync(fullPath) && fs.lstatSync(fullPath).isSymbolicLink()) {
-          throw new Error(`Zip contains symlink: ${entryPath}`);
-        }
-      }
-
-      // Read the manifest
-      const manifestPath = path.join(tmpDir, 'appliance.json');
-      if (!fs.existsSync(manifestPath)) throw new Error('Build missing appliance.json');
-      const manifest = applianceInput.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf-8')));
+      extractZipSafely(zipPath, tmpDir);
+      const manifest = readBuildManifest(tmpDir);
 
       // The build artifact is environment-invariant: per-environment
       // runtime config (env, memory, timeout, storage) is stripped at
@@ -145,7 +153,7 @@ export class BuildService {
       // manifest, then forwarded on the deploy payload. Anything in
       // appliance.json beyond the build-time schema is ignored here.
       return manifest.type === 'container'
-        ? await this.resolveContainer(tmpDir, tag, config)
+        ? await this.resolveContainer(manifest, tmpDir, tag, config)
         : manifest.type === 'framework'
           ? this.resolveFramework(manifest, s3Key, config)
           : { codeS3Key: s3Key };
@@ -191,12 +199,21 @@ export class BuildService {
   }
 
   /**
-   * Container builds are fully pre-processed by the CLI (Lambda Web Adapter
-   * already injected). The server pushes the image tar directly to ECR using
-   * crane (no Docker daemon required).
-   * All subprocess calls use execFileSync (array args) to prevent shell injection.
+   * Container builds on the cloud base. Two artifact generations:
+   *
+   *   - Source zips (current CLI): the zip carries the Dockerfile +
+   *     source. Built server-side with the base's BuildKit instance
+   *     (`aws.buildkit.addr`) in two steps — the app image, then a
+   *     thin wrapper grafting the Lambda Web Adapter extension on top
+   *     — and pushed to ECR. Same mechanism as the Kubernetes bases.
+   *
+   *   - Legacy image.tar zips (older CLIs, docker-built host-side with
+   *     the LWA already injected): pushed to ECR verbatim with crane.
+   *
+   * All subprocess calls use array args to prevent shell injection.
    */
   private async resolveContainer(
+    manifest: ApplianceContainer,
     tmpDir: string,
     tag: string,
     config: ReturnType<typeof getBaseConfig>
@@ -206,29 +223,102 @@ export class BuildService {
     const ecrRepositoryUrl = aws.ecrRepositoryUrl;
     if (!ecrRepositoryUrl) throw new Error('ECR repository not configured');
 
+    const registryHost = ecrRepositoryUrl.split('/')[0];
+    const { username, password } = await this.getEcrAuth(aws.region);
+
     const imageTarPath = path.join(tmpDir, 'image.tar');
-    if (!fs.existsSync(imageTarPath)) {
-      const extracted = fs.readdirSync(tmpDir);
-      throw new Error(`Build missing image.tar. Extracted contents: ${extracted.join(', ')}`);
+    if (fs.existsSync(imageTarPath)) {
+      return this.pushLegacyImageTar(imageTarPath, ecrRepositoryUrl, tag, registryHost, username, password);
     }
 
-    // Auth with ECR via crane
-    const ecr = new ECRClient({ region: aws.region });
+    const buildkitAddr = aws.buildkit?.addr;
+    if (!buildkitAddr) {
+      throw new Error(
+        'Container builds need a builder, and this base has none configured (aws.buildkit.addr). ' +
+          'Deploy a pre-built image with --image-uri instead.'
+      );
+    }
+
+    // buildctl authenticates to registries via the docker config file —
+    // write a scoped one from the ECR token and point DOCKER_CONFIG at it.
+    const dockerConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'appliance-ecr-auth-'));
+    try {
+      fs.writeFileSync(
+        path.join(dockerConfigDir, 'config.json'),
+        JSON.stringify({
+          auths: { [registryHost]: { auth: Buffer.from(`${username}:${password}`).toString('base64') } },
+        })
+      );
+      const env = { DOCKER_CONFIG: dockerConfigDir };
+
+      // Step 1: the app image, exactly as the user's Dockerfile builds it.
+      ensureDockerfile(tmpDir, manifest);
+      const baseRef = await buildImageWithBuildKit({
+        contextDir: tmpDir,
+        ref: `${ecrRepositoryUrl}:${tag}-base`,
+        addr: buildkitAddr,
+        platform: manifest.platform,
+        env,
+      });
+      logger.info('container app image built', { tag, baseRef });
+
+      // Step 2: graft the Lambda Web Adapter extension on top so the
+      // container runs behind Lambda's Function URL / API Gateway.
+      const wrapDir = fs.mkdtempSync(path.join(os.tmpdir(), 'appliance-lwa-wrap-'));
+      try {
+        fs.writeFileSync(
+          path.join(wrapDir, 'Dockerfile'),
+          [
+            `FROM ${LWA_IMAGE} AS adapter`,
+            `FROM ${baseRef}`,
+            'COPY --from=adapter /lambda-adapter /opt/extensions/lambda-adapter',
+            `ENV AWS_LWA_PORT=${manifest.port}`,
+            '',
+          ].join('\n')
+        );
+        const imageUri = await buildImageWithBuildKit({
+          contextDir: wrapDir,
+          ref: `${ecrRepositoryUrl}:${tag}`,
+          addr: buildkitAddr,
+          platform: manifest.platform,
+          env,
+        });
+        logger.info('container image built', { tag, imageUri });
+        return { imageUri };
+      } finally {
+        fs.rmSync(wrapDir, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(dockerConfigDir, { recursive: true, force: true });
+    }
+  }
+
+  private async getEcrAuth(region: string): Promise<{ username: string; password: string }> {
+    const ecr = new ECRClient({ region });
     const authResult = await ecr.send(new GetAuthorizationTokenCommand({}));
     const authData = authResult.authorizationData?.[0];
     if (!authData?.authorizationToken || !authData?.proxyEndpoint) {
       throw new Error('Failed to get ECR auth');
     }
-
     const decoded = Buffer.from(authData.authorizationToken, 'base64').toString();
     const [username, password] = decoded.split(':');
-    const registryHost = authData.proxyEndpoint.replace(/^https?:\/\//, '');
+    return { username, password };
+  }
+
+  /** Legacy path: push a CLI-produced image.tar to ECR with crane. */
+  private pushLegacyImageTar(
+    imageTarPath: string,
+    ecrRepositoryUrl: string,
+    tag: string,
+    registryHost: string,
+    username: string,
+    password: string
+  ): ResolvedBuild {
     execFileSync('crane', ['auth', 'login', registryHost, '-u', username, '--password-stdin'], {
       input: password,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Push image tar directly to ECR (no daemon, no load/tag step)
     const remoteTag = `${ecrRepositoryUrl}:${tag}`;
     execFileSync('crane', ['push', imageTarPath, remoteTag], { stdio: 'pipe' });
 

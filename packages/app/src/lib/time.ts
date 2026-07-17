@@ -28,6 +28,22 @@ export function relativeAge(iso?: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+/** Forward-looking counterpart of relativeTime — "in 3h" / "in 6d" for
+ *  a future ISO timestamp (invite expiry). Past timestamps read "now". */
+export function relativeUntil(iso: string | undefined): string {
+  if (!iso) return '—';
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return iso;
+  const diffSec = Math.round((then - Date.now()) / 1000);
+  if (diffSec <= 0) return 'now';
+  if (diffSec < 60) return `in ${diffSec}s`;
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60) return `in ${diffMin}m`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `in ${diffHr}h`;
+  return `in ${Math.round(diffHr / 24)}d`;
+}
+
 export function durationMs(start: string | undefined, end: string | undefined): string | null {
   if (!start || !end) return null;
   const a = new Date(start).getTime();

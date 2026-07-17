@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/infra",
-  "version": "1.50.0",
+  "version": "1.51.2",
   "private": true,
   "description": "Deploy the Appliance Infrastructure",
   "repository": {
@@ -27,6 +27,7 @@
     "clean": "rm -rf ./dist/",
     "deploy:entrypoint": "ts-node src/index.ts",
     "deploy": "pnpm run clean && pulumi up && pnpm run build",
+    "destroy": "pnpm run clean && pulumi down",
     "dev:setup": "echo 'pnpm workspaces handle linking automatically'"
   },
   "dependencies": {

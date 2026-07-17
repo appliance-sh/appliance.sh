@@ -118,7 +118,7 @@ export function DeploymentDetailPage() {
             <Row label="Status" value={d.status} />
             <Row label="Action" value={d.action} />
             <Row
-              label="Project"
+              label="App"
               value={
                 projectQuery.data ? (
                   <Link to={`/projects/${d.projectId}`} className="underline-offset-2 hover:underline">
@@ -134,7 +134,7 @@ export function DeploymentDetailPage() {
               value={
                 environmentQuery.data ? (
                   <Link
-                    to={`/environments/${d.projectId}/${d.environmentId}`}
+                    to={`/projects/${d.projectId}/environments/${d.environmentId}`}
                     className="underline-offset-2 hover:underline"
                   >
                     {environmentQuery.data.name}

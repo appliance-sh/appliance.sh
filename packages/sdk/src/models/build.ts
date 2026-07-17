@@ -60,12 +60,22 @@ export const build = z.object({
   /**
    * For `remote-image` builds: the caller-provided URL/URI, stored
    * verbatim and passed through to Lambda's imageUri at deploy time.
-   * For `upload` builds: the internal S3 key (`builds/<id>.zip`)
-   * the zip is expected at.
+   * For `upload` builds: the internal storage key (`builds/<id>.zip`)
+   * the zip is expected at — an S3 key on cloud bases, a path under
+   * the base's `dataDir` on Kubernetes bases.
    */
   source: z.string(),
   /** Declared container port — remote-image builds only. */
   port: z.number().int().min(1).max(65535).optional(),
+  /**
+   * One-time secret authorizing `PUT /api/v1/builds/:id/content`.
+   * Present only on upload builds created against bases that receive
+   * content directly (Kubernetes bases — cloud bases use presigned S3
+   * URLs instead). Cleared when the upload lands.
+   */
+  uploadToken: z.string().optional(),
+  /** Set when direct-upload content has been received. */
+  uploadedAt: z.string().optional(),
   createdAt: z.string(),
 });
 

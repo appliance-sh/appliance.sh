@@ -1,4 +1,4 @@
-import { applianceBaseConfig, getKubernetesParams, type ObjectStore } from '@appliance.sh/sdk';
+import { applianceBaseConfig, getDockerParams, getKubernetesParams, type ObjectStore } from '@appliance.sh/sdk';
 import { S3ObjectStore } from './s3-object-store';
 import { FilesystemObjectStore } from './filesystem-object-store';
 import { scopePath } from './tenant-context';
@@ -88,14 +88,17 @@ function createStorageService(): StorageService {
   const config = applianceBaseConfig.parse(JSON.parse(baseConfigJson));
 
   // Kubernetes-driven bases (local microVM + generic external clusters)
-  // both back state with a filesystem-mounted dataDir. The cloud
-  // (AWS) path falls through to S3 below.
+  // and Docker bases (the single-binary local daemon) all back state
+  // with a filesystem dataDir. The cloud (AWS) path falls through to
+  // S3 below.
   const k8s = getKubernetesParams(config);
-  if (k8s) {
-    if (!k8s.dataDir) {
+  const docker = getDockerParams(config);
+  const dataDir = k8s?.dataDir ?? docker?.dataDir;
+  if (k8s || docker) {
+    if (!dataDir) {
       throw new Error(`dataDir is required in APPLIANCE_BASE_CONFIG for ${config.type} bases`);
     }
-    return new StorageService(new FilesystemObjectStore(k8s.dataDir));
+    return new StorageService(new FilesystemObjectStore(dataDir));
   }
 
   if (!config.aws?.dataBucketName) {

@@ -1,9 +1,11 @@
 import { Command } from 'commander';
 import { input, select, password } from '@inquirer/prompts';
 import { createApplianceClient } from '@appliance.sh/sdk';
+import { apiServerUrlForHostPort } from '@appliance.sh/helper';
 import { saveCredentials } from './utils/credentials.js';
 import { attachProfileOption } from './utils/profile-flag.js';
 import { DEFAULT_PROFILE_NAME } from './utils/profile-store.js';
+import { readVmPorts } from './utils/microvm-up.js';
 import chalk from 'chalk';
 
 const program = new Command();
@@ -13,12 +15,17 @@ attachProfileOption(program);
 program.action(async () => {
   const opts = program.opts<{ profile?: string }>();
   const profileName = opts.profile ?? process.env.APPLIANCE_PROFILE ?? DEFAULT_PROFILE_NAME;
+  console.log(
+    chalk.dim('For local development you don’t need to log in — `appliance init` sets everything up automatically.')
+  );
   const apiUrl = await input({
     message: 'API URL:',
-    default: 'http://localhost:3000',
+    // Default to where the local runtime's api-server actually answers
+    // (the in-VM ingress route), read from the default VM's spec.
+    default: apiServerUrlForHostPort(readVmPorts().hostPort),
   });
 
-  const client = createApplianceClient({ baseUrl: apiUrl });
+  const client = createApplianceClient({ baseUrl: apiUrl, product: 'cli' });
 
   const method = await select({
     message: 'Authentication method:',
@@ -72,6 +79,7 @@ program.action(async () => {
   const verifyClient = createApplianceClient({
     baseUrl: apiUrl,
     credentials: { keyId, secret },
+    product: 'cli',
   });
 
   const testResult = await verifyClient.listProjects();

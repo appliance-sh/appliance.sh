@@ -85,7 +85,7 @@ export function WorkloadsPanel({
         {!isActive ? (
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-[var(--color-muted-foreground)]">
-              Select this microVM as the active cluster to read its workloads through the api-server.
+              Switch to this Dev Machine to read its workloads through the api-server.
             </p>
             <Button
               variant="outline"
@@ -95,7 +95,7 @@ export function WorkloadsPanel({
                 queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
               }}
             >
-              Select cluster
+              Switch
             </Button>
           </div>
         ) : workloadsQuery.isLoading ? (
@@ -104,7 +104,7 @@ export function WorkloadsPanel({
           <p className="text-xs text-red-300">{(workloadsQuery.error as Error).message}</p>
         ) : empty ? (
           <p className="text-xs text-[var(--color-muted-foreground)]">
-            No workloads yet. Deploy an appliance via Projects → Deployments to see it here.
+            No workloads yet. Deploy an app (Apps → Deploy your first app) to see it here.
           </p>
         ) : data ? (
           <div className="space-y-5">

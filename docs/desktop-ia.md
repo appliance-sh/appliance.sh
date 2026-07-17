@@ -1,5 +1,12 @@
 # Desktop information architecture — target IA, move-map, staging
 
+> **Status note (the IA has moved on).** The navigation has since evolved past
+> this plan: the current nav is **Apps / Agents / Machine / Cloud / Settings**,
+> with a **"Dev Machine"** vocabulary for the single managed microVM (a
+> parallel change is in flight in `packages/app`). The plan below is kept as
+> the historical blueprint — read its ①–⑤ areas and naming table as the
+> stepping stone to that IA, not the current state.
+
 Status: **plan** (no feature code). This is the blueprint phases **I1–I5** build to.
 Scope: the Appliance **desktop app** (`packages/app`, the shared `Console`). The same
 bundle is the web PWA, so every surface below is **host-capability gated** — the web

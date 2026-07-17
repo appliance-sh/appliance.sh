@@ -71,6 +71,11 @@ export const applianceRuntimeConfig = z.object({
   // the backend maps it to the target's equivalent (AWS: Lambda
   // ephemeralStorage).
   storage: z.number().int().min(512).max(10240).optional(),
+  // Pod count on Kubernetes bases (microVM local runtime + BYO
+  // clusters). Ignored on Lambda bases, where scaling is ambient
+  // concurrency. Omitted → redeploys keep the environment's current
+  // scale (first deploy: 1).
+  replicas: z.number().int().min(1).max(100).optional(),
   // Runtime environment variables. Merged with deploy-time
   // overrides; the deploy call wins on conflict.
   env: z.record(z.string(), z.string()).optional(),

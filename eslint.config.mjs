@@ -31,6 +31,7 @@ export default defineConfig([
     // too (e.g. packages/desktop/sidecar/dist/), which the previous
     // `packages/*/dist/**/*` glob missed by being one level too shallow.
     '**/dist/**',
+    '**/examples/**',
     // Rust build artifacts under src-tauri/target/ include generated
     // .js shims (e.g. __global-api-script.js) that eslint can't parse.
     '**/target/**',

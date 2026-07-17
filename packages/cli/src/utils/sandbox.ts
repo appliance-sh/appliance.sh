@@ -5,18 +5,23 @@ import { spawnSync } from 'node:child_process';
 import chalk from 'chalk';
 
 // Shared plumbing for the `appliance up`/`down`/`logs`/`status` sandbox
-// commands (docs/up.md). These drive the in-guest Docker engine inside a
-// single shared sandbox microVM, building + running a project's own
-// container definition from the host workspace shared over VirtioFS.
+// commands (docs/up.md). These drive the in-guest Docker engine inside
+// the ONE managed microVM, building + running a project's own container
+// definition from the host workspace shared over VirtioFS.
 //
 // The binary resolution + run helpers deliberately mirror
 // `appliance-vm.ts` (the microVM engine driver) so both surfaces resolve
 // the same `appliance-vm` Rust binary the same way.
 
-/** The shared default sandbox VM all `appliance up` projects coexist in
- *  (docs/up.md §3). A dedicated name (not the api-server `appliance` VM)
- *  keeps the sandbox dockerd separate from the deploy/k3s runtime. */
-export const DEFAULT_SANDBOX_VM = 'appliance-sbx';
+/** The single managed VM everything shares: the deploy runtime (k3s +
+ *  registry + buildkitd + the guest api-server) AND the dev/agent
+ *  sandbox sessions. One thing to boot, one lifecycle, one mental
+ *  model — `up`, `agent`, and `dev` all land in the same machine. */
+export const DEFAULT_SANDBOX_VM = 'appliance';
+
+/** The retired dedicated sandbox VM's name — used only to hint at
+ *  reclaiming its disk after the merge. */
+export const RETIRED_SANDBOX_VM = 'appliance-sbx';
 
 /** Guest path the host workspace is shared at (set by `--mount`). */
 const GUEST_WORKSPACE = '/persist/workspace';
@@ -492,11 +497,10 @@ export interface EnsureSandboxOpts {
 }
 
 /**
- * Ensure the shared sandbox VM is up with the project workspace mounted,
- * then wait for the in-guest agent runtime (vsock shell + Node). The
- * sandbox is ALWAYS agent-only — it never runs k3s — so `up` returns as
- * soon as the runtime is ready instead of blocking on a k3s election the
- * sandbox never uses (docs/fast-spin-up.md §1).
+ * Ensure the ONE managed VM is up as a dev environment with the project
+ * workspace mounted, then wait for the in-guest agent runtime (shell +
+ * Node). The same VM carries the deploy runtime (k3s + guest api-server),
+ * so `up`/`agent` and `dev` share a single machine and lifecycle.
  *
  * The mount (and docker provisioning) apply on the next boot, so if the
  * VM is already running with a different mount — or `--docker` is newly
@@ -513,6 +517,15 @@ export async function ensureSandboxVm(vm: string, projectDir: string, opts: Ensu
   const currentMount = spec?.devMount ? path.resolve(spec.devMount) : null;
   const currentDocker = spec?.docker ?? false;
 
+  hintRetiredSandboxVm();
+
+  // Stage the api-server guest artifacts BEFORE any boot: the merged VM
+  // carries the control plane, and provisioning only reads the staged
+  // assets at boot — a VM booted without them would make a later
+  // `appliance dev` wait on an api-server that never comes up.
+  const { ensureApiServerArtifacts } = await import('./api-server-artifact.js');
+  await ensureApiServerArtifacts();
+
   // A running VM only picks up a new mount — or newly-requested docker —
   // on its next boot. Restart it when the share points elsewhere, or when
   // --docker is newly requested (the lazy re-up), so the change takes
@@ -521,26 +534,39 @@ export async function ensureSandboxVm(vm: string, projectDir: string, opts: Ensu
   const needsDocker = running && docker && !currentDocker;
   if (needsRemount || needsDocker) {
     const why = needsRemount ? `mounted elsewhere (${currentMount ?? 'none'})` : 'docker newly requested (--docker)';
-    console.log(chalk.yellow(`» sandbox VM '${vm}' ${why}; restarting to apply`));
+    console.log(chalk.yellow(`» VM '${vm}' ${why}; restarting to apply`));
     const stop = runVm(['stop', vm]);
-    if (stop !== 0) throw new Error(`failed to stop sandbox VM '${vm}' to apply the change`);
+    if (stop !== 0) throw new Error(`failed to stop VM '${vm}' to apply the change`);
   }
 
-  const upArgs = ['up', vm, '--agent-only', '--mount', desiredMount];
+  // `--dev` provisions the dev toolchain + workspace on the SAME VM the
+  // deploy runtime lives in (persisted one-way by the engine).
+  const upArgs = ['up', vm, '--dev', '--mount', desiredMount];
   if (docker) upArgs.push('--docker');
   console.log(
-    chalk.cyan(
-      `» bringing up agent sandbox VM '${vm}' (${desiredMount} → ${GUEST_WORKSPACE}${docker ? ' + docker' : ''})`
-    )
+    chalk.cyan(`» bringing up VM '${vm}' (${desiredMount} → ${GUEST_WORKSPACE}${docker ? ' + docker' : ''})`)
   );
   const code = runVm(upArgs);
   if (code !== 0) throw new Error(`appliance-vm up '${vm}' failed (exit ${code})`);
 
-  // Readiness is the agent runtime — `up`'s agent-only gate already waits
-  // on it, so this vsock probe returns near-instantly. Only a --docker
-  // sandbox additionally waits on the backgrounded dockerd.
+  // Readiness is the agent runtime: the dev toolchain installs in the
+  // background, so poll until node answers. Only a --docker sandbox
+  // additionally waits on the backgrounded dockerd.
   await waitForAgentRuntime(vm, timeoutMs);
   if (docker) await waitForDocker(vm, timeoutMs);
+}
+
+/** One-time nudge: the dedicated sandbox VM was merged into the main
+ *  `appliance` VM — surface how to reclaim the old one's disk. */
+function hintRetiredSandboxVm(): void {
+  if (fs.existsSync(vmDir(RETIRED_SANDBOX_VM))) {
+    console.log(
+      chalk.dim(
+        `note: the separate '${RETIRED_SANDBOX_VM}' sandbox VM was merged into '${DEFAULT_SANDBOX_VM}' — ` +
+          `reclaim its disk with \`appliance vm delete ${RETIRED_SANDBOX_VM}\`.`
+      )
+    );
+  }
 }
 
 /** Poll until the in-guest agent runtime is ready: the vsock shell

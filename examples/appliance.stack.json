@@ -1,0 +1,12 @@
+{
+  "manifest": "v1",
+  "type": "stack",
+  "name": "demos",
+  "environment": "dev",
+  "apps": [
+    { "dir": "demo-node-framework" },
+    { "dir": "demo-node-container" },
+    { "dir": "demo-python-framework" },
+    { "dir": "demo-python-container" }
+  ]
+}

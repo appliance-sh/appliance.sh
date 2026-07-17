@@ -17,11 +17,12 @@ blind.
 
 **Conventions used below:**
 
-- `SBX=appliance-sbx` — the shared sandbox VM agents run in
-  (`DEFAULT_SANDBOX_VM`, `packages/cli/src/utils/sandbox.ts:19`). `appliance vm`
-  commands default to a **different** VM named `appliance`
-  (`DEFAULT_VM_NAME`), so **always pass `--name "$SBX"`** to `appliance vm …`
-  in this runbook.
+- `SBX=appliance` — the ONE managed VM. The separate agent sandbox VM
+  (`appliance-sbx`) is retired: agents, `appliance dev`, and `appliance up`
+  all ride the single default `appliance` VM (booted dev-capable with the
+  workspace mounted). `appliance vm` commands already default to it, but the
+  runbook keeps the explicit `--name "$SBX"` so every command is
+  copy-paste-unambiguous.
 - The egress subcommands live under **`appliance vm egress …`** (there is no
   top-level `appliance egress`; `packages/cli/src/appliance-vm.ts:559`). The
   egress-firewall doc's shorthand `egress allow`/`egress denied` = `appliance
@@ -33,7 +34,7 @@ egress gateway --name "$SBX"`.
 
 ```sh
 # Run once at the top of every shell you use for this runbook:
-export SBX=appliance-sbx
+export SBX=appliance
 cd ~/Workspaces/appliance.sh      # repo root
 ```
 
@@ -96,7 +97,7 @@ claude --version        # host claude present → OAuth path is usable
 
 **PASS:** you have the key in hand and `claude --version` prints a version.
 
-### 0.4 Boot a sandbox VM on the `net_link=Netstack` link (the enforced boundary)
+### 0.4 Boot the managed VM on the `net_link=Netstack` link (the enforced boundary)
 
 The egress firewall only enforces on a `net_link=Netstack` VM. There is **no
 CLI flag** for `net_link` — the persisted per-VM default is `Nat`, and the
@@ -108,21 +109,22 @@ only ever forces netstack **on**.
 **`<verify flag>`** — the override is read when the engine resolves the link,
 so a VM must be **created fresh under the override** (a VM already running on
 NAT is not rewired by setting the env on a later command). Delete any stale
-sandbox VM first, then export the override for **every** `appliance` command in
+VM first, then export the override for **every** `appliance` command in
 this runbook:
 
 ```sh
 appliance vm delete --name "$SBX" 2>/dev/null || true   # drop any stale NAT VM
 export APPLIANCE_NETSTACK=1                              # force the netstack link
-# Boot the sandbox VM fresh, with docker + this repo mounted as the workspace.
-# `appliance up` boots the shared sandbox VM via ensureSandboxVm
-# (runVm up --docker --mount, sandbox.ts:510). Run it from a project dir:
-appliance up --vm "$SBX"        # builds+runs this repo; boots $SBX with docker+workspace
+# Boot the managed VM fresh (dev-capable, workspace mounted). Run from the repo:
+appliance vm up --name "$SBX" --mount "$PWD"
+#   (or `appliance dev`, which brings the same VM up and deploys the cwd app;
+#    `appliance up` also boots this same VM for in-guest docker runs)
 ```
 
-> If `appliance up` is awkward for your project, `appliance agent start` (§1.2)
-> will itself boot/ensure `$SBX` on first use — but you still must have
-> `APPLIANCE_NETSTACK=1` exported **before** that first boot.
+> `appliance agent start` (§1.2) will itself boot/ensure the VM on first use —
+> but you still must have `APPLIANCE_NETSTACK=1` exported **before** that
+> first boot. There is **no Docker prerequisite anywhere** in this runbook:
+> deploy builds run server-side inside the VM.
 
 **PASS — the link is actually Netstack (behavior-neutral boot, §9.3 must-WORK):**
 
@@ -145,6 +147,27 @@ appliance vm shell --name "$SBX" -- sh -c 'getent hosts github.com'   # DNS reso
 
 **PASS:** node `Ready`, DNS resolves, kubeconfig handoff works — identical to
 NAT (this is the §9.3 baseline; the matrix in §3 below stresses it).
+
+### 0.5 No-docker deploy smoke (server-side builds end-to-end)
+
+Prove the docker-free pipeline: with **no docker on PATH at all**, deploy the
+three-tier demo stack and curl its frontend. The CLI uploads source zips; the
+in-VM api-server builds every image with the guest BuildKit and pushes to the
+in-VM registry.
+
+```sh
+# A shell where docker genuinely cannot be found:
+alias docker=false; hash -r
+command -v docker || echo "no docker on PATH — good"
+
+cd examples/demo-stack-3tier
+appliance deploy                    # bare deploy in a stack folder fans out to all members
+curl -sS http://demo-frontend-dev.appliance.localhost:8081/ | head -5
+```
+
+**PASS:** all three members (backend → bff → frontend) deploy — the summary
+table shows each built server-side — and the frontend curl returns its page.
+No step invoked docker, buildctl, or crane on the host.
 
 ---
 
@@ -257,13 +280,13 @@ own netstack + link, no host route between VM subnets
 (`docs/egress-firewall.md` §8.2); the pre-netstack guard is `peer_allowed`
 pinned to the exact guest IP (`egress.rs`).
 
-**`<verify flag>`** — intent: from a _second_ sandbox VM, try to reach VM-1's
+**`<verify flag>`** — intent: from a _second_ VM, try to reach VM-1's
 egress proxy gateway and confirm it is refused. Closest real commands (confirm
 the exact reach path live — under Netstack the sibling has no route at all):
 
 ```sh
-SBX2=appliance-sbx2
-appliance up --vm "$SBX2"                            # second netstack VM
+SBX2=appliance-two
+appliance vm up --name "$SBX2"                       # second netstack VM
 GW1=$(appliance vm egress gateway --name "$SBX" | sed -n 's/^HTTPS_PROXY=//p')
 appliance vm shell --name "$SBX2" -- sh -c "
   HTTPS_PROXY='$GW1' curl -sS -m 5 -o /dev/null -w '%{http_code}\n' \

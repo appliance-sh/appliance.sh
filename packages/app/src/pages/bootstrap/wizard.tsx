@@ -113,7 +113,7 @@ export function BootstrapWizardPage() {
     return (
       <AwsForm
         onBack={presetChoice ? null : () => setChoice(null)}
-        onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
+        onSubmit={(values) => navigate('/cloud/bootstrap/run', { state: values })}
       />
     );
   }
@@ -121,7 +121,7 @@ export function BootstrapWizardPage() {
   return (
     <LocalRuntimeForm
       onBack={presetChoice ? null : () => setChoice(null)}
-      onSubmit={(values) => navigate('/bootstrap/run', { state: values })}
+      onSubmit={(values) => navigate('/cloud/bootstrap/run', { state: values })}
     />
   );
 }
@@ -146,29 +146,28 @@ function ModePicker({
       <div className="space-y-2">
         <h1 className="text-2xl font-semibold">New installation</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Pick a target. The local runtime runs entirely on this machine — perfect for development. AWS provisions a
-          cloud-resident installation reachable from anywhere.
+          Pick a target. The Dev Machine runs entirely on this computer — perfect for development. AWS provisions a
+          cloud installation reachable from anywhere.
         </p>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
         <ModeCard
           icon={Laptop}
-          title="Local Runtime"
+          title="Dev Machine"
           body={
             <>
-              A cluster + api-server on this machine
-              {sandboxDefault ? ', sandboxed in a virtual machine by default' : ''}. Apps publish at{' '}
-              <code className="text-[11px]">&lt;project&gt;-&lt;env&gt;.appliance.localhost</code>.
+              Runs apps on this computer{sandboxDefault ? ', inside an isolated virtual machine' : ''}. Apps publish at{' '}
+              <code className="text-[11px]">&lt;app&gt;-&lt;env&gt;.appliance.localhost</code>.
             </>
           }
           available={localAvailable}
-          disabledReason="The local runtime needs the desktop app — the web shell can't drive it."
+          disabledReason="The Dev Machine needs the desktop app — the web shell can't drive it."
           onClick={() => onPick('local')}
         />
         <ModeCard
           icon={Cloud}
-          title="AWS Cluster"
+          title="AWS Cloud"
           body="Provision CloudFront + Lambda + Route53 on your account. Three Pulumi phases. Requires AWS credentials."
           available={awsAvailable}
           disabledReason="Bootstrap to AWS needs the desktop app or the CLI."
@@ -259,22 +258,22 @@ function LocalRuntimeForm({
       ) : null}
 
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">Local Runtime</h1>
+        <h1 className="text-2xl font-semibold">Dev Machine</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Set up boots a cluster + api-server inside an isolated microVM on this machine and connects the Console to it.
-          Defaults are fine for most setups.
+          Set up boots the Dev Machine — an isolated virtual machine with its own app platform — on this computer and
+          connects the Console to it. Defaults are fine for most setups.
         </p>
       </div>
 
       <form className="space-y-5" onSubmit={handleSubmit}>
         <div className="rounded-md border border-[var(--color-border)] p-3">
           <div className="flex items-center gap-2 text-sm font-medium">
-            Sandboxed in a virtual machine
+            Isolated virtual machine
             <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">default</span>
           </div>
           <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-            The cluster runs inside an isolated VM Appliance boots itself — stronger isolation, no docker provider for
-            the cluster.
+            Everything runs inside a VM Appliance boots itself — stronger isolation, nothing installed on your host
+            beyond the engine.
           </p>
         </div>
 
@@ -371,9 +370,9 @@ function AwsForm({ onBack, onSubmit }: { onBack: (() => void) | null; onSubmit: 
       ) : null}
 
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">AWS Cluster</h1>
+        <h1 className="text-2xl font-semibold">AWS Cloud</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          Provision the base AWS infrastructure for a new Appliance cluster. AWS credentials are sourced from the
+          Provision the base AWS infrastructure for a new Appliance installation. AWS credentials are sourced from the
           selected profile (or your shell environment if none is selected).
         </p>
       </div>

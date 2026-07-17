@@ -8,7 +8,12 @@ use std::path::PathBuf;
 /// helper-managed binaries so `rm -rf ~/.appliance` remains the one
 /// true uninstall.
 pub fn vm_root() -> PathBuf {
+    // HOME first (every Unix shell, and Git Bash on Windows), then
+    // USERPROFILE — PowerShell and the desktop don't set HOME on
+    // Windows, and falling through to "." would scatter VM state into
+    // whatever directory the process happened to start in.
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let root = home.join(".appliance").join("vm");
@@ -90,9 +95,16 @@ pub fn list_specs() -> Vec<VmSpec> {
 
 /// Create the sparse raw data disk if it doesn't exist yet. Sparse so a
 /// 10 GiB disk costs nothing until the guest writes to it.
+///
+/// No-op on Windows: the WSL2 backend's distro owns its own persistent
+/// VHDX, so a raw data disk would be 10 GiB of NTFS allocation nothing
+/// ever reads.
 pub fn ensure_disk(spec: &VmSpec) -> Result<PathBuf> {
     let paths = VmPaths::for_name(&spec.name);
     let disk = paths.disk();
+    if cfg!(windows) {
+        return Ok(disk);
+    }
     if !disk.exists() {
         fs::create_dir_all(&paths.dir)?;
         let file = fs::File::create(&disk).with_context(|| format!("create {}", disk.display()))?;
@@ -107,12 +119,42 @@ pub fn read_live_pid(name: &str) -> Option<i32> {
     let paths = VmPaths::for_name(name);
     let raw = fs::read_to_string(paths.pidfile()).ok()?;
     let pid: i32 = raw.trim().parse().ok()?;
-    // kill(pid, 0) probes liveness without sending a signal.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    if alive {
+    if pid_alive(pid) {
         Some(pid)
     } else {
         None
+    }
+}
+
+/// Probe liveness without touching the process.
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    // kill(pid, 0) probes liveness without sending a signal.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Windows stand-in for `kill(pid, 0)`: open the process for status
+/// query and check it hasn't exited. A pid we can't open at all is
+/// treated as dead — the host process is ours, so an access-denied
+/// answer means the pid was recycled by something privileged.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE as u32
     }
 }
 

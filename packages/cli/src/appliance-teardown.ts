@@ -2,7 +2,7 @@
 
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import * as prompts from '@inquirer/prompts';
 import chalk from 'chalk';
 import { runTeardown, type BootstrapEvent } from '@appliance.sh/bootstrap';
@@ -12,9 +12,17 @@ const program = new Command();
 program
   .description('destroy a bootstrap installation (reverses `appliance bootstrap`)')
   .option('--cache-dir <dir>', 'override ~/.appliance cache directory')
-  .option('--profile <name>', 'AWS profile to authenticate with')
+  .option('--aws-profile <name>', 'AWS profile to authenticate with')
+  .addOption(new Option('--profile <name>', 'deprecated alias for --aws-profile').hideHelp())
   .option('-y, --yes', 'skip the confirmation prompt')
-  .action(async (options: { cacheDir?: string; profile?: string; yes?: boolean }) => {
+  .action(async (options: { cacheDir?: string; awsProfile?: string; profile?: string; yes?: boolean }) => {
+    // `--profile` collides with the credential-profile meaning every
+    // other command uses; `--aws-profile` is the documented flag.
+    if (options.profile) {
+      console.error(chalk.yellow('--profile here means the AWS profile and is deprecated — use --aws-profile.'));
+    }
+    const awsProfile = options.awsProfile ?? options.profile;
+
     if (!options.yes) {
       console.log(
         chalk.yellow(
@@ -40,7 +48,7 @@ program
     try {
       await runTeardown({
         cacheDir: options.cacheDir ?? path.join(os.homedir(), '.appliance'),
-        awsProfile: options.profile,
+        awsProfile,
         emit: renderEvent,
       });
 

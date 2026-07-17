@@ -1,3 +1,54 @@
+## Unreleased
+
+### ⚠️ Breaking Changes — the Docker-free, one-VM overhaul
+
+- **Docker is no longer used anywhere.** The CLI never runs `docker`/`buildctl`/`crane`; app images build **server-side** (in-VM BuildKit locally, the installation's builder on cloud) from an uploaded source zip. `framework` apps get a generated Dockerfile and are now first-class on every base; `container` zips carry the build context (Dockerfile + source), not an `image.tar` (legacy image.tar zips still deploy on cloud).
+- **The api-server runs as a guest binary inside the microVM** — no more host daemon (`appliance server start` is a deprecation shim → `appliance dev` / `appliance vm`) and no more in-cluster api-server pod/image delivery at `vm up`. Credentials mint from the VM's bootstrap token automatically.
+- **One managed VM.** The separate agent-sandbox VM (`appliance-sbx`) merged into the `appliance` VM; `up`/`agent`/`dev` share it. Reclaim the old sandbox's disk with `appliance vm delete appliance-sbx`.
+- **Profiles:** the local profile is now `local` (owned by the VM); the legacy `microvm` name is dual-written for one release.
+- **Removed/deprecated commands:** `appliance local` (deleted), `server --runtime docker` and `dev --runtime` (removed — the host-Docker runtime `appliance-base-docker` is deprecated and deploys against it error with migration guidance), `profile` (use `cluster`). New: `appliance cloud bootstrap|teardown` umbrella; bare `appliance deploy` in a stack folder deploys the whole stack.
+- **Helper binaries:** docker/crane/buildctl providers removed (kubectl remains); `doctor` no longer checks Docker.
+- **The desktop deploy wizard builds server-side too.** It now mints a build, packages + uploads the source through the bundled CLI (`appliance build --upload-url`, byte-identical to a terminal `appliance deploy`), and lets the api-server build the image — the host-Docker build/push path (`build_and_import_image`, crane fallback) is removed. Framework apps deploy from the wizard with no Dockerfile.
+- **Desktop registers the local VM cluster as "Dev Machine"** (was "MicroVM Runtime"); previously persisted entries are relabeled in place.
+
+### Bug Fixes
+
+- **cli(windows):** the compiled binary parsed its own embedded entry (`B:/~BUN/...`) as the command — every invocation failed with "Unknown command"; and `.localhost` URLs (the VM's api-server + app ingress) could not connect because Bun's resolver only tries `::1` while the VM forwards listen on `127.0.0.1`. Both fixed; `ensureLocalhostFetch()` now covers the Bun runtime.
+
+## 1.51.2 (2026-07-04)
+
+### Bug Fixes
+
+- **build:** build the CLI + workspace deps before the desktop bundles them ([75761fe](https://github.com/appliance-sh/appliance.sh/commit/75761fe))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
+## 1.51.1 (2026-07-04)
+
+### Bug Fixes
+
+- **cli:** auto-pull published api-server image when local build is wrong arch ([2fc35e1](https://github.com/appliance-sh/appliance.sh/commit/2fc35e1))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
+## 1.51.0 (2026-07-04)
+
+### Features
+
+- **cli:** forget clusters without teardown ([df0a92c](https://github.com/appliance-sh/appliance.sh/commit/df0a92c))
+
+### Bug Fixes
+
+- **infra:** update tsbuildinfo location ([82232a4](https://github.com/appliance-sh/appliance.sh/commit/82232a4))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.50.0 (2026-07-01)
 
 ### Features

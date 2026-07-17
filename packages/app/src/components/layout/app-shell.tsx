@@ -1,9 +1,12 @@
 import * as React from 'react';
-import { NavLink, Outlet } from 'react-router';
-import { Wand, Server, Boxes, Folder, Bot, Cog } from 'lucide-react';
+import { Link, NavLink, Outlet } from 'react-router';
+import { Wand, Server, Laptop, Cloud, Folder, Bot, Cog, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
+import { useKeyRole } from '@/hooks/use-key-role';
+import { useAuthExpired, clearAuthFailure } from '@/lib/auth-signal';
+import { ClusterCompatBanner } from '@/components/cluster-compat-banner';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 import { TerminalDock } from './terminal-dock';
@@ -26,24 +29,29 @@ export function AppShell() {
   const { cluster, isLoading } = useSelectedCluster();
   const configured = Boolean(cluster);
 
-  // ④ Agents is desktop-only — it launches coding agents into a local
-  // runtime (host.vm). The web shell hides it, mirroring today's Runtimes
-  // gate; the `/agents` route itself renders a "desktop app only" message.
+  // Agents and Machine are desktop-only — both need the local VM engine
+  // (host.vm). The web shell hides them; the routes themselves render a
+  // "desktop app only" message for direct links.
   const host = useHost();
-  const showAgents = Boolean(host.vm);
+  const hasVm = Boolean(host.vm);
 
-  // Five-area IA (§2): Setup (adaptive) / Clusters / Projects / Agents /
-  // Settings — canonical labels only (no Dashboard/Overview/Runtimes drift).
-  // Clusters stays always-visible — its desktop-only bits are host-gated
-  // inside the page, not hidden from the rail; Agents is gated OFF the rail on
-  // web since the whole area is desktop-only. Clusters uses `Boxes` (a
-  // distinct icon, not the brand mark's `Server`) so the nav item doesn't read
-  // as a second logo (Devon); Agents uses `Bot`.
+  // Member keys (invite-onboarded teammates) get the task surface only:
+  // their apps and Settings. Machine / Cloud / Agents / Setup are operator
+  // tools — the API 403s a member on them anyway, so showing the nav
+  // items would only manufacture dead ends.
+  const { role } = useKeyRole();
+  const isOperator = role === 'admin';
+
+  // Nav: Setup (only while unconfigured) / Apps / Agents / Machine /
+  // Cloud / Settings — canonical labels only. Members see Apps + Settings;
+  // admin desktop sees everything; admin web (no host.vm) drops Agents +
+  // Machine and keeps Cloud.
   const nav: NavItem[] = [
-    ...(!isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
-    { to: '/clusters', label: 'Clusters', icon: Boxes },
-    { to: '/projects', label: 'Projects', icon: Folder },
-    ...(showAgents ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    ...(isOperator && !isLoading && !configured ? [{ to: '/setup', label: 'Setup', icon: Wand, prominent: true }] : []),
+    { to: '/projects', label: 'Apps', icon: Folder },
+    ...(isOperator && hasVm ? [{ to: '/agents', label: 'Agents', icon: Bot }] : []),
+    ...(isOperator && hasVm ? [{ to: '/machine', label: 'Machine', icon: Laptop }] : []),
+    ...(isOperator ? [{ to: '/cloud', label: 'Cloud', icon: Cloud }] : []),
     { to: '/settings', label: 'Settings', icon: Cog },
   ];
 
@@ -97,18 +105,56 @@ export function AppShell() {
       </header>
 
       <main className="col-start-2 min-h-0 overflow-auto p-6">
+        <AuthExpiredBanner />
+        <ClusterCompatBanner />
         <Outlet />
       </main>
 
       {/* Terminal dock — a tab strip for ALL live shells, in the grid row
           below `<main>` and OUTSIDE the `<Outlet/>`. Reachable from every
-          route, so a running-but-hidden shell is never orphaned. */}
-      <TerminalDock />
+          route, so a running-but-hidden shell is never orphaned.
+          Operator-only: members have no shell-opening affordances, so the
+          dock (and layer) would be permanent dead chrome for them. */}
+      {isOperator ? <TerminalDock /> : null}
 
       {/* Persistent terminal layer — OUTSIDE the `<Outlet/>` so navigating
           never unmounts the active shell. Its sessions live in
           `TerminalSessionsProvider`; this only shows/hides the view. */}
-      <TerminalLayer />
+      {isOperator ? <TerminalLayer /> : null}
+    </div>
+  );
+}
+
+// Dismissible auth-expiry banner. The query cache's error handler raises
+// the signal when any query fails with an auth-shaped error (401/403,
+// invalid signature) — one banner at the top instead of scattered raw
+// errors, with a Reconnect CTA into the connect page.
+function AuthExpiredBanner() {
+  const expired = useAuthExpired();
+  if (!expired) return null;
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2"
+    >
+      <span className="text-sm text-amber-200">Your connection to the server expired.</span>
+      <span className="flex shrink-0 items-center gap-1">
+        <Link
+          to="/setup/connect"
+          onClick={() => clearAuthFailure()}
+          className="rounded-md border border-amber-500/40 px-2.5 py-1 text-xs font-medium text-amber-100 hover:bg-amber-500/10"
+        >
+          Reconnect
+        </Link>
+        <button
+          type="button"
+          aria-label="Dismiss"
+          onClick={() => clearAuthFailure()}
+          className="rounded p-1 text-amber-200/70 hover:text-amber-100"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </span>
     </div>
   );
 }

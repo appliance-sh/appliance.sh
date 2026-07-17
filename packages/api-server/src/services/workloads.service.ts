@@ -1,14 +1,14 @@
-import { applianceBaseConfig, isKubernetesBase, type ApplianceBaseConfig, type Workloads } from '@appliance.sh/sdk';
-import { LocalContainerDeploymentService } from '@appliance.sh/infra';
+import type { Workloads } from '@appliance.sh/sdk';
+import type { ContainerDeploymentBackend } from '@appliance.sh/infra';
 import { Writable } from 'node:stream';
 import { environmentService } from './environment.service';
-import { logger } from '../logger';
+import { readBaseConfig, resolveContainerBackend, RemovedDockerBaseError } from './deployment-backend';
 
 /**
  * Raised when a workloads/pod-logs read is attempted on a base that
- * has no cluster to read from (AWS/Lambda), or when the api-server has
- * no base config at all. Routes map this to a 409 with the message,
- * mirroring `environment-health.service`'s `isKubernetesBase` gate
+ * has no container runtime to read from (AWS/Lambda), or when the
+ * api-server has no base config at all. Routes map this to a 409 with
+ * the message, mirroring `environment-health.service`'s base gate
  * (control-plane.md §2) — the difference being these endpoints have no
  * meaningful "unknown" fallback, so they refuse rather than degrade.
  */
@@ -20,49 +20,47 @@ export class NonKubernetesBaseError extends Error {
 }
 
 /**
- * Reads cluster workloads + pod logs for the console/SDK. Only
- * Kubernetes-driven bases (local microVM + generic Kubernetes)
- * carry pod/deployment/service state, so every method gates on
- * `isKubernetesBase` and instantiates the same `@appliance.sh/infra`
- * cluster client the deploy executor + health service use.
+ * Reads runtime workloads + container logs for the console/SDK. Only
+ * container-runtime bases — Kubernetes-driven (local microVM +
+ * generic Kubernetes) and plain-Docker (the local daemon) — carry
+ * workload state, so every method gates on the base type and
+ * instantiates the same `@appliance.sh/infra` runtime client the
+ * deploy executor + health service use.
  */
 export class WorkloadsService {
   /**
-   * Parse + validate the api-server's base config, requiring a
-   * Kubernetes-driven base. Throws NonKubernetesBaseError otherwise so
-   * the route can answer 409 before touching the response.
+   * Resolve the container backend for this base via the single fork
+   * point (deployment-backend.ts), requiring a container-runtime base.
+   * Throws NonKubernetesBaseError otherwise so the route can answer
+   * 409 before touching the response.
    */
-  private kubernetesBaseOrThrow(): ApplianceBaseConfig {
-    const raw = process.env.APPLIANCE_BASE_CONFIG;
-    if (!raw) {
+  private cluster(): ContainerDeploymentBackend {
+    const baseConfig = readBaseConfig();
+    if (!baseConfig) {
       throw new NonKubernetesBaseError('Cluster base config is unavailable on the api-server.');
     }
-    let baseConfig: ApplianceBaseConfig;
+    let backend: ContainerDeploymentBackend | null;
     try {
-      baseConfig = applianceBaseConfig.parse(JSON.parse(raw));
+      backend = resolveContainerBackend(baseConfig);
     } catch (error) {
-      logger.warn('failed to parse APPLIANCE_BASE_CONFIG for workloads lookup', { error: String(error) });
-      throw new NonKubernetesBaseError('Cluster base config could not be parsed on the api-server.');
+      if (error instanceof RemovedDockerBaseError) throw new NonKubernetesBaseError(error.message);
+      throw error;
     }
-    if (!isKubernetesBase(baseConfig)) {
+    if (!backend) {
       throw new NonKubernetesBaseError(
-        `Workloads and pod logs are only available for Kubernetes-driven bases (got '${baseConfig.type}').`
+        `Workloads and pod logs are only available for container-runtime bases (got '${baseConfig.type}').`
       );
     }
-    return baseConfig;
-  }
-
-  private cluster(): LocalContainerDeploymentService {
-    return new LocalContainerDeploymentService(this.kubernetesBaseOrThrow());
+    return backend;
   }
 
   /**
    * Throw NonKubernetesBaseError unless this api-server is on a
-   * Kubernetes-driven base. Lets a streaming route reject (→ 409)
+   * container-runtime base. Lets a streaming route reject (→ 409)
    * before it sets any response headers, so the 409 body is still JSON.
    */
   ensureKubernetesBase(): void {
-    this.kubernetesBaseOrThrow();
+    this.cluster();
   }
 
   /** Namespace-scoped workloads. Undefined namespace → the infra client
@@ -78,8 +76,8 @@ export class WorkloadsService {
    * (the route maps that to 404).
    */
   async listEnvironmentWorkloads(environmentId: string): Promise<Workloads | null> {
-    // Gate on the cluster base BEFORE the env lookup so a non-Kubernetes
-    // base answers 409 ("not available on this base") rather than a 404
+    // Gate on the runtime base BEFORE the env lookup so a cloud base
+    // answers 409 ("not available on this base") rather than a 404
     // for an environment it could never read workloads for anyway.
     this.ensureKubernetesBase();
     const environment = await environmentService.get(environmentId);

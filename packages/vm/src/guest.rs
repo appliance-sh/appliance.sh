@@ -51,6 +51,20 @@ pub const KUBECONFIG_PORT: u16 = 9991;
 /// range k3s allows by default).
 pub const REGISTRY_NODEPORT: u16 = 30500;
 
+/// Guest TCP port buildkitd's gRPC listener binds. The host forwards
+/// 127.0.0.1:<buildkitPort> (5054 by default) here so `buildctl` on the
+/// host builds images inside the VM with no Docker anywhere. Clear of
+/// the kubeconfig handoff (9991) and the NodePort window (30000+).
+pub const BUILDKITD_GUEST_PORT: u16 = 8372;
+
+/// Guest TCP port the appliance api-server binary listens on. Reached
+/// from the host via the existing ingress forward: a selector-less
+/// Service + Endpoints route `api.appliance.localhost` through traefik
+/// to this port, so no extra host forward is needed and every saved
+/// profile URL keeps working. Clear of the kubeconfig handoff (9991),
+/// buildkitd (8372), and the NodePort window (30000+).
+pub const API_SERVER_GUEST_PORT: u16 = 9091;
+
 /// VirtioFS tag the host-folder share is presented under. The VZ
 /// backend tags the device with this; the guest bootstrap mounts the
 /// same tag at /persist/workspace. Keep both sides in sync (a guest
@@ -64,6 +78,11 @@ pub const SHELL_VSOCK_PORT: u32 = 1024;
 
 pub struct BootMedia {
     pub image: PathBuf,
+    /// Whether THIS media embeds the CLI-staged api-server binary —
+    /// captured at build time so readiness (`wait_platform_ready`) keys
+    /// off what actually booted, not a later re-probe of the shared
+    /// guest-assets cache (which the CLI can change under a running VM).
+    pub apiserver_staged: bool,
 }
 
 fn arch_tuple() -> Result<(&'static str, &'static str)> {
@@ -75,18 +94,47 @@ fn arch_tuple() -> Result<(&'static str, &'static str)> {
     }
 }
 
-fn assets_dir() -> PathBuf {
+pub(crate) fn assets_dir() -> PathBuf {
     crate::store::vm_root().join("images").join("guest-assets")
+}
+
+/// Download (once) + verify the pinned k3s binary for this arch. Shared
+/// by the FAT boot-media assembly (vz/kvm) and the WSL2 backend (which
+/// copies it into the imported distro over drvfs and re-verifies it
+/// guest-side). Returns the on-disk path and the committed sha256.
+/// Sasha #3: hash-pinned and verified before use, every boot — a
+/// cached/tampered artifact is rejected, not silently embedded.
+pub fn ensure_k3s() -> Result<(PathBuf, &'static str)> {
+    let (_, k3s_asset) = arch_tuple()?;
+    let k3s_sha = match std::env::consts::ARCH {
+        "aarch64" => K3S_SHA256_ARM64,
+        "x86_64" => K3S_SHA256_AMD64,
+        other => bail!("unsupported host architecture: {other}"),
+    };
+    let dir = assets_dir();
+    fs::create_dir_all(&dir)?;
+    let k3s = dir.join(format!("k3s-{K3S_VERSION}"));
+    crate::images::download_and_verify(
+        &format!(
+            "https://github.com/k3s-io/k3s/releases/download/{}/{}",
+            K3S_VERSION.replace('+', "%2B"),
+            k3s_asset
+        ),
+        &k3s,
+        k3s_sha,
+    )?;
+    Ok((k3s, k3s_sha))
 }
 
 /// Download (once) + verify the module loop + k3s binary the boot media
 /// embeds. Sasha #3: both are hash-pinned and verified before use, every
 /// boot — a cached/tampered artifact is rejected, not silently embedded.
+#[cfg_attr(windows, allow(dead_code))]
 fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
-    let (alpine_arch, k3s_asset) = arch_tuple()?;
-    let (modloop_sha, k3s_sha) = match std::env::consts::ARCH {
-        "aarch64" => (MODLOOP_SHA256_AARCH64, K3S_SHA256_ARM64),
-        "x86_64" => (MODLOOP_SHA256_X86_64, K3S_SHA256_AMD64),
+    let (alpine_arch, _) = arch_tuple()?;
+    let modloop_sha = match std::env::consts::ARCH {
+        "aarch64" => MODLOOP_SHA256_AARCH64,
+        "x86_64" => MODLOOP_SHA256_X86_64,
         other => bail!("unsupported host architecture: {other}"),
     };
     let dir = assets_dir();
@@ -101,18 +149,130 @@ fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
         modloop_sha,
     )?;
 
-    let k3s = dir.join(format!("k3s-{K3S_VERSION}"));
-    crate::images::download_and_verify(
-        &format!(
-            "https://github.com/k3s-io/k3s/releases/download/{}/{}",
-            K3S_VERSION.replace('+', "%2B"),
-            k3s_asset
-        ),
-        &k3s,
-        k3s_sha,
-    )?;
+    let (k3s, _) = ensure_k3s()?;
 
     Ok((modloop, k3s))
+}
+
+/// Volume label of the platform-images media (the FAT wrapper around the
+/// k3s airgap tarball, attached as an extra read-only virtio-blk on k3s
+/// VMs). The guest probes `blkid` for THIS LABEL — never a device node:
+/// /dev/vdc is the agent image on agent-only VMs, and device order is an
+/// attachment detail, not a contract. A guest test locks the probe.
+pub const K3S_AIRGAP_VOLUME_LABEL: &str = "K3SIMAGES";
+
+/// File name the airgap tarball rides under, both on the media and in
+/// `$PERSIST/k3s/agent/images/` (k3s auto-imports anything there).
+pub const K3S_AIRGAP_MEDIA_FILE: &str = "k3s-airgap-images.tar.zst";
+
+/// Resolve (building on first use) the platform-images media: the pinned,
+/// hash-verified k3s airgap tarball wrapped in a small FAT volume so the
+/// guest can find it by label and mount it read-only. The SOURCE tarball
+/// is re-verified against its committed sha256 on every call (cache-hit
+/// included, `download_and_verify` semantics); the derived FAT image is a
+/// deterministic function of it, re-derived only when absent — the same
+/// verified-raw/derived split the normalized kernel uses.
+pub fn ensure_k3s_airgap_media() -> Result<PathBuf> {
+    let tarball = crate::images::ensure_k3s_airgap_images()?;
+    let dir = assets_dir();
+    let image_path = dir.join(format!(
+        "k3s-airgap-media-{}.img",
+        crate::images::K3S_AIRGAP_VERSION
+    ));
+    if image_path.exists() {
+        return Ok(image_path);
+    }
+
+    let tar_data = fs::read(&tarball)?;
+    let volume_bytes =
+        ((tar_data.len() as u64 + 64 * 1024 * 1024) / (16 * 1024 * 1024) + 1) * (16 * 1024 * 1024);
+    // Atomic like download_and_verify: build at .partial, rename into
+    // place — a killed build never leaves a truncated image at the
+    // canonical name.
+    let partial = image_path.with_extension("partial");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&partial)
+        .with_context(|| format!("create {}", partial.display()))?;
+    file.set_len(volume_bytes)?;
+    // FAT volume labels are exactly 11 bytes, space-padded.
+    let mut label = [b' '; 11];
+    label[..K3S_AIRGAP_VOLUME_LABEL.len()].copy_from_slice(K3S_AIRGAP_VOLUME_LABEL.as_bytes());
+    let buf = fscommon::BufStream::new(&file);
+    fatfs::format_volume(
+        buf,
+        fatfs::FormatVolumeOptions::new().volume_label(label),
+    )
+    .context("format platform-images FAT volume")?;
+    let buf = fscommon::BufStream::new(&file);
+    let fs = fatfs::FileSystem::new(buf, fatfs::FsOptions::new())
+        .context("open platform-images FAT volume")?;
+    {
+        let root = fs.root_dir();
+        let mut f = root.create_file(K3S_AIRGAP_MEDIA_FILE)?;
+        f.write_all(&tar_data)?;
+    }
+    fs.unmount().context("unmount platform-images FAT volume")?;
+    drop(file);
+    std::fs::rename(&partial, &image_path)?;
+    Ok(image_path)
+}
+
+/// CLI-staged api-server guest artifacts: the compiled linux binary
+/// (required) and the web-console bundle (optional). The appliance CLI
+/// stages these into the shared guest-assets cache before `vm up` —
+/// from a repo build or a release download — and the boot media embeds
+/// whatever is present. The engine itself never builds or downloads
+/// them; a VM booted without them simply has no control plane (the
+/// provision block logs that honestly).
+pub struct ApiServerAssets {
+    pub binary: PathBuf,
+    pub console: Option<PathBuf>,
+}
+
+/// Locate the staged api-server artifacts, or None when the binary is
+/// absent (agent-only workflows, or an engine invoked without the CLI).
+pub fn apiserver_assets() -> Option<ApiServerAssets> {
+    let dir = assets_dir();
+    let binary = dir.join("appliance-api-server");
+    if !binary.is_file() {
+        return None;
+    }
+    let console = dir.join("appliance-console.tar.gz");
+    let console = console.is_file().then_some(console);
+    Some(ApiServerAssets { binary, console })
+}
+
+/// Read (or generate once) the VM's bootstrap token — the shared secret
+/// `POST /bootstrap/create-key` requires. Persisted host-side at
+/// `~/.appliance/vm/<name>/bootstrap-token` so the CLI can mint keys,
+/// and injected into the guest at `/etc/appliance/bootstrap-token`
+/// (0600) so the api-server binary can verify them.
+pub fn ensure_bootstrap_token(vm_dir: &Path) -> Result<String> {
+    let path = vm_dir.join("bootstrap-token");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let token = existing.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| anyhow::anyhow!("system rng unavailable for bootstrap token"))?;
+    let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    fs::create_dir_all(vm_dir)?;
+    fs::write(&path, &token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
 }
 
 /// The guest bootstrap that openrc's `local` service runs once the
@@ -177,23 +337,37 @@ __DEV_PROVISION__
 # otherwise. Backgrounded and fully decoupled from the bring-up phases:
 # k3s readiness below is what `vm up` waits on, never dockerd.
 __DOCKER_PROVISION__
+# --- buildkit (docker-free image builds) ------------------------------
+# Substituted with the provisioning block below on every k3s VM, empty
+# for agent-only VMs (no registry to push to). Backgrounded like the
+# docker engine: k3s readiness never waits on buildkitd.
+__BUILDKIT_PROVISION__
 # --- k3s / agent-runtime handoff -------------------------------------
 # Substituted with the k3s control-plane block (normal VM) or the
 # agent-runtime handoff (agent-only VM). Quinn gap #1: this block carries
 # nested port markers, so it is injected BEFORE the port substitutions.
 __K3S_PROVISION__
+# --- appliance api-server (control plane as a guest binary) -----------
+# Substituted with the provisioning block below on k3s VMs whose boot
+# media carries the api-server binary; empty otherwise. Runs after the
+# k3s block so $PERSIST/k3s and the manifests dir conventions are
+# established (k3s itself is already backgrounded).
+__APISERVER_PROVISION__
 "#;
 
 /// The k3s control-plane region of `APPLIANCE_START`, substituted for
 /// the `__K3S_PROVISION__` marker on a normal (non-agent-only) VM:
-/// byte-for-byte the original inline block — the k3s binary copy,
-/// `registries.yaml`, the in-VM registry manifest, `k3s server`, and the
-/// kubeconfig handoff. Agent-only VMs swap in `AGENT_HANDOFF` instead.
+/// byte-for-byte the original inline block — the k3s binary copy
+/// (`K3S_MEDIA_COPY`), then `K3S_COMMON` (`registries.yaml`, the in-VM
+/// registry manifest, `k3s server`, the kubeconfig handoff). Agent-only
+/// VMs swap in `AGENT_HANDOFF` instead. Split in two so the WSL2
+/// backend can reuse the common core behind its own copy preamble
+/// (there is no FAT boot media inside a WSL distro).
 ///
 /// Carries nested `__REGISTRY_HOST_PORT__` / `__REGISTRY_NODEPORT__` /
 /// `__KUBECONFIG_PORT__` markers, so it MUST be injected before those
 /// port markers are substituted (Quinn gap #1; see `build_apkovl`).
-const K3S_PROVISION: &str = r#"# --- k3s -------------------------------------------------------------
+const K3S_MEDIA_COPY: &str = r#"# --- k3s -------------------------------------------------------------
 # The binary lives on the FAT boot media; copy to the root tmpfs so it
 # runs without noexec/permission concerns.
 MEDIA=$(dirname "$(find /media -maxdepth 2 -name k3s 2>/dev/null | head -1)")
@@ -203,8 +377,24 @@ if [ -z "$MEDIA" ]; then
 fi
 cp "$MEDIA/k3s" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
+"#;
 
+/// The backend-neutral half of the k3s provisioning: assumes
+/// `/usr/local/bin/k3s` is in place and `$PERSIST` is mounted; wires the
+/// registry mirror + manifest, launches `k3s server`, and serves the
+/// kubeconfig handoff. Reused verbatim by the WSL2 backend.
+pub(crate) const K3S_COMMON: &str = r#"
 mkdir -p "$PERSIST/k3s" /etc/rancher/k3s
+
+# --- bring-up progress handoff ---------------------------------------
+# Serve /srv/handoff from the START of the k3s block, not once k3s.yaml
+# exists: the host polls /progress to advance honest sub-phases through
+# the long "cluster" window, and later fetches /k3s.yaml off the same
+# httpd. Grippable markers only — the host never scrapes console echo.
+mkdir -p /srv/handoff
+: > /srv/handoff/progress
+httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+echo base-system-ready >> /srv/handoff/progress
 
 # containerd pull-through: image refs pushed from the host as
 # localhost:__REGISTRY_HOST_PORT__/<name> resolve to the in-VM registry's
@@ -268,6 +458,46 @@ spec:
     nodePort: __REGISTRY_NODEPORT__
 RMANIFEST
 
+# --- k3s airgap image preload -----------------------------------------
+# The preamble line below is substituted per backend: vz arms the probe
+# variable (it may attach the platform-images media as an extra
+# read-only virtio-blk); WSL substitutes it empty, so the whole block is
+# skipped and the images are pulled from the network exactly as before.
+# Runs BEFORE the server launch below so the tarball is in the import
+# dir when containerd starts.
+__K3S_AIRGAP_PREAMBLE__
+if [ -n "$APPLIANCE_AIRGAP_PROBE" ]; then
+  mkdir -p "$PERSIST/k3s/agent/images"
+  # First boot only: the staged tarball persists on the data disk, so
+  # its presence is the stamp. Probe by FILESYSTEM LABEL, never a device
+  # node — the third disk is the agent image on agent-only VMs, and
+  # device order is an attachment detail.
+  if [ ! -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    AIRGAP_DEV=$(blkid 2>/dev/null | awk -F: '/LABEL="K3SIMAGES"/ {print $1; exit}')
+    if [ -n "$AIRGAP_DEV" ]; then
+      mkdir -p /media/k3s-images
+      if mount -o ro "$AIRGAP_DEV" /media/k3s-images 2>/dev/null; then
+        # The stamp name must only ever appear COMPLETE: copy to a .tmp
+        # sibling on the same filesystem and mv into place (the commit
+        # point). A power-off mid-copy leaves only the .tmp — never a
+        # truncated stamp that poisons the preload on every later boot.
+        if cp /media/k3s-images/k3s-airgap-images.tar.zst "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"; then
+          mv "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp" "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst"
+          echo "k3s-airgap: staged platform images for k3s import"
+        else
+          rm -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"
+        fi
+        umount /media/k3s-images
+      fi
+    else
+      echo "k3s-airgap: no platform-images media — k3s pulls from the network"
+    fi
+  fi
+  if [ -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    echo images-imported >> /srv/handoff/progress
+  fi
+fi
+
 # Single-node dev cluster. Traefik (bundled) terminates ingress on
 # node port 80 via servicelb — the host forwards 127.0.0.1:<hostPort>
 # here. The kubeconfig is world-readable on purpose: it never leaves
@@ -278,14 +508,13 @@ RMANIFEST
   >/var/log/k3s.log 2>&1 &
 
 # --- kubeconfig handoff ----------------------------------------------
-# Serve the admin kubeconfig on the shared (host-only reachable) NAT
-# network once k3s writes it. The host rewrites the server address to
-# its forwarded localhost port.
-mkdir -p /srv/handoff
+# Publish the admin kubeconfig into the already-running handoff httpd
+# once k3s writes it, and mark the API up for the progress poller. The
+# host rewrites the server address to its forwarded localhost port.
 (
   while [ ! -s /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
   cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml
-  httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+  echo k3s-api-up >> /srv/handoff/progress
 ) &
 "#;
 
@@ -362,7 +591,7 @@ mkdir -p /srv/handoff
 /// the real `/usr/bin/docker` on PATH — but is only ever written on a
 /// no-docker agent boot (the marker is empty when `--docker` is set), so
 /// it never shadows a real engine.
-const AGENT_DOCKER_STUB: &str = r#"# docker not provisioned in this agent sandbox: fail honestly instead of
+pub(crate) const AGENT_DOCKER_STUB: &str = r#"# docker not provisioned in this agent sandbox: fail honestly instead of
 # a silent command-not-found. Skipped (marker empty) on a --docker VM.
 mkdir -p /usr/local/bin
 cat > /usr/local/bin/docker <<'DOCKERSTUB'
@@ -393,7 +622,7 @@ chmod +x /usr/local/bin/docker"#;
 /// image's `bin` (agent-only VMs, via `__AGENT_BIN_PATH__`) so the baked,
 /// read-only CLIs win and an agent can't shadow them, then the npm prefix
 /// `bin` for any self-healed installs.
-const APP_USER_PROVISION: &str = r#"
+pub(crate) const APP_USER_PROVISION: &str = r#"
 echo "appliance-user: provisioning the non-root appliance user"
 # uid/gid are PINNED (host uid/gid on --mount VMs, 1000 otherwise) so
 # /persist ownership stays stable across the diskless rebuild each boot.
@@ -451,6 +680,21 @@ export PATH="__AGENT_BIN_PATH__/persist/npm-global/bin:$PATH"
 PROFILE
 "#;
 
+/// The host user's uid/gid. Unix: the real ids, so a shared workspace
+/// keeps host-side ownership writable. Windows: there is no host uid to
+/// mirror — the WSL2 backend's drvfs automount does its own ownership
+/// mapping — so the conventional 1000/1000 is pinned.
+fn host_ids() -> (u32, u32) {
+    #[cfg(unix)]
+    unsafe {
+        (libc::getuid(), libc::getgid())
+    }
+    #[cfg(windows)]
+    {
+        (1000, 1000)
+    }
+}
+
 /// Resolve the `appliance` user's uid/gid for the guest. On a
 /// VirtioFS-mounted (`--mount`) VM the host folder is shared at the
 /// user's HOME (`/persist/workspace`) and presents **host-side
@@ -486,7 +730,7 @@ fn resolve_app_ids(mount: bool, host_uid: u32, host_gid: u32) -> (u32, u32) {
 ///     the background so it never delays k3s readiness (what `vm up`
 ///     waits on); a `.dev-ready` marker records completion for
 ///     `vm dev status`.
-const DEV_PROVISION: &str = r#"
+pub(crate) const DEV_PROVISION: &str = r#"
 echo "appliance-dev: provisioning development environment"
 # HOME is /persist/workspace now (consolidated; the appliance user's
 # passwd entry points there), so no separate /persist/home.
@@ -566,7 +810,7 @@ fi"#;
 /// (the host sits on the .1 of the vz NAT subnet) since the leased IP
 /// isn't known when the boot media is built. `__EGRESS_PORT__` is the
 /// per-VM egress proxy port, substituted from the spec at build time.
-const DOCKER_PROVISION: &str = r#"
+pub(crate) const DOCKER_PROVISION: &str = r#"
 echo "appliance-docker: provisioning in-guest Docker engine"
 mkdir -p /persist/docker /persist/apk-cache
 # Share the persistent apk cache (DEV_PROVISION also points it here; the
@@ -631,6 +875,315 @@ fi
     sleep 5
   done
 ) &
+"#;
+
+/// In-guest BuildKit provisioning, substituted into `APPLIANCE_START`
+/// (the `__BUILDKIT_PROVISION__` marker) on every k3s VM (agent-only
+/// VMs get an empty block — they have no registry to push to). The
+/// docker-free image build path: the host's `buildctl` dials the
+/// forwarded gRPC port, buildkitd builds from the streamed context and
+/// pushes straight to the in-VM registry.
+///
+/// Mirrors `DOCKER_PROVISION`'s shape:
+///
+///   • the apk install is backgrounded with the same DB-lock retry
+///     loop — k3s readiness (what `vm up` waits on) never waits on
+///     buildkitd; first boot installs from the network, later boots hit
+///     the persistent /persist/apk-cache.
+///   • the layer/cache root lives at /persist/buildkit, so rebuild
+///     caching survives vm stop/up.
+///   • pushes target `localhost:__REGISTRY_HOST_PORT__/<name>` — the
+///     SAME ref pods pull through the containerd registries.yaml
+///     mirror. Nothing in the guest listens on that port (host-side
+///     forward only), so a guest-loopback socat alias bridges it to the
+///     registry NodePort; one ref then works from the host CLI, from
+///     buildkitd, and from the kubelet.
+///   • a `/persist/.buildkit-ready` marker records completion.
+pub(crate) const BUILDKIT_PROVISION: &str = r#"
+echo "appliance-buildkit: provisioning in-guest BuildKit"
+mkdir -p /persist/buildkit /persist/apk-cache /etc/buildkit /run/buildkit
+# Shared persistent apk cache (same symlink DEV/DOCKER provisioning
+# makes; idempotent in any order).
+ln -sfn /persist/apk-cache /etc/apk/cache
+cat > /etc/buildkit/buildkitd.toml <<BKTOML
+root = "/persist/buildkit"
+[registry."localhost:__REGISTRY_HOST_PORT__"]
+  http = true
+[registry."127.0.0.1:__REGISTRY_NODEPORT__"]
+  http = true
+BKTOML
+# Install + launch in the background: never blocks the k3s readiness
+# gate. Same apk DB-lock retry loop as the docker provision. socat is
+# installed explicitly — the vz base world carries it (vsock shell
+# agent) but the WSL bootstrap's base package set does not.
+(
+  rm -f /persist/.buildkit-ready
+  apk update --no-progress >/dev/null 2>&1 || true
+  i=0
+  while :; do
+    if apk add --no-progress buildkit buildctl runc socat; then
+      # Guest-loopback alias for the registry ref: pushes address
+      # localhost:__REGISTRY_HOST_PORT__ (the host-forwarded port,
+      # which has no guest listener) and land on the registry
+      # NodePort. Forks per connection, so starting before the
+      # registry itself is up is fine.
+      socat TCP-LISTEN:__REGISTRY_HOST_PORT__,bind=127.0.0.1,reuseaddr,fork \
+        TCP:127.0.0.1:__REGISTRY_NODEPORT__ \
+        >/var/log/appliance-registry-alias.log 2>&1 &
+      buildkitd \
+        --config /etc/buildkit/buildkitd.toml \
+        --addr unix:///run/buildkit/buildkitd.sock \
+        --addr tcp://0.0.0.0:__BUILDKITD_GUEST_PORT__ \
+        >/var/log/appliance-buildkit.log 2>&1 &
+      : > /persist/.buildkit-ready
+      echo "appliance-buildkit: buildkitd listening on :__BUILDKITD_GUEST_PORT__"
+      break
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      echo "appliance-buildkit: buildkit install failed after retries (will retry on next boot)"
+      break
+    fi
+    sleep 5
+  done
+) &
+"#;
+
+/// The vz half of the api-server provisioning: copy the binary (and
+/// optional console bundle) off the FAT boot media, exactly like
+/// `K3S_MEDIA_COPY`. Prepended to the shared `APISERVER_COMMON`; the
+/// WSL2 backend swaps in its own drvfs copy preamble instead.
+const APISERVER_MEDIA_COPY: &str = r#"# --- appliance api-server ---------------------------------------------
+# The control plane runs as a plain guest binary — no image delivery,
+# no docker anywhere. The binary (and console bundle) ride the FAT boot
+# media; copy them off it like k3s above.
+mkdir -p /persist/appliance
+APISERVER_MEDIA=$(dirname "$(find /media -maxdepth 2 -name appliance-api-server 2>/dev/null | head -1)")
+if [ -n "$APISERVER_MEDIA" ]; then
+  cp "$APISERVER_MEDIA/appliance-api-server" /usr/local/bin/appliance-api-server
+  chmod +x /usr/local/bin/appliance-api-server
+  if [ -f "$APISERVER_MEDIA/appliance-console.tar.gz" ]; then
+    rm -rf /persist/appliance/console.new
+    mkdir -p /persist/appliance/console.new
+    if tar -xzf "$APISERVER_MEDIA/appliance-console.tar.gz" -C /persist/appliance/console.new 2>/dev/null; then
+      rm -rf /persist/appliance/console
+      mv /persist/appliance/console.new /persist/appliance/console
+    else
+      echo "appliance-api-server: console bundle extraction failed (API still serves)"
+    fi
+  fi
+fi
+"#;
+
+/// The backend-neutral half of the api-server provisioning: assumes
+/// `/usr/local/bin/appliance-api-server` and `/etc/appliance/bootstrap-token`
+/// are in place and `$PERSIST` is mounted. Routes
+/// `api.appliance.localhost` through traefik to the guest binary via a
+/// selector-less Service + Endpoints (no new host forward — saved
+/// profile URLs keep working), provisions the server's OWN
+/// ServiceAccount + non-expiring token via the same auto-applied
+/// manifest, retires the legacy in-cluster api-server, and supervises
+/// the binary with a plain respawn loop. Reused verbatim by the WSL2
+/// backend.
+///
+/// Why token auth (not the admin kubeconfig): the binary is
+/// bun-compiled, and bun's fetch ignores the custom https agent
+/// `@kubernetes/client-node` uses to carry client certificates — so
+/// kubeconfig client-cert auth can never authenticate. A bearer token
+/// rides a plain Authorization header (which fetch handles), and the
+/// k3s server CA is trusted process-wide via NODE_EXTRA_CA_CERTS.
+pub(crate) const APISERVER_COMMON: &str = r#"
+mkdir -p /persist/appliance /persist/appliance-data
+if [ -x /usr/local/bin/appliance-api-server ]; then
+  # Route http://api.appliance.localhost:<hostPort> (the URL every saved
+  # profile already uses) through traefik to the guest binary: a
+  # selector-less Service + manual Endpoints at the guest's own address.
+  # Rewritten every boot — the guest address can change across boots.
+  # The same manifest provisions the api-server's ServiceAccount +
+  # cluster-admin binding + non-expiring token Secret.
+  GUEST_IP=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  [ -n "$GUEST_IP" ] || GUEST_IP=127.0.0.1
+  mkdir -p "$PERSIST/k3s/server/manifests"
+  cat > "$PERSIST/k3s/server/manifests/appliance-api-server.yaml" <<APIMANIFEST
+apiVersion: v1
+kind: Service
+metadata:
+  name: appliance-api-server
+  namespace: default
+spec:
+  ports:
+  - port: 80
+    targetPort: __APISERVER_GUEST_PORT__
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: appliance-api-server
+  namespace: default
+subsets:
+- addresses:
+  - ip: $GUEST_IP
+  ports:
+  - port: __APISERVER_GUEST_PORT__
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: appliance-api-server
+  namespace: default
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: api.appliance.localhost
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: appliance-api-server
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: appliance-api-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  # NOT the bare name: the legacy in-cluster deployment used that name
+  # with a different (immutable) roleRef, which would block this apply
+  # forever on upgraded VMs. (No backticks here — this is an unquoted
+  # heredoc, where a backtick pair runs the api-server as a command.)
+  name: appliance-api-server-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: appliance-api-server
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: appliance-api-server-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: appliance-api-server
+type: kubernetes.io/service-account-token
+APIMANIFEST
+  # Launcher: wait for k3s + the SA token, write the base config, then
+  # supervise the binary. Backgrounded — k3s readiness never waits on it.
+  (
+    # Secrets flow through this launcher: the bootstrap token and the
+    # ServiceAccount token both ride $(…) expansions, and the boot
+    # script's `set -x` EXPANDS command substitutions into the traced
+    # line — without this they would be painted verbatim into the
+    # console log (which support bundles collect). Subshell-local: the
+    # rest of the bootstrap keeps tracing.
+    set +x
+    while [ ! -s /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
+    # Retire the legacy in-cluster api-server (VMs provisioned before
+    # the guest-binary control plane): its ingress claims the same
+    # hostname, and its cluster-scoped RBAC squats the names. Best-effort.
+    /usr/local/bin/k3s kubectl delete namespace appliance-system --ignore-not-found >/dev/null 2>&1 || true
+    /usr/local/bin/k3s kubectl delete clusterrolebinding appliance-api-server --ignore-not-found >/dev/null 2>&1 || true
+    /usr/local/bin/k3s kubectl delete clusterrole appliance-api-server --ignore-not-found >/dev/null 2>&1 || true
+    # The token controller populates the Secret once the manifest above
+    # is applied; non-expiring, stable across boots.
+    SA_TOKEN=""
+    while [ -z "$SA_TOKEN" ]; do
+      SA_TOKEN=$(/usr/local/bin/k3s kubectl -n kube-system get secret appliance-api-server-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null)
+      [ -n "$SA_TOKEN" ] || sleep 2
+    done
+    SA_CA=$(base64 -w0 "$PERSIST/k3s/server/tls/server-ca.crt" 2>/dev/null)
+    cat > /persist/appliance/base-config.json <<BASECFG
+{
+  "type": "appliance-base-kubernetes",
+  "name": "local-runtime",
+  "baseConfigVersion": "__BASE_CONFIG_VERSION__",
+  "kubernetes": {
+    "server": "https://127.0.0.1:6443",
+    "token": "$SA_TOKEN",
+    "ca": "$SA_CA",
+    "dataDir": "/persist/appliance-data",
+    "namespace": "appliance",
+    "hostnameSuffix": "appliance.localhost",
+    "ingressClassName": "traefik",
+    "hostPort": __HOST_PORT__,
+    "registry": { "url": "localhost:__REGISTRY_HOST_PORT__", "insecure": true },
+    "buildkit": { "addr": "unix:///run/buildkit/buildkitd.sock" }
+  }
+}
+BASECFG
+    chmod 600 /persist/appliance/base-config.json
+    export APPLIANCE_MODE=server PORT=__APISERVER_GUEST_PORT__ HOST=0.0.0.0
+    export BOOTSTRAP_TOKEN="$(cat /etc/appliance/bootstrap-token 2>/dev/null)"
+    export APPLIANCE_BASE_CONFIG="$(cat /persist/appliance/base-config.json)"
+    export APPLIANCE_CONSOLE_DIR=/persist/appliance/console
+    # Warnings the quarantine watchdog (below) appends; cluster-info
+    # surfaces them so an out-of-date CLI is visible in every client.
+    export APPLIANCE_WARNINGS_FILE=/var/log/appliance-api-server.warnings
+    # bun honors NODE_EXTRA_CA_CERTS: trust the k3s server CA without
+    # disabling TLS verification process-wide.
+    export NODE_EXTRA_CA_CERTS="$PERSIST/k3s/server/tls/server-ca.crt"
+    : > /persist/.apiserver-ready
+    echo "appliance-api-server: launching (guest port __APISERVER_GUEST_PORT__)"
+    while :; do
+      /usr/local/bin/appliance-api-server >> /var/log/appliance-api-server.log 2>&1
+      echo "appliance-api-server: exited — respawning in 2s" >> /var/log/appliance-api-server.log
+      sleep 2
+    done
+  ) &
+  # Quarantine watchdog: a CLI older than this VM can re-apply the
+  # LEGACY in-cluster api-server deploy (namespace appliance-system +
+  # an Ingress claiming api.appliance.localhost), shadowing the
+  # canonical default/appliance-api-server route above with a stale
+  # image. The one-shot retirement in the launcher only covers boot —
+  # this loop keeps the VM clean while it runs. Best-effort throughout;
+  # every removal leaves a distinctive line in the api-server log AND
+  # the warnings file cluster-info surfaces to clients.
+  (
+    WARNINGS_FILE=/var/log/appliance-api-server.warnings
+    while :; do
+      sleep 60
+      [ -s /etc/rancher/k3s/k3s.yaml ] || continue
+      REMOVED=""
+      # Any Ingress OUTSIDE `default` claiming the api hostname is a
+      # legacy deploy (per-app ingresses use <stack>.appliance.localhost).
+      OFFENDERS=$(/usr/local/bin/k3s kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.rules[*].host}{"\n"}{end}' 2>/dev/null \
+        | awk '$1 != "default" { for (i = 3; i <= NF; i++) if ($i == "api.appliance.localhost") { print $1 "/" $2; break } }')
+      for ING in $OFFENDERS; do
+        NS=${ING%%/*}
+        NAME=${ING#*/}
+        /usr/local/bin/k3s kubectl -n "$NS" delete ingress "$NAME" --ignore-not-found >/dev/null 2>&1 || true
+        REMOVED="ingress $ING"
+      done
+      # Re-retire the legacy namespace if something re-created it. Only
+      # an Active namespace counts — a Terminating one is the previous
+      # delete still draining, not a new offense.
+      if [ "$(/usr/local/bin/k3s kubectl get namespace appliance-system -o jsonpath='{.status.phase}' 2>/dev/null)" = "Active" ]; then
+        /usr/local/bin/k3s kubectl delete namespace appliance-system --ignore-not-found >/dev/null 2>&1 || true
+        REMOVED="${REMOVED:+$REMOVED, }namespace appliance-system"
+      fi
+      if [ -n "$REMOVED" ]; then
+        MSG="legacy api-server deploy detected and removed ($REMOVED) — an out-of-date appliance CLI deployed it; update the CLI (run: appliance upgrade)"
+        echo "appliance-api-server: WARNING: $MSG" >> /var/log/appliance-api-server.log
+        echo "$MSG" >> "$WARNINGS_FILE"
+        # Cap the warnings file so a persistent legacy CLI can't grow it
+        # unbounded; cluster-info dedupes what remains.
+        tail -n 50 "$WARNINGS_FILE" > "$WARNINGS_FILE.tmp" 2>/dev/null && mv "$WARNINGS_FILE.tmp" "$WARNINGS_FILE" || true
+      fi
+    done
+  ) &
+else
+  echo "appliance-api-server: binary not present — control plane unavailable in this VM"
+fi
 "#;
 
 /// Per-connection shell run by the vsock agent (socat EXEC target). The
@@ -727,7 +1280,7 @@ exec su -s "$__SH" -l appliance
 /// short escape-time so key passthrough feels raw, a large scrollback that
 /// survives detach/reattach, and `destroy-unattached off` so a session
 /// lives on while no client is attached — the whole point of reattach.
-const TMUX_CONF: &str = r#"set -g status off
+pub(crate) const TMUX_CONF: &str = r#"set -g status off
 set -g default-terminal "tmux-256color"
 set -g escape-time 10
 set -g history-limit 50000
@@ -750,6 +1303,16 @@ fn build_apkovl(
     // guest compares to decide whether to wipe /persist/npm-global on a
     // project switch. Empty ⇒ no mount ⇒ no wipe.
     project_id: &str,
+    // Host ingress port for deploy-result URLs (spec.host_port),
+    // embedded into the guest api-server's base config.
+    host_port: u16,
+    // The VM's bootstrap token (`ensure_bootstrap_token`); baked into
+    // the overlay at /etc/appliance/bootstrap-token (0600). Empty when
+    // the api-server isn't provisioned.
+    bootstrap_token: &str,
+    // Whether the boot media carries the staged api-server binary; the
+    // provision block is only injected when it does.
+    apiserver: bool,
 ) -> Result<Vec<u8>> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
@@ -783,10 +1346,13 @@ fn build_apkovl(
     // --session / sessions): an in-guest multiplexer whose named sessions
     // survive a client disconnect + desktop restart. Unconditional, like
     // the shell agent itself — every VM, not just dev VMs.
+    // libstdc++/libgcc back the bun-compiled api-server binary; unzip
+    // (zipinfo included) backs its server-side build pipeline. All three
+    // are small and ride every VM so the world file stays static.
     file(
         "etc/apk/world",
         0o644,
-        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\ntmux\n",
+        b"alpine-base\ne2fsprogs\nca-certificates\nbusybox-extras\nsocat\nsudo\ntmux\nlibstdc++\nlibgcc\nunzip\n",
     )?;
     file(
         "etc/apk/repositories",
@@ -805,8 +1371,8 @@ fn build_apkovl(
     // The non-root appliance user is provisioned on every VM. uid/gid
     // are pinned here: the host user's own ids on a VirtioFS-mounted VM
     // (so the shared workspace stays writable), 1000 otherwise.
-    let (app_uid, app_gid) =
-        resolve_app_ids(mount, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let (host_uid, host_gid) = host_ids();
+    let (app_uid, app_gid) = resolve_app_ids(mount, host_uid, host_gid);
     let app_user_provision = APP_USER_PROVISION
         .replace("__APP_UID__", &app_uid.to_string())
         .replace("__APP_GID__", &app_gid.to_string());
@@ -824,15 +1390,54 @@ fn build_apkovl(
             // an injected __KUBECONFIG_PORT__ as a literal.
             .replace(
                 "__K3S_PROVISION__",
-                if agent_only { AGENT_HANDOFF } else { K3S_PROVISION },
+                &if agent_only {
+                    AGENT_HANDOFF.to_string()
+                } else {
+                    format!("{K3S_MEDIA_COPY}{K3S_COMMON}")
+                },
             )
             .replace(
                 "__AGENT_DOCKER_STUB__",
                 if agent_only && !docker { AGENT_DOCKER_STUB } else { "" },
             )
+            // BuildKit rides every k3s VM (agent-only VMs have no
+            // registry to push to). Injected before the port
+            // substitutions below — it carries nested
+            // __REGISTRY_HOST_PORT__/__REGISTRY_NODEPORT__/
+            // __BUILDKITD_GUEST_PORT__ markers (Quinn gap #1, same as
+            // the k3s branch).
+            .replace(
+                "__BUILDKIT_PROVISION__",
+                if agent_only { "" } else { BUILDKIT_PROVISION },
+            )
+            // The api-server guest binary rides k3s VMs whose media
+            // carries the staged binary. Injected before the port
+            // substitutions — it carries nested __HOST_PORT__/
+            // __REGISTRY_HOST_PORT__/__APISERVER_GUEST_PORT__ markers
+            // (Quinn gap #1, same as the k3s branch).
+            .replace(
+                "__APISERVER_PROVISION__",
+                &if agent_only || !apiserver {
+                    String::new()
+                } else {
+                    format!("{APISERVER_MEDIA_COPY}{APISERVER_COMMON}")
+                },
+            )
+            // vz boot media: arm the guest-side probe for the
+            // platform-images media. Harmless when the media wasn't
+            // attached (the probe finds no label and k3s pulls from the
+            // network); the WSL bootstrap substitutes this to empty.
+            .replace("__K3S_AIRGAP_PREAMBLE__", "APPLIANCE_AIRGAP_PROBE=1")
+            .replace("__APISERVER_GUEST_PORT__", &API_SERVER_GUEST_PORT.to_string())
+            // Writer-version stamp on the guest's base config, logged by
+            // the api-server on parse — makes engine/guest schema drift
+            // visible in the server log (incident B follow-up).
+            .replace("__BASE_CONFIG_VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__HOST_PORT__", &host_port.to_string())
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())
             .replace("__REGISTRY_HOST_PORT__", &registry_host_port.to_string())
+            .replace("__BUILDKITD_GUEST_PORT__", &BUILDKITD_GUEST_PORT.to_string())
             .replace("__SHELL_VSOCK_PORT__", &SHELL_VSOCK_PORT.to_string())
             .replace("__APP_USER_PROVISION__", &app_user_provision)
             .replace("__DEV_PROVISION__", if dev { DEV_PROVISION } else { "" })
@@ -858,6 +1463,13 @@ fn build_apkovl(
     file("usr/local/bin/appliance-shell-agent", 0o755, SHELL_AGENT.as_bytes())?;
     // Transparent tmux config for the agent's reattachable sessions.
     file("etc/appliance/tmux.conf", 0o644, TMUX_CONF.as_bytes())?;
+    // The bootstrap token the guest api-server verifies create-key
+    // requests against. Root-only, exactly like the host-side copy.
+    // Gated like the provision block itself — agent-only VMs carry no
+    // control plane and therefore no secret.
+    if !agent_only && apiserver && !bootstrap_token.is_empty() {
+        file("etc/appliance/bootstrap-token", 0o600, bootstrap_token.as_bytes())?;
+    }
 
     // The per-VM egress CA, trusted node-wide by appliance.start's
     // update-ca-certificates step. Placed even when interception is
@@ -901,6 +1513,7 @@ fn build_apkovl(
 /// change is overkill for now — we rebuild on every `up`/`run`; it
 /// takes well under a second and guarantees the media matches the
 /// code that produced it.
+#[allow(clippy::too_many_arguments)]
 pub fn build_boot_media(
     vm_dir: &Path,
     registry_host_port: u16,
@@ -913,8 +1526,21 @@ pub fn build_boot_media(
     docker: bool,
     egress_port: u16,
     agent_only: bool,
+    // Host ingress port (spec.host_port) — embedded in the guest
+    // api-server's base config for deploy-result URLs.
+    host_port: u16,
 ) -> Result<BootMedia> {
     let (modloop, k3s) = ensure_assets()?;
+    // The CLI-staged api-server binary + console bundle (guest control
+    // plane). Optional by contract: agent-only VMs never carry them,
+    // and an engine invoked without the CLI simply boots without a
+    // control plane (the guest logs that honestly).
+    let apiserver = if agent_only { None } else { apiserver_assets() };
+    let bootstrap_token = if apiserver.is_some() {
+        ensure_bootstrap_token(vm_dir)?
+    } else {
+        String::new()
+    };
     // Generate (once) and bake the per-VM egress CA into the overlay so
     // the guest's system trust store includes it. Best-effort: a CA
     // failure must not block boot media assembly.
@@ -938,13 +1564,29 @@ pub fn build_boot_media(
         egress_port,
         agent_only,
         &project_id,
+        host_port,
+        &bootstrap_token,
+        apiserver.is_some(),
     )?;
 
     let modloop_data = fs::read(&modloop)?;
     let k3s_data = fs::read(&k3s)?;
+    let apiserver_data = apiserver
+        .as_ref()
+        .map(|a| fs::read(&a.binary))
+        .transpose()?;
+    let console_data = apiserver
+        .as_ref()
+        .and_then(|a| a.console.as_ref())
+        .map(fs::read)
+        .transpose()?;
 
     // Size the volume to fit contents + FAT overhead, rounded up.
-    let content = modloop_data.len() + k3s_data.len() + apkovl.len();
+    let content = modloop_data.len()
+        + k3s_data.len()
+        + apkovl.len()
+        + apiserver_data.as_ref().map_or(0, Vec::len)
+        + console_data.as_ref().map_or(0, Vec::len);
     let volume_bytes = ((content as u64 + 64 * 1024 * 1024) / (16 * 1024 * 1024) + 1) * (16 * 1024 * 1024);
 
     let image_path = vm_dir.join("boot-media.img");
@@ -975,10 +1617,21 @@ pub fn build_boot_media(
         f.write_all(&apkovl)?;
         let mut f = root.create_file("k3s")?;
         f.write_all(&k3s_data)?;
+        if let Some(data) = &apiserver_data {
+            let mut f = root.create_file("appliance-api-server")?;
+            f.write_all(data)?;
+        }
+        if let Some(data) = &console_data {
+            let mut f = root.create_file("appliance-console.tar.gz")?;
+            f.write_all(data)?;
+        }
     }
     fs.unmount().context("unmount FAT volume")?;
 
-    Ok(BootMedia { image: image_path })
+    Ok(BootMedia {
+        image: image_path,
+        apiserver_staged: apiserver.is_some(),
+    })
 }
 
 /// Kernel command line for the k3s guest. The netboot initramfs
@@ -1031,12 +1684,17 @@ fn plan_host_services(spec: &crate::spec::VmSpec) -> HostServicePlan {
 ///   3. fetch the admin kubeconfig over the guest's handoff endpoint,
 ///      rewrite it to the forwarded port, persist it next to the VM
 ///
-/// Files written (guest-ip, kubeconfig.yaml) are the contract `up`
-/// polls on from the calling process.
+/// Files written (guest-ip, kubeconfig.yaml) plus the terminal `Ready`
+/// phase are the contract `up` polls on from the calling process —
+/// kubeconfig.yaml lands as soon as the cluster answers (a debugging
+/// surface), Ready only once the whole platform does.
 pub fn host_services(
     spec: &crate::spec::VmSpec,
     vm_dir: &Path,
     netstack: Option<&crate::netstack::Netstack>,
+    // Whether this boot's media embeds the api-server binary (captured
+    // at media-build time; see `BootMedia::apiserver_staged`).
+    apiserver_staged: bool,
 ) -> Result<()> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
@@ -1074,6 +1732,8 @@ pub fn host_services(
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
                 crate::net::spawn_proxy_netstack(spec.registry_port, REGISTRY_NODEPORT, ns.clone())
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                crate::net::spawn_proxy_netstack(spec.buildkit_port, BUILDKITD_GUEST_PORT, ns.clone())
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.buildkit_port, "buildkit")))?;
                 for port in 30000..=30050u16 {
                     let _ = crate::net::spawn_proxy_netstack(port, port, ns.clone());
                 }
@@ -1097,6 +1757,8 @@ pub fn host_services(
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.host_port, "ingress")))?;
                 crate::net::spawn_proxy(spec.registry_port, SocketAddr::new(guest_ip, REGISTRY_NODEPORT))
                     .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.registry_port, "registry")))?;
+                crate::net::spawn_proxy(spec.buildkit_port, SocketAddr::new(guest_ip, BUILDKITD_GUEST_PORT))
+                    .map_err(|e| anyhow::anyhow!("{}\n{e:#}", bind_hint(spec.buildkit_port, "buildkit")))?;
                 // The deterministic-NodePort window KubernetesDeploymentService
                 // assigns from — forwarded so the "direct" URLs in deploy
                 // results work exactly as they do on k3d.
@@ -1115,7 +1777,7 @@ pub fn host_services(
     // skipped above, never the discovery/lease. `persist_guest_ip` is
     // always true (the plan locks it); guarding the write through it keeps
     // the invariant a single tested decision.
-    eprintln!("guest address: {guest_ip}");
+    crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     if plan.persist_guest_ip {
         fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     }
@@ -1126,30 +1788,144 @@ pub fn host_services(
         // guest serves an `agent-ready` sentinel once the Node toolchain
         // (.dev-ready) is up (Quinn gap #2). Then write the host-side
         // readiness marker `up`/`status`/`list` poll on for this spec.
-        eprintln!("agent-only: gating on the agent runtime (node + vsock shell)");
+        crate::bringup::hostlog("agent-only: gating on the agent runtime (node + vsock shell)");
         crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
         let handoff = format!("http://{handoff_host}:{handoff_port}/agent-ready");
         crate::net::wait_http(&handoff, Duration::from_secs(600))?;
         fs::write(vm_dir.join("agent-ready"), b"agent-ready\n")?;
-        eprintln!("agent runtime ready: {}", vm_dir.join("agent-ready").display());
+        crate::bringup::hostlog(&format!(
+            "agent runtime ready: {}",
+            vm_dir.join("agent-ready").display()
+        ));
         crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
         return Ok(());
     }
 
-    eprintln!(
-        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry)",
-        spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT
-    );
+    crate::bringup::hostlog(&format!(
+        "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
+        spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
+    ));
 
-    // The guest serves its kubeconfig only after k3s has written it —
-    // first boot includes apk installs + image pulls, so be generous.
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
-    crate::net::wait_http(&handoff, Duration::from_secs(600))?;
+    wait_platform_ready(spec, vm_dir, handoff_host, handoff_port, apiserver_staged)
+}
+
+/// Drive the honest cluster sub-phases through the long "cluster" window
+/// and only declare `Ready` once the platform actually answers:
+/// kubeconfig fetched, the in-VM registry's `/v2/` reachable through its
+/// host forward, and — when the media carried the api-server — its
+/// traefik route answering. Backend-neutral (plain HTTP polling of
+/// host-reachable endpoints): the vz and WSL host services both end here.
+///
+/// `apiserver_staged` is whether THIS boot's media carries the
+/// api-server binary — captured at media-build time by the backend and
+/// plumbed through, never re-probed off the shared guest-assets cache
+/// here (a CLI staging or pruning the binary mid-boot must not change
+/// what readiness means for a VM already booted without/with it).
+pub(crate) fn wait_platform_ready(
+    spec: &crate::spec::VmSpec,
+    vm_dir: &Path,
+    handoff_host: std::net::IpAddr,
+    handoff_port: u16,
+    apiserver_staged: bool,
+) -> Result<()> {
+    use crate::bringup::{hostlog, set, Phase};
+    use std::time::{Duration, Instant};
+
+    // Publish the coarse phase FIRST: older desktops ignore the unknown
+    // sub-phases below, so `cluster` is what keeps their ladder moving.
+    set(vm_dir, Phase::Cluster, None);
+
+    // Poll the guest's grippable /progress markers to advance sub-phases
+    // while waiting on the k3s API — same 600s cold budget the plain
+    // k3s.yaml wait had (first boot installs packages / imports images).
+    let progress_url = format!("http://{handoff_host}:{handoff_port}/progress");
+    let kubeconfig_url = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut node_seen = false;
+    let mut images_seen = false;
+    loop {
+        if let Some(progress) = crate::net::http_get_text(&progress_url) {
+            if !node_seen && progress.contains("base-system-ready") {
+                set(vm_dir, Phase::ClusterNode, None);
+                hostlog("guest base system up");
+                node_seen = true;
+            }
+            if !images_seen && progress.contains("images-imported") {
+                set(vm_dir, Phase::ClusterImages, Some("airgap tarball staged".into()));
+                hostlog("platform images staged for k3s import");
+                images_seen = true;
+            }
+            if progress.contains("k3s-api-up") {
+                break;
+            }
+        }
+        // Belt and braces: the kubeconfig answering IS the API being up,
+        // marker or no marker (e.g. a guest predating the marker).
+        if crate::net::http_get_text(&kubeconfig_url).is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("guest kubeconfig handoff did not answer within 600s");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    set(vm_dir, Phase::ClusterApi, None);
+    hostlog("kubernetes api up (kubeconfig served)");
+    // The marker can beat a first fetch by a beat — give it patience.
+    crate::net::wait_http(&kubeconfig_url, Duration::from_secs(30))?;
     let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
+    // Persist the kubeconfig the moment it exists — BEFORE the last-mile
+    // waits below, exactly like main always did. A registry/ingress
+    // failure then still leaves kubectl usable for debugging (the CLI's
+    // kubeconfig path helpers gate on this file); it no longer implies
+    // readiness — `up` gates on the terminal `Ready` phase, which only
+    // lands after the last mile answers.
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
+    hostlog(&format!(
+        "kubeconfig written to {}",
+        vm_dir.join("kubeconfig.yaml").display()
+    ));
+
+    // Last mile — what `ready` must actually mean. The registry rides
+    // every k3s VM (first boot may still be pulling registry:2); the
+    // api-server route only exists when the media carried the binary,
+    // and traefik's own install shares the same cold window. Each cold
+    // budget is capped by what REMAINS of the total bring-up budget
+    // (`up --timeout`, threaded in via the env var), so the serial waits
+    // can never add up past what the caller is polling against. On
+    // failure the error propagates to the backend's host-services
+    // supervisor, which publishes Phase::Failed with the detail —
+    // kubeconfig.yaml stays on disk.
+    let budgeted = |what: &str, cold: Duration| {
+        let (wait, truncated) = crate::bringup::budgeted_wait(cold, crate::bringup::remaining_budget());
+        if truncated {
+            hostlog(&format!(
+                "{what} wait capped at {}s by the remaining bring-up budget (cold budget {}s)",
+                wait.as_secs(),
+                cold.as_secs()
+            ));
+        }
+        wait
+    };
+    set(vm_dir, Phase::Ingress, Some("in-VM registry".into()));
+    let registry_url = format!("http://127.0.0.1:{}/v2/", spec.registry_port);
+    crate::net::wait_http(&registry_url, budgeted("in-VM registry", Duration::from_secs(300)))?;
+    hostlog("in-VM registry answering");
+    if apiserver_staged {
+        set(vm_dir, Phase::Ingress, Some("api-server route".into()));
+        let ingress_url = format!("http://127.0.0.1:{}/bootstrap/status", spec.host_port);
+        crate::net::wait_http_host(
+            &ingress_url,
+            "api.appliance.localhost",
+            budgeted("api-server ingress", Duration::from_secs(600)),
+        )?;
+        hostlog("api-server ingress answering");
+    }
+
+    // Terminal success — the phase `up` gates readiness on (together
+    // with the kubeconfig marker), deliberately LAST so `Ready` means
+    // "actually usable", not just "k3s elected itself".
+    set(vm_dir, Phase::Ready, None);
     Ok(())
 }
 
@@ -1187,7 +1963,7 @@ mod tests {
     #[test]
     fn apkovl_embeds_egress_ca_when_provided() {
         let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(paths.iter().any(|p| p == "usr/local/share/ca-certificates/appliance-egress.crt"));
         // And the bootstrap trusts it node-wide.
@@ -1197,7 +1973,7 @@ mod tests {
 
     #[test]
     fn apkovl_omits_egress_ca_when_absent() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let paths = apkovl_paths(&ovl);
         assert!(!paths.iter().any(|p| p.contains("appliance-egress.crt")));
     }
@@ -1205,7 +1981,7 @@ mod tests {
     #[test]
     fn apkovl_ca_pem_round_trips() {
         let pem = "-----BEGIN CERTIFICATE-----\nROUNDTRIP\n-----END CERTIFICATE-----\n";
-        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, Some(pem), false, false, false, 5053, false, "", 8081, "", false).unwrap();
         assert_eq!(
             apkovl_file(&ovl, "usr/local/share/ca-certificates/appliance-egress.crt").as_deref(),
             Some(pem)
@@ -1216,23 +1992,24 @@ mod tests {
     fn dev_provisioning_present_only_for_dev_vms() {
         // Non-dev: the marker is substituted to empty and no dev wiring
         // leaks into the bootstrap.
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"), "marker must be substituted");
         // The base user block references /persist/workspace on every VM,
-        // so assert on dev-only wiring instead.
+        // and buildkit's own apk install rides every k3s VM — so assert
+        // on dev-only wiring (the toolchain package set) instead.
         assert!(!start.contains("appliance-dev: provisioning"));
-        assert!(!start.contains("apk add"));
+        assert!(!start.contains("bash bash-completion git"));
 
         // Dev: the workspace, persistent apk cache, login profile, and
         // backgrounded toolchain install are all present.
-        let dev = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
+        let dev = build_apkovl(5052, None, true, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&dev, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DEV_PROVISION__"));
         assert!(start.contains("mkdir -p /persist/workspace"));
         assert!(start.contains("ln -sfn /persist/apk-cache /etc/apk/cache"));
         assert!(start.contains("/etc/profile.d/appliance-dev.sh"));
-        assert!(start.contains("apk add"));
+        assert!(start.contains("bash bash-completion git"));
         assert!(start.contains("/persist/.dev-ready"));
     }
 
@@ -1240,7 +2017,7 @@ mod tests {
     fn appliance_user_provisioned_on_every_vm() {
         // The non-root user is unconditional — present even on a plain
         // (non-dev, non-docker, non-mount) VM, just like the shell agent.
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__APP_USER_PROVISION__"), "marker must be substituted");
         // User + primary group, pinned uid/gid, on the persistent home.
@@ -1281,7 +2058,7 @@ mod tests {
         assert_eq!(resolve_app_ids(true, 501, 20), (501, 20));
 
         // A non-mount VM pins the conventional 1000/1000.
-        let plain = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
+        let plain = build_apkovl(5052, None, true, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("APP_UID=1000"));
         assert!(start.contains("APP_GID=1000"));
@@ -1291,10 +2068,9 @@ mod tests {
         // except when the host is root, where the resolver falls back to
         // 1000 (asserted separately), so derive the expected ids the same
         // way and don't hard-code the live host's values.
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        let (host_uid, host_gid) = host_ids();
         let (exp_uid, exp_gid) = resolve_app_ids(true, host_uid, host_gid);
-        let shared = build_apkovl(5052, None, true, true, false, 5053, false, "").unwrap();
+        let shared = build_apkovl(5052, None, true, true, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&shared, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains(&format!("APP_UID={exp_uid}")), "mounted VM must pin the resolved uid");
         assert!(start.contains(&format!("APP_GID={exp_gid}")), "mounted VM must pin the resolved gid");
@@ -1317,7 +2093,7 @@ mod tests {
 
     #[test]
     fn vsock_shell_agent_is_baked_into_every_vm() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         // socat backs the agent and is in the base package set.
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "socat"));
@@ -1342,14 +2118,14 @@ mod tests {
     fn tmux_is_in_the_base_world_set() {
         // The reattachable-session multiplexer ships on EVERY VM (not just
         // dev VMs), next to socat/sudo — the feature is unconditional.
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let world = apkovl_file(&ovl, "etc/apk/world").unwrap();
         assert!(world.lines().any(|l| l == "tmux"), "tmux must be in the base world set");
     }
 
     #[test]
     fn transparent_tmux_conf_is_baked_in() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let conf = apkovl_file(&ovl, "etc/appliance/tmux.conf").expect("tmux.conf present");
         // Invisible multiplexer: no status bar, short escape passthrough,
         // large scrollback, and sessions outlive a detach.
@@ -1363,7 +2139,7 @@ mod tests {
 
     #[test]
     fn shell_agent_routes_session_verbs_to_tmux() {
-        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let agent = apkovl_file(&ovl, "usr/local/bin/appliance-shell-agent").unwrap();
 
         // The four verbs are parsed off the size line.
@@ -1410,17 +2186,17 @@ mod tests {
         // Both markers must always be substituted away.
         for (dev, mount) in [(false, false), (true, false), (true, true)] {
             let start =
-                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
+                apkovl_file(&build_apkovl(5052, None, dev, mount, false, 5053, false, "", 8081, "", false).unwrap(), "etc/local.d/appliance.start").unwrap();
             assert!(!start.contains("__DEV_MOUNT__"), "marker must be substituted (dev={dev} mount={mount})");
         }
 
         // Dev without a share: no virtiofs mount.
-        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
+        let dev_only = apkovl_file(&build_apkovl(5052, None, true, false, false, 5053, false, "", 8081, "", false).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(!dev_only.contains("mount -t virtiofs"));
 
         // Dev + share: the bootstrap mounts the workspace tag, and the
         // tag literal matches the constant the VZ backend tags with.
-        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053, false, "").unwrap(), "etc/local.d/appliance.start").unwrap();
+        let shared = apkovl_file(&build_apkovl(5052, None, true, true, false, 5053, false, "", 8081, "", false).unwrap(), "etc/local.d/appliance.start").unwrap();
         assert!(shared.contains(&format!("mount -t virtiofs {WORKSPACE_VIRTIOFS_TAG} /persist/workspace")));
         assert!(DEV_MOUNT.contains(WORKSPACE_VIRTIOFS_TAG));
     }
@@ -1431,7 +2207,7 @@ mod tests {
         // provisioning leaks into the bootstrap. (The section-header
         // comment legitimately names dockerd even when off, so assert on
         // the provisioning strings that only the block emits.)
-        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("apk add --no-progress docker docker-cli-compose"));
@@ -1440,7 +2216,7 @@ mod tests {
 
         // Docker: the apk install, the separate dockerd engine, the
         // egress env injection, and the readiness marker are all present.
-        let docker = build_apkovl(5052, None, false, false, true, 5053, false, "").unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__DOCKER_PROVISION__"));
         // Packaged from the Alpine community repo, cached on /persist.
@@ -1474,16 +2250,230 @@ mod tests {
         // The egress port is substituted into the proxy URL the guest
         // builds at boot from its default-route gateway — the marker must
         // be gone and the actual port present.
-        let docker = build_apkovl(5052, None, false, false, true, 8203, false, "").unwrap();
+        let docker = build_apkovl(5052, None, false, false, true, 8203, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__EGRESS_PORT__"), "port marker must be substituted");
         assert!(start.contains(":8203"), "the per-VM egress port must be embedded");
     }
 
     #[test]
+    fn buildkit_provisioned_on_k3s_vms_but_not_agent_only() {
+        // Normal (k3s) VM: buildkitd is provisioned unconditionally —
+        // marker substituted, apk install + tcp listener + persistent
+        // cache root + registry alias + readiness marker all present.
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__BUILDKIT_PROVISION__"), "marker must be substituted");
+        // socat rides the same install: present in the vz world file
+        // but NOT in the WSL bootstrap's base packages.
+        assert!(start.contains("apk add --no-progress buildkit buildctl runc socat"));
+        assert!(start.contains("root = \"/persist/buildkit\""));
+        assert!(start.contains(&format!("--addr tcp://0.0.0.0:{BUILDKITD_GUEST_PORT}")));
+        assert!(start.contains("/persist/.buildkit-ready"));
+        // The guest-loopback registry alias bridges the host-forwarded
+        // ref (localhost:<registryPort>) to the registry NodePort so
+        // buildkitd pushes the SAME ref pods pull.
+        assert!(start.contains("socat TCP-LISTEN:5052,bind=127.0.0.1,reuseaddr,fork"));
+        assert!(start.contains(&format!("TCP:127.0.0.1:{REGISTRY_NODEPORT}")));
+        // Insecure (plain-HTTP) push for both spellings of the registry.
+        assert!(start.contains("[registry.\"localhost:5052\"]"));
+        assert!(start.contains(&format!("[registry.\"127.0.0.1:{REGISTRY_NODEPORT}\"]")));
+        // No literal port markers survive.
+        assert!(!start.contains("__BUILDKITD_GUEST_PORT__"));
+        assert!(!start.contains("__REGISTRY_HOST_PORT__"));
+
+        // Agent-only VM: no k3s, no registry — no buildkit either. (The
+        // section-header comment legitimately names buildkitd even when
+        // off, so assert on strings only the provision block emits.)
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__BUILDKIT_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("apk add --no-progress buildkit buildctl runc socat"), "agent-only VMs provision no buildkit");
+        assert!(!start.contains("/persist/.buildkit-ready"));
+    }
+
+    #[test]
+    fn buildkit_heredoc_terminates() {
+        // The BKTOML heredoc must close: an unterminated heredoc would
+        // swallow the rest of the bootstrap silently.
+        let opens = BUILDKIT_PROVISION.matches("<<BKTOML").count();
+        let closes = BUILDKIT_PROVISION.lines().filter(|l| l.trim() == "BKTOML").count();
+        assert_eq!(opens, 1);
+        assert_eq!(closes, 1, "the BKTOML heredoc must terminate at column 0");
+    }
+
+    #[test]
+    fn apiserver_provisioned_on_k3s_vms_with_staged_assets_only() {
+        // k3s VM with the api-server staged: media copy, base config,
+        // ingress route, token launch env, respawn loop — all present,
+        // no literal markers.
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__APISERVER_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("__APISERVER_GUEST_PORT__"));
+        assert!(!start.contains("__HOST_PORT__"));
+        assert!(start.contains("cp \"$APISERVER_MEDIA/appliance-api-server\" /usr/local/bin/appliance-api-server"));
+        // Token auth against the local k3s: bun's fetch can't carry the
+        // kubeconfig's client certificates, so the server gets its own
+        // ServiceAccount token + the k3s CA via NODE_EXTRA_CA_CERTS.
+        assert!(start.contains("\"server\": \"https://127.0.0.1:6443\""));
+        assert!(start.contains("type: kubernetes.io/service-account-token"));
+        assert!(start.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(start.contains("\"hostPort\": 8081"));
+        assert!(start.contains("\"registry\": { \"url\": \"localhost:5052\", \"insecure\": true }"));
+        assert!(start.contains("\"buildkit\": { \"addr\": \"unix:///run/buildkit/buildkitd.sock\" }"));
+        assert!(start.contains("host: api.appliance.localhost"));
+        assert!(start.contains(&format!("PORT={API_SERVER_GUEST_PORT} HOST=0.0.0.0")));
+        assert!(start.contains("BOOTSTRAP_TOKEN=\"$(cat /etc/appliance/bootstrap-token 2>/dev/null)\""));
+        assert!(start.contains("/persist/.apiserver-ready"));
+        // The token itself lands in the overlay, root-only.
+        assert_eq!(apkovl_file(&plain, "etc/appliance/bootstrap-token").as_deref(), Some("tok3n"));
+        // The runtime deps for the bun binary + server-side builds ride
+        // the world file.
+        let world = apkovl_file(&plain, "etc/apk/world").unwrap();
+        assert!(world.contains("libstdc++"));
+        assert!(world.contains("libgcc"));
+        assert!(world.contains("unzip"));
+
+        // Without staged assets: block and token absent.
+        let unstaged = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&unstaged, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__APISERVER_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("base-config.json"));
+        assert!(apkovl_file(&unstaged, "etc/appliance/bootstrap-token").is_none());
+
+        // Agent-only: never provisioned, even with a token passed.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("__APISERVER_PROVISION__"), "marker must be substituted");
+        assert!(!start.contains("base-config.json"));
+    }
+
+    #[test]
+    fn apiserver_ships_the_legacy_quarantine_watchdog() {
+        // The watchdog rides only the guest-binary bootstrap: pure-legacy
+        // VMs (no staged api-server) must never run it.
+        let plain = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&plain, "etc/local.d/appliance.start").unwrap();
+        // Sweep: hostname-claiming ingresses outside `default`…
+        assert!(start.contains("kubectl get ingress -A -o jsonpath="));
+        assert!(start.contains(r#"$1 != "default""#));
+        assert!(start.contains(r#"$i == "api.appliance.localhost""#));
+        // …and a re-created legacy namespace, but only when Active (a
+        // Terminating one is the previous delete still draining).
+        assert!(start.contains("kubectl get namespace appliance-system -o jsonpath='{.status.phase}'"));
+        // Distinctive warning line lands in the log AND the surfaced file.
+        assert!(start.contains("legacy api-server deploy detected and removed"));
+        assert!(start.contains("APPLIANCE_WARNINGS_FILE=/var/log/appliance-api-server.warnings"));
+        assert!(start.contains(r#"echo "$MSG" >> "$WARNINGS_FILE""#));
+
+        // Gated on the staged binary: absent without assets and on
+        // agent-only VMs.
+        let unstaged = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&unstaged, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_WARNINGS_FILE"));
+        assert!(!start.contains("legacy api-server deploy detected"));
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "tok3n", true).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_WARNINGS_FILE"));
+    }
+
+    #[test]
+    fn apiserver_launcher_never_traces_its_tokens() {
+        // The boot script runs under `set -x`, and xtrace EXPANDS
+        // command substitutions — so the launcher lines
+        // `BOOTSTRAP_TOKEN="$(cat …)"` and `SA_TOKEN=$(kubectl get
+        // secret …)` would paint both secrets verbatim into the console
+        // log unless the launcher subshell turns tracing off first.
+        // Assert `set +x` exists and precedes EVERY token expansion.
+        let off = APISERVER_COMMON
+            .find("set +x")
+            .expect("the api-server launcher must disable xtrace");
+        // The launcher subshell's close: every token expansion must sit
+        // inside it, or it runs OUTSIDE the `set +x` scope and traces.
+        let close = APISERVER_COMMON
+            .find(") &")
+            .expect("the launcher subshell must close with `) &`");
+        let mut last_token = 0usize;
+        for token_read in ["SA_TOKEN=", "BOOTSTRAP_TOKEN=", "base64 -d"] {
+            let first = APISERVER_COMMON
+                .find(token_read)
+                .unwrap_or_else(|| panic!("{token_read} expected in the launcher"));
+            assert!(
+                off < first,
+                "`set +x` must come before {token_read} or the secret leaks into console.log"
+            );
+            let last = APISERVER_COMMON.rfind(token_read).unwrap();
+            assert!(
+                last < close,
+                "every {token_read} expansion must occur inside the launcher subshell (before `) &`)"
+            );
+            last_token = last_token.max(last);
+        }
+        // No re-enable between the trace-off and the LAST token
+        // expansion — a stray `set -x` there would undo the protection.
+        assert!(
+            !APISERVER_COMMON[off..last_token].contains("set -x"),
+            "`set -x` must not re-enable tracing between `set +x` and the last token expansion"
+        );
+        // The trace-off is scoped to the backgrounded launcher subshell
+        // — it must appear after the subshell opens, so the rest of the
+        // bootstrap keeps its (deliberate) tracing.
+        let subshell = APISERVER_COMMON.find("(\n").expect("backgrounded launcher subshell");
+        assert!(off > subshell, "`set +x` must be inside the launcher subshell");
+        // And the boot script itself still traces (the console log is
+        // the primary debugging surface).
+        assert!(APPLIANCE_START.contains("set -x"));
+    }
+
+    #[test]
+    fn apiserver_heredocs_terminate() {
+        // BASECFG + APIMANIFEST must close — an unterminated heredoc
+        // would swallow the rest of the bootstrap silently.
+        for tag in ["BASECFG", "APIMANIFEST"] {
+            let opens = APISERVER_COMMON.matches(&format!("<<{tag}")).count();
+            let closes = APISERVER_COMMON.lines().filter(|l| l.trim() == tag).count();
+            assert_eq!(opens, 1, "{tag} must open once");
+            assert_eq!(closes, 1, "the {tag} heredoc must terminate at column 0");
+        }
+    }
+
+    #[test]
+    fn apiserver_manifest_heredoc_has_no_command_substitution() {
+        // The APIMANIFEST heredoc is unquoted (it must expand $GUEST_IP at
+        // runtime), so a backtick pair anywhere in its body runs as a
+        // command during expansion. A stray `appliance-api-server` in a
+        // comment once did exactly that — launching the server binary
+        // mid-heredoc, which never exits, so the `cat` hung and the manifest
+        // was written empty (no Service/Endpoints/token Secret → the guest
+        // control plane never became reachable). Guard the body.
+        let body = APISERVER_COMMON
+            .split_once("<<APIMANIFEST")
+            .and_then(|(_, rest)| rest.split_once("\nAPIMANIFEST"))
+            .map(|(body, _)| body)
+            .expect("APIMANIFEST heredoc present");
+        assert!(
+            !body.contains('`'),
+            "the unquoted APIMANIFEST heredoc must not contain backticks (they run as commands)"
+        );
+    }
+
+    #[test]
+    fn bootstrap_token_persists_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("appliance-token-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let first = ensure_bootstrap_token(&dir).unwrap();
+        assert_eq!(first.len(), 64, "32 random bytes, hex-encoded");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        let second = ensure_bootstrap_token(&dir).unwrap();
+        assert_eq!(first, second, "the token is generated once and reused");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn k3s_provisioned_only_for_non_agent_only_vms() {
         // Normal VM: the k3s block is present and the marker is gone.
-        let k3s = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
+        let k3s = build_apkovl(5052, None, true, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&k3s, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
         assert!(start.contains("k3s server"), "k3s launches on a normal VM");
@@ -1494,7 +2484,7 @@ mod tests {
         // Agent-only VM: the k3s block is GONE, replaced by the agent
         // handoff that waits on .dev-ready and serves the agent-ready
         // sentinel.
-        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("__K3S_PROVISION__"), "marker must be substituted");
         assert!(!start.contains("k3s server"), "agent-only provisions NO k3s");
@@ -1506,12 +2496,98 @@ mod tests {
     }
 
     #[test]
+    fn k3s_bringup_serves_grippable_progress_markers() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The handoff httpd starts at the TOP of the k3s block (not gated
+        // on k3s.yaml existing) so the host can poll /progress through the
+        // whole cluster window.
+        let httpd_at = start
+            .find(&format!("httpd -f -p {KUBECONFIG_PORT} -h /srv/handoff"))
+            .unwrap();
+        // Anchor on the LAUNCH LINE itself ("/usr/local/bin/k3s server"),
+        // never bare "k3s server" — prose in the bootstrap's comments
+        // could shadow a bare needle and let the ordering rot unnoticed.
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
+        assert!(httpd_at < k3s_at, "handoff httpd must start before k3s launches");
+        // Grippable markers (never console echo), appended in order:
+        // base system up before k3s, the API marker after it.
+        assert!(start.contains(": > /srv/handoff/progress"));
+        let base_at = start.find("echo base-system-ready >> /srv/handoff/progress").unwrap();
+        let api_at = start.find("echo k3s-api-up >> /srv/handoff/progress").unwrap();
+        assert!(base_at < k3s_at, "base-system-ready precedes the k3s launch");
+        assert!(k3s_at < api_at, "k3s-api-up follows the k3s launch");
+        // The kubeconfig is still published for the host fetch, before the
+        // API marker fires (the marker means "the file is fetchable").
+        let copy_at = start.find("cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml").unwrap();
+        assert!(copy_at < api_at, "k3s.yaml is published before k3s-api-up");
+    }
+
+    #[test]
+    fn k3s_airgap_preload_probes_by_label_and_marks_progress() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The vz boot media arms the probe; the marker itself must be gone.
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"), "marker must be substituted");
+        assert!(start.contains("APPLIANCE_AIRGAP_PROBE=1"), "vz arms the airgap probe");
+        // Device discovery is BY VOLUME LABEL, never a hard-coded node —
+        // /dev/vdc is the agent image on agent VMs (a separate test pins
+        // that a k3s VM's bootstrap has no /dev/vdc at all).
+        assert!(
+            start.contains(&format!("LABEL=\"{K3S_AIRGAP_VOLUME_LABEL}\"")),
+            "the guest must probe blkid for the platform-images label"
+        );
+        assert!(!start.contains("AIRGAP_DEV=/dev/"), "no hard-coded airgap device node");
+        // Stamp-guarded copy into k3s's auto-import dir, with the T2 hook.
+        assert!(start.contains(&format!("$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains(&format!("cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains("echo images-imported >> /srv/handoff/progress"));
+        // Crash-atomic staging: the copy lands at a .tmp sibling and mv
+        // (same filesystem) is the commit point — the stamp name never
+        // exists truncated, and a failed cp sweeps only the .tmp.
+        assert!(start.contains(&format!(
+            "cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE} \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\""
+        )));
+        assert!(start.contains(&format!(
+            "mv \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\" \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}\""
+        )));
+        assert!(start.contains(&format!("rm -f \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\"")));
+        // The preload runs before k3s server starts (containerd imports at
+        // startup) and after the persist mount. Anchored on the REAL code
+        // lines — the probe's `if` and the launch line — never on comment
+        // prose that could shadow the needles.
+        let preload_at = start.find(r#"if [ -n "$APPLIANCE_AIRGAP_PROBE" ]"#).unwrap();
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
+        let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
+        assert!(mount_at < preload_at && preload_at < k3s_at, "preload sits between the persist mount and k3s launch");
+
+        // Agent-only VMs run no k3s: the preload block is absent entirely.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_AIRGAP_PROBE"), "no airgap preload on agent-only VMs");
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"));
+    }
+
+    #[test]
+    fn airgap_volume_label_fits_fat_and_matches_the_probe() {
+        // FAT labels are at most 11 bytes (the builder space-pads to
+        // exactly 11); an oversized const would panic the copy there.
+        assert!(K3S_AIRGAP_VOLUME_LABEL.len() <= 11);
+        // The guest probe greps blkid for the label VERBATIM — busybox
+        // blkid prints it space-trimmed, so it must carry none itself.
+        assert_eq!(K3S_AIRGAP_VOLUME_LABEL, K3S_AIRGAP_VOLUME_LABEL.trim());
+        // And distinct from the boot media's label, so the probe can never
+        // grab the wrong FAT volume.
+        assert_ne!(K3S_AIRGAP_VOLUME_LABEL, "APPLIANCE");
+    }
+
+    #[test]
     fn agent_only_substitution_leaks_no_literal_port_markers() {
         // Quinn gap #1: the branch is injected before the port markers, so
         // the agent handoff's nested __KUBECONFIG_PORT__ must be expanded —
         // never survive as a literal. Assert no marker survives and the
         // real port is embedded on the handoff httpd.
-        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         for marker in [
             "__K3S_PROVISION__",
@@ -1519,6 +2595,8 @@ mod tests {
             "__REGISTRY_NODEPORT__",
             "__REGISTRY_HOST_PORT__",
             "__AGENT_DOCKER_STUB__",
+            "__BUILDKIT_PROVISION__",
+            "__BUILDKITD_GUEST_PORT__",
         ] {
             assert!(!start.contains(marker), "literal marker {marker} leaked into agent-only bootstrap");
         }
@@ -1530,19 +2608,19 @@ mod tests {
     fn agent_only_docker_stub_gated_on_the_docker_flag() {
         // No --docker: the honest-failure docker shim is dropped so an
         // unflagged `docker` call doesn't silently break.
-        let no_docker = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let no_docker = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&no_docker, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("/usr/local/bin/docker"), "no-docker agent VM gets the honest-error shim");
         assert!(start.contains("Relaunch the agent with: appliance agent start --docker"));
 
         // --docker: the shim is skipped so it never shadows the real engine
         // the docker provision installs.
-        let with_docker = build_apkovl(5052, None, true, false, true, 5053, true, "").unwrap();
+        let with_docker = build_apkovl(5052, None, true, false, true, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&with_docker, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("/usr/local/bin/docker"), "--docker agent VM must not shim docker");
         assert!(start.contains("apk add --no-progress docker docker-cli-compose"), "real docker is provisioned");
         // A normal (non-agent) VM never carries the shim either.
-        let normal = build_apkovl(5052, None, false, false, false, 5053, false, "").unwrap();
+        let normal = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&normal, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("/usr/local/bin/docker"));
     }
@@ -1552,7 +2630,7 @@ mod tests {
         // Agent-only: the read-only squashfs (vdc) is mounted at
         // /opt/appliance/agents and its bin is PATH-FIRST so the baked CLIs
         // win and an agent can't shadow them (docs/fast-spin-up.md §2.4).
-        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
         assert!(
             start.contains("mount -t squashfs -o ro /dev/vdc /opt/appliance/agents"),
@@ -1566,7 +2644,7 @@ mod tests {
 
         // A normal (non-agent) VM has no squashfs: no mount, and its bin is
         // NOT on PATH (the marker expands to empty).
-        let normal = build_apkovl(5052, None, true, false, false, 5053, false, "").unwrap();
+        let normal = build_apkovl(5052, None, true, false, false, 5053, false, "", 8081, "", false).unwrap();
         let start = apkovl_file(&normal, "etc/local.d/appliance.start").unwrap();
         assert!(!start.contains("/dev/vdc"), "non-agent VM attaches no agent image");
         assert!(!start.contains("/opt/appliance/agents/bin"), "non-agent VM keeps the squashfs bin off PATH");
@@ -1582,7 +2660,7 @@ mod tests {
         // Sasha #2: with a project identity (a mounted project), the
         // bootstrap wipes /persist/npm-global when the recorded project
         // differs — closing the cross-project PATH-persistence vector.
-        let with_project = build_apkovl(5052, None, true, true, false, 5053, true, "deadbeefcafe0001").unwrap();
+        let with_project = build_apkovl(5052, None, true, true, false, 5053, true, "deadbeefcafe0001", 8081, "", false).unwrap();
         let start = apkovl_file(&with_project, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("APPLIANCE_PROJECT='deadbeefcafe0001'"), "the project identity is stamped in");
         assert!(
@@ -1597,7 +2675,7 @@ mod tests {
 
         // No mount ⇒ empty identity ⇒ the guard is inert (the `-n` test is
         // false), so npm-global is never wiped out from under a project.
-        let no_project = build_apkovl(5052, None, true, false, false, 5053, true, "").unwrap();
+        let no_project = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
         let start = apkovl_file(&no_project, "etc/local.d/appliance.start").unwrap();
         assert!(start.contains("APPLIANCE_PROJECT=''"), "no mount ⇒ empty project identity");
     }

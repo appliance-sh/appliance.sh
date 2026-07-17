@@ -5,12 +5,11 @@ import {
   DeploymentAction,
   EnvironmentStatus,
   deploymentInput,
-  isKubernetesBase,
   z,
 } from '@appliance.sh/sdk';
 import {
   createApplianceDeploymentService,
-  LocalContainerDeploymentService,
+  type ContainerDeploymentBackend,
   type ApplianceStackMetadata,
   type PulumiStackHandle,
 } from '@appliance.sh/infra';
@@ -18,6 +17,7 @@ import { getStorageService } from './storage.service';
 import { environmentService } from './environment.service';
 import { buildService, type ResolvedBuild } from './build.service';
 import { getCurrentTenant, runWithTenant, DEFAULT_TENANT } from './tenant-context';
+import { readBaseConfig, resolveContainerBackend } from './deployment-backend';
 import { logger } from '../logger';
 
 // Project + env name pair that triggers the dogfood role override.
@@ -117,23 +117,20 @@ async function executeDeploymentInTenant(event: WorkerEvent): Promise<void> {
   });
 
   try {
-    const baseConfigRaw = process.env.APPLIANCE_BASE_CONFIG;
-    const baseConfig = baseConfigRaw ? applianceBaseConfig.parse(JSON.parse(baseConfigRaw)) : undefined;
+    const baseConfig = readBaseConfig();
     const onStack = (s: PulumiStackHandle) => {
       activeStack = s;
     };
 
+    // THE base fork, resolved in one place (deployment-backend.ts):
+    // container-runtime bases get the cluster client (no Pulumi, no
+    // cancel-aware stack handle — build resolution still flows through
+    // buildService so the upload/remote-image distinction is
+    // preserved); cloud bases run Pulumi.
     let result;
-    if (baseConfig && isKubernetesBase(baseConfig)) {
-      // Kubernetes-driven runtime (the microVM local runtime + any
-      // generic external cluster) — no Pulumi, no cancel-aware stack
-      // handle. Build
-      // resolution still flows through buildService so the upstream
-      // upload/remote-image distinction is preserved, but the
-      // executor maps the resolved bits into LocalResolvedBuild
-      // instead of the AWS-shaped ResolvedBuild.
-      const local = new LocalContainerDeploymentService(baseConfig);
-      result = await executeLocalAction(local, input, metadata, deployment.id);
+    const backend = resolveContainerBackend(baseConfig);
+    if (backend) {
+      result = await executeLocalAction(backend, input, metadata, deployment.id);
     } else {
       const infraService = createApplianceDeploymentService();
       result = await executeCloudAction(infraService, input, metadata, deployment.id, onStack);
@@ -265,6 +262,24 @@ interface ExecutionResult {
   url?: string;
 }
 
+/**
+ * Surface build/deploy progress on the Deployment record — server-side
+ * image builds can take minutes on a cold builder, and this message is
+ * what the CLI's poll line and the console's status chip show.
+ */
+async function noteProgress(deploymentId: string, message: string): Promise<void> {
+  const storage = getStorageService();
+  try {
+    const d = await storage.get<Deployment>(COLLECTION, deploymentId);
+    if (d && d.status === DeploymentStatus.InProgress) {
+      d.message = message;
+      await storage.set(COLLECTION, d.id, d);
+    }
+  } catch (err) {
+    logger.warn('progress note failed', { deploymentId, err: String(err) });
+  }
+}
+
 async function executeCloudAction(
   infraService: ReturnType<typeof createApplianceDeploymentService>,
   input: WorkerEvent['input'],
@@ -274,6 +289,7 @@ async function executeCloudAction(
 ): Promise<ExecutionResult> {
   switch (input.action) {
     case DeploymentAction.Deploy: {
+      if (input.buildId) await noteProgress(deploymentId, 'Resolving build (building the image server-side)…');
       const build = input.buildId
         ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deploymentId}`)
         : undefined;
@@ -334,13 +350,14 @@ async function executeCloudAction(
 }
 
 async function executeLocalAction(
-  local: LocalContainerDeploymentService,
+  local: ContainerDeploymentBackend,
   input: WorkerEvent['input'],
   metadata: ApplianceStackMetadata,
   deploymentId: string
 ): Promise<ExecutionResult> {
   switch (input.action) {
     case DeploymentAction.Deploy: {
+      if (input.buildId) await noteProgress(deploymentId, 'Resolving build (building the image server-side)…');
       const build: ResolvedBuild | undefined = input.buildId
         ? await buildService.resolve(input.buildId, `${metadata.stackName}-${deploymentId}`)
         : undefined;
@@ -386,6 +403,9 @@ async function executeLocalAction(
         imageUri,
         port,
         environment: env,
+        // Omitted → the service preserves the live Deployment's scale,
+        // so a bare redeploy doesn't reset a scaled environment to 1.
+        replicas: input.replicas,
       });
       return { message: result.message, idempotentNoop: result.idempotentNoop, url: result.url };
     }

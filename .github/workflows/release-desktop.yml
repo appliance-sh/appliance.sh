@@ -10,6 +10,11 @@ on:
         description: Release tag the bundles attach to (e.g. v1.48.0). Defaults to the desktop package.json version with a leading "v".
         required: false
         default: ''
+      unsigned:
+        description: Build UNSIGNED, un-notarized macOS bundles (skips the Developer ID keychain import + notarization). Updater .sig generation via TAURI_SIGNING_PRIVATE_KEY is unaffected.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write # to upload DMGs + the updater manifest to the release
@@ -39,8 +44,11 @@ jobs:
             runs_on: macos-14
           - arch: x86_64
             rust_target: x86_64-apple-darwin
-            # Intel runner.
-            runs_on: macos-13
+            # Intel runner. macos-13 was retired by GitHub (jobs never
+            # schedule and time out after 24h); macos-15-intel is the
+            # supported native-Intel image, so the Bun sidecar arch
+            # still matches the bundle without cross-compiling.
+            runs_on: macos-15-intel
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
@@ -76,18 +84,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build the workspace deps the desktop bundle imports at compile
-      # time, topologically. Same order as release-cli-binaries.yml; the
-      # desktop additionally needs @appliance.sh/app (the React console)
-      # built so the Tauri frontendDist has something to bundle.
+      # Build the desktop's compile-time workspace deps from the nx
+      # dependency graph: the CLI (bundled as the sidecar binary) and the
+      # @appliance.sh/app React frontend (the Tauri frontendDist), plus
+      # their transitive deps (sdk → infra → bootstrap → helper), all in
+      # topological order. nx derives the order from the graph — no
+      # hand-maintained list shared with release-cli-binaries.yml to drift.
       - name: Build desktop prerequisites
-        run: |
-          pnpm --filter @appliance.sh/sdk run build
-          pnpm --filter @appliance.sh/infra run build
-          pnpm --filter @appliance.sh/bootstrap run build
-          pnpm --filter @appliance.sh/helper run build
-          pnpm --filter @appliance.sh/cli run build
-          pnpm --filter @appliance.sh/app run build
+        run: pnpm exec nx run-many -t build -p @appliance.sh/cli @appliance.sh/app
 
       # nx-release bumps the package.json versions but does NOT touch the
       # Rust-side version sources (tauri.conf.json, Cargo.toml). The
@@ -97,6 +101,14 @@ jobs:
       # here from the single source of truth.
       - name: Sync bundle version from package.json
         run: node packages/desktop/scripts/sync-version.mjs
+
+      # The committed tauri.conf.json carries a placeholder updater
+      # pubkey (fail-safe: update checks reject everything). Release
+      # builds inject the real public key so self-update actually works.
+      - name: Inject updater public key
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: node packages/desktop/scripts/set-updater-pubkey.mjs
 
       # Build, Developer-ID-sign (hardened runtime), notarize + staple,
       # and emit signed updater artifacts. Every secret below is OPTIONAL
@@ -121,8 +133,15 @@ jobs:
           # --- updater artifact signing (Tauri) ---
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # workflow_dispatch escape hatch: force an unsigned build even
+          # when the APPLE_* secrets exist (e.g. cert expired mid-release).
+          UNSIGNED: ${{ inputs.unsigned }}
         run: |
           set -euo pipefail
+          if [ "${UNSIGNED:-false}" = "true" ]; then
+            echo "unsigned=true — masking APPLE_* creds; keychain import and notarization will be skipped."
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD
+          fi
           # Import the Developer ID cert into a temporary keychain when the
           # secret is present; codesign can't see a cert that isn't in a
           # keychain. Skipped (with the rest of signing) when absent.
@@ -177,13 +196,108 @@ jobs:
           if-no-files-found: warn
 
   # ----------------------------------------------------------------------
-  # Collect both arches, build the single `latest.json` updater manifest
-  # that points at each arch's signed tarball, and publish everything to
-  # the GitHub Release for the tag.
+  # Windows x86_64 bundle. Produces the NSIS installer (the artifact a
+  # non-technical user downloads and double-clicks) plus its updater
+  # signature. The WSL2 microVM backend (packages/vm/src/backend/wsl.rs)
+  # is compiled and bundled by the same vm:build/vm:bundle scripts the
+  # macOS job runs — they are platform-aware.
+  # ----------------------------------------------------------------------
+  build-windows:
+    name: Build windows-x86_64 bundle
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/desktop/src-tauri
+            packages/vm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop prerequisites
+        run: pnpm exec nx run-many -t build -p @appliance.sh/cli @appliance.sh/app
+
+      - name: Sync bundle version from package.json
+        run: node packages/desktop/scripts/sync-version.mjs
+
+      - name: Inject updater public key
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: node packages/desktop/scripts/set-updater-pubkey.mjs
+
+      # No Apple secrets here — notarize-macos.mjs skips itself off-darwin.
+      # Windows Authenticode signing is not configured yet; the installer
+      # ships unsigned (SmartScreen shows a "more info" step) until a
+      # WINDOWS_CERTIFICATE secret + signtool step is added.
+      - name: Build bundle
+        working-directory: packages/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm run tauri:build:release
+
+      - name: Stage release assets
+        id: stage
+        working-directory: packages/desktop/src-tauri/target/release/bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/release-assets"
+          mkdir -p "$OUT"
+          # NSIS installer: the download for humans AND the updater
+          # artifact (Tauri v2 updates in place from the -setup.exe).
+          SETUP=$(find nsis -name '*-setup.exe' | head -n1 || true)
+          if [ -n "$SETUP" ]; then
+            cp "$SETUP" "$OUT/Appliance_x86_64-setup.exe"
+            if [ -f "$SETUP.sig" ]; then
+              cp "$SETUP.sig" "$OUT/Appliance_x86_64-setup.exe.sig"
+            fi
+          fi
+          ( cd "$OUT" && sha256sum ./* > "checksums-windows-x86_64.txt" )
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"
+
+      - name: Upload per-arch artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows-x86_64
+          path: ${{ steps.stage.outputs.out }}
+          if-no-files-found: warn
+
+  # ----------------------------------------------------------------------
+  # Collect every platform, build the single `latest.json` updater
+  # manifest that points at each platform's signed artifact, and publish
+  # everything to the GitHub Release for the tag.
   # ----------------------------------------------------------------------
   publish:
     name: Publish bundles + updater manifest
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

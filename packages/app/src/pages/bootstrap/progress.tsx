@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { ApplianceBaseType } from '@appliance.sh/sdk/models';
 import { Check, Circle, Loader2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import { useHost } from '@/providers/host-provider';
 import type {
   BootstrapEvent,
@@ -15,6 +16,7 @@ import type {
 } from '@/lib/host';
 import type { AwsWizardValues, MicroVmWizardValues, WizardValues } from './wizard';
 import { microVmClusterId } from '@/lib/host';
+import { useTailAutoscroll } from '@/hooks/use-tail-autoscroll';
 import { cn } from '@/lib/utils';
 
 type PhaseState = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -43,7 +45,7 @@ export function BootstrapProgressPage() {
   if (!values || values.mode === 'aws') {
     return <AwsProgress values={values} />;
   }
-  return <Navigate to="/bootstrap" replace />;
+  return <Navigate to="/cloud/bootstrap" replace />;
 }
 
 function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
@@ -66,6 +68,8 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
   const startedRef = React.useRef(false);
   const handoffStartedRef = React.useRef(false);
   const logIdRef = React.useRef(0);
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLDivElement>([logs]);
+
   // Captured outputs of phases that have succeeded so far. Seeded
   // back into the engine on retry so phase 2 doesn't have to re-run
   // phase 1, etc.
@@ -222,7 +226,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
   }, [result, host, queryClient, values?.name]);
 
   if (!values) {
-    return <Navigate to="/bootstrap" replace />;
+    return <Navigate to="/cloud/bootstrap" replace />;
   }
 
   return (
@@ -262,7 +266,7 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
         <div className="border-b border-[var(--color-border)] px-3 py-2 text-xs uppercase tracking-wide text-[var(--color-muted-foreground)]">
           Event log
         </div>
-        <div className="h-80 overflow-auto font-mono text-xs leading-relaxed">
+        <div ref={logBoxRef} onScroll={onLogScroll} className="h-80 overflow-auto font-mono text-xs leading-relaxed">
           {logs.length === 0 ? (
             <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
           ) : (
@@ -318,49 +322,53 @@ function AwsProgress({ values }: { values: AwsWizardValues | undefined }) {
           </dl>
           {handoff === 'failed' && handoffError ? (
             <div className="rounded-md border border-red-500/50 bg-red-500/5 p-2 text-xs text-red-400">
-              {handoffError} — connect manually via Settings.
+              {handoffError} — connect manually under Cloud → Add cloud.
             </div>
           ) : null}
-          <Button onClick={() => navigate('/')} disabled={handoff === 'saving'}>
-            {handoff === 'saving' ? 'Saving…' : 'Open dashboard'}
+          <Button onClick={() => navigate('/projects')} disabled={handoff === 'saving'}>
+            {handoff === 'saving' ? 'Saving…' : 'Open Apps'}
           </Button>
         </div>
       ) : null}
 
       {error ? (
-        <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
-          <div className="font-medium text-red-400">Bootstrap failed</div>
-          <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div>
-          <div className="mt-3 flex gap-2">
-            {failedPhase ? (
-              <Button onClick={() => runFrom(failedPhase)} disabled={retrying}>
-                {retrying ? 'Retrying…' : `Retry ${failedPhase}`}
+        <FriendlyError
+          error={error}
+          fallbackHeadline="The cloud setup couldn't finish"
+          actions={
+            <>
+              {failedPhase ? (
+                <Button onClick={() => runFrom(failedPhase)} disabled={retrying}>
+                  {retrying ? 'Retrying…' : `Retry ${failedPhase}`}
+                </Button>
+              ) : null}
+              <Button variant="outline" onClick={() => navigate('/cloud/bootstrap')} disabled={retrying}>
+                Start over
               </Button>
-            ) : null}
-            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
-              Start over
-            </Button>
-          </div>
-        </div>
+            </>
+          }
+        />
       ) : null}
     </div>
   );
 }
 
 // ============================================================
-// Local Runtime (microVM) bootstrap
+// Dev Machine (microVM) bootstrap
 //
-// One "Get started" press lands here and boots the default VM. The
-// engine already publishes structured bring-up phases
-// (media → booting → network → cluster → ready / failed, mirrored by
-// MicroVmStatus.phase), so instead of a single opaque node we render a
+// One "Get started" press lands here and boots the default VM — DEV-
+// CAPABLE (devUp) when the host supports it, so the freshly-booted
+// machine can run agents and dev shells without a second detour through
+// the Machine page. The engine already publishes structured bring-up
+// phases (media → booting → network → cluster → ready / failed, mirrored
+// by MicroVmStatus.phase), so instead of a single opaque node we render a
 // five-rung ladder driven by polled status().phase: each rung goes
 // pending → running (spinner) → completed (check). The streamed boot
 // lines live underneath as a collapsible detail, and a `failed` phase
 // fails fast — the in-flight rung turns red and the error is surfaced
-// with a Retry. Lands on a clean "ready" state whose primary CTA leads
-// straight into the first deploy ("Deploy your first app" →
-// /projects/deploy), with "Open dashboard" as the secondary action.
+// with a Retry. Lands on a clean "ready" state with ONE primary CTA into
+// the first deploy ("Deploy your first app" → /projects/deploy) and a
+// secondary "Run an agent" → /agents.
 // ============================================================
 
 // The bring-up ladder, mirroring Phase in packages/vm/src/bringup.rs.
@@ -377,14 +385,31 @@ const MICROVM_LADDER: {
   { phase: 'media', label: 'Boot media', detail: 'Preparing the VM kernel and disk image.' },
   { phase: 'booting', label: 'Booting guest', detail: 'Starting the virtual machine.' },
   { phase: 'network', label: 'Guest network', detail: 'Connecting the VM to the network.' },
-  { phase: 'cluster', label: 'Starting k3s', detail: 'First boot pulls images — this can take a few minutes.' },
+  {
+    phase: 'cluster',
+    label: 'Starting the app platform',
+    detail: 'First boot downloads a few components — this can take a few minutes.',
+  },
   {
     phase: 'ready',
-    label: 'Cluster ready',
-    runningLabel: 'Registering cluster',
-    detail: 'Delivering the api-server and registering the cluster.',
+    label: 'Ready',
+    runningLabel: 'Registering with the console',
+    detail: 'Delivering the api-server and registering the machine as a deploy target.',
   },
 ];
+
+// Live sub-phases newer engines publish INSIDE the long cluster rung
+// (cluster-node → cluster-images → cluster-api → ingress). They map onto
+// the cluster rung — the ladder keeps its five steps — and swap its
+// resting detail line for what is actually happening right now. Phases
+// outside the ladder AND this map still fall through applyPhase
+// untouched, so unknown-phase tolerance is preserved in both directions.
+const CLUSTER_SUB_PHASES: Partial<Record<MicroVmPhase, string>> = {
+  'cluster-node': 'Base system up — starting Kubernetes.',
+  'cluster-images': 'Platform images staged — importing.',
+  'cluster-api': 'Kubernetes API up — starting platform services.',
+  ingress: 'Wiring the registry and API routes.',
+};
 
 type MicroVmOutcome = 'running' | 'ready' | 'failed';
 
@@ -399,6 +424,9 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // `outcome` is the terminal verdict. The two together derive every
   // rung's state, so a stale/late status poll can never rewind the UI.
   const [reached, setReached] = React.useState(-1);
+  // The live cluster sub-phase line (label + engine detail), shown as the
+  // cluster rung's detail while that rung is in flight.
+  const [clusterDetail, setClusterDetail] = React.useState<string | null>(null);
   const [outcome, setOutcome] = React.useState<MicroVmOutcome>('running');
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -413,6 +441,10 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // setReached/setOutcome post-unmount.
   const liveRef = React.useRef(false);
   const timerRef = React.useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  // Tail the stream (the longest rung streams for minutes) without
+  // fighting a user who scrolled up to read an earlier line. `showLog`
+  // is a dep so re-expanding the pane also lands on the tail.
+  const { ref: logBoxRef, onScroll: onLogScroll } = useTailAutoscroll<HTMLDivElement>([logs, showLog]);
 
   const appendLog = React.useCallback((level: LogLine['level'], message: string) => {
     logIdRef.current += 1;
@@ -422,7 +454,16 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // Fold a polled engine phase into the ladder. Forward rungs only
   // advance the high-water mark; `failed` flips the outcome without
   // choosing a rung — the rung in flight stays the one painted red.
-  const applyPhase = React.useCallback((phase: MicroVmPhase) => {
+  // Cluster sub-phases pin the cluster rung and update its live detail;
+  // anything else unknown is ignored (older/newer engine tolerance).
+  const applyPhase = React.useCallback((phase: MicroVmPhase, detail?: string) => {
+    const sub = CLUSTER_SUB_PHASES[phase];
+    if (sub) {
+      const clusterIdx = MICROVM_LADDER.findIndex((r) => r.phase === 'cluster');
+      setReached((prev) => Math.max(prev, clusterIdx));
+      setClusterDetail(detail ? `${sub} (${detail})` : sub);
+      return;
+    }
     const idx = MICROVM_LADDER.findIndex((r) => r.phase === phase);
     if (idx >= 0) setReached((prev) => Math.max(prev, idx));
     else if (phase === 'failed') setOutcome((prev) => (prev === 'running' ? 'failed' : prev));
@@ -430,13 +471,14 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
 
   const start = React.useCallback(async () => {
     if (!vmHost) {
-      setError('The microVM engine is only available in the desktop app.');
+      setError('The Dev Machine is only available in the desktop app.');
       setOutcome('failed');
       return;
     }
     setError(null);
     setOutcome('running');
     setReached(-1);
+    setClusterDetail(null);
     setLogs([]);
     setShowLog(true);
     setRetrying(true);
@@ -458,7 +500,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         const s = await instance.status();
         // Re-check liveness after the await: a poll already in flight when
         // the run settles (or the page unmounts) must not apply a phase.
-        if (liveRef.current && s.phase) applyPhase(s.phase);
+        if (liveRef.current && s.phase) applyPhase(s.phase, s.phaseDetail);
       } catch {
         // keep polling
       }
@@ -469,11 +511,21 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     void poll();
 
     try {
-      appendLog('info', `Booting microVM "${name}" and bootstrapping its api-server…`);
-      // up() streams the same lines the CLI prints, installs the engine
-      // binary if missing, and registers the VM as a cluster on success.
-      await instance.up((e) => appendLog('info', e.message));
-      appendLog('info', `microVM "${name}" is up and registered as a cluster.`);
+      appendLog('info', `Booting the "${name}" VM and bootstrapping its api-server…`);
+      // The express boot provisions the VM DEV-CAPABLE (devUp: dev
+      // toolchain + persistent workspace) so agents and dev shells work
+      // right after onboarding — no second detour through the Machine
+      // page. Falls back to a plain up() on hosts without devUp.
+      const onLog = (e: { message: string }) => appendLog('info', e.message);
+      // Streams the same lines the CLI prints, installs the engine
+      // binary if missing, and registers the VM as a deploy target on
+      // success.
+      if (typeof instance.devUp === 'function') {
+        await instance.devUp(onLog);
+      } else {
+        await instance.up(onLog);
+      }
+      appendLog('info', `The "${name}" VM is up and registered as a deploy target.`);
       setReached(MICROVM_LADDER.length - 1);
       setOutcome('ready');
       // Collapse the bring-up log once we're green — the ladder tells the
@@ -512,7 +564,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   );
 
   if (!vmHost) {
-    return <Navigate to="/bootstrap" replace />;
+    return <Navigate to="/cloud/bootstrap" replace />;
   }
 
   // The rung currently in focus: the high-water mark, defaulting to the
@@ -535,12 +587,12 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // A single spoken sentence for the visually-hidden live region, so screen
   // readers hear the ladder advance / settle without parsing the rungs.
   const announce = (() => {
-    if (outcome === 'ready') return 'Local runtime ready.';
+    if (outcome === 'ready') return 'Dev Machine ready.';
     if (outcome === 'failed') {
       // Mirror the visible header: don't name a stage we never reached.
       return reached < 0 ? 'Start failed.' : `Start failed at the ${MICROVM_LADDER[cur].label} step.`;
     }
-    if (reached < 0) return 'Starting local runtime…';
+    if (reached < 0) return 'Starting the Dev Machine…';
     const rung = MICROVM_LADDER[cur];
     return `${rung.runningLabel ?? rung.label} in progress…`;
   })();
@@ -548,11 +600,8 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   return (
     <div className="mx-auto max-w-3xl space-y-6 pt-8">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold">Starting local runtime</h1>
-        <p className="text-sm text-[var(--color-muted-foreground)]">
-          Sandboxed in a virtual machine · {name} · registers as{' '}
-          <code className="font-mono text-xs">{microVmClusterId(name)}</code>
-        </p>
+        <h1 className="text-2xl font-semibold">Starting your Dev Machine</h1>
+        <p className="text-sm text-[var(--color-muted-foreground)]">Isolated virtual machine · {name}</p>
       </div>
 
       {/* Visually-hidden running commentary for assistive tech. */}
@@ -567,11 +616,14 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
           // contradiction next to a spinner — swap in the action-oriented
           // one. The failed rung keeps the strong-border highlight too.
           const label = st === 'running' && rung.runningLabel ? rung.runningLabel : rung.label;
+          // The cluster rung narrates its live sub-phase (engine-published)
+          // instead of the static "can take a few minutes" while running.
+          const detail = rung.phase === 'cluster' && st === 'running' && clusterDetail ? clusterDetail : rung.detail;
           return (
             <MicroVmPhaseStep
               key={rung.phase}
               label={label}
-              detail={rung.detail}
+              detail={detail}
               state={st}
               active={st === 'running' || st === 'failed'}
             />
@@ -591,7 +643,11 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
           <span>{showLog ? 'Hide' : 'Show'}</span>
         </button>
         {showLog ? (
-          <div className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed">
+          <div
+            ref={logBoxRef}
+            onScroll={onLogScroll}
+            className="h-72 overflow-auto border-t border-[var(--color-border)] font-mono text-xs leading-relaxed"
+          >
             {logs.length === 0 ? (
               <div className="px-3 py-4 text-[var(--color-muted-foreground)]">Waiting…</div>
             ) : (
@@ -615,53 +671,69 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
       {outcome === 'ready' ? (
         <div className="space-y-3 rounded-md border border-[var(--color-border)] p-4">
           <div className="flex items-center gap-2 text-sm font-medium text-green-400">
-            <Check className="h-4 w-4" /> Local runtime ready
+            <Check className="h-4 w-4" /> Dev Machine ready
           </div>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt className="text-[var(--color-muted-foreground)]">Sandbox</dt>
-            <dd>virtual machine ({name})</dd>
-            <dt className="text-[var(--color-muted-foreground)]">Console cluster id</dt>
-            <dd className="font-mono">{microVmClusterId(name)}</dd>
+            <dt className="text-[var(--color-muted-foreground)]">Virtual machine</dt>
+            <dd>{name}</dd>
           </dl>
-          {/* The runtime being up is the middle, not the end — lead straight
-              into the first deploy. The wizard find-or-creates the project +
+          {/* Engine jargon (profile id, deploy-target registration) demoted
+              behind a disclosure — the default success view stays plain. */}
+          <details>
+            <summary className="cursor-pointer select-none text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]">
+              Technical details
+            </summary>
+            <div className="mt-1 space-y-1 text-xs text-[var(--color-muted-foreground)]">
+              <div>
+                Profile: <code className="font-mono">{microVmClusterId(name)}</code>
+              </div>
+              <div>
+                The machine registers as <code className="font-mono">{microVmClusterId(name)}</code> and appears as a
+                deploy target in the target switcher.
+              </div>
+            </div>
+          </details>
+          {/* The machine being up is the middle, not the end — lead straight
+              into the first deploy. The wizard find-or-creates the app +
               environment and writes the link itself, so there's no separate
-              "project setup" step to discover first. "Open dashboard" stays
-              as the secondary escape hatch. */}
+              setup step to discover first. ONE primary CTA; "Run an agent"
+              is the secondary path (the express boot is dev-capable, so
+              agents work right away). */}
           <p className="text-xs text-[var(--color-muted-foreground)]">
-            Next, deploy your first app. The wizard creates the project and environment for you — no separate setup step
+            Next, deploy your first app. The wizard creates the app and environment for you — no separate setup step
             needed.
           </p>
           <div className="flex gap-2">
             <Button onClick={() => navigate('/projects/deploy')}>Deploy your first app</Button>
-            <Button variant="outline" onClick={() => navigate('/')}>
-              Open dashboard
-            </Button>
-            <Button variant="outline" onClick={() => navigate('/clusters')}>
-              Manage runtimes
+            <Button variant="outline" onClick={() => navigate('/agents')}>
+              Run an agent
             </Button>
           </div>
         </div>
       ) : null}
 
       {outcome === 'failed' ? (
-        <div className="rounded-md border border-red-500/50 bg-red-500/5 p-4 text-sm">
-          <div className="font-medium text-red-400">
-            {/* Only blame a stage once one has actually been observed — an
-                up() failure before any phase publishes (binary install,
-                handshake, missing engine) isn't the "Boot media" step. */}
-            {reached < 0 ? 'Start failed' : `Start failed — ${MICROVM_LADDER[cur].label}`}
-          </div>
-          {error ? <div className="mt-2 whitespace-pre-wrap font-mono text-xs">{error}</div> : null}
-          <div className="mt-3 flex gap-2">
-            <Button onClick={() => void start()} disabled={retrying}>
-              {retrying ? 'Retrying…' : 'Retry'}
-            </Button>
-            <Button variant="outline" onClick={() => navigate('/bootstrap')} disabled={retrying}>
-              Start over
-            </Button>
-          </div>
-        </div>
+        <FriendlyError
+          error={error}
+          // Only blame a stage once one has actually been observed — an
+          // up() failure before any phase publishes (binary install,
+          // handshake, missing engine) isn't the "Boot media" step.
+          fallbackHeadline={
+            reached < 0
+              ? "The local machine couldn't start"
+              : `The local machine couldn't start — stopped at "${MICROVM_LADDER[cur].label}"`
+          }
+          actions={
+            <>
+              <Button onClick={() => void start()} disabled={retrying}>
+                {retrying ? 'Retrying…' : 'Retry'}
+              </Button>
+              <Button variant="outline" onClick={() => navigate('/setup')} disabled={retrying}>
+                Start over
+              </Button>
+            </>
+          }
+        />
       ) : null}
     </div>
   );

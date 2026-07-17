@@ -60,7 +60,7 @@ describe('EnvironmentHealthService', () => {
     process.env.APPLIANCE_BASE_CONFIG = AWS_BASE;
     const result = await environmentHealthService.getForEnvironment('env-1');
     expect(result?.status).toBe(EnvironmentHealthStatus.Unknown);
-    expect(result?.message).toMatch(/Kubernetes-driven/);
+    expect(result?.message).toMatch(/container-runtime/);
     expect(mockGetDeploymentHealth).not.toHaveBeenCalled();
   });
 

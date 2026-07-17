@@ -8,8 +8,10 @@ import { addTrustedProject, isTrustedProject, settingsFilePath } from './setting
 import { evaluateManifest } from '../sandbox/index.js';
 
 // Ordered by precedence. First hit wins when the user passes neither
-// --file nor --directory (or --directory without --file).
-const DEFAULT_FILENAMES = [
+// --file nor --directory (or --directory without --file). Exported so
+// other surfaces (e.g. `appliance stack init` scanning for member
+// apps) recognize exactly the same set of manifest filenames.
+export const MANIFEST_FILENAMES = [
   'appliance.ts',
   'appliance.mts',
   'appliance.cts',
@@ -123,7 +125,7 @@ function resolveManifestPath(cmd: Command): string | null {
   }
 
   const dir = dirOpt ? path.resolve(process.cwd(), dirOpt) : process.cwd();
-  const matches = DEFAULT_FILENAMES.map((name) => path.join(dir, name)).filter((p) => fs.existsSync(p));
+  const matches = MANIFEST_FILENAMES.map((name) => path.join(dir, name)).filter((p) => fs.existsSync(p));
   if (matches.length === 0) return null;
 
   const picked = matches[0];

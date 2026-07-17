@@ -17,6 +17,15 @@ export enum ApplianceBaseType {
   // server + token). The microVM local runtime uses this variant. The
   // sole Kubernetes-driven base going forward.
   ApplianceKubernetes = 'appliance-base-kubernetes',
+  /**
+   * @deprecated The plain-Docker runtime (the host daemon's
+   * `--runtime docker`) has been removed — the microVM local runtime
+   * is the sole local base. The enum value & schema are retained for
+   * back-compat: existing configs still parse, and the api-server's
+   * base fork (deployment-backend.ts) maps them to a clear
+   * "runtime removed" error with migration guidance.
+   */
+  ApplianceDocker = 'appliance-base-docker',
 }
 
 // True for any base whose deploys go through the Kubernetes API
@@ -32,6 +41,14 @@ export function isKubernetesBase<T extends { type: ApplianceBaseType }>(
   config: T
 ): config is T & { type: ApplianceBaseType.ApplianceLocal | ApplianceBaseType.ApplianceKubernetes } {
   return config.type === ApplianceBaseType.ApplianceLocal || config.type === ApplianceBaseType.ApplianceKubernetes;
+}
+
+// True for the plain-Docker base (the single-binary local daemon).
+// Deploys are containers on a Docker daemon: no Pulumi, no k8s client.
+export function isDockerBase<T extends { type: ApplianceBaseType }>(
+  config: T
+): config is T & { type: ApplianceBaseType.ApplianceDocker } {
+  return config.type === ApplianceBaseType.ApplianceDocker;
 }
 
 export const applianceBaseInput = z.object({
@@ -113,6 +130,11 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
     token: z.string().optional(),
     // Inline kubeconfig YAML. Mutex with `server`/`token`.
     kubeconfig: z.string().optional(),
+    // Path to a kubeconfig file, read lazily at deploy time. The guest
+    // api-server binary uses this to point at its local k3s
+    // (`/etc/rancher/k3s/k3s.yaml`) without inlining a file that may
+    // not exist yet when the server starts.
+    kubeconfigPath: z.string().optional(),
     // Namespace appliances deploy into. Defaults to `appliance`.
     namespace: z.string().optional(),
     // DNS suffix appended to per-appliance Ingress hostnames
@@ -140,130 +162,270 @@ export const applianceKubernetesInput = applianceBaseInput.omit({ dns: true }).e
         insecure: z.boolean().optional(),
       })
       .optional(),
+    // Optional buildkitd gRPC address reachable from the operator's
+    // machine (e.g. `tcp://127.0.0.1:5054`, the microVM's forwarded
+    // in-guest buildkitd). When set the CLI builds images with
+    // buildctl instead of a local Docker daemon. BYO clusters omit it.
+    buildkit: z
+      .object({
+        addr: z.string(),
+      })
+      .optional(),
   }),
 });
 
 export type ApplianceKubernetesInput = z.infer<typeof applianceKubernetesInput>;
+
+// Shared shape of the plain-Docker runtime config. Used verbatim by
+// both the input schema and the resolved base config — unlike the
+// cloud bases there is no provisioning step that enriches it.
+const dockerBlock = z.object({
+  // Absolute path backing the FilesystemObjectStore (projects,
+  // environments, deployments, api-keys). The daemon owns this dir.
+  dataDir: z.string(),
+  // Optional DOCKER_HOST override for the daemon's docker CLI calls.
+  // Omit to use the ambient environment (the common case).
+  host: z.string().optional(),
+  // Host-port window deploys draw from. Each stack hashes to a stable
+  // port inside it. Defaults to 8300-8699.
+  portRange: z
+    .object({
+      min: z.number().int().min(1).max(65535),
+      max: z.number().int().min(1).max(65535),
+    })
+    .optional(),
+});
+
+// Plain-Docker base: containers on a Docker daemon, driven by the
+// single-binary local server. `dns` is omitted for the same reason as
+// the Kubernetes bases — services are reached via published host
+// ports, not DNS records.
+export const applianceDockerInput = applianceBaseInput.omit({ dns: true }).extend({
+  type: z.literal(ApplianceBaseType.ApplianceDocker),
+  docker: dockerBlock,
+});
+
+export type ApplianceDockerInput = z.infer<typeof applianceDockerInput>;
 
 export const applianceBaseConfigInput = z.discriminatedUnion('type', [
   applianceAwsPublicInput,
   applianceAwsVpcInput,
   applianceLocalInput,
   applianceKubernetesInput,
+  applianceDockerInput,
 ]);
 
 export type ApplianceBaseConfigInput = z.infer<typeof applianceBaseConfigInput>;
 
-export const applianceBaseConfig = z.object({
-  name: z.string(),
-  type: z.enum(ApplianceBaseType),
-  // Cloud bases (aws-*) require this — Pulumi state backend URL,
-  // typically `s3://<bucket>`. Local bases don't run Pulumi, so it
-  // is optional at the schema level and enforced by the consumer
-  // (e.g. ApplianceDeploymentService) when present.
-  stateBackendUrl: z.string().optional(),
-  domainName: z.string().optional(),
-  // SDK version of the `@appliance.sh/infra` package that last
-  // applied this base. Stamped by the infra component on every
-  // `pulumi up`; surfaced via /api/v1/cluster-info so the desktop
-  // can compare against its bundled version and offer a baseline
-  // update. Absent for clusters bootstrapped before this field
-  // was added — treat as "unknown" / "needs update."
-  baselineVersion: z.string().optional(),
-  // AWS-specific runtime config. Present for `appliance-base-aws-*`
-  // bases. Optional at the schema level so `appliance-base-local`
-  // (and any future non-AWS base) can omit it.
-  aws: z
-    .object({
-      region: z.string(),
-      zoneId: z.string(),
-      cloudfrontDistributionId: z.string().optional(),
-      cloudfrontDistributionDomainName: z.string().optional(),
-      edgeRouterRoleArn: z.string().optional(),
-      dataBucketName: z.string().optional(),
-      ecrRepositoryUrl: z.string().optional(),
-      // KMS key (ARN) used as the Pulumi stack secrets provider for
-      // every stack the api-server creates against this base. Replaces
-      // PULUMI_CONFIG_PASSPHRASE-based encryption — operator and
-      // system Lambda roles authenticate to the key via IAM rather than
-      // a shared passphrase.
-      kmsKeyArn: z.string().optional(),
-      // Pre-created Lambda execution roles for the system api-server and
-      // worker appliances. The dogfooded bootstrap deploys those two
-      // appliances using these ARNs instead of letting ApplianceStack
-      // mint a fresh role per deploy — they need broader IAM than user
-      // workloads (Pulumi automation, ECR push, S3 state read/write).
-      systemRoleArns: z
-        .object({
-          apiServer: z.string(),
-          worker: z.string(),
-        })
-        .optional(),
-    })
-    .optional(),
-  // Deprecated local container runtime config. Present only for legacy
-  // `appliance-base-local` bases (the host-side k3d runtime has been
-  // removed; `appliance-base-kubernetes` + its `kubernetes` block is the
-  // replacement). `dataDir` is an absolute path the api-server uses as
-  // the filesystem object store root (replaces S3 for
-  // projects/environments/deployments). `cluster` mirrors the input
-  // shape; defaults are filled in by the consumer.
-  local: z
-    .object({
-      dataDir: z.string(),
-      cluster: z
-        .object({
-          clusterName: z.string().optional(),
-          namespace: z.string().optional(),
-          hostPort: z.number().int().min(1).max(65535).optional(),
-          // DNS suffix appended to each deploy's hostname to form
-          // `<stackName>.<suffix>` Ingress routes. Defaults to
-          // `appliance.localhost` — `.localhost` is RFC 6761
-          // reserved and auto-resolves to 127.0.0.1 in every modern
-          // browser + OS resolver, so no /etc/hosts setup is needed.
-          // Override to `appliance.local` or your own domain for
-          // setups that route via custom DNS.
-          hostnameSuffix: z.string().optional(),
-          // Ingress class the per-appliance Ingress declares.
-          // Defaults to the local runtime's built-in `traefik`
-          // controller. Override for clusters that swapped in
-          // nginx-ingress or similar.
-          ingressClassName: z.string().optional(),
-        })
-        .optional(),
-    })
-    .optional(),
-  // Generic Kubernetes runtime config. Present for
-  // `appliance-base-kubernetes` bases. Same role as `local` but the
-  // cluster connection is explicit (server URL + credentials or an
-  // inline kubeconfig) rather than discovered from the host's
-  // default kubeconfig. Omit all of `server`, `kubeconfig`, and
-  // `token` to fall back to `kc.loadFromCluster()` when running
-  // inside a pod with a mounted ServiceAccount.
-  kubernetes: z
-    .object({
-      server: z.string().optional(),
-      ca: z.string().optional(),
-      token: z.string().optional(),
-      kubeconfig: z.string().optional(),
-      namespace: z.string().optional(),
-      hostnameSuffix: z.string().optional(),
-      ingressClassName: z.string().optional(),
-      // Host-side ingress/LB port for reported URLs. See the input
-      // schema's field of the same name.
-      hostPort: z.number().int().min(1).max(65535).optional(),
-      dataDir: z.string(),
-      registry: z
-        .object({
-          url: z.string(),
-          insecure: z.boolean().optional(),
-        })
-        .optional(),
-    })
-    .optional(),
-});
+// The RESOLVED base config is round-tripped by mixed-version actors:
+// the engine writes it into the guest's env file, the api-server parses
+// it, tooling may parse-and-rewrite it. Every object node therefore
+// carries `.passthrough()` — an OLDER schema parsing a NEWER config
+// must preserve the keys it doesn't know instead of silently dropping
+// them (incident B: an old parse dropped `kubernetes.buildkit` on
+// re-serialization, killing source builds until the VM was recreated).
+// The INPUT schemas above stay strict: they validate operator input,
+// they are not a round-trip surface.
+export const applianceBaseConfig = z
+  .object({
+    name: z.string(),
+    type: z.enum(ApplianceBaseType),
+    // Cloud bases (aws-*) require this — Pulumi state backend URL,
+    // typically `s3://<bucket>`. Local bases don't run Pulumi, so it
+    // is optional at the schema level and enforced by the consumer
+    // (e.g. ApplianceDeploymentService) when present.
+    stateBackendUrl: z.string().optional(),
+    domainName: z.string().optional(),
+    // SDK version of the `@appliance.sh/infra` package that last
+    // applied this base. Stamped by the infra component on every
+    // `pulumi up`; surfaced via /api/v1/cluster-info so the desktop
+    // can compare against its bundled version and offer a baseline
+    // update. Absent for clusters bootstrapped before this field
+    // was added — treat as "unknown" / "needs update."
+    baselineVersion: z.string().optional(),
+    // Version of the WRITER that produced this config (the engine
+    // stamps its crate version when it writes the guest's base config).
+    // Purely for drift visibility: the api-server logs it on parse so
+    // a stale writer/parser pair is diagnosable from the server log.
+    // Absent from configs written before the field existed.
+    baseConfigVersion: z.string().optional(),
+    // AWS-specific runtime config. Present for `appliance-base-aws-*`
+    // bases. Optional at the schema level so `appliance-base-local`
+    // (and any future non-AWS base) can omit it.
+    aws: z
+      .object({
+        region: z.string(),
+        zoneId: z.string(),
+        cloudfrontDistributionId: z.string().optional(),
+        cloudfrontDistributionDomainName: z.string().optional(),
+        edgeRouterRoleArn: z.string().optional(),
+        dataBucketName: z.string().optional(),
+        ecrRepositoryUrl: z.string().optional(),
+        // KMS key (ARN) used as the Pulumi stack secrets provider for
+        // every stack the api-server creates against this base. Replaces
+        // PULUMI_CONFIG_PASSPHRASE-based encryption — operator and
+        // system Lambda roles authenticate to the key via IAM rather than
+        // a shared passphrase.
+        kmsKeyArn: z.string().optional(),
+        // Pre-created Lambda execution roles for the system api-server and
+        // worker appliances. The dogfooded bootstrap deploys those two
+        // appliances using these ARNs instead of letting ApplianceStack
+        // mint a fresh role per deploy — they need broader IAM than user
+        // workloads (Pulumi automation, ECR push, S3 state read/write).
+        systemRoleArns: z
+          .object({
+            apiServer: z.string(),
+            worker: z.string(),
+          })
+          .passthrough()
+          .optional(),
+        // Optional buildkitd gRPC address reachable from the api-server /
+        // worker (e.g. a small BuildKit instance provisioned next to the
+        // base). When set, container-type uploads are built server-side
+        // from source and pushed to ECR — the same mechanism as the
+        // Kubernetes bases' in-VM buildkitd. When absent, container
+        // deploys must pass --image-uri (or ship a legacy image.tar zip).
+        buildkit: z
+          .object({
+            addr: z.string(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    // Deprecated local container runtime config. Present only for legacy
+    // `appliance-base-local` bases (the host-side k3d runtime has been
+    // removed; `appliance-base-kubernetes` + its `kubernetes` block is the
+    // replacement). `dataDir` is an absolute path the api-server uses as
+    // the filesystem object store root (replaces S3 for
+    // projects/environments/deployments). `cluster` mirrors the input
+    // shape; defaults are filled in by the consumer.
+    local: z
+      .object({
+        dataDir: z.string(),
+        cluster: z
+          .object({
+            clusterName: z.string().optional(),
+            namespace: z.string().optional(),
+            hostPort: z.number().int().min(1).max(65535).optional(),
+            // DNS suffix appended to each deploy's hostname to form
+            // `<stackName>.<suffix>` Ingress routes. Defaults to
+            // `appliance.localhost` — `.localhost` is RFC 6761
+            // reserved and auto-resolves to 127.0.0.1 in every modern
+            // browser + OS resolver, so no /etc/hosts setup is needed.
+            // Override to `appliance.local` or your own domain for
+            // setups that route via custom DNS.
+            hostnameSuffix: z.string().optional(),
+            // Ingress class the per-appliance Ingress declares.
+            // Defaults to the local runtime's built-in `traefik`
+            // controller. Override for clusters that swapped in
+            // nginx-ingress or similar.
+            ingressClassName: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    // Generic Kubernetes runtime config. Present for
+    // `appliance-base-kubernetes` bases. Same role as `local` but the
+    // cluster connection is explicit (server URL + credentials or an
+    // inline kubeconfig) rather than discovered from the host's
+    // default kubeconfig. Omit all of `server`, `kubeconfig`, and
+    // `token` to fall back to `kc.loadFromCluster()` when running
+    // inside a pod with a mounted ServiceAccount.
+    kubernetes: z
+      .object({
+        server: z.string().optional(),
+        ca: z.string().optional(),
+        token: z.string().optional(),
+        kubeconfig: z.string().optional(),
+        // Kubeconfig file path, read lazily at deploy time (the guest
+        // api-server points this at its local k3s).
+        kubeconfigPath: z.string().optional(),
+        namespace: z.string().optional(),
+        hostnameSuffix: z.string().optional(),
+        ingressClassName: z.string().optional(),
+        // Host-side ingress/LB port for reported URLs. See the input
+        // schema's field of the same name.
+        hostPort: z.number().int().min(1).max(65535).optional(),
+        dataDir: z.string(),
+        registry: z
+          .object({
+            url: z.string(),
+            insecure: z.boolean().optional(),
+          })
+          .passthrough()
+          .optional(),
+        // buildkitd gRPC address for host-side docker-free builds. See
+        // the input schema's field of the same name.
+        buildkit: z
+          .object({
+            addr: z.string(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    // Plain-Docker runtime config. Present for `appliance-base-docker`
+    // bases (the single-binary local daemon). Same shape as the input —
+    // there is no provisioning step that enriches it. `.passthrough()`
+    // applies to the CONFIG copy only; the shared input stays strict.
+    docker: dockerBlock.passthrough().optional(),
+  })
+  .passthrough();
 
 export type ApplianceBaseConfig = z.infer<typeof applianceBaseConfig>;
+
+/** Rebuild a schema tree in strip mode: same shape at every level, but
+ *  unknown keys are DROPPED instead of preserved. Derived mechanically
+ *  from the schema above so the two can never drift. Only the wrapper
+ *  kinds the resolved config actually uses need handling (objects and
+ *  optionals); other leaves pass through untouched. */
+function stripDeep(schema: z.ZodType): z.ZodType {
+  if (schema instanceof z.ZodOptional) {
+    return stripDeep(schema.unwrap() as z.ZodType).optional();
+  }
+  if (schema instanceof z.ZodObject) {
+    const shape = Object.fromEntries(
+      Object.entries(schema.shape).map(([key, value]) => [key, stripDeep(value as z.ZodType)])
+    );
+    return z.object(shape);
+  }
+  return schema;
+}
+
+/**
+ * Strict (strip-mode) twin of {@link applianceBaseConfig}. The
+ * passthrough schema exists for the INTERNAL round-trip (engine ⇄ env
+ * file ⇄ api-server) where unknown keys must survive; anything leaving
+ * the trust boundary — the cluster-info response any authenticated
+ * caller can read — must be parsed through this twin instead, so keys
+ * the schema doesn't know can't ride along to clients.
+ */
+export const applianceBaseConfigStrict = stripDeep(applianceBaseConfig) as unknown as typeof applianceBaseConfig;
+
+/**
+ * Project a resolved base config for UNTRUSTED wire consumers (any
+ * authenticated cluster-info caller — member-role keys included):
+ * strict-parse to drop unknown keys at every level, then remove the
+ * credential-bearing Kubernetes fields — the ServiceAccount `token`,
+ * the inline `kubeconfig` (embeds client credentials), and the `ca`
+ * bundle (no client consumer reads it). Everything clients actually
+ * use survives: `stateBackendUrl`, `baselineVersion`, base `type`,
+ * block presence, registry/buildkit endpoints.
+ */
+export function sanitizeBaseConfigForWire(config: ApplianceBaseConfig): ApplianceBaseConfig {
+  const stripped = applianceBaseConfigStrict.parse(config);
+  if (stripped.kubernetes) {
+    delete stripped.kubernetes.token;
+    delete stripped.kubernetes.kubeconfig;
+    delete stripped.kubernetes.ca;
+  }
+  return stripped;
+}
 
 /**
  * Common Kubernetes deploy parameters extracted from either an
@@ -297,4 +459,24 @@ export function getKubernetesParams(config: ApplianceBaseConfig): {
     };
   }
   return null;
+}
+
+/**
+ * Docker runtime parameters extracted from an `appliance-base-docker`
+ * config. Returns null for every other base type. Defaults for the
+ * optional fields (port range) are consumer-side, mirroring
+ * getKubernetesParams.
+ */
+export function getDockerParams(config: ApplianceBaseConfig): {
+  dataDir: string;
+  host?: string;
+  portRange?: { min: number; max: number };
+} | null {
+  if (config.type !== ApplianceBaseType.ApplianceDocker) return null;
+  if (!config.docker) return null;
+  return {
+    dataDir: config.docker.dataDir,
+    host: config.docker.host,
+    portRange: config.docker.portRange,
+  };
 }

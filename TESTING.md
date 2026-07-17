@@ -37,17 +37,20 @@ npm run --workspace=packages/api-server test:cov
 
 ### API Server Unit Tests (`packages/api-server/src/**/*.spec.ts`)
 
-| File                                       | What it tests                                                        |
-| ------------------------------------------ | -------------------------------------------------------------------- |
-| `services/api-key.service.spec.ts`         | API key creation, retrieval, existence check, lastUsed               |
-| `services/project.service.spec.ts`         | Project CRUD with mocked storage                                     |
-| `services/environment.service.spec.ts`     | Environment CRUD, status transitions, project filtering              |
-| `middleware/auth.spec.ts`                  | Signature verification middleware (valid/invalid/missing signatures) |
-| `app.controller.spec.ts`                   | Root route and unauthenticated 401 response                          |
-| `routes/bootstrap/bootstrap.spec.ts`       | Bootstrap key creation and status routes                             |
-| `routes/projects/projects.spec.ts`         | Project CRUD routes                                                  |
-| `routes/environments/environments.spec.ts` | Environment CRUD routes with project scoping                         |
-| `routes/deployments/deployments.spec.ts`   | Deployment execution and retrieval routes                            |
+| File                                       | What it tests                                                                                                                                                                                                                                                      |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `services/api-key.service.spec.ts`         | API key creation, retrieval, existence check, lastUsed                                                                                                                                                                                                             |
+| `services/project.service.spec.ts`         | Project CRUD with mocked storage                                                                                                                                                                                                                                   |
+| `services/environment.service.spec.ts`     | Environment CRUD, status transitions, project filtering                                                                                                                                                                                                            |
+| `middleware/auth.spec.ts`                  | Signature verification middleware (valid/invalid/missing signatures)                                                                                                                                                                                               |
+| `app.controller.spec.ts`                   | Root route and unauthenticated 401 response                                                                                                                                                                                                                        |
+| `routes/bootstrap/bootstrap.spec.ts`       | Bootstrap key creation and status routes                                                                                                                                                                                                                           |
+| `routes/projects/projects.spec.ts`         | Project CRUD routes                                                                                                                                                                                                                                                |
+| `routes/environments/environments.spec.ts` | Environment CRUD routes with project scoping                                                                                                                                                                                                                       |
+| `routes/deployments/deployments.spec.ts`   | Deployment execution and retrieval routes                                                                                                                                                                                                                          |
+| `services/image-build.service.spec.ts`     | Server-side image builds: the server-generated Dockerfile for `framework` apps (node/python/auto detection, lockfile-aware installs, start-command resolution), `ensureDockerfile` pass-through/escape-hatch rules for `container` apps, and build-zip path safety |
+| `services/build-upload.service.spec.ts`    | Upload-URL minting: a self-URL + one-time token on Kubernetes bases with a builder; rejection without a builder; the removed docker base errors with migration guidance; `markUploaded` burns the token                                                            |
+| `routes/builds/content.spec.ts`            | `PUT /api/v1/builds/:id/content?token=…` — the one-time upload token: a valid token writes the zip and is burned; wrong/missing tokens, unknown builds, remote-image builds, and re-uploads all 404; oversized content 413s and leaves no zip                      |
 
 ### E2E Tests (`packages/api-server/test/**/*.e2e-spec.ts`)
 
@@ -57,6 +60,39 @@ Full lifecycle tests using in-memory storage and real HTTP message signing:
 - Authenticated project CRUD
 - Environment lifecycle under projects
 - Cross-project isolation
+
+### VM engine tests (`packages/vm`, `cargo test`)
+
+Rust unit tests cover the guest provisioning that stages and launches the
+in-VM api-server:
+
+| Where                       | What it asserts                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/guest.rs` (vz backend) | `apiserver_provisioned_on_k3s_vms_with_staged_assets_only` — the `__APISERVER_PROVISION__` marker is substituted, the guest binary is copied from the boot media to `/usr/local/bin/appliance-api-server`, and provisioning is skipped when no assets are staged; `apiserver_heredocs_terminate` — every heredoc in the generated bootstrap closes |
+| `src/guest.rs`              | `bootstrap_token_persists_and_round_trips` — `ensure_bootstrap_token` generates the token once (32 random bytes, hex-encoded) into the VM dir (`~/.appliance/vm/<name>/bootstrap-token`) and returns the same value on every subsequent call                                                                                                       |
+| `src/backend/wsl.rs`        | `bootstrap_substitutes_every_marker` — the WSL bootstrap substitutes the `__APISERVER_*__` markers (win-path copy, token, guest port, launch env) and writes the token + the `/persist/.apiserver-ready` handoff                                                                                                                                   |
+
+Run with `cargo test` in `packages/vm` (no VM boot required — these are pure
+script-generation assertions).
+
+### Live no-docker smoke (manual)
+
+The end-to-end proof that the pipeline is docker-free. With **no docker on
+PATH** (e.g. `alias docker=false`):
+
+1. `appliance vm up` — boots the managed VM; the api-server guest binary
+   rides the boot media (no image pull), and the CLI mints an API key from
+   the VM's bootstrap token into the `local` profile.
+2. `cd examples/demo-stack-3tier && appliance deploy` — a bare deploy in a
+   stack folder fans out to all members; each uploads a source zip via
+   `PUT /api/v1/builds/:id/content?token=…` and is built server-side by the
+   in-VM BuildKit.
+3. `curl http://demo-frontend-dev.appliance.localhost:8081/` — the frontend
+   answers through the VM's ingress.
+
+PASS: all three members deploy and the curl returns the page without docker,
+buildctl, or crane ever running on the host. (See also
+`docs/live-test-runbook.md` §0.5.)
 
 ---
 

@@ -1,77 +1,116 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { runWithTenant } from './tenant-context';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { BuildType } from '@appliance.sh/sdk';
 
-// Capture the Key handed to PutObjectCommand so we can assert the
-// build-artifact S3 key is tenant-scoped (Quinn #2). The S3 client is a
-// no-op; getSignedUrl returns a stub.
-const putInputs: Array<{ Key?: string }> = [];
+const store = vi.hoisted(() => new Map<string, unknown>());
 
-vi.mock('@aws-sdk/client-s3', () => ({
-  S3Client: class {
-    async send() {
-      return {};
-    }
-  },
-  PutObjectCommand: class {
-    constructor(public input: { Key?: string }) {
-      putInputs.push(input);
-    }
-  },
-}));
-
-vi.mock('@aws-sdk/s3-request-presigner', () => ({
-  getSignedUrl: async () => 'https://example.test/presigned',
-}));
-
-// Capture persisted build records.
-const persisted: Array<{ collection: string; id: string; value: { source: string } }> = [];
 vi.mock('./storage.service', () => ({
   getStorageService: () => ({
-    set: async (collection: string, id: string, value: { source: string }) => {
-      persisted.push({ collection, id, value });
+    get: async (collection: string, id: string) => store.get(`${collection}/${id}`) ?? null,
+    set: async (collection: string, id: string, value: unknown) => {
+      store.set(`${collection}/${id}`, value);
     },
-    get: async () => null,
   }),
 }));
 
-import { BuildUploadService } from './build-upload.service';
+import { BuildUploadService, MissingBuilderError, supportsUploadBuilds } from './build-upload.service';
+import { applianceBaseConfig } from '@appliance.sh/sdk';
 
-const AWS_BASE = JSON.stringify({
-  type: 'appliance-base-aws-public',
-  name: 'prod',
-  stateBackendUrl: 's3://x',
-  aws: { region: 'us-east-1', zoneId: 'Z1', dataBucketName: 'data-bucket' },
-});
+const K8S_BASE = {
+  type: 'appliance-base-kubernetes',
+  name: 'local-runtime',
+  kubernetes: {
+    dataDir: '/data',
+    registry: { url: 'localhost:5052', insecure: true },
+    buildkit: { addr: 'unix:///run/buildkit/buildkitd.sock' },
+  },
+};
 
-describe('BuildUploadService — direct-S3 build artifact is tenant-scoped (Quinn #2)', () => {
-  const original = process.env.APPLIANCE_BASE_CONFIG;
+describe('BuildUploadService.createUpload', () => {
+  const originalEnv = process.env;
 
   beforeEach(() => {
-    putInputs.length = 0;
-    persisted.length = 0;
-    process.env.APPLIANCE_BASE_CONFIG = AWS_BASE;
+    store.clear();
+    process.env = { ...originalEnv };
   });
 
   afterEach(() => {
-    delete process.env.APPLIANCE_MULTI_TENANT;
-    if (original === undefined) delete process.env.APPLIANCE_BASE_CONFIG;
-    else process.env.APPLIANCE_BASE_CONFIG = original;
+    process.env = originalEnv;
   });
 
-  it('flag OFF: uses the un-prefixed builds/<id>.zip key (byte-identical)', async () => {
-    const svc = new BuildUploadService();
-    const { buildId } = await svc.createUpload();
-    expect(putInputs[0].Key).toBe(`builds/${buildId}.zip`);
-    expect(persisted[0].value.source).toBe(`builds/${buildId}.zip`);
+  it('mints a self-URL + one-time token on kubernetes bases with a builder', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    const service = new BuildUploadService();
+
+    const result = await service.createUpload('http://api.appliance.localhost:8081');
+
+    expect(result.uploadUrl).toMatch(
+      new RegExp(
+        `^http://api\\.appliance\\.localhost:8081/api/v1/builds/${result.buildId}/content\\?token=[0-9a-f]{64}$`
+      )
+    );
+    const record = (await service.get(result.buildId))!;
+    expect(record.type).toBe(BuildType.Upload);
+    expect(record.source).toBe(`builds/${result.buildId}.zip`);
+    expect(record.uploadToken).toHaveLength(64);
+    expect(result.uploadUrl).toContain(record.uploadToken!);
   });
 
-  it('flag ON: scopes the artifact key under the caller tenant', async () => {
-    process.env.APPLIANCE_MULTI_TENANT = 'true';
-    const svc = new BuildUploadService();
-    const { buildId } = await runWithTenant('acme', () => svc.createUpload());
-    expect(putInputs[0].Key).toBe(`tenants/acme/builds/${buildId}.zip`);
-    // The scoped key is persisted as `source`, so resolve() reads it back
-    // already-scoped (no double-prefix at deploy time).
-    expect(persisted[0].value.source).toBe(`tenants/acme/builds/${buildId}.zip`);
+  it('rejects upload builds on kubernetes bases without a builder', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify({
+      ...K8S_BASE,
+      kubernetes: { dataDir: '/data' },
+    });
+    const service = new BuildUploadService();
+    // Typed so the builds route can map it to a 409 (vs generic 500).
+    await expect(service.createUpload('http://x')).rejects.toThrow(MissingBuilderError);
+    await expect(service.createUpload('http://x')).rejects.toThrow(/builder/);
+  });
+
+  it('rejects the removed docker base with migration guidance', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify({
+      type: 'appliance-base-docker',
+      name: 'local',
+      docker: { dataDir: '/data' },
+    });
+    const service = new BuildUploadService();
+    await expect(service.createUpload('http://x')).rejects.toThrow(/removed local Docker runtime/);
+  });
+
+  // Mirrors createUpload's gates — /api/v1/cluster-info reports it as
+  // `capabilities.uploadBuilds` so clients can warn before the 409.
+  describe('supportsUploadBuilds', () => {
+    it('is true on kubernetes bases with a builder, false without', () => {
+      expect(supportsUploadBuilds(applianceBaseConfig.parse(K8S_BASE))).toBe(true);
+      expect(supportsUploadBuilds(applianceBaseConfig.parse({ ...K8S_BASE, kubernetes: { dataDir: '/data' } }))).toBe(
+        false
+      );
+    });
+
+    it('on aws bases requires only the data bucket the presigned PUT targets', () => {
+      const awsBase = (aws: Record<string, unknown>) =>
+        applianceBaseConfig.parse({ type: 'appliance-base-aws-public', name: 'cloud', aws });
+      expect(supportsUploadBuilds(awsBase({ region: 'us-east-1', zoneId: 'Z1', dataBucketName: 'b' }))).toBe(true);
+      expect(supportsUploadBuilds(awsBase({ region: 'us-east-1', zoneId: 'Z1' }))).toBe(false);
+    });
+
+    it('is false for the removed docker base', () => {
+      expect(
+        supportsUploadBuilds(
+          applianceBaseConfig.parse({ type: 'appliance-base-docker', name: 'local', docker: { dataDir: '/data' } })
+        )
+      ).toBe(false);
+    });
+  });
+
+  it('markUploaded stamps uploadedAt and burns the token', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    const service = new BuildUploadService();
+    const { buildId } = await service.createUpload('http://x');
+
+    await service.markUploaded(buildId);
+
+    const record = (await service.get(buildId))!;
+    expect(record.uploadedAt).toBeTruthy();
+    expect(record.uploadToken).toBeUndefined();
   });
 });

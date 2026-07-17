@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import request from 'supertest';
-import { createApp } from '../src/main';
+import { createApp } from '../src/app';
 import type { Express } from 'express';
 
 describe('App (e2e)', () => {

@@ -5,8 +5,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ensureHelperBinOnPath, DEFAULT_LOCAL_NAMESPACE } from '@appliance.sh/helper';
-import { removeProfile } from './utils/profile-store.js';
-import { DEFAULT_VM_NAME, profileForVm, vmDir, vmBinary, runVm, runUp } from './utils/microvm-up.js';
+import {
+  DEFAULT_VM_NAME,
+  profileForVm,
+  vmDir,
+  vmBinary,
+  runVm,
+  runUp,
+  deleteVmAndProfile,
+} from './utils/microvm-up.js';
 
 // `appliance vm` — the microVM runtime engine (appliance-vm), the sole
 // local runtime now that bare k3d has been removed. Workloads run inside
@@ -51,7 +58,7 @@ program
   .description('boot the microVM, bootstrap the in-VM api-server, and log in')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
   .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
@@ -92,27 +99,13 @@ for (const [cmd, desc] of [
     });
 }
 
-// `delete`/`prune` are not plain passthroughs. The Rust engine removes
-// the VM and its on-disk state, but the credential profile that `vm up`
-// minted (`microvm` for the default VM, `microvm-<name>` otherwise)
-// lives in the CLI profile store — which the engine knows nothing about.
-// Without pruning it, a deleted VM leaves an orphan cluster behind in
-// both the CLI and the desktop (both read ~/.appliance/profiles.json).
-
-/** Delete a microVM via the engine, then prune its CLI credential
- *  profile. The profile is only removed once the engine confirms the VM
- *  is gone (exit 0), so a failed delete never strips a usable profile.
- *  Returns the engine's exit code. */
-function deleteVmAndProfile(name: string): number {
-  const code = runVm(['delete', name]);
-  if (code === 0) {
-    const profile = profileForVm(name);
-    if (removeProfile(profile)) {
-      console.log(chalk.dim(`removed credential profile '${profile}'`));
-    }
-  }
-  return code;
-}
+// `delete`/`prune` are not plain passthroughs: the Rust engine removes
+// the VM and its on-disk state, but the credential profile `vm up`
+// minted lives in the CLI profile store, which the engine knows nothing
+// about. `deleteVmAndProfile` (utils/microvm-up) removes both so a
+// deleted VM never leaves an orphan cluster behind in the CLI or the
+// desktop (both read ~/.appliance/profiles.json). `appliance cluster rm
+// --delete-vm` shares the same helper.
 
 program
   .command('delete')
@@ -402,14 +395,16 @@ const DEV_SHELL_LOGIN =
 
 const dev = program
   .command('dev')
-  .description('run the microVM as a development environment (provisioned host + persistent workspace)');
+  .description(
+    'manage the shared dev environment VM used by the desktop app and coding agents (for the local app dev loop, use `appliance dev`)'
+  );
 
 dev
   .command('up')
   .description('boot a microVM as a dev environment (toolchain + persistent /persist/workspace)')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--mount <path>', 'share a host folder into /persist/workspace (edit on host, run in VM)')

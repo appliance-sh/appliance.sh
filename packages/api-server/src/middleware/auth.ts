@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
-import { verifySignedRequest, computeContentDigest } from '@appliance.sh/sdk';
-import { apiKeyService } from '../services/api-key.service';
+import { verifySignedRequest, computeContentDigest, type ApiKeyRole } from '@appliance.sh/sdk';
+import { apiKeyService, roleOf } from '../services/api-key.service';
 import { DEFAULT_TENANT, runWithTenant, tenantIdForKey } from '../services/tenant-context';
 import { logger } from '../logger';
 
@@ -11,6 +11,13 @@ import { logger } from '../logger';
  * server→worker `/api/internal/*` routes — the server re-signs each worker
  * dispatch with the original caller's key, so both sides share the same
  * key lookup.
+ *
+ * Every 401 body carries `{ error, cause }` (AuthFailureCause) so
+ * clients pick the right recovery instead of guessing from opaque text.
+ * Deliberate disclosure trade-off: `unknown_key` vs `signature_mismatch`
+ * lets an unauthenticated caller probe whether a key id exists (an
+ * oracle) — accepted for a local appliance, where the self-heal path
+ * needs exactly that distinction to know re-minting will help.
  */
 export async function signatureAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const signature = req.headers['signature'];
@@ -18,7 +25,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
 
   if (!signature || !signatureInput) {
     logger.warn('auth failed: missing signature headers', { requestId: req.requestId, path: req.originalUrl });
-    res.status(401).json({ error: 'Missing signature headers' });
+    res.status(401).json({ error: 'Missing signature headers', cause: 'missing_signature' });
     return;
   }
 
@@ -26,7 +33,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
     const contentDigest = req.headers['content-digest'] as string | undefined;
     if (!contentDigest) {
       logger.warn('auth failed: missing content-digest', { requestId: req.requestId, path: req.originalUrl });
-      res.status(401).json({ error: 'Missing Content-Digest header' });
+      res.status(401).json({ error: 'Missing Content-Digest header', cause: 'missing_digest' });
       return;
     }
 
@@ -36,7 +43,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       !timingSafeEqual(Buffer.from(contentDigest), Buffer.from(expected))
     ) {
       logger.warn('auth failed: content-digest mismatch', { requestId: req.requestId, path: req.originalUrl });
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Request body does not match its Content-Digest', cause: 'digest_mismatch' });
       return;
     }
   }
@@ -45,7 +52,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   const host = /^[a-zA-Z0-9._-]+(:\d+)?$/.test(rawHost ?? '') ? rawHost : undefined;
   if (!host) {
     logger.warn('auth failed: invalid host header', { requestId: req.requestId, path: req.originalUrl });
-    res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Invalid Host header', cause: 'invalid_host' });
     return;
   }
   const url = `${req.protocol}://${host}${req.originalUrl}`;
@@ -54,6 +61,9 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   // side effect of the signature-verification lookup — never from a
   // client-asserted header/body. A legacy key maps to the default tenant.
   let principalTenantId: string | undefined;
+  // Captured by the key-lookup callback so the verified request can
+  // carry its role without a second storage read.
+  let resolvedRole: ApiKeyRole | undefined;
 
   const result = await verifySignedRequest(
     {
@@ -65,6 +75,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       const key = await apiKeyService.getByKeyId(keyId);
       if (!key) return null;
       principalTenantId = tenantIdForKey(key);
+      resolvedRole = roleOf(key);
       return { secret: key.secret };
     }
   );
@@ -74,9 +85,21 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
       requestId: req.requestId,
       path: req.originalUrl,
       error: result.error,
+      cause: result.cause,
       diag: buildAuthDiag(req, url),
     });
-    res.status(401).json({ error: 'Unauthorized' });
+    // Human message per cause; the raw verifier error stays in the log
+    // only (it can echo header internals).
+    const messages: Record<string, string> = {
+      unknown_key: 'This API key is not recognized by the server',
+      clock_skew: 'Request timestamp outside the accepted window (client/server clock skew)',
+      malformed_signature: 'Request signature is malformed',
+      signature_mismatch: 'Request signature does not match',
+    };
+    res.status(401).json({
+      error: (result.cause && messages[result.cause]) || 'Unauthorized',
+      ...(result.cause ? { cause: result.cause } : {}),
+    });
     return;
   }
 
@@ -85,6 +108,7 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   // the key resolved during verification; default once more defensively.
   const tenantId = principalTenantId ?? DEFAULT_TENANT;
   req.tenantId = tenantId;
+  req.apiKeyRole = resolvedRole;
 
   if (result.keyId) {
     apiKeyService.updateLastUsed(result.keyId).catch(() => {});
@@ -97,6 +121,26 @@ export async function signatureAuth(req: Request, res: Response, next: NextFunct
   // point reads this ambient tenant; outside it (multi-tenant on, no
   // context) keyed access fails closed.
   runWithTenant(tenantId, () => next());
+}
+
+/**
+ * Gate a route on the calling key's role. Runs after `signatureAuth`,
+ * which attaches `req.apiKeyRole`. Member keys get the data plane only;
+ * key/invite management stays admin-only so a teammate's leaked key
+ * cannot enumerate or revoke other credentials.
+ */
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (req.apiKeyRole !== 'admin') {
+    logger.warn('authz failed: admin role required', {
+      requestId: req.requestId,
+      path: req.originalUrl,
+      keyId: req.apiKeyId,
+      role: req.apiKeyRole,
+    });
+    res.status(403).json({ error: 'This action needs an admin key' });
+    return;
+  }
+  next();
 }
 
 // Redacted snapshot of the inbound request to help diagnose signature

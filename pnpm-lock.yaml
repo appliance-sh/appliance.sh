@@ -355,6 +355,9 @@ importers:
         specifier: ^19.0.0
         version: 19.2.5(react@19.2.5)
     devDependencies:
+      '@appliance.sh/cli':
+        specifier: workspace:*
+        version: link:../cli
       '@tauri-apps/cli':
         specifier: ^2.1.0
         version: 2.10.1
@@ -381,6 +384,10 @@ importers:
         version: 3.2.4(@types/node@24.12.2)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.21.0)(yaml@2.8.3)
 
   packages/helper:
+    dependencies:
+      undici:
+        specifier: ^8.7.0
+        version: 8.7.0
     devDependencies:
       '@types/node':
         specifier: 24.12.2
@@ -6295,6 +6302,10 @@ packages:
 
   undici-types@7.8.0:
     resolution: {integrity: sha512-9UJ2xGDvQ43tYyVMpuHlsgApydB8ZKfVYTsLDhXkFL/6gfkp+U8xTGdh8pMJv1SpZna0zxG1DwsKZsreLbXBxw==}
+
+  undici@8.7.0:
+    resolution: {integrity: sha512-N7iQtfyLhIMOFgQubvmLV26svHpO0bqKnAiWotTQCVKCmWrcGbBotPuW1x+xwYZ2VHdSTVUfPQQnlEt1/LouTQ==}
+    engines: {node: '>=22.19.0'}
 
   unicode-canonical-property-names-ecmascript@2.0.1:
     resolution: {integrity: sha512-dA8WbNeb2a6oQzAQ55YlT5vQAWGV9WXOsi3SskE3bcCdM0P4SDd+24zS/OCacdRq5BkdsRj9q3Pg6YyQoxIGqg==}
@@ -13853,6 +13864,8 @@ snapshots:
   undici-types@7.18.2: {}
 
   undici-types@7.8.0: {}
+
+  undici@8.7.0: {}
 
   unicode-canonical-property-names-ecmascript@2.0.1: {}
 

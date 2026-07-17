@@ -40,6 +40,11 @@ export const deploymentInput = z.object({
   // layer's arch (for framework builds). Defaults to ['x86_64'] when
   // omitted, which matches Lambda's own default.
   architectures: z.array(z.enum(['x86_64', 'arm64'])).optional(),
+  // Pod count for Kubernetes bases (microVM local runtime + BYO
+  // clusters). When omitted, a redeploy preserves the environment's
+  // current scale (first deploy: 1). Ignored on Lambda bases, where
+  // concurrency is ambient.
+  replicas: z.number().int().min(1).max(100).optional(),
   // Reconcile Pulumi state with cloud reality before computing the
   // diff (deploys an effective `pulumi up --refresh`). Used by the
   // dogfood self-update path to recover from stale provider state

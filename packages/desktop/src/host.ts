@@ -22,16 +22,14 @@ import type {
   BootstrapEvent,
   BootstrapInput,
   BootstrapOptions,
-  BootstrapInClusterInput,
-  BootstrapInClusterResult,
   BootstrapResult,
   Cluster,
   ConsoleHost,
   HostConfig,
   LatestGhcrTagInput,
   LocalApplianceManifest,
-  LocalBuildAndImportInput,
   LocalDeployToCloudInput,
+  LocalPackageUploadInput,
   LocalHelperInstallResult,
   LocalLogEvent,
   LocalPreflightCheck,
@@ -198,13 +196,18 @@ export const tauriHost: ConsoleHost = {
     async readApplianceManifest(path: string): Promise<LocalApplianceManifest> {
       return invoke<LocalApplianceManifest>('read_appliance_manifest', { path });
     },
-    async buildAndImportImage(
-      input: LocalBuildAndImportInput,
+    async packageAndUploadBuild(
+      input: LocalPackageUploadInput,
       onEvent: (event: LocalLogEvent) => void
-    ): Promise<string> {
-      const channel = new Channel<LocalLogEvent>();
-      channel.onmessage = onEvent;
-      return invoke<string>('build_and_import_image', { input, onEvent: channel });
+    ): Promise<void> {
+      // The sidecar CLI emits `{type:'log', level, message}` lines
+      // without a stream tag — normalize to the LocalLogEvent shape so
+      // the wizard's log pane renders them like any other progress.
+      const channel = new Channel<LocalLogEvent & { stream?: LocalLogEvent['stream'] }>();
+      channel.onmessage = (event) => {
+        if (event?.message) onEvent({ type: 'log', stream: event.stream ?? 'meta', message: event.message });
+      };
+      await invoke('package_and_upload_build', { input, onEvent: channel });
     },
     async deployToCloud(input: LocalDeployToCloudInput, onEvent: (event: LocalLogEvent) => void): Promise<void> {
       // Shells the SAME bundled `appliance` sidecar the helper-install /
@@ -215,9 +218,6 @@ export const tauriHost: ConsoleHost = {
       const channel = new Channel<LocalLogEvent>();
       channel.onmessage = onEvent;
       await invoke('deploy_to_cloud', { input, onEvent: channel });
-    },
-    async bootstrapInClusterApiServer(input?: BootstrapInClusterInput): Promise<BootstrapInClusterResult> {
-      return invoke<BootstrapInClusterResult>('bootstrap_in_cluster_api_server', { input: input ?? {} });
     },
   },
 
@@ -253,6 +253,13 @@ export const tauriHost: ConsoleHost = {
         },
         async cleanupShell() {
           await invoke('microvm_dev_cleanup', { name: vm });
+        },
+        healCredentials(failedKeyId?: string, cause?: string) {
+          return invoke<boolean>('microvm_heal_credentials', {
+            name: vm,
+            failedKeyId: failedKeyId ?? null,
+            cause: cause ?? null,
+          });
         },
         stop() {
           return invoke('microvm_stop', { name: vm });

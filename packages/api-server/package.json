@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/api-server",
-  "version": "1.50.0",
+  "version": "1.51.2",
   "private": true,
   "description": "",
   "author": "Eliot Lim",
@@ -10,8 +10,13 @@
     "directory": "packages/api-server"
   },
   "license": "MIT",
+  "main": "dist/src/app.js",
+  "types": "dist/src/app.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "compile:guest-x64": "bun build src/main.ts --compile --target=bun-linux-x64-musl --outfile=dist/guest/appliance-api-server-linux-x64",
+    "compile:guest-arm64": "bun build src/main.ts --compile --target=bun-linux-arm64-musl --outfile=dist/guest/appliance-api-server-linux-arm64",
+    "compile:guest": "pnpm run compile:guest-x64 && pnpm run compile:guest-arm64",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "node dist/src/main.js",
     "start:dev": "tsx watch src/main.ts",

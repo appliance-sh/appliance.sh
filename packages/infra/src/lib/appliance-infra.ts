@@ -1,7 +1,7 @@
 import * as aws from '@pulumi/aws';
 import * as awsNative from '@pulumi/aws-native';
 import { lookup } from './controller';
-import { applianceBaseConfigInput, ApplianceBaseConfigInput, isKubernetesBase } from '@appliance.sh/sdk';
+import { applianceBaseConfigInput, ApplianceBaseConfigInput, isDockerBase, isKubernetesBase } from '@appliance.sh/sdk';
 import { ApplianceBaseAwsPublic } from './aws/ApplianceBaseAwsPublic';
 import { ApplianceBaseAwsVpc } from './aws/ApplianceBaseAwsVpc';
 
@@ -38,6 +38,11 @@ export async function applianceInfra(input: ApplianceInfraInput): Promise<Applia
     // the declarative `applianceInfra({ bases })` interface can
     // still accept mixed base lists.
     if (isKubernetesBase(baseConfig)) {
+      continue;
+    }
+    // Docker bases (the single-binary local daemon) likewise deploy
+    // through their own runtime service, never through Pulumi.
+    if (isDockerBase(baseConfig)) {
       continue;
     }
     const baseController = lookup(baseConfig);

@@ -2,6 +2,16 @@
 // import at runtime (it rejects directory imports); bundlers are happy
 // either way. Types come from the umbrella entry.
 import { signMessage, verifyMessage } from 'http-message-signatures/lib/httpbis/index.js';
+// The error classes are dependency-free (plain Error subclasses), so —
+// like the httpbis deep import above — pulling them in keeps the
+// Node-only `algorithm` module out of browser bundles.
+import {
+  ExpiredError,
+  MalformedSignatureError,
+  UnacceptableSignatureError,
+  UnknownKeyError,
+  UnsupportedAlgorithmError,
+} from 'http-message-signatures/lib/errors/index.js';
 import type { SigningKey, VerifyingKey } from 'http-message-signatures';
 
 // Universal (Node 18+/browser) HMAC-SHA256 signer/verifier using the
@@ -29,10 +39,31 @@ export interface VerifyRequestInput {
 
 export type KeyLookup = (keyId: string) => Promise<{ secret: string } | null>;
 
+/**
+ * Why a signed request was rejected — machine-readable so clients can
+ * pick the right recovery (re-mint on `unknown_key`, clock sync on
+ * `clock_skew`, "don't mint again" on everything else) instead of
+ * pattern-matching opaque 401 text. The first four are produced by the
+ * server middleware before signature verification; the rest by
+ * `verifySignedRequest`.
+ */
+export type AuthFailureCause =
+  | 'missing_signature'
+  | 'missing_digest'
+  | 'digest_mismatch'
+  | 'invalid_host'
+  | 'unknown_key'
+  | 'clock_skew'
+  | 'malformed_signature'
+  | 'signature_mismatch';
+
 export interface VerifyResult {
   verified: boolean;
   keyId?: string;
   error?: string;
+  /** Machine-readable failure classification; absent when verified
+   *  (or when the failure defies classification). */
+  cause?: AuthFailureCause;
 }
 
 const FIELDS_WITH_BODY = ['@method', '@path', '@authority', 'content-type', 'content-digest'];
@@ -151,15 +182,50 @@ export async function signRequest(
   return result;
 }
 
+/**
+ * Map a `verifyMessage` rejection to a cause. ExpiredError covers both
+ * "too old" (created outside maxAge/notAfter — on a local appliance
+ * that's guest-clock skew, not replay) and "expired"; the other
+ * VerificationError subclasses are all structural problems with the
+ * signature material. Unclassified errors get no cause so callers fall
+ * back to their cause-less behavior.
+ */
+function classifyVerifyError(err: unknown): AuthFailureCause | undefined {
+  if (err instanceof ExpiredError) return 'clock_skew';
+  if (err instanceof UnknownKeyError) return 'unknown_key';
+  if (
+    err instanceof MalformedSignatureError ||
+    err instanceof UnacceptableSignatureError ||
+    err instanceof UnsupportedAlgorithmError
+  ) {
+    return 'malformed_signature';
+  }
+  // Thrown (as a plain Error) when only one of signature /
+  // signature-input is present.
+  if (err instanceof Error && err.message.includes('Incomplete signature headers')) return 'malformed_signature';
+  return undefined;
+}
+
 export async function verifySignedRequest(request: VerifyRequestInput, keyLookup: KeyLookup): Promise<VerifyResult> {
+  // `verifyMessage` collapses a keyLookup miss into the same falsy
+  // result as an HMAC mismatch; this flag keeps the two apart so the
+  // caller can distinguish "key id not in the store" (re-mint) from
+  // "right key id, wrong bytes" (don't).
+  let keyUnknown = false;
   try {
     const result = await verifyMessage(
       {
         keyLookup: async (params): Promise<VerifyingKey | null> => {
           const keyId = params.keyid as string | undefined;
-          if (!keyId) return null;
+          if (!keyId) {
+            keyUnknown = true;
+            return null;
+          }
           const keyData = await keyLookup(keyId);
-          if (!keyData) return null;
+          if (!keyData) {
+            keyUnknown = true;
+            return null;
+          }
           const verifier = async (data: Uint8Array, signature: Uint8Array) =>
             hmacVerify(keyData.secret, asBytes(data), asBytes(signature));
           return {
@@ -189,8 +255,16 @@ export async function verifySignedRequest(request: VerifyRequestInput, keyLookup
       const keyIdMatch = sigInput?.toString().match(/keyid="([^"]+)"/);
       return { verified: true, keyId: keyIdMatch?.[1] };
     }
-    return { verified: false, error: 'Signature verification failed' };
+    return {
+      verified: false,
+      error: 'Signature verification failed',
+      cause: keyUnknown ? 'unknown_key' : 'signature_mismatch',
+    };
   } catch (err) {
-    return { verified: false, error: err instanceof Error ? err.message : String(err) };
+    return {
+      verified: false,
+      error: err instanceof Error ? err.message : String(err),
+      cause: classifyVerifyError(err) ?? (keyUnknown ? 'unknown_key' : undefined),
+    };
   }
 }

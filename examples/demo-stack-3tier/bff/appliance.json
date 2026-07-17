@@ -1,0 +1,6 @@
+{
+  "manifest": "v1",
+  "type": "container",
+  "name": "demo-bff",
+  "port": 3000
+}

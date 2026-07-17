@@ -1,6 +1,6 @@
 {
   "name": "@appliance.sh/helper",
-  "version": "1.50.0",
+  "version": "1.51.2",
   "private": true,
   "description": "Cross-platform dependency installer for the Appliance local runtime (docker / kubectl / crane)",
   "repository": {
@@ -25,7 +25,9 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "dependencies": {},
+  "dependencies": {
+    "undici": "^8.7.0"
+  },
   "devDependencies": {
     "@types/node": "24.12.2",
     "typescript": "5.9.3",

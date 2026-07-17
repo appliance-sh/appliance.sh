@@ -117,7 +117,7 @@ function registerMockMicroVmCluster(vm: MockVm): void {
   if (!state.clusters.some((c) => c.id === clusterId)) {
     state.clusters.push({
       id: clusterId,
-      name: vm.name === 'appliance' ? 'MicroVM Runtime' : `MicroVM Runtime (${vm.name})`,
+      name: vm.name === 'appliance' ? 'Dev Machine' : `Dev Machine (${vm.name})`,
       apiServerUrl: `http://api.appliance.localhost:${vm.hostPort}`,
       createdAt: new Date().toISOString(),
       apiKey: { id: 'apikey_mock', secret: 'sk_mock' },
@@ -399,28 +399,20 @@ export function createMockHost(): ConsoleHost {
         };
       },
 
-      async buildAndImportImage(input, onEvent) {
-        const ref = input.registryUrl ? `${input.registryUrl}/${input.imageTag}` : input.imageTag;
-        onEvent({ type: 'log', stream: 'meta', message: `$ docker build -t ${ref} ${input.path}` });
+      async packageAndUploadBuild(input, onEvent) {
+        // Mirror the sidecar-CLI flow: package the source zip, then PUT
+        // it to the one-time upload URL. The image is built server-side.
+        onEvent({ type: 'log', stream: 'meta', message: `$ appliance build --upload-url … (${input.path})` });
         const lines = [
-          '#1 [internal] load build definition from Dockerfile',
-          '#2 [internal] load metadata for docker.io/library/node:24-slim',
-          '#3 [1/4] FROM docker.io/library/node:24-slim',
-          '#4 [2/4] WORKDIR /app',
-          '#5 [3/4] COPY package.json index.js ./',
-          '#6 [4/4] RUN npm install --omit=dev',
-          `#7 exporting to image — naming to ${ref}`,
+          'Packaging framework source (built server-side).',
+          'Built: appliance.zip (1.2 MB)',
+          'Uploading source (1.2 MB)…',
+          'Source uploaded.',
         ];
         for (const line of lines) {
-          await sleep(250);
-          onEvent({ type: 'log', stream: 'stdout', message: line });
+          await sleep(300);
+          onEvent({ type: 'log', stream: 'meta', message: line });
         }
-        if (input.registryUrl) {
-          onEvent({ type: 'log', stream: 'meta', message: `$ docker push ${ref}` });
-          await sleep(400);
-          onEvent({ type: 'log', stream: 'stdout', message: 'latest: digest: sha256:mock size: 1677' });
-        }
-        return ref;
       },
 
       // Stand-in for the bundled `appliance deploy` shell (AWS/bundle cloud
@@ -447,14 +439,6 @@ export function createMockHost(): ConsoleHost {
           await sleep(350);
           onEvent({ type: 'log', stream: 'stdout', message });
         }
-      },
-
-      async bootstrapInClusterApiServer() {
-        await sleep(1_200);
-        return {
-          apiServerUrl: 'http://api.appliance.localhost:8081',
-          apiKey: { id: 'apikey_mock-bootstrap', secret: 'sk_mock-secret' },
-        };
       },
     },
 

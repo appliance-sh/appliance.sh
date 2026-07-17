@@ -6,6 +6,7 @@ declare module 'express-serve-static-core' {
     apiKeyId?: string;
     /** Server-derived owning principal (tenant) for the request. */
     tenantId?: string;
+    apiKeyRole?: import('@appliance.sh/sdk').ApiKeyRole;
     rawBody?: Buffer;
   }
 }

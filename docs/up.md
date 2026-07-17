@@ -1,10 +1,10 @@
 # `appliance up`: project detection + UX contract
 
-**Status:** Decision (SPIKE). No implementation. Sits on the in-guest Docker engine (`docs/sandbox.md`) and must stay cloud-promotable (`docs/cloud-promotion-contract.md` §5).
+**Status:** Implemented (originally a spike; this remains the UX contract). Sits on the in-guest Docker engine (`docs/sandbox.md`) and must stay cloud-promotable (`docs/cloud-promotion-contract.md` §5).
 
 ## Premise
 
-`appliance up` is near-zero-config local testing of a repo's _own_ container definition (Dockerfile/compose/devcontainer), distinct from `appliance deploy` (ships an appliance to the in-VM api-server) and `appliance vm dev up` (an interactive provisioned workspace). It drives the in-guest **dockerd** over the vsock `DOCKER_HOST` and forwards published ports from the VM's allocated block (`docs/sandbox.md` §3, §5). It is **not** k3s; nothing here touches the api-server bootstrap path in `appliance-vm.ts:218-255`.
+`appliance up` is near-zero-config local testing of a repo's _own_ container definition (Dockerfile/compose/devcontainer), distinct from `appliance deploy` (ships an appliance to the in-VM api-server) and `appliance vm dev up` (an interactive provisioned workspace). It drives the in-guest **dockerd** over the vsock `DOCKER_HOST` and forwards published ports from the VM's allocated block (`docs/sandbox.md` §3, §5). The in-guest dockerd is a guest feature that exists solely for `up`'s own container runs — the deploy pipeline never touches it (deploy builds run server-side via the api-server's BuildKit). It is **not** k3s; nothing here touches the api-server guest-binary provisioning.
 
 ## 1. Detection precedence
 
@@ -32,17 +32,17 @@ appliance logs [service] [-f] [--tail <n>] [--vm <name>]
 appliance status [--vm <name>] [--json]         # per-service state + URL map
 ```
 
-`up` is foreground-with-`--detach` (Vercel-like: stream build, then print the URL map). It implicitly boots/uses the sandbox VM (calls the same engine path as `vm up`, minus api-server bootstrap) and shares the workspace (§3) before invoking docker/compose over `DOCKER_HOST`.
+`up` is foreground-with-`--detach` (Vercel-like: stream build, then print the URL map). It implicitly boots/uses the one managed VM (the same engine path as `vm up`) and shares the workspace (§3) before invoking docker/compose over `DOCKER_HOST`.
 
 ## 3. Project → VM
 
-Run in a **single shared default sandbox VM** (`--vm` overrides; default name `appliance`, reusing `DEFAULT_VM_NAME`). One-VM-per-project is rejected: it multiplies 4-GiB/2-CPU VMs (`spec.rs:59-62`) and fragments the shared dockerd image cache on `/persist/docker`. Projects coexist by Docker Compose project name (§5) inside one dockerd, exactly as `docker compose` isolates projects on one daemon.
+Run in the **single managed VM** (`--vm` overrides; default name `appliance` — the same VM `appliance dev`, `appliance deploy`, and `appliance agent` use, booted dev-capable with docker + the workspace mounted; the former separate `appliance-sbx` sandbox VM is retired). One-VM-per-project is rejected: it multiplies 4-GiB/2-CPU VMs (`spec.rs:59-62`) and fragments the shared dockerd image cache on `/persist/docker`. Projects coexist by Docker Compose project name (§5) inside one dockerd, exactly as `docker compose` isolates projects on one daemon.
 
 The workspace reaches the guest by **reusing VirtioFS `--mount`** (`guest.rs:43,295-300`): `up` shares cwd at `/persist/workspace` and runs the build there (matches `docs/sandbox.md` Task B). `up` re-shares on each invocation; an existing different mount errors with the `vm up --no-mount` hint rather than silently re-pointing.
 
 ## 4. Port / URL surfacing
 
-Deterministic, Vercel-like map. Each service's published ports draw from the VM's **allocated block**, never the reserved `8081/6443/5052/5053` (`docs/sandbox.md` §5; `spec.rs:54,104`). Forwarding is `spawn_proxy(hostPort, guest_ip:containerPort)` via the per-VM published-port registry. Output (honors checklist item 6 — **no single-URL assumption**):
+Deterministic, Vercel-like map. Each service's published ports draw from the VM's **allocated block**, never the reserved `8081/6443/5052/5053/5054` (`docs/sandbox.md` §5; `spec.rs:54,104`). Forwarding is `spawn_proxy(hostPort, guest_ip:containerPort)` via the per-VM published-port registry. Output (honors checklist item 6 — **no single-URL assumption**):
 
 ```
 Sandbox up — myapp (compose)

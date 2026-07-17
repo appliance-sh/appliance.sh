@@ -24,6 +24,7 @@ import {
   wireValueForCred,
   writeAgentKey,
 } from './utils/agent.js';
+import { printCliError } from './utils/errors.js';
 import { runVm } from './utils/sandbox.js';
 import {
   type AgentStatus,
@@ -139,7 +140,8 @@ program
           docker: opts.docker,
         });
       } catch (err) {
-        console.error(chalk.red(`agent launch failed: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(chalk.red('agent launch failed:'));
+        printCliError(err);
         process.exit(1);
       }
 

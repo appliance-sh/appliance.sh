@@ -54,6 +54,10 @@ pub struct VmSpec {
     /// Host port the egress proxy binds for this VM (default 5053).
     #[serde(default = "default_egress_port")]
     pub egress_port: u16,
+    /// Host loopback port forwarded to the in-guest buildkitd gRPC
+    /// listener (default 5054) — the docker-free image build path.
+    #[serde(default = "default_buildkit_port")]
+    pub buildkit_port: u16,
     /// When set, this VM is provisioned as a development environment:
     /// the guest bootstrap installs a dev toolchain (cached on the data
     /// disk) and creates a persistent `/persist/workspace` + home you
@@ -127,11 +131,12 @@ pub struct PublishedPort {
 // E2.3 and out of scope for this pure slice. Allow dead_code here so the
 // `-D warnings` gate stays green until that code lands.
 
-/// The four canonical host ports reserved for ingress, kubernetes API,
-/// registry, and egress respectively. The default VM keeps these; a
-/// published port may never reuse one (docs/sandbox.md §5, finding C4).
+/// The five canonical host ports reserved for ingress, kubernetes API,
+/// registry, egress, and buildkit respectively. The default VM keeps
+/// these; a published port may never reuse one (docs/sandbox.md §5,
+/// finding C4).
 #[allow(dead_code)]
-pub const RESERVED_HOST_PORTS: [u16; 4] = [8081, 6443, 5052, 5053];
+pub const RESERVED_HOST_PORTS: [u16; 5] = [8081, 6443, 5052, 5053, 5054];
 
 /// The deterministic-NodePort window `host_services` blanket-forwards
 /// (`guest.rs:631`, `30000..=30050` inclusive). A published port must
@@ -147,8 +152,8 @@ pub const NODEPORT_FORWARD_RANGE: std::ops::RangeInclusive<u16> = 30000..=30050;
 const PUBLISHED_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=29999;
 
 /// The default VM name. The default VM keeps the canonical host ports
-/// (8081/6443/5052/5053) for backward compatibility and parity with
-/// the k3d runtime; additional VMs get allocated distinct blocks.
+/// (8081/6443/5052/5053/5054) for backward compatibility and parity
+/// with the k3d runtime; additional VMs get allocated distinct blocks.
 pub const DEFAULT_VM_NAME: &str = "appliance";
 
 /// Default virtual CPU count for a fresh VM.
@@ -180,6 +185,7 @@ impl VmSpec {
             api_port: 6443,
             registry_port: 5052,
             egress_port: 5053,
+            buildkit_port: 5054,
             dev: false,
             dev_mount: None,
             docker: false,
@@ -198,28 +204,40 @@ impl VmSpec {
         resolve_net_link(self.net_link, forced)
     }
 
-    /// Resolve the four host ports for `name` so multiple VMs can run
+    /// Resolve the five host ports for `name` so multiple VMs can run
     /// concurrently without colliding. An existing VM keeps its ports;
     /// the default VM gets the canonical block; any other new VM gets
-    /// the lowest free contiguous block of four from 8100 upward
-    /// (ingress, api, registry, egress).
-    pub fn allocate_ports(name: &str) -> (u16, u16, u16, u16) {
+    /// the lowest free contiguous block of five from 8100 upward
+    /// (ingress, api, registry, egress, buildkit).
+    pub fn allocate_ports(name: &str) -> (u16, u16, u16, u16, u16) {
         if let Ok(Some(existing)) = crate::store::load_spec(name) {
-            return (existing.host_port, existing.api_port, existing.registry_port, existing.egress_port);
+            return (
+                existing.host_port,
+                existing.api_port,
+                existing.registry_port,
+                existing.egress_port,
+                existing.buildkit_port,
+            );
         }
         if name == DEFAULT_VM_NAME {
-            return (8081, 6443, 5052, 5053);
+            return (8081, 6443, 5052, 5053, 5054);
         }
-        let mut used: std::collections::HashSet<u16> = [8081, 6443, 5052, 5053].into_iter().collect();
+        let mut used: std::collections::HashSet<u16> = RESERVED_HOST_PORTS.into_iter().collect();
         for spec in crate::store::list_specs() {
-            used.extend([spec.host_port, spec.api_port, spec.registry_port, spec.egress_port]);
+            used.extend([
+                spec.host_port,
+                spec.api_port,
+                spec.registry_port,
+                spec.egress_port,
+                spec.buildkit_port,
+            ]);
         }
         let mut slot: u16 = 0;
         loop {
-            let base = 8100 + slot * 4;
-            let block = [base, base + 1, base + 2, base + 3];
+            let base = 8100 + slot * 5;
+            let block = [base, base + 1, base + 2, base + 3, base + 4];
             if block.iter().all(|p| !used.contains(p)) {
-                return (block[0], block[1], block[2], block[3]);
+                return (block[0], block[1], block[2], block[3], block[4]);
             }
             slot += 1;
         }
@@ -349,9 +367,19 @@ impl VmPaths {
     pub fn host_log(&self) -> PathBuf {
         self.dir.join("host.log")
     }
+    /// Cross-platform stop request: `appliance-vm stop` drops this file
+    /// and the resident host process's parking loop acts on it. On Unix
+    /// SIGTERM is the primary channel and this file is the fallback; on
+    /// Windows (no SIGTERM) it is the only one. Cleared on every boot.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn stop_request(&self) -> PathBuf {
+        self.dir.join("stop.request")
+    }
     /// Per-VM Unix socket the resident host process serves: it bridges
     /// each connection to a fresh guest vsock shell. `appliance-vm
-    /// shell` connects here.
+    /// shell` connects here. Unix engines only — the Windows client
+    /// rides `wsl.exe` instead, so no relay socket exists there.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn shell_sock(&self) -> PathBuf {
         self.dir.join("shell.sock")
     }
@@ -374,9 +402,15 @@ pub struct VmStatus {
     /// starting" from "ready".
     pub cluster_ready: bool,
     /// The current bring-up stage while a VM is starting (media, booting,
-    /// network, cluster, ready, failed). `None` when not running.
+    /// network, cluster + its sub-phases, ready, failed). `None` when not
+    /// running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<crate::bringup::Phase>,
+    /// Free-text context for `phase` (guest IP, what ingress is waiting
+    /// on, the failure reason) — the desktop renders it as the live
+    /// detail line under the in-flight rung.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Forwarded host ports (present once the VM is defined).
@@ -388,6 +422,8 @@ pub struct VmStatus {
     pub registry_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buildkit_port: Option<u16>,
     /// Whether this VM is provisioned as a development environment.
     pub dev: bool,
 }
@@ -398,6 +434,10 @@ fn default_registry_port() -> u16 {
 
 fn default_egress_port() -> u16 {
     5053
+}
+
+fn default_buildkit_port() -> u16 {
+    5054
 }
 
 #[cfg(test)]
@@ -442,10 +482,23 @@ mod tests {
         let legacy = r#"{"name":"x","cpus":2,"memoryMib":4096,"diskGib":10,"image":"alpine-3.21.3","cmdline":"console=hvc0","mac":"02:00:00:00:00:01","hostPort":8081,"apiPort":6443}"#;
         let spec: VmSpec = serde_json::from_str(legacy).unwrap();
         assert_eq!(spec.registry_port, 5052);
+        // Old specs predate the buildkit port — it must default to 5054.
+        assert_eq!(spec.buildkit_port, 5054);
         // Old specs predate the dev flag — it must default to off.
         assert!(!spec.dev);
         // Old specs predate the docker flag too — default off.
         assert!(!spec.docker);
+    }
+
+    #[test]
+    fn buildkit_port_round_trips_as_camel_case() {
+        let mut spec = VmSpec::defaults("x");
+        assert_eq!(spec.buildkit_port, 5054, "fresh specs get the canonical buildkit port");
+        spec.buildkit_port = 8104;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"buildkitPort\":8104"), "wire form is camelCase buildkitPort");
+        let back: VmSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.buildkit_port, 8104);
     }
 
     #[test]

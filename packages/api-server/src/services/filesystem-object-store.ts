@@ -57,7 +57,10 @@ export class FilesystemObjectStore implements ObjectStore {
     }
     return (
       entries
-        .map((p) => path.relative(this.rootDir, p))
+        // Keys are S3-shaped (`/`-separated) regardless of host OS —
+        // path.relative emits `\` on Windows, which would both fail the
+        // prefix filter and hand callers keys get() can't round-trip.
+        .map((p) => path.relative(this.rootDir, p).split(path.sep).join('/'))
         .filter((rel) => (prefix ? rel.startsWith(prefix) : true))
         // Skip the in-flight `.tmp` files set() leaves behind on crash —
         // they aren't legitimate keys and would deserialise as bad JSON.

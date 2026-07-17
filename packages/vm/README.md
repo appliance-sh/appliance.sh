@@ -11,7 +11,7 @@ repo root for the architecture.
 | -------- | -------------------------------------------- | ------------------------------ |
 | macOS    | Virtualization.framework (in-process, objc2) | boots                          |
 | Linux    | KVM                                          | scaffold (reports unavailable) |
-| Windows  | WSL2                                         | scaffold (reports unavailable) |
+| Windows  | WSL2 (managed distro via `wsl.exe`)          | boots                          |
 
 ## Build & run (macOS)
 
@@ -31,6 +31,32 @@ State lives under `~/.appliance/vm/<name>/` (definition, sparse data
 disk, console log, pidfile); guest kernel/initramfs pairs are cached
 under `~/.appliance/vm/images/<image>/` and unwrapped from EFI zboot
 packaging automatically.
+
+## Build & run (Windows)
+
+Requires WSL2 (`wsl --install` from an elevated prompt, then reboot —
+`appliance-vm doctor` tells you when it's missing). No signing step:
+
+```powershell
+cargo build
+.\target\debug\appliance-vm.exe doctor
+.\target\debug\appliance-vm.exe up
+```
+
+Mechanics differ from macOS while the guest contract stays identical:
+each VM is a registered WSL distro (`appliance-vm-<name>`) imported
+from the hash-pinned Alpine minirootfs, with its VHDX stored under the
+VM dir. The bootstrap (the WSL analogue of `appliance.start`) provisions
+the same non-root `appliance` user, dev toolchain, optional dockerd, and
+k3s + kubeconfig handoff. `/persist` is a plain directory (the VHDX is
+the persistence), `--mount` is a drvfs bind mount instead of VirtioFS,
+`vm shell` rides `wsl.exe`'s own ConPTY channel instead of vsock (tmux
+sessions included), and `stop` is signalled through a per-VM
+`stop.request` file (no SIGTERM on Windows) that terminates the distro.
+`delete` also unregisters the distro. The egress proxy and credential
+store are host-side and platform-neutral; the Netstack link (hard egress
+boundary) is vz-only — WSL VMs police egress cooperatively via the
+proxy, like a NAT VM.
 
 ## The full Appliance flow
 

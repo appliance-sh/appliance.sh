@@ -15,6 +15,10 @@ pnpm --filter @appliance.sh/infra run build
 echo "Building api-server..."
 pnpm --filter @appliance.sh/api-server run build
 
+echo "Building web console..."
+pnpm --filter @appliance.sh/app run build
+pnpm --filter @appliance.sh/console run build
+
 popd > /dev/null
 
 # Stage workspace deps into .docker-deps/ so the Dockerfile can COPY them
@@ -28,6 +32,10 @@ cp -r "$REPO_ROOT/packages/sdk/dist" "$STAGE_DIR/sdk/dist"
 
 cp "$REPO_ROOT/packages/infra/package.json" "$STAGE_DIR/infra/"
 cp -r "$REPO_ROOT/packages/infra/dist" "$STAGE_DIR/infra/dist"
+
+# The built console SPA ships inside the image so the api-server's URL
+# is itself the web console a teammate can open.
+cp -r "$REPO_ROOT/packages/console/dist" "$STAGE_DIR/console-dist"
 
 # Copy root package files for workspace install
 cp "$REPO_ROOT/package.json" "$STAGE_DIR/root-package.json"

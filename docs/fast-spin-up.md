@@ -1,5 +1,14 @@
 # Fast agent spin-up — agent-only VM mode + a prebuilt agent image
 
+> **Status update (single-VM model).** The separate agent-only sandbox VM
+> (`appliance-sbx`) is **retired in the CLI**: agent sessions now ride the
+> ONE managed `appliance` VM (booted dev-capable with the workspace
+> mounted), alongside `appliance dev` and `appliance up`. The Rust
+> `agent_only` spec flag remains in `packages/vm` for back-compat, but the
+> CLI no longer creates agent-only VMs. The analysis below is kept as the
+> historical record of Levers 1 and 2; read `appliance-sbx` as the
+> now-retired dedicated VM.
+
 **Status:** S1 (Lever 1, agent-only VM mode) **shipped** — see [§1.6 Invariants](#16-invariants-enforced-as-built). S2 (Lever 2, the prebuilt agent image) **machinery shipped** — the build workflow, fetch + `download_and_verify`, RO squashfs attach (`vdc`), PATH-first, the npm prefix move + wipe-on-project-switch, and the claude-code pin all land in `packages/vm` + `packages/cli` + a CI workflow. **Owed-live (owner/CI):** the squashfs artifact must be built by `release-agent-image.yml` and its per-arch sha256 committed into `images.rs` (the all-zero sentinel until then — the attach is skipped and the guest self-heals via npm), then a live boot+launch on a VM. **Scope:** this doc decides _what_ S1/S2 build. **Owner-locked going in:** two levers only; **VM snapshots are ruled out** — see [§0](#0-why-not-snapshots).
 
 > **S2 as built — verify-before-use for ALL downloads (Sasha condition #3, elevated).** `download_and_verify(url, dest, sha256)` verifies the on-disk artifact's sha256 **before use, every boot — on a cache hit as well as a fresh download** (closing the `download_to` early-return-on-`exists()` hole — Quinn gap #3). It is applied not only to the new agent image but **retrofitted to the pre-existing unauthenticated root-code downloads** — k3s, `modloop-virt`, and the Alpine kernel/initramfs (`images.rs`/`guest.rs`) — whose digests are now committed in-source. The agent squashfs is additionally **re-verified at attach time** immediately before the device is attached. See §2.3.

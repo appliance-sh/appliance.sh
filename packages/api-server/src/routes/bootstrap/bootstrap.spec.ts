@@ -11,6 +11,14 @@ vi.mock('../../services/api-key.service', () => ({
   apiKeyService: mockApiKeyService,
 }));
 
+const mockInviteService = vi.hoisted(() => ({
+  redeem: vi.fn(),
+}));
+
+vi.mock('../../services/invite.service', () => ({
+  inviteService: mockInviteService,
+}));
+
 import { bootstrapRoutes } from './index';
 
 function createTestApp() {
@@ -92,6 +100,66 @@ describe('Bootstrap routes', () => {
     });
   });
 
+  describe('POST /bootstrap/redeem-invite', () => {
+    it('mints a key for a valid token without any auth headers', async () => {
+      mockInviteService.redeem.mockResolvedValue({
+        ok: true,
+        key: {
+          id: 'apikey_new',
+          name: 'teammate',
+          secret: 'sk_new',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          role: 'member',
+        },
+      });
+
+      const app = createTestApp();
+      const res = await request(app).post('/bootstrap/redeem-invite').send({ token: 'inv_abc' });
+
+      expect(res.status).toBe(201);
+      expect(res.body.secret).toBe('sk_new');
+      expect(res.body.role).toBe('member');
+      expect(mockInviteService.redeem).toHaveBeenCalledWith('inv_abc');
+    });
+
+    it('returns 404 for an unknown token', async () => {
+      mockInviteService.redeem.mockResolvedValue({ ok: false, reason: 'not-found' });
+
+      const app = createTestApp();
+      const res = await request(app).post('/bootstrap/redeem-invite').send({ token: 'inv_nope' });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 410 for an already-used token', async () => {
+      mockInviteService.redeem.mockResolvedValue({ ok: false, reason: 'redeemed' });
+
+      const app = createTestApp();
+      const res = await request(app).post('/bootstrap/redeem-invite').send({ token: 'inv_used' });
+
+      expect(res.status).toBe(410);
+      expect(res.body.error).toContain('already used');
+    });
+
+    it('returns 410 for an expired token', async () => {
+      mockInviteService.redeem.mockResolvedValue({ ok: false, reason: 'expired' });
+
+      const app = createTestApp();
+      const res = await request(app).post('/bootstrap/redeem-invite').send({ token: 'inv_old' });
+
+      expect(res.status).toBe(410);
+      expect(res.body.error).toContain('expired');
+    });
+
+    it('returns 400 when the token is missing', async () => {
+      const app = createTestApp();
+      const res = await request(app).post('/bootstrap/redeem-invite').send({});
+
+      expect(res.status).toBe(400);
+      expect(mockInviteService.redeem).not.toHaveBeenCalled();
+    });
+  });
+
   describe('GET /bootstrap/status', () => {
     it('should return initialized: false when no keys exist', async () => {
       mockApiKeyService.exists.mockResolvedValue(false);
@@ -111,6 +179,19 @@ describe('Bootstrap routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.initialized).toBe(true);
+    });
+
+    it('should report serverVersion on the unauthenticated probe', async () => {
+      mockApiKeyService.exists.mockResolvedValue(true);
+
+      const app = createTestApp();
+      const res = await request(app).get('/bootstrap/status');
+
+      expect(res.status).toBe(200);
+      // The pre-credential version-skew signal: cluster-info needs a
+      // signed request, this route does not.
+      expect(typeof res.body.serverVersion).toBe('string');
+      expect(res.body.serverVersion.length).toBeGreaterThan(0);
     });
   });
 });

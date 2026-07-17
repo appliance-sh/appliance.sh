@@ -10,13 +10,14 @@ Tauri 2 shell for the Appliance desktop app. Frontend is `@appliance.sh/app`; th
 
 ## Icons
 
-Placeholder PNGs are checked in under `src-tauri/icons/` so `cargo check` and `tauri dev` work out of the box. Before shipping an installer, replace them with real icons:
+The full platform icon set (PNGs + `icon.icns` + `icon.ico`) is checked in under `src-tauri/icons/`, generated from a programmatic brand mark. To regenerate (e.g. after tweaking the mark in `scripts/generate-icon.mjs`):
 
 ```
-pnpm tauri icon path/to/source.png
+node scripts/generate-icon.mjs
+pnpm exec tauri icon src-tauri/icons/source.png
 ```
 
-Source image should be at least 1024×1024 PNG with transparency. That command regenerates the PNGs and adds `.icns` / `.ico` too. Re-add `icons/icon.icns` and `icons/icon.ico` to `src-tauri/tauri.conf.json`'s `bundle.icon` array before running `pnpm tauri build` on macOS / Windows.
+To swap in designed artwork, replace `src-tauri/icons/source.png` with a ≥1024×1024 PNG (transparency preserved) and re-run `pnpm exec tauri icon src-tauri/icons/source.png`. `bundle.icon` in `tauri.conf.json` already references the `.icns` / `.ico` outputs (Windows bundling hard-requires the `.ico`).
 
 ## Scripts
 
@@ -49,9 +50,14 @@ plugin (`tauri-plugin-updater` on the Rust side, `@tauri-apps/plugin-updater` +
   signed tarball.
 - `pubkey` → the **public** half of the updater signing keypair. Safe to
   commit. The committed value is a placeholder
-  (`REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY`); replace it once you generate the
-  real keypair (below). Until then the bundle builds fine but update _checks_
-  fail signature verification (which is the safe default — nothing installs).
+  (`REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY`) so local/fork builds fail-safe:
+  the bundle builds fine but update _checks_ fail signature verification
+  (nothing installs). The release workflow injects the real public key at
+  build time via `scripts/set-updater-pubkey.mjs` from the
+  `TAURI_UPDATER_PUBKEY` repo secret — set it (see keypair generation below)
+  alongside `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+  and released builds self-update on macOS **and Windows** (the NSIS
+  `-setup.exe` doubles as the Windows updater artifact).
 
 The UI lives in **Settings → Updates**: "Check for updates" → shows the
 available version + notes → "Download & install" (with a progress bar) →

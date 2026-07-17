@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import * as prompts from '@inquirer/prompts';
 import * as slug from 'random-word-slugs';
 import chalk from 'chalk';
@@ -34,15 +38,16 @@ program
   .option('--attach-zone', 'attach an existing Route53 zone')
   .option(
     '--phases <phases>',
-    `comma-separated phases to run (${ALL_PHASES.join(',')}); phase 2/3 are not implemented yet`,
-    'phase1'
+    `comma-separated phases to run (${ALL_PHASES.join(',')} or 'all'); default runs the full installation`,
+    'all'
   )
   .option('--cache-dir <dir>', 'override ~/.appliance cache directory')
   .option(
     '--image-uri <uri>',
     'override the default api-server image (default: `ghcr.io/appliance-sh/api-server:<version>`)'
   )
-  .option('--profile <name>', 'AWS profile to authenticate with (overrides shell env credentials)')
+  .option('--aws-profile <name>', 'AWS profile to authenticate with (overrides shell env credentials)')
+  .addOption(new Option('--profile <name>', 'deprecated alias for --aws-profile').hideHelp())
   .option('-y, --yes', 'skip the confirmation prompt')
   .action(
     async (options: {
@@ -54,9 +59,21 @@ program
       phases: string;
       cacheDir?: string;
       imageUri?: string;
+      awsProfile?: string;
       profile?: string;
       yes?: boolean;
     }) => {
+      // Fail fast on a missing Pulumi CLI — every phase shells out to it,
+      // so an actionable pointer beats an ENOENT halfway through.
+      ensurePulumiCli();
+
+      // `--profile` collides with the credential-profile meaning every
+      // other command uses; `--aws-profile` is the documented flag.
+      if (options.profile) {
+        console.error(chalk.yellow('--profile here means the AWS profile and is deprecated — use --aws-profile.'));
+      }
+      const awsProfile = options.awsProfile ?? options.profile;
+
       const name =
         options.name ??
         (await prompts.input({
@@ -116,7 +133,7 @@ program
         console.log(`  Zone:    ${createZone ? 'create new' : 'attach existing'}`);
         console.log(`  Phases:  ${phases.join(', ')}`);
         console.log(`  Image:   ${imageUri ?? '(default ghcr.io/appliance-sh/api-server)'}`);
-        console.log(`  Profile: ${options.profile ?? '(shell env)'}`);
+        console.log(`  AWS:     ${awsCredentialsNote(awsProfile)}`);
         if (options.cacheDir) console.log(`  Cache:   ${options.cacheDir}`);
         console.log();
         const ok = await prompts.confirm({ message: 'Proceed?', default: true });
@@ -131,7 +148,7 @@ program
           {
             base: { name, config: baseConfig },
             apiServerImageUri: imageUri,
-            aws: options.profile ? { profile: options.profile } : undefined,
+            aws: awsProfile ? { profile: awsProfile } : undefined,
           },
           {
             phases,
@@ -145,6 +162,7 @@ program
         console.log(`  State backend:  ${result.stateBackendUrl}`);
         if (result.apiServerUrl) {
           console.log(`  API server:     ${result.apiServerUrl}`);
+          console.log(`  Web console:    ${chalk.cyan(result.apiServerUrl)}  (open it in a browser)`);
         }
         if (result.apiKey) {
           console.log(`  API key id:     ${result.apiKey.id}`);
@@ -159,6 +177,10 @@ program
           console.log(
             `  then ${chalk.cyan('appliance setup')} in your app folder and ${chalk.cyan('appliance deploy')}.`
           );
+          console.log(
+            `  To onboard teammates, open the web console and use ${chalk.cyan('Settings → Invite teammate')} —`
+          );
+          console.log('  they get a link that signs them in with their own key, no secrets to paste.');
         } else {
           console.log(
             '  Phase 2 (hoist api-server) has not run yet — re-run with `--phases all` to finish the installation.'
@@ -177,6 +199,32 @@ program
       }
     }
   );
+
+/** Fail fast when the Pulumi CLI is missing — probe it before any
+ *  prompting or provisioning work. */
+function ensurePulumiCli(): void {
+  const probe = spawnSync('pulumi', ['version'], { stdio: 'ignore' });
+  if (!probe.error && probe.status === 0) return;
+  console.error(chalk.red('The Pulumi CLI is required to provision AWS infrastructure, but it was not found on PATH.'));
+  console.error(
+    chalk.dim('Install it from https://www.pulumi.com/docs/install/ (macOS: `brew install pulumi`), then re-run.')
+  );
+  process.exit(1);
+}
+
+/** Which AWS credentials phase 1 will authenticate with — the explicit
+ *  --aws-profile, the AWS_PROFILE env var, or the default chain when
+ *  ~/.aws credentials exist. Cosmetic; shown in the plan so the target
+ *  account is visible before confirming. */
+function awsCredentialsNote(awsProfile?: string): string {
+  if (awsProfile) return `profile ${awsProfile}`;
+  if (process.env.AWS_PROFILE) return `profile ${process.env.AWS_PROFILE} (from AWS_PROFILE)`;
+  const awsDir = path.join(os.homedir(), '.aws');
+  if (fs.existsSync(path.join(awsDir, 'credentials')) || fs.existsSync(path.join(awsDir, 'config'))) {
+    return 'default profile (~/.aws)';
+  }
+  return '(shell env credentials)';
+}
 
 function parsePhases(raw: string): BootstrapPhase[] {
   const normalized = raw === 'all' ? ALL_PHASES.join(',') : raw;

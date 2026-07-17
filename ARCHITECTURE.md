@@ -4,15 +4,16 @@ Technical reference for Appliance internals, API, and infrastructure.
 
 ## Packages
 
-Appliance is a TypeScript monorepo (pnpm workspaces + Nx) with 5 packages:
+Appliance is a TypeScript monorepo (pnpm workspaces + Nx). Core packages:
 
-| Package                       | Description                                               |
-| ----------------------------- | --------------------------------------------------------- |
-| **@appliance.sh/sdk**         | Core SDK — Zod models, API client, storage abstraction    |
-| **@appliance.sh/cli**         | CLI built on Commander.js + Inquirer                      |
-| **@appliance.sh/api-server**  | Express REST API server (control plane)                   |
-| **@appliance.sh/infra**       | Pulumi infrastructure-as-code for AWS                     |
-| **@appliance.sh/install-aws** | AWS CDK stack for bootstrapping Appliance on your account |
+| Package                       | Description                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| **@appliance.sh/sdk**         | Core SDK — Zod models, API client, storage abstraction                           |
+| **@appliance.sh/cli**         | CLI built on Commander.js + Inquirer                                             |
+| **@appliance.sh/api-server**  | Express REST API server (control plane)                                          |
+| **@appliance.sh/infra**       | Pulumi infrastructure-as-code for AWS                                            |
+| **@appliance.sh/bootstrap**   | Provisions Appliance installations on AWS (Pulumi; drives `appliance bootstrap`) |
+| **@appliance.sh/install-aws** | Placeholder CDK stack (state bucket only) — not the install path                 |
 
 ### Dependencies
 
@@ -72,7 +73,7 @@ All models are defined as Zod schemas in `packages/sdk/src/models/`.
 - **aws-public**: `{ type: 'appliance-base-aws-public', name, region, dns: { domainName, createZone?, attachZone? } }`
 - **aws-vpc**: `{ type: 'appliance-base-aws-vpc', name, region, dns, vpc: { vpcCidr?, numberOfAzs? } | { vpcId } }`
 - **local** _(deprecated)_: `{ type: 'appliance-base-local', name, cluster?: { clusterName?, namespace?, hostPort?, hostnameSuffix?, ingressClassName? } }` — the former host-side k3d runtime. Removed; the enum value & schema are retained only so deploys created before the cutover still parse. New local deploys use the microVM, which is an `appliance-base-kubernetes` base under the hood.
-- **kubernetes**: `{ type: 'appliance-base-kubernetes', name, kubernetes: { server?, ca?, token?, kubeconfig?, namespace?, hostnameSuffix?, ingressClassName?, hostPort?, dataDir, registry? } }` — generic BYO Kubernetes cluster reachable via URL + credentials (or an inline kubeconfig, or in-cluster ServiceAccount when api-server is itself in the cluster). `hostPort` is the host-side ingress/LB port used when composing reported deploy URLs (defaults to 80).
+- **kubernetes**: `{ type: 'appliance-base-kubernetes', name, kubernetes: { server?, ca?, token?, kubeconfig?, namespace?, hostnameSuffix?, ingressClassName?, hostPort?, dataDir, registry? } }` — generic BYO Kubernetes cluster reachable via URL + credentials (or an inline kubeconfig). The microVM's guest api-server uses `server` + `token` (its own ServiceAccount token). `hostPort` is the host-side ingress/LB port used when composing reported deploy URLs (defaults to 80).
 
 Both `local` and `kubernetes` are handled by the same `KubernetesDeploymentService` under the hood. Use the helper `isKubernetesBase(config)` (exported from `@appliance.sh/sdk`) to branch on "is this a k8s-driven base" rather than enumerating the two variants explicitly.
 
@@ -125,10 +126,11 @@ Returns an access key ID (`ak_...`) and secret (`sk_...`). The secret is shown o
 
 ### Builds
 
-| Method | Path                 | Description      |
-| ------ | -------------------- | ---------------- |
-| `POST` | `/api/v1/builds`     | Create a build   |
-| `GET`  | `/api/v1/builds/:id` | Get build status |
+| Method | Path                                 | Description                                                                                                                                         |
+| ------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/v1/builds`                     | Create a build; returns an upload URL (presigned S3 PUT on cloud bases, the content route locally)                                                  |
+| `PUT`  | `/api/v1/builds/:id/content?token=…` | Upload the source zip on Kubernetes bases — authenticated by a **one-time token** minted at create (the self-hosted analogue of a presigned S3 URL) |
+| `GET`  | `/api/v1/builds/:id`                 | Get build status                                                                                                                                    |
 
 ## Authentication
 
@@ -179,7 +181,7 @@ Only one deployment can be active per environment at a time. Deployments are ide
 All state is stored via the `ObjectStore` interface (`get`, `set`, `delete`, `list`). Two implementations are available:
 
 - **S3ObjectStore** (cloud bases) — backed by the cluster's data bucket; also where Pulumi state lives.
-- **FilesystemObjectStore** (local base) — backed by `local.dataDir` from the base config; no S3, no Pulumi state.
+- **FilesystemObjectStore** (Kubernetes bases, incl. the microVM) — backed by `kubernetes.dataDir` from the base config (`/persist/appliance-data` in the VM); no S3, no Pulumi state.
 
 The api-server picks the implementation at startup based on `APPLIANCE_BASE_CONFIG.type`.
 
@@ -192,72 +194,79 @@ Two base variants drive deploys against a Kubernetes cluster instead of AWS:
 
 Both variants flow through `KubernetesDeploymentService` (`@appliance.sh/infra/lib/local/`), which talks to the cluster via `@kubernetes/client-node` rather than shelling out to `kubectl`. Each appliance maps to a Deployment + Service (NodePort) + Ingress in the configured namespace; destroy tears the same trio down.
 
-| Cloud component              | Kubernetes equivalent                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| S3 object store              | `FilesystemObjectStore` rooted at `kubernetes.dataDir` (PVC-mounted in-cluster)                              |
-| ECR image push (via `crane`) | `docker push` to the runtime's image registry (the microVM's in-VM registry, or any reachable registry)      |
-| Pulumi-driven Lambda deploy  | k8s API `apply` (read → create-or-replace) of a Deployment + Service + Ingress per appliance                 |
-| Lambda execution role        | k8s ServiceAccount (default)                                                                                 |
-| CloudFront / Route53         | Cluster Ingress (Traefik) at `<stack>.<hostnameSuffix>` — defaults to `*.appliance.localhost` on the microVM |
-| Pulumi cancel / refresh      | No-op — the k8s API state IS the source of truth                                                             |
+**One fork point.** The api-server's base-type branch lives in exactly one place — `packages/api-server/src/services/deployment-backend.ts`: Kubernetes bases (the microVM + BYO clusters) resolve to the container backend; cloud (AWS/Lambda) bases resolve to `null` and take the Pulumi path; the removed docker base throws a "removed runtime" error that names the migration.
+
+| Cloud component             | Kubernetes equivalent                                                                                        |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| S3 object store             | `FilesystemObjectStore` rooted at `kubernetes.dataDir`                                                       |
+| BuildKit build + ECR push   | The same server-side BuildKit build, pushed to the runtime's registry (the microVM's in-VM registry)         |
+| Pulumi-driven Lambda deploy | k8s API `apply` (read → create-or-replace) of a Deployment + Service + Ingress per appliance                 |
+| Lambda execution role       | k8s ServiceAccount (default)                                                                                 |
+| CloudFront / Route53        | Cluster Ingress (Traefik) at `<stack>.<hostnameSuffix>` — defaults to `*.appliance.localhost` on the microVM |
+| Pulumi cancel / refresh     | No-op — the k8s API state IS the source of truth                                                             |
 
 #### Cluster connection
 
 `KubernetesDeploymentService` resolves a `KubeConfig` in this priority order:
 
 1. `appliance-base-kubernetes` with inline `kubernetes.kubeconfig` (YAML).
-2. `appliance-base-kubernetes` with `kubernetes.server` + `kubernetes.token` (+ optional `ca`).
-3. `appliance-base-kubernetes` with nothing set — `kc.loadFromCluster()` reads the mounted ServiceAccount (the path taken when api-server itself runs in-cluster).
+2. `appliance-base-kubernetes` with `kubernetes.server` + `kubernetes.token` (+ optional `ca`) — the path the in-VM guest api-server takes, using the ServiceAccount token created by the auto-applied manifest (bun's fetch cannot do kubeconfig client-cert auth).
+3. `appliance-base-kubernetes` with nothing set — `kc.loadFromCluster()` reads a mounted ServiceAccount (only applies when the server runs as a pod in some BYO arrangement).
 4. `appliance-base-local` _(deprecated)_ — falls back to the host's default kubeconfig.
 
 #### Deploying to a Kubernetes base
 
-Kubernetes-driven api-servers reject upload-flow builds (the in-cluster api-server has no docker daemon to build with) — deploys reference **container images** instead. `appliance deploy` detects the base type via `GET /api/v1/cluster-info` and switches pipeline automatically:
+Builds are **server-side on every base** — the CLI never runs docker, buildctl, or crane. `appliance deploy` detects the base type via `GET /api/v1/cluster-info` and follows one pipeline:
 
-1. `docker build` the appliance directory (container-type manifests only — framework apps need a Dockerfile to deploy locally).
-2. Push the image to the runtime's image registry (`kubernetes.registry.url`) — the microVM's in-VM registry, or any registry a BYO cluster can reach. Image delivery is **registry-only**; there is no host-side image-import fallback.
-3. Register a `remote-image` build (`POST /api/v1/builds` with `{ type: 'remote-image', uploadUrl, port }`). The declared `port` rides on the build record and becomes the k8s Service target port — remote images carry no manifest to read it from.
+1. The CLI packages the appliance directory into a **source zip** (manifest + tree). `framework` apps (node/python/auto) are first-class on every base — the server generates their Dockerfile; `container` apps ship their own Dockerfile + build context in the zip.
+2. `POST /api/v1/builds` returns an upload URL: a presigned S3 PUT on cloud bases, or `PUT /api/v1/builds/:id/content?token=…` on Kubernetes bases (a one-time token minted at create — the self-hosted analogue of a presigned URL).
+3. The api-server builds the image with **BuildKit** — the in-VM buildkitd + in-VM registry locally, the installation's builder + ECR on cloud — and the deployment rolls out from the pushed ref.
 
 Reported deploy URLs are composed as `http://<stack>.<hostnameSuffix>[:<hostPort>]`; `kubernetes.hostPort` declares the host-side port the cluster's ingress/LB answers on (8081 for the microVM runtime, defaults to 80 for directly-routable clusters).
 
-#### In-cluster api-server
+#### The api-server's placement
 
-api-server runs as a Kubernetes Deployment inside the cluster it manages — mirroring the AWS path where api-server is itself a deployed appliance. The bootstrap (desktop: `bootstrap_in_cluster_api_server` Tauri command; CLI: `bootstrapInClusterApiServer` in `@appliance.sh/helper`) applies the manifests (Deployment + Service + Ingress + ServiceAccount + ClusterRole(Binding) + Secret + PVC) into the `appliance-system` namespace, waits for the Ingress at `api.appliance.localhost` to be reachable, and mints the first API key via the bootstrap token.
+There is no in-cluster api-server pod and no host-side daemon. **Locally**, the api-server runs as a plain binary inside the microVM: a bun-compiled linux-musl executable (plus the web console bundle) that the CLI stages into `~/.appliance/vm/images/guest-assets/`, `appliance-vm` embeds into the boot media, and the guest bootstrap launches on guest port `9091` under a respawn loop. It is reached through the Traefik ingress at `http://api.appliance.localhost:8081` via a selector-less Service + Endpoints pointing at the guest process, authenticates to k3s with its own ServiceAccount token (bun's fetch cannot do kubeconfig client-cert auth), and trusts the k3s CA via `NODE_EXTRA_CA_CERTS`. **On cloud**, the same api-server code runs on the installation's compute.
 
-The in-cluster api-server image defaults to `ghcr.io/appliance-sh/api-server:latest`. For local iteration, build the image (`packages/api-server/scripts/docker-prep.sh`), push it to the runtime's registry (`localhost:5052/appliance-api-server:<tag>` for the microVM), then pass that ref through `BootstrapInClusterOptions.image` / `appliance vm up --image`.
+Credentials: `appliance-vm` generates a bootstrap token persisted at `~/.appliance/vm/<name>/bootstrap-token` and injected into the guest at `/etc/appliance/bootstrap-token`; the CLI mints the first API key from it automatically at `vm up`. `appliance server start` survives only as a deprecation shim that boots the VM.
 
 #### MicroVM engine (the local runtime)
 
 The local runtime boots an isolated VM that Appliance owns end-to-end
 (`packages/vm`, design in `docs/microvm.md`): direct kernel boot via the
-platform hypervisor (Virtualization.framework on macOS; KVM/WSL2
-scaffolded), k3s on containerd inside, an in-VM image registry, and
-host-side TCP forwards that preserve the exact
-`*.appliance.localhost:8081` URL surface. `appliance vm up` boots it,
-bootstraps the in-VM api-server, and registers the `microvm` profile;
-`appliance deploy --profile microvm` then works verbatim. It is the sole
-local runtime — the former host-side k3d engine has been removed (macOS /
-Virtualization.framework is supported today; Linux/Windows wait on the
-KVM/WSL2 backend, with no k3d fallback in the interim). The desktop
-presents it as the single **Local runtime**, set up by a one-press
-first-run prompt.
+platform hypervisor (Virtualization.framework on macOS; WSL2 on Windows;
+KVM scaffolded), k3s on containerd inside, an in-VM image registry,
+in-guest buildkitd, the api-server guest binary, and host-side TCP
+forwards that preserve the exact `*.appliance.localhost:8081` URL
+surface. There is **one managed VM**: `appliance dev`, `appliance up`,
+`appliance agent`, and `appliance deploy` all use the default
+`appliance` VM (booted dev-capable with the workspace mounted); the
+former separate agent sandbox VM is retired. `appliance vm up` boots it,
+waits for the guest api-server, mints an API key from the bootstrap
+token, and registers the **`local`** profile (legacy `microvm`
+dual-written for one release); additional VMs get `microvm-<name>`.
+`appliance deploy` then works verbatim. It is the sole local runtime —
+the former host-side k3d engine has been removed. The desktop presents
+it as the single **Local runtime**, set up by a one-press first-run
+prompt.
 
 Because the local cluster runs the host's architecture and can't emulate
-(no binfmt in the microVM), every host-side image delivery targets the
-host arch: the api-server image is extracted with
-`docker save --platform linux/<host>` (works for single- or multi-arch
-images, fails fast otherwise), and app-image builds are pinned to the
-host arch regardless of the manifest's `platform` — a cross-arch image
-would otherwise crashloop with `exec format error`.
+(no binfmt in the microVM), builds happening inside the VM automatically
+produce the VM's (= the host's) architecture regardless of the
+manifest's `platform` — a cross-arch image would otherwise crashloop
+with `exec format error`.
 
 Lifecycle (boot / stop / delete) belongs to the `appliance vm` commands
-and the desktop's microVM Tauri commands, driving the `appliance-vm` Rust
-binary in `packages/vm`. The shared in-cluster api-server bootstrap lives
-in `@appliance.sh/helper` (`api-server.ts`).
+and the desktop's microVM Tauri commands, driving the `appliance-vm`
+Rust binary in `packages/vm`. The shared api-server URL/key-minting
+helpers live in `@appliance.sh/helper` (`api-server.ts`); the CLI-side
+bring-up is `runUp` in `packages/cli/src/utils/microvm-up.ts`.
 
 ### Installing Appliance on AWS
 
-The `install-aws` package provides an AWS CDK construct (`ApplianceInstaller`) that bootstraps the required S3 bucket and IAM roles. It outputs a CloudFormation template at `dist/appliance-install-aws.yml`.
+`appliance bootstrap` (alias `appliance cloud bootstrap`) is the install path. It drives `@appliance.sh/bootstrap`, which runs three Pulumi phases: base infrastructure → hoist the api-server/worker onto it → promote installer state to S3. It needs AWS credentials (`~/.aws`; SSO profiles work — pass `--aws-profile`), a domain for the installation, and the Pulumi CLI on PATH.
+
+The `install-aws` package is a placeholder: its CDK construct (`ApplianceInstaller`) currently provisions only an encrypted S3 state bucket. Don't build new install logic there — it lives in `@appliance.sh/bootstrap` + `@appliance.sh/infra`.
 
 ## Environment Variables
 

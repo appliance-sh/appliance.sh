@@ -37,28 +37,29 @@ function requireEnv(name) {
   return v;
 }
 
-// Map our build matrix arches onto the updater's platform keys. Tauri
-// keys platforms as `<os>-<arch>`; on macOS that's darwin-<arch>.
+// Map our build jobs onto the updater's platform keys (`<os>-<arch>`).
+// macOS updates from the .app tarball; Windows updates in place from
+// the NSIS -setup.exe (Tauri v2).
 const PLATFORMS = [
-  { arch: 'aarch64', key: 'darwin-aarch64' },
-  { arch: 'x86_64', key: 'darwin-x86_64' },
+  { artifactDir: 'desktop-aarch64', asset: 'Appliance_aarch64.app.tar.gz', key: 'darwin-aarch64' },
+  { artifactDir: 'desktop-x86_64', asset: 'Appliance_x86_64.app.tar.gz', key: 'darwin-x86_64' },
+  { artifactDir: 'desktop-windows-x86_64', asset: 'Appliance_x86_64-setup.exe', key: 'windows-x86_64' },
 ];
 
 const artifactsRoot = 'dist-artifacts';
 const platforms = {};
 
-for (const { arch, key } of PLATFORMS) {
-  const dir = path.join(artifactsRoot, `desktop-${arch}`);
-  const tarball = `Appliance_${arch}.app.tar.gz`;
-  const sigPath = path.join(dir, `${tarball}.sig`);
+for (const { artifactDir, asset, key } of PLATFORMS) {
+  const dir = path.join(artifactsRoot, artifactDir);
+  const sigPath = path.join(dir, `${asset}.sig`);
   if (!fs.existsSync(sigPath)) {
     console.warn(`[updater-manifest] no signature for ${key} (${sigPath}) — skipping this platform.`);
     continue;
   }
   const signature = fs.readFileSync(sigPath, 'utf8').trim();
-  // The updater downloads from the release's asset URL. The tarball is
-  // uploaded under its arch-tagged name by the publish job.
-  const url = `https://github.com/${REPO}/releases/download/${TAG}/${tarball}`;
+  // The updater downloads from the release's asset URL. The artifact is
+  // uploaded under its platform-tagged name by the publish job.
+  const url = `https://github.com/${REPO}/releases/download/${TAG}/${asset}`;
   platforms[key] = { signature, url };
   console.log(`[updater-manifest] + ${key} -> ${url}`);
 }

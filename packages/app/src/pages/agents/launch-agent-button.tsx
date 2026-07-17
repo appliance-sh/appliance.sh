@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { Bot, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { FriendlyError } from '@/components/friendly-error';
 import { AgentLoginPanel, useAgentSignedIn } from '@/components/agent-login';
 import { AGENT_ADAPTERS, agentAdapter, agentLabel } from '@/lib/agents';
 import { useHost } from '@/providers/host-provider';
@@ -317,12 +318,17 @@ export function LaunchAgentButton({
           Copilot opens a fresh interactive session — a task here only labels the tab; it isn&rsquo;t run automatically.
         </p>
       ) : null}
-      {/* A keyless failure flips the launcher to the login affordance above;
-          any other error shows here as an alert. */}
+      {/* A keyless/auth failure flips the launcher to the re-login affordance
+          above; any other error shows here — plain headline, raw text behind
+          Details. hideReconnect: the fix for agent-auth errors is the login
+          panel, not the server connect page. */}
       {err ? (
-        <p role="alert" className="max-w-[28rem] font-mono text-[10px] text-red-300">
-          {err}
-        </p>
+        <FriendlyError
+          error={err}
+          fallbackHeadline="The agent couldn't start"
+          hideReconnect
+          className="max-w-[28rem] text-xs"
+        />
       ) : null}
       <p className="text-[10px] text-[var(--color-muted-foreground)]">
         Runs <code className="font-mono">{selectedBin}</code> in the shared workspace — your {selectedLabel} credential
@@ -344,10 +350,11 @@ export function LaunchAgentButton({
         )}
       </p>
       {/* Honest-limits caveat (Parker): the key is brokered, but the
-          workspace is not. Surface the blast radius where the user launches
-          so a throwaway sandbox isn't mistaken for a security jail. */}
+          workspace is not. Surface the blast radius where the user launches —
+          calm plain language, same honest content. */}
       <p className="text-[10px] text-amber-300/90">
-        ⚠ Sandbox is throwaway, not a jail — the agent can read/write your mounted workspace.
+        The agent can read and change files in the shared workspace folder. Don&rsquo;t point it at folders you
+        don&rsquo;t want modified.
       </p>
     </div>
   );

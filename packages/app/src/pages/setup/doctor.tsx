@@ -10,12 +10,12 @@ import type { LocalPreflightCheck } from '@/lib/host';
 // preflight that used to sit atop the runtimes page now stands alone as the
 // canonical Doctor at `/setup/doctor`. I5 extracted it here out of the old
 // `pages/local-runtime/index.tsx` kitchen-sink page (now deleted); everything
-// else that page once carried already moved in I2–I4 — runtime management to
-// ② Clusters (`pages/clusters/*`), `WorkloadsPanel` to ③ env-detail
+// else that page once carried has moved — Dev Machine management to
+// `pages/machine/*`, `WorkloadsPanel` to ③ env-detail
 // (`pages/environments/workloads-panel.tsx`), and the agent launcher
 // (`LaunchAgentButton`) to ④ Agents (`pages/agents/launch-agent-button.tsx`).
-// This page hosts the shared `DoctorPanel`, which is also rendered from the ②
-// runtime-detail "Re-run checks" entry — one PreflightPanel, two entry points.
+// This page hosts the shared `DoctorPanel`, which is also rendered from the
+// machine detail's "Re-run checks" entry — one PreflightPanel, two entry points.
 export function SetupDoctorPage() {
   const host = useHost();
   const supported = Boolean(host.vm);
@@ -25,7 +25,7 @@ export function SetupDoctorPage() {
       <div className="max-w-2xl space-y-4">
         <h1 className="text-xl font-semibold">Doctor</h1>
         <p className="text-sm text-[var(--color-muted-foreground)]">
-          This shell can&rsquo;t run a local runtime — the prerequisite Doctor is only available in the desktop app.
+          This shell can&rsquo;t run a Dev Machine — the prerequisite Doctor is only available in the desktop app.
         </p>
       </div>
     );
@@ -36,8 +36,9 @@ export function SetupDoctorPage() {
       <header>
         <h1 className="text-xl font-semibold">Doctor</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Prerequisite checks for the local runtime — Docker / kubectl, a running container-runtime daemon, and a
-          one-click start.
+          Prerequisite checks for the Dev Machine — kubectl for workload views and pod shells, with one-click installs.
+          Docker isn&rsquo;t required: images build server-side inside the Dev Machine, so it&rsquo;s only checked for
+          the deprecated host-Docker runtime.
         </p>
       </header>
       <DoctorPanel />
@@ -153,12 +154,12 @@ function PreflightPanel({
           <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-300" />
           <div>
             <h2 className="text-sm font-semibold text-amber-200">
-              {onlyDaemonDown ? 'Start the container runtime' : 'Install required tools'}
+              {onlyDaemonDown ? 'Container runtime not running' : 'Install missing tools'}
             </h2>
             <p className="mt-0.5 text-xs text-amber-200/80">
               {onlyDaemonDown
-                ? 'The local runtime needs a running Docker daemon. Start it below, then re-check.'
-                : 'Image builds need Docker; pod shells and deploys need kubectl. Install the missing tools below, then re-check.'}
+                ? 'Docker is installed but not running. The Dev Machine doesn’t need it — images build server-side — so start it only if you use the deprecated host-Docker runtime, then re-check.'
+                : 'Workload views and pod shells need kubectl. Docker is optional — the Dev Machine builds images server-side; only the deprecated host-Docker runtime uses it. Install what’s missing below, then re-check.'}
             </p>
           </div>
         </div>

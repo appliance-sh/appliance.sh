@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { chooseCredential, keychainAccountFor, parseKeychainPayload, type KeychainApiKey } from './keychain.js';
+import {
+  chooseCredential,
+  classifySecurityExit,
+  keychainAccountFor,
+  parseKeychainPayload,
+  type KeychainApiKey,
+} from './keychain.js';
 
 describe('chooseCredential', () => {
   const fileCopy = { keyId: 'file-key', secret: 'file-secret' };
@@ -29,6 +35,23 @@ describe('chooseCredential', () => {
       keyId: 'new-key',
       secret: 'new-secret',
     });
+  });
+});
+
+describe('classifySecurityExit', () => {
+  it('treats exit 44 (errSecItemNotFound) as genuinely missing', () => {
+    expect(classifySecurityExit(44)).toBe('missing');
+  });
+
+  it('treats every other failure as unreadable — the item may exist but macOS refused to say', () => {
+    // ACL denial on dev-signed binaries commonly exits non-44: the
+    // doctor must not report a healthy desktop-managed profile (Keychain
+    // canonical, empty file secret) as having NO secret.
+    expect(classifySecurityExit(36)).toBe('unreadable'); // errSecAuthFailed
+    expect(classifySecurityExit(1)).toBe('unreadable');
+    expect(classifySecurityExit(128)).toBe('unreadable');
+    expect(classifySecurityExit(null)).toBe('unreadable'); // killed / no status
+    expect(classifySecurityExit(undefined)).toBe('unreadable'); // spawn failure
   });
 });
 

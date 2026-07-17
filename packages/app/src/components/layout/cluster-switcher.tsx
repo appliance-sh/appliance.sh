@@ -1,25 +1,29 @@
 import * as React from 'react';
 import { Link, useNavigate } from 'react-router';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, Check, Plus } from 'lucide-react';
 import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { cn } from '@/lib/utils';
-import { isMicroVmClusterId } from '@/lib/host';
+import { devMachineLabel, isMicroVmClusterId, microVmNameFromClusterId } from '@/lib/host';
+import { resolveDevMachineTargets } from '@/lib/dev-machine-targets';
+import type { Cluster } from '@/lib/host';
 
-/** Tag a microVM-backed cluster so it's tellable apart from cloud
- *  clusters at a glance. Mirrors the management page's EngineTag
- *  wording — the local runtime is sandboxed in a virtual machine. */
-function engineLabel(clusterId: string): string | null {
-  if (isMicroVmClusterId(clusterId)) return 'sandboxed';
-  return null;
+/** Display name for a deploy target: the local VM's own `microvm*`
+ *  cluster shows as the Dev Machine; everything else keeps its given
+ *  name. Only canonical rows render here — an alias entry that folds
+ *  into a VM (see lib/dev-machine-targets.ts) never reaches this. */
+function targetName(cluster: Cluster): string {
+  const vm = microVmNameFromClusterId(cluster.id);
+  return vm ? devMachineLabel(vm) : cluster.name;
 }
 
-function EngineBadge({ clusterId }: { clusterId: string }) {
-  const label = engineLabel(clusterId);
-  if (!label) return null;
+function EngineBadge({ local }: { local: boolean }) {
+  if (!local) return null;
   return (
-    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">{label}</span>
+    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+      this computer
+    </span>
   );
 }
 
@@ -27,8 +31,27 @@ export function ClusterSwitcher() {
   const host = useHost();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { config, cluster } = useSelectedCluster();
+  const { config, cluster, isLoading } = useSelectedCluster();
   const clusters = config?.clusters ?? [];
+
+  // Local VM inventory (ports) so profile-derived duplicates of the Dev
+  // Machine can be recognised by endpoint. Same query key the Machine
+  // page and deploy wizard poll — the cache is shared.
+  const vmListQuery = useQuery({
+    queryKey: ['microvm', 'list'],
+    enabled: Boolean(host.vm),
+    queryFn: () => host.vm!.list(),
+  });
+  const vms = vmListQuery.data ?? [];
+
+  // Canonical dedupe (see lib/dev-machine-targets.ts): a CLI profile
+  // whose URL points at a running local VM's forwarded api-server port
+  // IS that VM — one machine must not list as two targets. The alias row
+  // never renders when its `microvm*` twin exists; there's no "selected
+  // alias" special case because useSelectedCluster REBINDS an alias
+  // selection to the twin, so the check mark always lands on the
+  // surviving row and clicking it selects the working identity.
+  const { visibleClusters } = resolveDevMachineTargets(clusters, vms);
 
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
@@ -53,17 +76,22 @@ export function ClusterSwitcher() {
     mutationFn: async (id: string) => host.selectCluster(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['host', 'config'] });
-      // Cluster-scoped data is going to be refetched. Reset to dashboard
-      // so deep-linked rows for the previous cluster don't 404.
-      navigate('/');
+      // Deep-linked rows (a project, an environment, a deployment)
+      // belong to the previous cluster and would 404 after the switch —
+      // those reset to the landing. Top-level sections carry no
+      // per-cluster ids and just refetch, so stay put instead of
+      // yanking the user off the page they were reading.
+      const segments = window.location.pathname.split('/').filter(Boolean);
+      const stayable = ['projects', 'machine', 'cloud', 'settings', 'agents', 'deployments'];
+      if (segments.length !== 1 || !stayable.includes(segments[0])) {
+        navigate('/');
+      }
       setOpen(false);
     },
   });
 
   if (clusters.length === 0) {
-    return (
-      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">No cluster connected</div>
-    );
+    return <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">Not connected</div>;
   }
 
   return (
@@ -76,14 +104,16 @@ export function ClusterSwitcher() {
           open && 'bg-[var(--color-muted)]'
         )}
       >
-        <span className="font-medium">{cluster?.name ?? 'Select cluster'}</span>
-        {cluster ? <EngineBadge clusterId={cluster.id} /> : null}
+        {/* While an alias selection is still resolving against the VM
+            inventory, show a quiet ellipsis — never the alias identity. */}
+        <span className="font-medium">{cluster ? targetName(cluster) : isLoading ? '…' : 'Select target'}</span>
+        {cluster ? <EngineBadge local={isMicroVmClusterId(cluster.id)} /> : null}
         <ChevronDown className="h-3.5 w-3.5 text-[var(--color-muted-foreground)]" />
       </button>
       {open ? (
         <div className="absolute left-0 top-full z-10 mt-1 w-72 rounded-md border border-[var(--color-border)] bg-[var(--color-background)] shadow-lg">
           <ul className="max-h-72 overflow-auto py-1">
-            {clusters.map((c) => {
+            {visibleClusters.map((c) => {
               const isSelected = c.id === cluster?.id;
               return (
                 <li key={c.id}>
@@ -104,7 +134,7 @@ export function ClusterSwitcher() {
                     </div>
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5 font-medium">
-                        {c.name} <EngineBadge clusterId={c.id} />
+                        {targetName(c)} <EngineBadge local={isMicroVmClusterId(c.id)} />
                       </div>
                       <div className="truncate font-mono text-xs text-[var(--color-muted-foreground)]">
                         {c.apiServerUrl}
@@ -117,14 +147,14 @@ export function ClusterSwitcher() {
           </ul>
           <div className="border-t border-[var(--color-border)] p-1">
             <Link
-              // Canonical add-cluster surface (§5.2 dedup / Devon nit) —
+              // Canonical add-cloud surface (§5.2 dedup / Devon nit) —
               // the onboarding Connect form, not the old bare /connect.
               to="/setup/connect"
               onClick={() => setOpen(false)}
               className="flex items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-[var(--color-muted)]"
             >
               <Plus className="h-4 w-4" />
-              Add cluster
+              Add cloud
             </Link>
           </div>
         </div>
