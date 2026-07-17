@@ -5,6 +5,14 @@ export interface ClientConfig {
     keyId: string;
     secret: string;
   };
+  /**
+   * Product tag for the `x-appliance-client: <product>/<version>`
+   * header sent on every request (version-skew observability: server
+   * logs can attribute traffic to a concrete client build). Defaults
+   * to `sdk`. NOT part of the signed field set — it must stay ignorable
+   * by old servers and stripped-by-proxies safe.
+   */
+  product?: string;
 }
 
 export interface ListOptions {

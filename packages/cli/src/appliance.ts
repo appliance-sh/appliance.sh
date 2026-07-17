@@ -150,6 +150,10 @@ const SUBCOMMANDS: Record<string, SubcommandDef> = {
     description: 'remove the local project/environment link',
     load: () => import('./appliance-unlink.js'),
   },
+  upgrade: {
+    description: 'show how to update this CLI (per install channel; prints, never executes)',
+    load: () => import('./appliance-upgrade.js'),
+  },
   up: {
     description: 'build + run this project (Dockerfile, compose, or devcontainer) in the managed microVM',
     load: () => import('./appliance-up.js'),
@@ -213,7 +217,19 @@ const COMMAND_GROUPS: Array<{ title: string; names: string[] }> = [
   },
   {
     title: 'Advanced (cloud installs, machine & diagnostics)',
-    names: ['bootstrap', 'teardown', 'vm', 'deployment', 'keys', 'doctor', 'test', 'manifest', 'build', 'destroy'],
+    names: [
+      'bootstrap',
+      'teardown',
+      'vm',
+      'deployment',
+      'keys',
+      'doctor',
+      'test',
+      'manifest',
+      'build',
+      'destroy',
+      'upgrade',
+    ],
   },
 ];
 

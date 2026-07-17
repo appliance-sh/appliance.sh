@@ -169,13 +169,19 @@ export function DeployPage() {
     queryFn: async () => {
       const r = await client!.getClusterInfo();
       if (!r.success) throw r.error;
-      // The SDK's return type predates the capability fields — widen
-      // locally until it catches up (both are additive + optional).
-      return r.data as typeof r.data & { serverVersion?: string; capabilities?: { uploadBuilds: boolean } };
+      return r.data;
     },
     retry: false,
   });
-  const sourceBuildsUnsupported = clusterInfoQuery.data?.capabilities?.uploadBuilds === false;
+  // A microVM control plane that doesn't report a version at all is a
+  // guest binary older than capability reporting — treat it exactly
+  // like "can't upload builds" (a restart updates it). Cloud clusters
+  // keep the permissive default: missing data never strands a working
+  // pre-capabilities server.
+  const microVmPredatesReporting =
+    isMicroVmTarget && Boolean(clusterInfoQuery.data) && !clusterInfoQuery.data?.serverVersion;
+  const sourceBuildsUnsupported =
+    clusterInfoQuery.data?.capabilities?.uploadBuilds === false || microVmPredatesReporting;
 
   // Step 1 — folder + manifest
   const [folderPath, setFolderPath] = React.useState<string | null>(null);

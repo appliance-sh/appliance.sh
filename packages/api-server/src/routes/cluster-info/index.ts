@@ -31,6 +31,12 @@ export interface ClusterInfo {
    */
   serverVersion: string;
   /**
+   * The oldest client version this server supports, for the client-side
+   * preflight. ADVISORY ONLY: clients compare their own version and
+   * print/render an upgrade hint — neither side enforces anything.
+   */
+  minClientVersion: string;
+  /**
    * What this base can do, so clients can warn up front instead of
    * discovering it via a failed request. `uploadBuilds`: whether
    * upload-flow (source zip) builds can run here — mirrors the gates
@@ -39,6 +45,12 @@ export interface ClusterInfo {
    */
   capabilities: { uploadBuilds: boolean };
 }
+
+/**
+ * Hand-raised when a wire-breaking change ships. "0.0.0" = every client
+ * is acceptable (the advisory floor has never been raised).
+ */
+const MIN_CLIENT_VERSION = '0.0.0';
 
 export const clusterInfoRoutes: Router = Router();
 
@@ -57,6 +69,7 @@ clusterInfoRoutes.get('/', async (req, res) => {
       consoleMode: getConsoleMode(),
       ...(externalUrl ? { consoleUrl: externalUrl } : {}),
       serverVersion: VERSION,
+      minClientVersion: MIN_CLIENT_VERSION,
       capabilities: { uploadBuilds: supportsUploadBuilds(baseConfig) },
     };
     res.json(body);

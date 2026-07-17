@@ -6,6 +6,7 @@ import { useHost } from '@/providers/host-provider';
 import { useSelectedCluster } from '@/hooks/use-selected-cluster';
 import { useKeyRole } from '@/hooks/use-key-role';
 import { useAuthExpired, clearAuthFailure } from '@/lib/auth-signal';
+import { ClusterCompatBanner } from '@/components/cluster-compat-banner';
 import { TerminalLayer } from '@/pages/local-runtime/terminal-drawer';
 import { ClusterSwitcher } from './cluster-switcher';
 import { TerminalDock } from './terminal-dock';
@@ -105,6 +106,7 @@ export function AppShell() {
 
       <main className="col-start-2 min-h-0 overflow-auto p-6">
         <AuthExpiredBanner />
+        <ClusterCompatBanner />
         <Outlet />
       </main>
 

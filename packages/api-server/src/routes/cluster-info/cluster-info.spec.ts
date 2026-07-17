@@ -40,6 +40,16 @@ describe('GET /api/v1/cluster-info', () => {
     expect(res.body.capabilities).toEqual({ uploadBuilds: true });
   });
 
+  it('reports an advisory minClientVersion', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    // Semver-shaped; "0.0.0" until the floor is deliberately raised.
+    expect(res.body.minClientVersion).toMatch(/^\d+\.\d+\.\d+/);
+  });
+
   it('reports uploadBuilds=false on a kubernetes base without a builder', async () => {
     process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
 
