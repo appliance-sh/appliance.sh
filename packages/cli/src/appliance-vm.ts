@@ -58,7 +58,7 @@ program
   .description('boot the microVM, bootstrap the in-VM api-server, and log in')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
   .action(async (opts: { name: string; image?: string; timeout: string; cpus?: number; memory?: number }) => {
@@ -404,7 +404,7 @@ dev
   .description('boot a microVM as a dev environment (toolchain + persistent /persist/workspace)')
   .option('--name <name>', 'VM name', DEFAULT_VM_NAME)
   .option('--image <ref>', 'api-server image to run in the VM (must exist in the local docker daemon)')
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .option('--cpus <n>', 'virtual CPUs for the VM (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--memory <MiB>', 'guest memory in MiB (persisted; takes effect on next boot)', parsePositiveInt)
   .option('--mount <path>', 'share a host folder into /persist/workspace (edit on host, run in VM)')

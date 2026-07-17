@@ -166,6 +166,45 @@ export function readVmPorts(name: string = DEFAULT_VM_NAME): VmPorts {
   return vmPorts(name);
 }
 
+/** Pure decision core for the engine fast-pass: the history must show an
+ *  `ingress` phase AND be at least as fresh as the kubeconfig. The
+ *  freshness guard closes the engine-downgrade hole — old engines clear
+ *  only `bringup.json`, never the history file, so a boot under a
+ *  downgraded engine leaves the NEW engine's stale history next to a
+ *  kubeconfig the old engine just wrote. History from this boot is
+ *  always written after (or in the same instant as) the kubeconfig: the
+ *  engine appends `ingress`/`ready` entries after persisting it.
+ *  Exported for tests. */
+export function historyGuaranteesPlatformReady(
+  historyRaw: string,
+  historyMtimeMs: number,
+  kubeconfigMtimeMs: number
+): boolean {
+  return historyRaw.includes('"phase":"ingress"') && historyMtimeMs >= kubeconfigMtimeMs;
+}
+
+/** True when the engine's bring-up history shows THIS boot gated `ready`
+ *  on the FULL platform (an `ingress` phase: registry /v2/ + the
+ *  api-server's traefik route answering) — the honest-readiness engine
+ *  contract. Old engines never write that phase (or the history file at
+ *  all), and a stale history left behind by an engine downgrade fails
+ *  the mtime freshness check — either way the CLI keeps the long,
+ *  load-bearing wait budgets below; against a new engine the same waits
+ *  shrink to fast-pass confirmations. */
+function engineGuaranteedPlatformReady(name: string): boolean {
+  try {
+    const historyPath = path.join(vmDir(name), 'bringup-history.jsonl');
+    const raw = fs.readFileSync(historyPath, 'utf8');
+    return historyGuaranteesPlatformReady(
+      raw,
+      fs.statSync(historyPath).mtimeMs,
+      fs.statSync(path.join(vmDir(name), 'kubeconfig.yaml')).mtimeMs
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Deleting a microVM is not a plain engine passthrough. The Rust engine
 // removes the VM and its on-disk state, but the credential profile that
 // `vm up` minted (`microvm` for the default VM, `microvm-<name>`
@@ -209,7 +248,11 @@ export async function ensureVmRuntime(
     resources?: { cpus?: number; memory?: number; dev?: boolean; mount?: string };
   } = {}
 ): Promise<VmRuntimeInfo> {
-  const timeout = opts.timeout ?? 600;
+  // New engines gate `vm up` on the WHOLE platform (kubeconfig +
+  // registry + api-server ingress), which folds the waits below into the
+  // engine's own budget — so `up` needs headroom beyond the old
+  // kubeconfig-only 600s for a cold, network-pulling first boot.
+  const timeout = opts.timeout ?? 900;
   const resources = opts.resources ?? {};
   // Boot the VM + wait for its kubernetes endpoint. Per-VM resource
   // overrides are persisted into the spec by the engine, so they
@@ -242,11 +285,15 @@ export async function ensureVmRuntime(
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
 
-  // Wait for the in-VM registry forward — image delivery for the
-  // in-cluster api-server and every `appliance deploy` rides this.
-  // First boot includes the registry:2 image pull.
-  console.log(chalk.cyan('» waiting for the in-VM registry'));
-  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, 240_000);
+  // Confirm the in-VM registry forward — image delivery for the
+  // in-cluster api-server and every `appliance deploy` rides this. A T2
+  // engine already gated `ready` on it, so this is a fast-pass check;
+  // against an older engine (no `ingress` phase in its history) it stays
+  // the load-bearing wait it always was — first boot includes the
+  // registry:2 image pull.
+  const engineReady = engineGuaranteedPlatformReady(name);
+  console.log(chalk.cyan(engineReady ? '» confirming the in-VM registry' : '» waiting for the in-VM registry'));
+  await waitForRegistry(`http://127.0.0.1:${ports.registryPort}/v2/`, engineReady ? 30_000 : 240_000);
 
   return { name, kubeconfigPath, ports };
 }
@@ -318,8 +365,12 @@ export async function runUp(
     console.log(`${chalk.green('✓')} api-server reachable; profile ${chalk.bold(profile)} already authenticated`);
     persistVmCredentials(name, profile, { apiUrl: apiServerUrl, keyId: existing.keyId, secret: existing.secret });
   } else {
-    console.log(chalk.cyan('» waiting for the in-VM api-server'));
-    await waitForApiServerUrl(apiServerUrl, 600_000);
+    // Fast-pass against a T2 engine (which already gated `ready` on the
+    // api-server's ingress route); the long cold budget stays for older
+    // engines, whose first boot installs traefik inside this window.
+    const engineReady = engineGuaranteedPlatformReady(name);
+    console.log(chalk.cyan(engineReady ? '» confirming the in-VM api-server' : '» waiting for the in-VM api-server'));
+    await waitForApiServerUrl(apiServerUrl, engineReady ? 60_000 : 600_000);
     const token = readVmBootstrapToken(name);
     const keyName = name === DEFAULT_VM_NAME ? 'Dev Machine' : `Dev Machine (${name})`;
     const apiKey = await mintApiKey(apiServerUrl, token, keyName);
@@ -394,7 +445,7 @@ function persistVmCredentials(
 export async function ensureLocalRuntime(
   resources: { cpus?: number; memory?: number; dev?: boolean; mount?: string } = {}
 ): Promise<void> {
-  await runUp(DEFAULT_VM_NAME, undefined, 600, resources, { showDeployHint: false });
+  await runUp(DEFAULT_VM_NAME, undefined, 900, resources, { showDeployHint: false });
 }
 
 /**

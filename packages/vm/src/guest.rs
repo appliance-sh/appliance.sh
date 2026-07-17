@@ -78,6 +78,11 @@ pub const SHELL_VSOCK_PORT: u32 = 1024;
 
 pub struct BootMedia {
     pub image: PathBuf,
+    /// Whether THIS media embeds the CLI-staged api-server binary —
+    /// captured at build time so readiness (`wait_platform_ready`) keys
+    /// off what actually booted, not a later re-probe of the shared
+    /// guest-assets cache (which the CLI can change under a running VM).
+    pub apiserver_staged: bool,
 }
 
 fn arch_tuple() -> Result<(&'static str, &'static str)> {
@@ -89,7 +94,7 @@ fn arch_tuple() -> Result<(&'static str, &'static str)> {
     }
 }
 
-fn assets_dir() -> PathBuf {
+pub(crate) fn assets_dir() -> PathBuf {
     crate::store::vm_root().join("images").join("guest-assets")
 }
 
@@ -147,6 +152,73 @@ fn ensure_assets() -> Result<(PathBuf, PathBuf)> {
     let (k3s, _) = ensure_k3s()?;
 
     Ok((modloop, k3s))
+}
+
+/// Volume label of the platform-images media (the FAT wrapper around the
+/// k3s airgap tarball, attached as an extra read-only virtio-blk on k3s
+/// VMs). The guest probes `blkid` for THIS LABEL — never a device node:
+/// /dev/vdc is the agent image on agent-only VMs, and device order is an
+/// attachment detail, not a contract. A guest test locks the probe.
+pub const K3S_AIRGAP_VOLUME_LABEL: &str = "K3SIMAGES";
+
+/// File name the airgap tarball rides under, both on the media and in
+/// `$PERSIST/k3s/agent/images/` (k3s auto-imports anything there).
+pub const K3S_AIRGAP_MEDIA_FILE: &str = "k3s-airgap-images.tar.zst";
+
+/// Resolve (building on first use) the platform-images media: the pinned,
+/// hash-verified k3s airgap tarball wrapped in a small FAT volume so the
+/// guest can find it by label and mount it read-only. The SOURCE tarball
+/// is re-verified against its committed sha256 on every call (cache-hit
+/// included, `download_and_verify` semantics); the derived FAT image is a
+/// deterministic function of it, re-derived only when absent — the same
+/// verified-raw/derived split the normalized kernel uses.
+pub fn ensure_k3s_airgap_media() -> Result<PathBuf> {
+    let tarball = crate::images::ensure_k3s_airgap_images()?;
+    let dir = assets_dir();
+    let image_path = dir.join(format!(
+        "k3s-airgap-media-{}.img",
+        crate::images::K3S_AIRGAP_VERSION
+    ));
+    if image_path.exists() {
+        return Ok(image_path);
+    }
+
+    let tar_data = fs::read(&tarball)?;
+    let volume_bytes =
+        ((tar_data.len() as u64 + 64 * 1024 * 1024) / (16 * 1024 * 1024) + 1) * (16 * 1024 * 1024);
+    // Atomic like download_and_verify: build at .partial, rename into
+    // place — a killed build never leaves a truncated image at the
+    // canonical name.
+    let partial = image_path.with_extension("partial");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&partial)
+        .with_context(|| format!("create {}", partial.display()))?;
+    file.set_len(volume_bytes)?;
+    // FAT volume labels are exactly 11 bytes, space-padded.
+    let mut label = [b' '; 11];
+    label[..K3S_AIRGAP_VOLUME_LABEL.len()].copy_from_slice(K3S_AIRGAP_VOLUME_LABEL.as_bytes());
+    let buf = fscommon::BufStream::new(&file);
+    fatfs::format_volume(
+        buf,
+        fatfs::FormatVolumeOptions::new().volume_label(label),
+    )
+    .context("format platform-images FAT volume")?;
+    let buf = fscommon::BufStream::new(&file);
+    let fs = fatfs::FileSystem::new(buf, fatfs::FsOptions::new())
+        .context("open platform-images FAT volume")?;
+    {
+        let root = fs.root_dir();
+        let mut f = root.create_file(K3S_AIRGAP_MEDIA_FILE)?;
+        f.write_all(&tar_data)?;
+    }
+    fs.unmount().context("unmount platform-images FAT volume")?;
+    drop(file);
+    std::fs::rename(&partial, &image_path)?;
+    Ok(image_path)
 }
 
 /// CLI-staged api-server guest artifacts: the compiled linux binary
@@ -314,6 +386,16 @@ chmod +x /usr/local/bin/k3s
 pub(crate) const K3S_COMMON: &str = r#"
 mkdir -p "$PERSIST/k3s" /etc/rancher/k3s
 
+# --- bring-up progress handoff ---------------------------------------
+# Serve /srv/handoff from the START of the k3s block, not once k3s.yaml
+# exists: the host polls /progress to advance honest sub-phases through
+# the long "cluster" window, and later fetches /k3s.yaml off the same
+# httpd. Grippable markers only — the host never scrapes console echo.
+mkdir -p /srv/handoff
+: > /srv/handoff/progress
+httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+echo base-system-ready >> /srv/handoff/progress
+
 # containerd pull-through: image refs pushed from the host as
 # localhost:__REGISTRY_HOST_PORT__/<name> resolve to the in-VM registry's
 # NodePort. Read by k3s at startup.
@@ -376,6 +458,46 @@ spec:
     nodePort: __REGISTRY_NODEPORT__
 RMANIFEST
 
+# --- k3s airgap image preload -----------------------------------------
+# The preamble line below is substituted per backend: vz arms the probe
+# variable (it may attach the platform-images media as an extra
+# read-only virtio-blk); WSL substitutes it empty, so the whole block is
+# skipped and the images are pulled from the network exactly as before.
+# Runs BEFORE the server launch below so the tarball is in the import
+# dir when containerd starts.
+__K3S_AIRGAP_PREAMBLE__
+if [ -n "$APPLIANCE_AIRGAP_PROBE" ]; then
+  mkdir -p "$PERSIST/k3s/agent/images"
+  # First boot only: the staged tarball persists on the data disk, so
+  # its presence is the stamp. Probe by FILESYSTEM LABEL, never a device
+  # node — the third disk is the agent image on agent-only VMs, and
+  # device order is an attachment detail.
+  if [ ! -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    AIRGAP_DEV=$(blkid 2>/dev/null | awk -F: '/LABEL="K3SIMAGES"/ {print $1; exit}')
+    if [ -n "$AIRGAP_DEV" ]; then
+      mkdir -p /media/k3s-images
+      if mount -o ro "$AIRGAP_DEV" /media/k3s-images 2>/dev/null; then
+        # The stamp name must only ever appear COMPLETE: copy to a .tmp
+        # sibling on the same filesystem and mv into place (the commit
+        # point). A power-off mid-copy leaves only the .tmp — never a
+        # truncated stamp that poisons the preload on every later boot.
+        if cp /media/k3s-images/k3s-airgap-images.tar.zst "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"; then
+          mv "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp" "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst"
+          echo "k3s-airgap: staged platform images for k3s import"
+        else
+          rm -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"
+        fi
+        umount /media/k3s-images
+      fi
+    else
+      echo "k3s-airgap: no platform-images media — k3s pulls from the network"
+    fi
+  fi
+  if [ -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst" ]; then
+    echo images-imported >> /srv/handoff/progress
+  fi
+fi
+
 # Single-node dev cluster. Traefik (bundled) terminates ingress on
 # node port 80 via servicelb — the host forwards 127.0.0.1:<hostPort>
 # here. The kubeconfig is world-readable on purpose: it never leaves
@@ -386,14 +508,13 @@ RMANIFEST
   >/var/log/k3s.log 2>&1 &
 
 # --- kubeconfig handoff ----------------------------------------------
-# Serve the admin kubeconfig on the shared (host-only reachable) NAT
-# network once k3s writes it. The host rewrites the server address to
-# its forwarded localhost port.
-mkdir -p /srv/handoff
+# Publish the admin kubeconfig into the already-running handoff httpd
+# once k3s writes it, and mark the API up for the progress poller. The
+# host rewrites the server address to its forwarded localhost port.
 (
   while [ ! -s /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
   cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml
-  httpd -f -p __KUBECONFIG_PORT__ -h /srv/handoff &
+  echo k3s-api-up >> /srv/handoff/progress
 ) &
 "#;
 
@@ -1257,6 +1378,11 @@ fn build_apkovl(
                     format!("{APISERVER_MEDIA_COPY}{APISERVER_COMMON}")
                 },
             )
+            // vz boot media: arm the guest-side probe for the
+            // platform-images media. Harmless when the media wasn't
+            // attached (the probe finds no label and k3s pulls from the
+            // network); the WSL bootstrap substitutes this to empty.
+            .replace("__K3S_AIRGAP_PREAMBLE__", "APPLIANCE_AIRGAP_PROBE=1")
             .replace("__APISERVER_GUEST_PORT__", &API_SERVER_GUEST_PORT.to_string())
             .replace("__HOST_PORT__", &host_port.to_string())
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
@@ -1453,7 +1579,10 @@ pub fn build_boot_media(
     }
     fs.unmount().context("unmount FAT volume")?;
 
-    Ok(BootMedia { image: image_path })
+    Ok(BootMedia {
+        image: image_path,
+        apiserver_staged: apiserver.is_some(),
+    })
 }
 
 /// Kernel command line for the k3s guest. The netboot initramfs
@@ -1506,12 +1635,17 @@ fn plan_host_services(spec: &crate::spec::VmSpec) -> HostServicePlan {
 ///   3. fetch the admin kubeconfig over the guest's handoff endpoint,
 ///      rewrite it to the forwarded port, persist it next to the VM
 ///
-/// Files written (guest-ip, kubeconfig.yaml) are the contract `up`
-/// polls on from the calling process.
+/// Files written (guest-ip, kubeconfig.yaml) plus the terminal `Ready`
+/// phase are the contract `up` polls on from the calling process —
+/// kubeconfig.yaml lands as soon as the cluster answers (a debugging
+/// surface), Ready only once the whole platform does.
 pub fn host_services(
     spec: &crate::spec::VmSpec,
     vm_dir: &Path,
     netstack: Option<&crate::netstack::Netstack>,
+    // Whether this boot's media embeds the api-server binary (captured
+    // at media-build time; see `BootMedia::apiserver_staged`).
+    apiserver_staged: bool,
 ) -> Result<()> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
@@ -1594,7 +1728,7 @@ pub fn host_services(
     // skipped above, never the discovery/lease. `persist_guest_ip` is
     // always true (the plan locks it); guarding the write through it keeps
     // the invariant a single tested decision.
-    eprintln!("guest address: {guest_ip}");
+    crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     if plan.persist_guest_ip {
         fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     }
@@ -1605,30 +1739,144 @@ pub fn host_services(
         // guest serves an `agent-ready` sentinel once the Node toolchain
         // (.dev-ready) is up (Quinn gap #2). Then write the host-side
         // readiness marker `up`/`status`/`list` poll on for this spec.
-        eprintln!("agent-only: gating on the agent runtime (node + vsock shell)");
+        crate::bringup::hostlog("agent-only: gating on the agent runtime (node + vsock shell)");
         crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
         let handoff = format!("http://{handoff_host}:{handoff_port}/agent-ready");
         crate::net::wait_http(&handoff, Duration::from_secs(600))?;
         fs::write(vm_dir.join("agent-ready"), b"agent-ready\n")?;
-        eprintln!("agent runtime ready: {}", vm_dir.join("agent-ready").display());
+        crate::bringup::hostlog(&format!(
+            "agent runtime ready: {}",
+            vm_dir.join("agent-ready").display()
+        ));
         crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
         return Ok(());
     }
 
-    eprintln!(
+    crate::bringup::hostlog(&format!(
         "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
-    );
+    ));
 
-    // The guest serves its kubeconfig only after k3s has written it —
-    // first boot includes apk installs + image pulls, so be generous.
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
-    crate::net::wait_http(&handoff, Duration::from_secs(600))?;
+    wait_platform_ready(spec, vm_dir, handoff_host, handoff_port, apiserver_staged)
+}
+
+/// Drive the honest cluster sub-phases through the long "cluster" window
+/// and only declare `Ready` once the platform actually answers:
+/// kubeconfig fetched, the in-VM registry's `/v2/` reachable through its
+/// host forward, and — when the media carried the api-server — its
+/// traefik route answering. Backend-neutral (plain HTTP polling of
+/// host-reachable endpoints): the vz and WSL host services both end here.
+///
+/// `apiserver_staged` is whether THIS boot's media carries the
+/// api-server binary — captured at media-build time by the backend and
+/// plumbed through, never re-probed off the shared guest-assets cache
+/// here (a CLI staging or pruning the binary mid-boot must not change
+/// what readiness means for a VM already booted without/with it).
+pub(crate) fn wait_platform_ready(
+    spec: &crate::spec::VmSpec,
+    vm_dir: &Path,
+    handoff_host: std::net::IpAddr,
+    handoff_port: u16,
+    apiserver_staged: bool,
+) -> Result<()> {
+    use crate::bringup::{hostlog, set, Phase};
+    use std::time::{Duration, Instant};
+
+    // Publish the coarse phase FIRST: older desktops ignore the unknown
+    // sub-phases below, so `cluster` is what keeps their ladder moving.
+    set(vm_dir, Phase::Cluster, None);
+
+    // Poll the guest's grippable /progress markers to advance sub-phases
+    // while waiting on the k3s API — same 600s cold budget the plain
+    // k3s.yaml wait had (first boot installs packages / imports images).
+    let progress_url = format!("http://{handoff_host}:{handoff_port}/progress");
+    let kubeconfig_url = format!("http://{handoff_host}:{handoff_port}/k3s.yaml");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut node_seen = false;
+    let mut images_seen = false;
+    loop {
+        if let Some(progress) = crate::net::http_get_text(&progress_url) {
+            if !node_seen && progress.contains("base-system-ready") {
+                set(vm_dir, Phase::ClusterNode, None);
+                hostlog("guest base system up");
+                node_seen = true;
+            }
+            if !images_seen && progress.contains("images-imported") {
+                set(vm_dir, Phase::ClusterImages, Some("airgap tarball staged".into()));
+                hostlog("platform images staged for k3s import");
+                images_seen = true;
+            }
+            if progress.contains("k3s-api-up") {
+                break;
+            }
+        }
+        // Belt and braces: the kubeconfig answering IS the API being up,
+        // marker or no marker (e.g. a guest predating the marker).
+        if crate::net::http_get_text(&kubeconfig_url).is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("guest kubeconfig handoff did not answer within 600s");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    set(vm_dir, Phase::ClusterApi, None);
+    hostlog("kubernetes api up (kubeconfig served)");
+    // The marker can beat a first fetch by a beat — give it patience.
+    crate::net::wait_http(&kubeconfig_url, Duration::from_secs(30))?;
     let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
+    // Persist the kubeconfig the moment it exists — BEFORE the last-mile
+    // waits below, exactly like main always did. A registry/ingress
+    // failure then still leaves kubectl usable for debugging (the CLI's
+    // kubeconfig path helpers gate on this file); it no longer implies
+    // readiness — `up` gates on the terminal `Ready` phase, which only
+    // lands after the last mile answers.
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
+    hostlog(&format!(
+        "kubeconfig written to {}",
+        vm_dir.join("kubeconfig.yaml").display()
+    ));
+
+    // Last mile — what `ready` must actually mean. The registry rides
+    // every k3s VM (first boot may still be pulling registry:2); the
+    // api-server route only exists when the media carried the binary,
+    // and traefik's own install shares the same cold window. Each cold
+    // budget is capped by what REMAINS of the total bring-up budget
+    // (`up --timeout`, threaded in via the env var), so the serial waits
+    // can never add up past what the caller is polling against. On
+    // failure the error propagates to the backend's host-services
+    // supervisor, which publishes Phase::Failed with the detail —
+    // kubeconfig.yaml stays on disk.
+    let budgeted = |what: &str, cold: Duration| {
+        let (wait, truncated) = crate::bringup::budgeted_wait(cold, crate::bringup::remaining_budget());
+        if truncated {
+            hostlog(&format!(
+                "{what} wait capped at {}s by the remaining bring-up budget (cold budget {}s)",
+                wait.as_secs(),
+                cold.as_secs()
+            ));
+        }
+        wait
+    };
+    set(vm_dir, Phase::Ingress, Some("in-VM registry".into()));
+    let registry_url = format!("http://127.0.0.1:{}/v2/", spec.registry_port);
+    crate::net::wait_http(&registry_url, budgeted("in-VM registry", Duration::from_secs(300)))?;
+    hostlog("in-VM registry answering");
+    if apiserver_staged {
+        set(vm_dir, Phase::Ingress, Some("api-server route".into()));
+        let ingress_url = format!("http://127.0.0.1:{}/bootstrap/status", spec.host_port);
+        crate::net::wait_http_host(
+            &ingress_url,
+            "api.appliance.localhost",
+            budgeted("api-server ingress", Duration::from_secs(600)),
+        )?;
+        hostlog("api-server ingress answering");
+    }
+
+    // Terminal success — the phase `up` gates readiness on (together
+    // with the kubeconfig marker), deliberately LAST so `Ready` means
+    // "actually usable", not just "k3s elected itself".
+    set(vm_dir, Phase::Ready, None);
     Ok(())
 }
 
@@ -2167,6 +2415,92 @@ mod tests {
         // shell agent's console echo.
         assert!(start.contains("while [ ! -f /persist/.dev-ready ]"));
         assert!(start.contains("echo agent-ready > /srv/handoff/agent-ready"));
+    }
+
+    #[test]
+    fn k3s_bringup_serves_grippable_progress_markers() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The handoff httpd starts at the TOP of the k3s block (not gated
+        // on k3s.yaml existing) so the host can poll /progress through the
+        // whole cluster window.
+        let httpd_at = start
+            .find(&format!("httpd -f -p {KUBECONFIG_PORT} -h /srv/handoff"))
+            .unwrap();
+        // Anchor on the LAUNCH LINE itself ("/usr/local/bin/k3s server"),
+        // never bare "k3s server" — prose in the bootstrap's comments
+        // could shadow a bare needle and let the ordering rot unnoticed.
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
+        assert!(httpd_at < k3s_at, "handoff httpd must start before k3s launches");
+        // Grippable markers (never console echo), appended in order:
+        // base system up before k3s, the API marker after it.
+        assert!(start.contains(": > /srv/handoff/progress"));
+        let base_at = start.find("echo base-system-ready >> /srv/handoff/progress").unwrap();
+        let api_at = start.find("echo k3s-api-up >> /srv/handoff/progress").unwrap();
+        assert!(base_at < k3s_at, "base-system-ready precedes the k3s launch");
+        assert!(k3s_at < api_at, "k3s-api-up follows the k3s launch");
+        // The kubeconfig is still published for the host fetch, before the
+        // API marker fires (the marker means "the file is fetchable").
+        let copy_at = start.find("cp /etc/rancher/k3s/k3s.yaml /srv/handoff/k3s.yaml").unwrap();
+        assert!(copy_at < api_at, "k3s.yaml is published before k3s-api-up");
+    }
+
+    #[test]
+    fn k3s_airgap_preload_probes_by_label_and_marks_progress() {
+        let ovl = build_apkovl(5052, None, false, false, false, 5053, false, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&ovl, "etc/local.d/appliance.start").unwrap();
+        // The vz boot media arms the probe; the marker itself must be gone.
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"), "marker must be substituted");
+        assert!(start.contains("APPLIANCE_AIRGAP_PROBE=1"), "vz arms the airgap probe");
+        // Device discovery is BY VOLUME LABEL, never a hard-coded node —
+        // /dev/vdc is the agent image on agent VMs (a separate test pins
+        // that a k3s VM's bootstrap has no /dev/vdc at all).
+        assert!(
+            start.contains(&format!("LABEL=\"{K3S_AIRGAP_VOLUME_LABEL}\"")),
+            "the guest must probe blkid for the platform-images label"
+        );
+        assert!(!start.contains("AIRGAP_DEV=/dev/"), "no hard-coded airgap device node");
+        // Stamp-guarded copy into k3s's auto-import dir, with the T2 hook.
+        assert!(start.contains(&format!("$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains(&format!("cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE}")));
+        assert!(start.contains("echo images-imported >> /srv/handoff/progress"));
+        // Crash-atomic staging: the copy lands at a .tmp sibling and mv
+        // (same filesystem) is the commit point — the stamp name never
+        // exists truncated, and a failed cp sweeps only the .tmp.
+        assert!(start.contains(&format!(
+            "cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE} \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\""
+        )));
+        assert!(start.contains(&format!(
+            "mv \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\" \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}\""
+        )));
+        assert!(start.contains(&format!("rm -f \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\"")));
+        // The preload runs before k3s server starts (containerd imports at
+        // startup) and after the persist mount. Anchored on the REAL code
+        // lines — the probe's `if` and the launch line — never on comment
+        // prose that could shadow the needles.
+        let preload_at = start.find(r#"if [ -n "$APPLIANCE_AIRGAP_PROBE" ]"#).unwrap();
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
+        let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
+        assert!(mount_at < preload_at && preload_at < k3s_at, "preload sits between the persist mount and k3s launch");
+
+        // Agent-only VMs run no k3s: the preload block is absent entirely.
+        let agent = build_apkovl(5052, None, true, false, false, 5053, true, "", 8081, "", false).unwrap();
+        let start = apkovl_file(&agent, "etc/local.d/appliance.start").unwrap();
+        assert!(!start.contains("APPLIANCE_AIRGAP_PROBE"), "no airgap preload on agent-only VMs");
+        assert!(!start.contains("__K3S_AIRGAP_PREAMBLE__"));
+    }
+
+    #[test]
+    fn airgap_volume_label_fits_fat_and_matches_the_probe() {
+        // FAT labels are at most 11 bytes (the builder space-pads to
+        // exactly 11); an oversized const would panic the copy there.
+        assert!(K3S_AIRGAP_VOLUME_LABEL.len() <= 11);
+        // The guest probe greps blkid for the label VERBATIM — busybox
+        // blkid prints it space-trimmed, so it must carry none itself.
+        assert_eq!(K3S_AIRGAP_VOLUME_LABEL, K3S_AIRGAP_VOLUME_LABEL.trim());
+        // And distinct from the boot media's label, so the probe can never
+        // grab the wrong FAT volume.
+        assert_ne!(K3S_AIRGAP_VOLUME_LABEL, "APPLIANCE");
     }
 
     #[test]

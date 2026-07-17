@@ -398,6 +398,19 @@ const MICROVM_LADDER: {
   },
 ];
 
+// Live sub-phases newer engines publish INSIDE the long cluster rung
+// (cluster-node → cluster-images → cluster-api → ingress). They map onto
+// the cluster rung — the ladder keeps its five steps — and swap its
+// resting detail line for what is actually happening right now. Phases
+// outside the ladder AND this map still fall through applyPhase
+// untouched, so unknown-phase tolerance is preserved in both directions.
+const CLUSTER_SUB_PHASES: Partial<Record<MicroVmPhase, string>> = {
+  'cluster-node': 'Base system up — starting Kubernetes.',
+  'cluster-images': 'Platform images staged — importing.',
+  'cluster-api': 'Kubernetes API up — starting platform services.',
+  ingress: 'Wiring the registry and API routes.',
+};
+
 type MicroVmOutcome = 'running' | 'ready' | 'failed';
 
 function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
@@ -411,6 +424,9 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // `outcome` is the terminal verdict. The two together derive every
   // rung's state, so a stale/late status poll can never rewind the UI.
   const [reached, setReached] = React.useState(-1);
+  // The live cluster sub-phase line (label + engine detail), shown as the
+  // cluster rung's detail while that rung is in flight.
+  const [clusterDetail, setClusterDetail] = React.useState<string | null>(null);
   const [outcome, setOutcome] = React.useState<MicroVmOutcome>('running');
   const [logs, setLogs] = React.useState<LogLine[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -438,7 +454,16 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
   // Fold a polled engine phase into the ladder. Forward rungs only
   // advance the high-water mark; `failed` flips the outcome without
   // choosing a rung — the rung in flight stays the one painted red.
-  const applyPhase = React.useCallback((phase: MicroVmPhase) => {
+  // Cluster sub-phases pin the cluster rung and update its live detail;
+  // anything else unknown is ignored (older/newer engine tolerance).
+  const applyPhase = React.useCallback((phase: MicroVmPhase, detail?: string) => {
+    const sub = CLUSTER_SUB_PHASES[phase];
+    if (sub) {
+      const clusterIdx = MICROVM_LADDER.findIndex((r) => r.phase === 'cluster');
+      setReached((prev) => Math.max(prev, clusterIdx));
+      setClusterDetail(detail ? `${sub} (${detail})` : sub);
+      return;
+    }
     const idx = MICROVM_LADDER.findIndex((r) => r.phase === phase);
     if (idx >= 0) setReached((prev) => Math.max(prev, idx));
     else if (phase === 'failed') setOutcome((prev) => (prev === 'running' ? 'failed' : prev));
@@ -453,6 +478,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
     setError(null);
     setOutcome('running');
     setReached(-1);
+    setClusterDetail(null);
     setLogs([]);
     setShowLog(true);
     setRetrying(true);
@@ -474,7 +500,7 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
         const s = await instance.status();
         // Re-check liveness after the await: a poll already in flight when
         // the run settles (or the page unmounts) must not apply a phase.
-        if (liveRef.current && s.phase) applyPhase(s.phase);
+        if (liveRef.current && s.phase) applyPhase(s.phase, s.phaseDetail);
       } catch {
         // keep polling
       }
@@ -590,11 +616,14 @@ function MicroVmProgress({ values }: { values: MicroVmWizardValues }) {
           // contradiction next to a spinner — swap in the action-oriented
           // one. The failed rung keeps the strong-border highlight too.
           const label = st === 'running' && rung.runningLabel ? rung.runningLabel : rung.label;
+          // The cluster rung narrates its live sub-phase (engine-published)
+          // instead of the static "can take a few minutes" while running.
+          const detail = rung.phase === 'cluster' && st === 'running' && clusterDetail ? clusterDetail : rung.detail;
           return (
             <MicroVmPhaseStep
               key={rung.phase}
               label={label}
-              detail={rung.detail}
+              detail={detail}
               state={st}
               active={st === 'running' || st === 'failed'}
             />
