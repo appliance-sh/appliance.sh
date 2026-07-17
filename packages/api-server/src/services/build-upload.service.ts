@@ -11,6 +11,7 @@ import {
 } from '@appliance.sh/sdk';
 import { randomBytes } from 'node:crypto';
 import { getStorageService } from './storage.service';
+import { scopePath } from './tenant-context';
 import { assertSupportedBase } from './deployment-backend';
 
 const COLLECTION = 'builds';
@@ -101,7 +102,13 @@ export class BuildUploadService {
     if (!config.aws?.dataBucketName) {
       throw new Error('aws.dataBucketName is required for upload-flow builds');
     }
-    const s3Key = `builds/${buildId}.zip`;
+    // The build zip lives in S3 OUTSIDE the keyed `${collection}/`
+    // keyspace, so it needs the same tenant scoping applied explicitly
+    // (Quinn #2) — otherwise it is an unmodeled cross-tenant surface. The
+    // scoped key is persisted as the build's `source`, so `resolve()`
+    // reads it back already-scoped (no double-prefix). Flag-off ⇒
+    // unchanged `builds/<id>.zip`.
+    const s3Key = scopePath(`builds/${buildId}.zip`);
     const s3 = new S3Client({ region: config.aws.region });
     const command = new PutObjectCommand({
       Bucket: config.aws.dataBucketName,

@@ -1,6 +1,19 @@
 import { applianceBaseConfig, getDockerParams, getKubernetesParams, type ObjectStore } from '@appliance.sh/sdk';
 import { S3ObjectStore } from './s3-object-store';
 import { FilesystemObjectStore } from './filesystem-object-store';
+import { scopePath } from './tenant-context';
+
+/**
+ * Collections that are looked up BEFORE a principal is known and must
+ * therefore stay un-tenant-scoped. `api-keys` is the auth root: the
+ * tenant is resolved *from* the key, so scoping the key lookup by tenant
+ * would be circular. This is the ONE deliberate, centralized exemption
+ * (Quinn #3) — it lives inside the choke point so it is auditable, not an
+ * arbitrary caller-side escape hatch. The server-bootstrap "is there any
+ * key at all" gate (`ApiKeyService.exists`) rides on this same
+ * collection.
+ */
+const AUTH_ROOT_COLLECTIONS = new Set<string>(['api-keys']);
 
 export class StorageService {
   private readonly store: ObjectStore;
@@ -9,8 +22,27 @@ export class StorageService {
     this.store = store;
   }
 
+  /**
+   * THE tenant-scoping choke point for point operations. Every keyed
+   * read/write/delete funnels through here, so an unresolved principal
+   * (multi-tenant on, no context) FAILS CLOSED via `scopePath` instead of
+   * falling back to a global store. Auth-root collections are the single
+   * exemption.
+   */
   private getKey(collection: string, id: string): string {
-    return `${collection}/${id}.json`;
+    const raw = `${collection}/${id}.json`;
+    return AUTH_ROOT_COLLECTIONS.has(collection) ? raw : scopePath(raw);
+  }
+
+  /**
+   * THE tenant-scoping choke point for list operations. `getAll` (and
+   * therefore every `list`/`filter` — projects.list, deployment/env
+   * filters) narrows to the caller's tenant by prefixing the list key,
+   * so a `list` can never enumerate another tenant's records.
+   */
+  private getListPrefix(collection: string): string {
+    const raw = `${collection}/`;
+    return AUTH_ROOT_COLLECTIONS.has(collection) ? raw : scopePath(raw);
   }
 
   async get<T>(collection: string, id: string): Promise<T | null> {
@@ -20,7 +52,7 @@ export class StorageService {
   }
 
   async getAll<T>(collection: string): Promise<T[]> {
-    const keys = await this.store.list(`${collection}/`);
+    const keys = await this.store.list(this.getListPrefix(collection));
     const items: T[] = [];
 
     for (const key of keys) {
