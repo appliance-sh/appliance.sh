@@ -61,7 +61,19 @@ const options: CorsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Content-Digest', 'Signature', 'Signature-Input', 'X-Bootstrap-Token'],
+  // X-Appliance-Client (the SDK's version-tag header) is allow-listed
+  // for future-proofing: today's SDK only sends it from non-browser
+  // contexts (older deployed servers lack this entry, and a browser
+  // request carrying the header would fail their preflight), but a
+  // server that allows it lets future clients tag browser traffic too.
+  allowedHeaders: [
+    'Content-Type',
+    'Content-Digest',
+    'Signature',
+    'Signature-Input',
+    'X-Bootstrap-Token',
+    'X-Appliance-Client',
+  ],
   exposedHeaders: ['Content-Digest', 'Signature', 'Signature-Input'],
   maxAge: 600,
 };

@@ -680,12 +680,15 @@ export interface MicroVmInstanceHost {
    *  bootstrap token and persist it everywhere the old key lived
    *  (profiles.json, keychain, cluster registry). `failedKeyId` is the
    *  key the server just rejected — the host skips minting when the
-   *  store already carries a different (fresher) key. Resolves `true`
-   *  when fresh credentials are in place and the caller should retry;
-   *  `false` when there's nothing to heal with (no bootstrap token,
-   *  attempt too recent). Optional: only hosts that own local VM state
-   *  (the desktop) can heal. */
-  healCredentials?(failedKeyId?: string): Promise<boolean>;
+   *  store already carries a different (fresher) key. `cause` is the
+   *  server's machine-readable 401 classification (AuthFailureCause)
+   *  when it sent one — it picks the recovery (mint vs guest clock
+   *  sync vs nothing); optional for old cause-less servers. Resolves
+   *  `true` when fresh credentials are in place and the caller should
+   *  retry; `false` when there's nothing to heal with (no bootstrap
+   *  token, attempt too recent). Optional: only hosts that own local
+   *  VM state (the desktop) can heal. */
+  healCredentials?(failedKeyId?: string, cause?: string): Promise<boolean>;
   stop(): Promise<void>;
   /** Delete the VM and its state (stops first if needed). */
   remove(): Promise<void>;

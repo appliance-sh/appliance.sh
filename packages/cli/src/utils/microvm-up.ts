@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mintApiKey, waitForApiServerUrl, apiServerUrlForHostPort } from '@appliance.sh/helper';
-import { createApplianceClient } from '@appliance.sh/sdk';
+import { createApplianceClient, VERSION as SDK_VERSION } from '@appliance.sh/sdk';
 import { saveCredentials } from './credentials.js';
 import { readProfiles, removeProfile } from './profile-store.js';
 import { ensureApiServerArtifacts } from './api-server-artifact.js';
@@ -355,6 +355,7 @@ export async function runUp(
       const client = createApplianceClient({
         baseUrl: apiServerUrl,
         credentials: { keyId: existing.keyId, secret: existing.secret },
+        product: 'cli',
       });
       verified = (await client.listProjects()).success;
     } catch {
@@ -378,6 +379,12 @@ export async function runUp(
     console.log(`${chalk.green('✓')} api-server ready; credentials saved to profile ${chalk.bold(profile)}`);
   }
 
+  // Version-skew preflight: compare the guest api-server's reported
+  // version with this CLI's SDK. Purely advisory (a one-line warn with
+  // the fix), and best-effort — an older guest binary without
+  // cluster-info must never fail a successful bring-up.
+  await warnOnServerVersionSkew(profile, apiServerUrl);
+
   // Publish the egress policy into the cluster now that the namespace
   // exists, so the api-server can confine workloads per policy. Best-
   // effort: a permissive default policy is a harmless no-op.
@@ -399,6 +406,39 @@ export async function runUp(
     console.log(`  Workspace:   ${workspace}`);
     console.log(`  Shell:       appliance vm dev shell${nameFlag}`);
     console.log(chalk.dim('  (the dev toolchain finishes installing in the background on first boot)'));
+  }
+}
+
+/** One-line advisory when the guest api-server's version ≠ this CLI's
+ *  SDK version (they release in lockstep, so skew means the guest
+ *  binary — baked into boot media — lags the CLI, or vice versa).
+ *  Best-effort: pre-cluster-info guests and transient errors warn
+ *  nothing and never fail the bring-up. */
+async function warnOnServerVersionSkew(profile: string, apiServerUrl: string): Promise<void> {
+  try {
+    const entry = readProfiles().profiles[profile];
+    if (!entry) return;
+    const client = createApplianceClient({
+      baseUrl: apiServerUrl,
+      credentials: { keyId: entry.keyId, secret: entry.secret },
+      product: 'cli',
+    });
+    const info = await client.getClusterInfo();
+    if (!info.success) return;
+    // Normalize the optional v-prefix (the SDK stamps "v1.x.y").
+    const server = info.data.serverVersion?.replace(/^v/, '');
+    const cli = SDK_VERSION.replace(/^v/, '');
+    // Unstamped dev builds ('0.0.0-…') can't be meaningfully compared.
+    if (!server || cli.startsWith('0.0.0') || server.startsWith('0.0.0')) return;
+    if (server !== cli) {
+      console.log(
+        chalk.yellow(
+          `⚠ control plane is v${server} but this CLI is v${cli} — run \`appliance upgrade\` for how to update.`
+        )
+      );
+    }
+  } catch {
+    // advisory only
   }
 }
 

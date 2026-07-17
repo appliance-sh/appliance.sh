@@ -27,6 +27,7 @@ import { DEFAULT_MICROVM_NAME, devMachineLabel, microVmClusterId, microVmNameFro
 import { resolveDevMachineTargets } from '@/lib/dev-machine-targets';
 import type { Cluster, LocalApplianceManifest, LocalLogEvent } from '@/lib/host';
 import { extractDeploymentUrl } from '@/lib/deployment';
+import { parseStructuredHttpError } from '@/lib/http-error';
 
 // Docker Desktop-style deploy wizard, the canonical ③ /projects/deploy.
 // It deploys into the *selected* target — the Dev Machine registers as a
@@ -168,13 +169,19 @@ export function DeployPage() {
     queryFn: async () => {
       const r = await client!.getClusterInfo();
       if (!r.success) throw r.error;
-      // The SDK's return type predates the capability fields — widen
-      // locally until it catches up (both are additive + optional).
-      return r.data as typeof r.data & { serverVersion?: string; capabilities?: { uploadBuilds: boolean } };
+      return r.data;
     },
     retry: false,
   });
-  const sourceBuildsUnsupported = clusterInfoQuery.data?.capabilities?.uploadBuilds === false;
+  // A microVM control plane that doesn't report a version at all is a
+  // guest binary older than capability reporting — treat it exactly
+  // like "can't upload builds" (a restart updates it). Cloud clusters
+  // keep the permissive default: missing data never strands a working
+  // pre-capabilities server.
+  const microVmPredatesReporting =
+    isMicroVmTarget && Boolean(clusterInfoQuery.data) && !clusterInfoQuery.data?.serverVersion;
+  const sourceBuildsUnsupported =
+    clusterInfoQuery.data?.capabilities?.uploadBuilds === false || microVmPredatesReporting;
 
   // Step 1 — folder + manifest
   const [folderPath, setFolderPath] = React.useState<string | null>(null);
@@ -1171,26 +1178,17 @@ interface RunFailure {
   requestId?: string;
 }
 
-/** Extract the structured body from an SDK error message. The client
- *  formats every non-2xx as `HTTP <status>: <raw body>` — when that body
- *  is the api-server's structured error JSON, pull the fields out; any
- *  other shape (older servers, proxies, plain text) returns null and the
- *  caller falls back to the raw rendering. */
+/** Split a structured server failure (lib/http-error's shared parser)
+ *  for this page's rendering: promote the server's human `error` (plus
+ *  `detail`) to the headline, keep the requestId for correlating with
+ *  server logs. Unparseable shapes return null → raw rendering. */
 function parseStructuredFailure(message: string): { serverError: string; requestId?: string } | null {
-  const match = /HTTP \d+: (\{[\s\S]*\})\s*$/.exec(message);
-  if (!match) return null;
-  try {
-    const body: unknown = JSON.parse(match[1]);
-    if (typeof body !== 'object' || body === null) return null;
-    const { error, detail, requestId } = body as { error?: unknown; detail?: unknown; requestId?: unknown };
-    if (typeof error !== 'string' || !error) return null;
-    return {
-      serverError: typeof detail === 'string' && detail ? `${error} — ${detail}` : error,
-      requestId: typeof requestId === 'string' && requestId ? requestId : undefined,
-    };
-  } catch {
-    return null;
-  }
+  const parsed = parseStructuredHttpError(message);
+  if (!parsed) return null;
+  return {
+    serverError: parsed.detail ? `${parsed.error} — ${parsed.detail}` : parsed.error,
+    requestId: parsed.requestId,
+  };
 }
 
 function StatusBadge({ status }: { status: RunStatus }) {

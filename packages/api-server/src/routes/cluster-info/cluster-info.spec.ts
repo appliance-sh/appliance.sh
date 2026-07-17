@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import express from 'express';
+import { writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { VERSION } from '@appliance.sh/sdk';
 import { clusterInfoRoutes } from './index';
 
@@ -40,6 +43,16 @@ describe('GET /api/v1/cluster-info', () => {
     expect(res.body.capabilities).toEqual({ uploadBuilds: true });
   });
 
+  it('reports an advisory minClientVersion', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    // Semver-shaped; "0.0.0" until the floor is deliberately raised.
+    expect(res.body.minClientVersion).toMatch(/^\d+\.\d+\.\d+/);
+  });
+
   it('reports uploadBuilds=false on a kubernetes base without a builder', async () => {
     process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
 
@@ -47,5 +60,62 @@ describe('GET /api/v1/cluster-info', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.capabilities).toEqual({ uploadBuilds: false });
+  });
+
+  it('never leaks cluster credentials or unknown config keys in baseConfig', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify({
+      ...K8S_BASE,
+      futureTopLevelField: 'internal-only',
+      kubernetes: {
+        dataDir: '/data',
+        server: 'https://10.0.0.1:6443',
+        token: 'sha256~the-k3s-sa-token',
+        ca: 'LS0tLS1CRUdJTi==',
+        kubeconfig: 'apiVersion: v1\nkind: Config\n',
+        buildkit: { addr: 'tcp://127.0.0.1:5054' },
+        futureKubernetesField: 'internal-only',
+      },
+    });
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    // Credential-bearing fields are dropped from the wire copy…
+    expect(res.body.baseConfig.kubernetes.token).toBeUndefined();
+    expect(res.body.baseConfig.kubernetes.ca).toBeUndefined();
+    expect(res.body.baseConfig.kubernetes.kubeconfig).toBeUndefined();
+    expect(res.text).not.toContain('sha256~the-k3s-sa-token');
+    expect(res.text).not.toContain('internal-only');
+    // …while capabilities still see the FULL config (buildkit ⇒ uploads)
+    // and clients keep the fields they consume.
+    expect(res.body.capabilities).toEqual({ uploadBuilds: true });
+    expect(res.body.baseConfig.kubernetes.dataDir).toBe('/data');
+    expect(res.body.baseConfig.kubernetes.buildkit).toEqual({ addr: 'tcp://127.0.0.1:5054' });
+  });
+
+  it('surfaces deduplicated watchdog warnings from APPLIANCE_WARNINGS_FILE', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    const file = join(tmpdir(), `appliance-warnings-${process.pid}-${Date.now()}`);
+    const line = 'legacy api-server deploy detected and removed (namespace appliance-system) — update the CLI';
+    writeFileSync(file, `${line}\n${line}\n\n`);
+    process.env.APPLIANCE_WARNINGS_FILE = file;
+
+    try {
+      const res = await request(createTestApp()).get('/api/v1/cluster-info');
+      expect(res.status).toBe(200);
+      expect(res.body.warnings).toEqual([line]);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  });
+
+  it('omits warnings when the file is absent or empty', async () => {
+    process.env.APPLIANCE_BASE_CONFIG = JSON.stringify(K8S_BASE);
+    process.env.APPLIANCE_WARNINGS_FILE = join(tmpdir(), 'appliance-warnings-does-not-exist');
+
+    const res = await request(createTestApp()).get('/api/v1/cluster-info');
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toBeUndefined();
   });
 });

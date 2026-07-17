@@ -13,5 +13,6 @@ export function getClient() {
       keyId: credentials.keyId,
       secret: credentials.secret,
     },
+    product: 'cli',
   });
 }
