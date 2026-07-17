@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { createHash, timingSafeEqual } from 'crypto';
-import { apiKeyInput, inviteRedeemInput } from '@appliance.sh/sdk';
+import { apiKeyInput, inviteRedeemInput, VERSION } from '@appliance.sh/sdk';
 import { apiKeyService } from '../../services/api-key.service';
 import { inviteService } from '../../services/invite.service';
 import { logger } from '../../logger';
@@ -72,7 +72,11 @@ bootstrapRoutes.post('/redeem-invite', async (req, res) => {
 bootstrapRoutes.get('/status', async (req, res) => {
   try {
     const initialized = await apiKeyService.exists();
-    res.json({ initialized });
+    // serverVersion rides the one unauthenticated probe every client
+    // already polls, so version skew is observable before any
+    // credential exists (cluster-info needs a signed request). Engine-
+    // side consumption is deferred; additive + optional for clients.
+    res.json({ initialized, serverVersion: VERSION });
   } catch (error) {
     logger.error('bootstrap status check failed', error, { requestId: req.requestId });
     res.status(500).json({ error: 'Failed to check bootstrap status', message: String(error) });

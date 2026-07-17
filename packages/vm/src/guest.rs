@@ -978,6 +978,7 @@ APIMANIFEST
 {
   "type": "appliance-base-kubernetes",
   "name": "local-runtime",
+  "baseConfigVersion": "__BASE_CONFIG_VERSION__",
   "kubernetes": {
     "server": "https://127.0.0.1:6443",
     "token": "$SA_TOKEN",
@@ -1251,6 +1252,10 @@ fn build_apkovl(
                 },
             )
             .replace("__APISERVER_GUEST_PORT__", &API_SERVER_GUEST_PORT.to_string())
+            // Writer-version stamp on the guest's base config, logged by
+            // the api-server on parse — makes engine/guest schema drift
+            // visible in the server log (incident B follow-up).
+            .replace("__BASE_CONFIG_VERSION__", env!("CARGO_PKG_VERSION"))
             .replace("__HOST_PORT__", &host_port.to_string())
             .replace("__KUBECONFIG_PORT__", &KUBECONFIG_PORT.to_string())
             .replace("__REGISTRY_NODEPORT__", &REGISTRY_NODEPORT.to_string())

@@ -85,6 +85,59 @@ describe('appliance-base-kubernetes schema', () => {
       })
     ).toThrow();
   });
+
+  // THE regression test for incident B: an OLD schema (one that doesn't
+  // know a field a NEWER writer added) parsing a round-tripped config
+  // must PRESERVE the unknown keys, not silently drop them. The
+  // incident: a pre-buildkit schema parsed a config carrying
+  // `kubernetes.buildkit`, re-serialized it without the key, and source
+  // builds died until the VM was recreated. `.passthrough()` on every
+  // config object node is the fix — unknown keys (stand-ins for any
+  // future field) survive a parse → JSON → parse cycle at every level.
+  it('preserves unknown keys through an old-schema parse (incident B regression)', () => {
+    const newerConfig = {
+      type: ApplianceBaseType.ApplianceKubernetes,
+      name: 'local',
+      baseConfigVersion: '9.9.9',
+      futureTopLevelField: { anything: true },
+      kubernetes: {
+        kubeconfigPath: '/etc/rancher/k3s/k3s.yaml',
+        dataDir: '/data',
+        buildkit: { addr: 'tcp://127.0.0.1:5054', futureBuildkitField: 'x' },
+        registry: { url: 'localhost:5052', futureRegistryField: 1 },
+        futureKubernetesField: 'keep-me',
+      },
+    };
+
+    const parsed = applianceBaseConfig.parse(newerConfig);
+    // Round-trip exactly as the guest/env plumbing does.
+    const roundTripped = applianceBaseConfig.parse(JSON.parse(JSON.stringify(parsed)));
+
+    expect(roundTripped).toMatchObject(newerConfig);
+    // The incident's exact casualty, spelled out.
+    expect((roundTripped.kubernetes as Record<string, unknown>)?.buildkit).toEqual({
+      addr: 'tcp://127.0.0.1:5054',
+      futureBuildkitField: 'x',
+    });
+    expect(roundTripped.baseConfigVersion).toBe('9.9.9');
+  });
+
+  it('preserves unknown keys on the aws and docker config blocks too', () => {
+    const aws = applianceBaseConfig.parse({
+      type: ApplianceBaseType.ApplianceAwsPublic,
+      name: 'prod',
+      aws: { region: 'us-east-1', zoneId: 'Z1', futureAwsField: 'keep', buildkit: { addr: 'tcp://b', extra: 1 } },
+    });
+    expect((aws.aws as Record<string, unknown>).futureAwsField).toBe('keep');
+    expect((aws.aws?.buildkit as Record<string, unknown>).extra).toBe(1);
+
+    const docker = applianceBaseConfig.parse({
+      type: ApplianceBaseType.ApplianceDocker,
+      name: 'dockerbox',
+      docker: { dataDir: '/data', futureDockerField: true },
+    });
+    expect((docker.docker as Record<string, unknown>).futureDockerField).toBe(true);
+  });
 });
 
 describe('isKubernetesBase', () => {

@@ -201,7 +201,10 @@ export class ApplianceClient {
     }
   }
 
-  async getBootstrapStatus(): Promise<Result<{ initialized: boolean }>> {
+  /** `serverVersion` is reported by newer servers on this
+   *  unauthenticated probe (pre-credential skew visibility); absent on
+   *  older ones. */
+  async getBootstrapStatus(): Promise<Result<{ initialized: boolean; serverVersion?: string }>> {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeout);
@@ -223,7 +226,7 @@ export class ApplianceClient {
       }
 
       const data = await response.json();
-      return { success: true, data: data as { initialized: boolean } };
+      return { success: true, data: data as { initialized: boolean; serverVersion?: string } };
     } catch (error) {
       return {
         success: false,
