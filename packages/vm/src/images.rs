@@ -95,6 +95,20 @@ fn k3s_airgap_asset() -> Result<(&'static str, &'static str)> {
     }
 }
 
+/// True when the pinned airgap tarball is already on disk — i.e. the
+/// expensive first-run download is done. A cheap presence probe for the
+/// boot path to decide whether to ANNOUNCE a download before starting
+/// it; `ensure_k3s_airgap_images` still re-verifies the cached bytes.
+pub fn k3s_airgap_images_cached() -> bool {
+    k3s_airgap_asset()
+        .map(|(asset, _)| {
+            crate::guest::assets_dir()
+                .join(format!("k3s-airgap-{K3S_AIRGAP_VERSION}-{asset}"))
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve (fetching + verifying on first use, re-verifying on every
 /// cache hit) the pinned k3s airgap-images tarball for this arch —
 /// `ensure_agent_image`'s pattern, cached under the shared guest-assets

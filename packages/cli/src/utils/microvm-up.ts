@@ -166,16 +166,40 @@ export function readVmPorts(name: string = DEFAULT_VM_NAME): VmPorts {
   return vmPorts(name);
 }
 
-/** True when the engine's bring-up history shows it gated `ready` on the
- *  FULL platform (an `ingress` phase: registry /v2/ + the api-server's
- *  traefik route answering) — the honest-readiness engine contract. Old
- *  engines never write that phase (or the history file at all), so their
- *  CLIs keep the long, load-bearing wait budgets below; against a new
- *  engine the same waits shrink to fast-pass confirmations. */
+/** Pure decision core for the engine fast-pass: the history must show an
+ *  `ingress` phase AND be at least as fresh as the kubeconfig. The
+ *  freshness guard closes the engine-downgrade hole — old engines clear
+ *  only `bringup.json`, never the history file, so a boot under a
+ *  downgraded engine leaves the NEW engine's stale history next to a
+ *  kubeconfig the old engine just wrote. History from this boot is
+ *  always written after (or in the same instant as) the kubeconfig: the
+ *  engine appends `ingress`/`ready` entries after persisting it.
+ *  Exported for tests. */
+export function historyGuaranteesPlatformReady(
+  historyRaw: string,
+  historyMtimeMs: number,
+  kubeconfigMtimeMs: number
+): boolean {
+  return historyRaw.includes('"phase":"ingress"') && historyMtimeMs >= kubeconfigMtimeMs;
+}
+
+/** True when the engine's bring-up history shows THIS boot gated `ready`
+ *  on the FULL platform (an `ingress` phase: registry /v2/ + the
+ *  api-server's traefik route answering) — the honest-readiness engine
+ *  contract. Old engines never write that phase (or the history file at
+ *  all), and a stale history left behind by an engine downgrade fails
+ *  the mtime freshness check — either way the CLI keeps the long,
+ *  load-bearing wait budgets below; against a new engine the same waits
+ *  shrink to fast-pass confirmations. */
 function engineGuaranteedPlatformReady(name: string): boolean {
   try {
-    const raw = fs.readFileSync(path.join(vmDir(name), 'bringup-history.jsonl'), 'utf8');
-    return raw.includes('"phase":"ingress"');
+    const historyPath = path.join(vmDir(name), 'bringup-history.jsonl');
+    const raw = fs.readFileSync(historyPath, 'utf8');
+    return historyGuaranteesPlatformReady(
+      raw,
+      fs.statSync(historyPath).mtimeMs,
+      fs.statSync(path.join(vmDir(name), 'kubeconfig.yaml')).mtimeMs
+    );
   } catch {
     return false;
   }

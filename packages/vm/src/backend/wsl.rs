@@ -176,8 +176,13 @@ impl VmBackend for WslBackend {
             let spec = spec.clone();
             let paths_dir = paths.dir.clone();
             let distro = distro.clone();
+            // What THIS boot's bootstrap embeds decides the readiness
+            // gate — captured at bootstrap build, never re-probed at
+            // readiness time (the shared guest-assets cache can change
+            // under a running VM).
+            let apiserver_staged = apiserver.is_some();
             std::thread::spawn(move || {
-                if let Err(err) = host_services(&spec, &paths_dir, &distro) {
+                if let Err(err) = host_services(&spec, &paths_dir, &distro, apiserver_staged) {
                     eprintln!("host services: {err:#}");
                     crate::bringup::set(
                         &paths_dir,
@@ -684,7 +689,7 @@ fn build_bootstrap(
 /// (there is no macOS lease table here); everything downstream — the TCP
 /// forwards, the kubeconfig/agent handoff, the bringup phases and marker
 /// files `up` polls on — is the same contract.
-fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
+fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str, apiserver_staged: bool) -> Result<()> {
     let guest_ip = discover_guest_ip(distro, Duration::from_secs(120))?;
     crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     std::fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
@@ -742,7 +747,13 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
     // Shared with the vz backend: honest cluster sub-phases off the
     // guest's /progress markers, and `Ready` only once the kubeconfig,
     // registry, and (when staged) api-server route actually answer.
-    crate::guest::wait_platform_ready(spec, vm_dir, guest_ip, crate::guest::KUBECONFIG_PORT)
+    crate::guest::wait_platform_ready(
+        spec,
+        vm_dir,
+        guest_ip,
+        crate::guest::KUBECONFIG_PORT,
+        apiserver_staged,
+    )
 }
 
 /// Poll `ip addr show eth0` inside the distro until the WSL NAT lease

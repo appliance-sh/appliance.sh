@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A stage in the boot → cluster-ready lifecycle, ordered by the
 /// sequence a healthy boot passes through.
@@ -197,6 +197,51 @@ pub fn render_timings(entries: &[HistoryEntry]) -> String {
     out
 }
 
+// --- bring-up time budget ---------------------------------------------
+// `up --timeout` is the ONE budget a caller expresses; the resident host
+// process must never let its internal serial waits (k3s + registry +
+// ingress) add up past it, or `up` times out while the engine is still
+// happily waiting. `up` threads its timeout into the spawned host
+// process via this env var; the last-mile waits then size themselves
+// off the REMAINING budget instead of fixed worst-case constants.
+
+/// Env var `up` sets on the spawned host process carrying its --timeout
+/// (seconds). Engine-internal only — both ends are this same binary.
+pub const BUDGET_ENV: &str = "APPLIANCE_VM_BRINGUP_BUDGET_SECS";
+
+/// Default total bring-up budget (seconds) — matches `up --timeout`'s
+/// default, and covers a `start`-spawned host process (no `up` waiting).
+pub const DEFAULT_BUDGET_SECS: u64 = 900;
+
+/// Parse a budget value off the env var. Pure — absent, empty, zero, or
+/// garbage all fall back to the default (a broken env var must never
+/// zero out the waits).
+fn parse_budget(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_BUDGET_SECS)
+}
+
+/// The total bring-up budget for THIS host process.
+pub fn total_budget() -> Duration {
+    Duration::from_secs(parse_budget(std::env::var(BUDGET_ENV).ok().as_deref()))
+}
+
+/// Budget remaining, measured against the host clock epoch
+/// (`init_host_clock`, the top of the resident host process).
+pub fn remaining_budget() -> Duration {
+    total_budget().saturating_sub(HOST_CLOCK.get_or_init(Instant::now).elapsed())
+}
+
+/// Cap a readiness wait by the remaining budget, with a 60s floor so an
+/// already-blown budget still gets a real (if short) chance instead of
+/// an instant failure. Pure; returns the wait and whether the budget
+/// truncated it (callers hostlog the truncation).
+pub fn budgeted_wait(original: Duration, remaining: Duration) -> (Duration, bool) {
+    let capped = original.min(remaining.max(Duration::from_secs(60)));
+    (capped, capped < original)
+}
+
 // --- timestamped host-side logging -----------------------------------
 // host.log is created fresh per boot, so an elapsed-since-start prefix
 // is exactly the delta a "where did the time go" read cares about (and
@@ -323,6 +368,32 @@ mod tests {
     #[test]
     fn timings_render_is_empty_for_no_history() {
         assert_eq!(render_timings(&[]), "");
+    }
+
+    #[test]
+    fn budget_parse_defaults_on_absent_garbage_or_zero() {
+        assert_eq!(parse_budget(None), DEFAULT_BUDGET_SECS);
+        assert_eq!(parse_budget(Some("")), DEFAULT_BUDGET_SECS);
+        assert_eq!(parse_budget(Some("soon")), DEFAULT_BUDGET_SECS);
+        assert_eq!(parse_budget(Some("0")), DEFAULT_BUDGET_SECS);
+        assert_eq!(parse_budget(Some("-5")), DEFAULT_BUDGET_SECS);
+        assert_eq!(parse_budget(Some("600")), 600);
+        assert_eq!(parse_budget(Some(" 600 ")), 600);
+    }
+
+    #[test]
+    fn budgeted_wait_caps_by_remaining_with_a_floor() {
+        let s = Duration::from_secs;
+        // Plenty of budget left: the wait keeps its full cold window.
+        assert_eq!(budgeted_wait(s(300), s(800)), (s(300), false));
+        // Budget tighter than the wait: truncated to what remains.
+        assert_eq!(budgeted_wait(s(600), s(90)), (s(90), true));
+        // Budget (nearly) exhausted: the 60s floor still applies, so a
+        // blown budget degrades to a short wait, never an instant fail.
+        assert_eq!(budgeted_wait(s(600), s(0)), (s(60), true));
+        assert_eq!(budgeted_wait(s(600), s(10)), (s(60), true));
+        // The floor never STRETCHES a short wait past its own length.
+        assert_eq!(budgeted_wait(s(30), s(0)), (s(30), false));
     }
 
     #[test]

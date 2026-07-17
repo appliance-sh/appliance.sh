@@ -116,14 +116,46 @@ impl VmBackend for VzBackend {
         // docker.io. Best-effort by contract: any failure here falls back
         // to today's network pulls — bring-up must never get WORSE. The
         // guest finds the media by volume label, never a device node.
+        //
+        // The first-run download is BIG and used to be invisible-and-
+        // unbounded inside the Media phase: say what is happening (host
+        // log + phase detail, so `up`/desktop show it), and bound the
+        // synchronous wait to half the remaining bring-up budget — a slow
+        // link degrades to the network-pull fallback while the download
+        // keeps priming the shared cache in the background for the next
+        // boot (its .partial→rename staging is already crash-atomic).
+        // Cache-warm boots take the fast path through the same bound.
         let platform_images: Option<std::path::PathBuf> = if spec.agent_only {
             None
         } else {
-            match crate::guest::ensure_k3s_airgap_media() {
-                Ok(p) => Some(p),
-                Err(e) => {
+            if !crate::images::k3s_airgap_images_cached() {
+                crate::bringup::hostlog("downloading k3s platform images (~300 MB, first run only)");
+                crate::bringup::set(
+                    &paths.dir,
+                    crate::bringup::Phase::Media,
+                    Some("downloading k3s platform images (first run only)".into()),
+                );
+            }
+            let bound = std::cmp::max(
+                std::time::Duration::from_secs(60),
+                crate::bringup::remaining_budget() / 2,
+            );
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::guest::ensure_k3s_airgap_media());
+            });
+            match rx.recv_timeout(bound) {
+                Ok(Ok(p)) => Some(p),
+                Ok(Err(e)) => {
                     crate::bringup::hostlog(&format!(
                         "k3s airgap images unavailable ({e:#}); first boot pulls from the network"
+                    ));
+                    None
+                }
+                Err(_) => {
+                    crate::bringup::hostlog(&format!(
+                        "k3s platform images still downloading after {}s — booting without the preload (network pulls); the download continues for the next boot",
+                        bound.as_secs()
                     ));
                     None
                 }
@@ -200,8 +232,13 @@ impl VmBackend for VzBackend {
             let spec = spec.clone();
             let paths_dir = paths.dir.clone();
             let netstack = netstack.clone();
+            // What THIS boot's media carries decides the readiness gate —
+            // captured at media build, never re-probed at readiness time.
+            let apiserver_staged = boot_media.apiserver_staged;
             std::thread::spawn(move || {
-                if let Err(err) = crate::guest::host_services(&spec, &paths_dir, netstack.as_ref()) {
+                if let Err(err) =
+                    crate::guest::host_services(&spec, &paths_dir, netstack.as_ref(), apiserver_staged)
+                {
                     crate::bringup::hostlog(&format!("host services: {err:#}"));
                     // Record the failure so `up` can stop waiting and
                     // report what broke instead of timing out blind.

@@ -78,6 +78,11 @@ pub const SHELL_VSOCK_PORT: u32 = 1024;
 
 pub struct BootMedia {
     pub image: PathBuf,
+    /// Whether THIS media embeds the CLI-staged api-server binary —
+    /// captured at build time so readiness (`wait_platform_ready`) keys
+    /// off what actually booted, not a later re-probe of the shared
+    /// guest-assets cache (which the CLI can change under a running VM).
+    pub apiserver_staged: bool,
 }
 
 fn arch_tuple() -> Result<(&'static str, &'static str)> {
@@ -454,11 +459,12 @@ spec:
 RMANIFEST
 
 # --- k3s airgap image preload -----------------------------------------
-# __K3S_AIRGAP_PREAMBLE__ is substituted per backend: vz sets the probe
-# var (it may attach the platform-images media as an extra read-only
-# virtio-blk); WSL leaves it empty, so the whole block is skipped and
-# k3s pulls from the network exactly as before. Runs BEFORE `k3s server`
-# so the tarball is in the import dir when containerd starts.
+# The preamble line below is substituted per backend: vz arms the probe
+# variable (it may attach the platform-images media as an extra
+# read-only virtio-blk); WSL substitutes it empty, so the whole block is
+# skipped and the images are pulled from the network exactly as before.
+# Runs BEFORE the server launch below so the tarball is in the import
+# dir when containerd starts.
 __K3S_AIRGAP_PREAMBLE__
 if [ -n "$APPLIANCE_AIRGAP_PROBE" ]; then
   mkdir -p "$PERSIST/k3s/agent/images"
@@ -471,12 +477,15 @@ if [ -n "$APPLIANCE_AIRGAP_PROBE" ]; then
     if [ -n "$AIRGAP_DEV" ]; then
       mkdir -p /media/k3s-images
       if mount -o ro "$AIRGAP_DEV" /media/k3s-images 2>/dev/null; then
-        if cp /media/k3s-images/k3s-airgap-images.tar.zst "$PERSIST/k3s/agent/images/"; then
+        # The stamp name must only ever appear COMPLETE: copy to a .tmp
+        # sibling on the same filesystem and mv into place (the commit
+        # point). A power-off mid-copy leaves only the .tmp — never a
+        # truncated stamp that poisons the preload on every later boot.
+        if cp /media/k3s-images/k3s-airgap-images.tar.zst "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"; then
+          mv "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp" "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst"
           echo "k3s-airgap: staged platform images for k3s import"
         else
-          # Never leave a truncated tarball behind: its presence is the
-          # stamp, and k3s would trip over half a file every boot.
-          rm -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst"
+          rm -f "$PERSIST/k3s/agent/images/k3s-airgap-images.tar.zst.tmp"
         fi
         umount /media/k3s-images
       fi
@@ -1563,7 +1572,10 @@ pub fn build_boot_media(
     }
     fs.unmount().context("unmount FAT volume")?;
 
-    Ok(BootMedia { image: image_path })
+    Ok(BootMedia {
+        image: image_path,
+        apiserver_staged: apiserver.is_some(),
+    })
 }
 
 /// Kernel command line for the k3s guest. The netboot initramfs
@@ -1616,12 +1628,17 @@ fn plan_host_services(spec: &crate::spec::VmSpec) -> HostServicePlan {
 ///   3. fetch the admin kubeconfig over the guest's handoff endpoint,
 ///      rewrite it to the forwarded port, persist it next to the VM
 ///
-/// Files written (guest-ip, kubeconfig.yaml) are the contract `up`
-/// polls on from the calling process.
+/// Files written (guest-ip, kubeconfig.yaml) plus the terminal `Ready`
+/// phase are the contract `up` polls on from the calling process —
+/// kubeconfig.yaml lands as soon as the cluster answers (a debugging
+/// surface), Ready only once the whole platform does.
 pub fn host_services(
     spec: &crate::spec::VmSpec,
     vm_dir: &Path,
     netstack: Option<&crate::netstack::Netstack>,
+    // Whether this boot's media embeds the api-server binary (captured
+    // at media-build time; see `BootMedia::apiserver_staged`).
+    apiserver_staged: bool,
 ) -> Result<()> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
@@ -1733,7 +1750,7 @@ pub fn host_services(
         spec.api_port, spec.host_port, spec.registry_port, REGISTRY_NODEPORT, spec.buildkit_port, BUILDKITD_GUEST_PORT
     ));
 
-    wait_platform_ready(spec, vm_dir, handoff_host, handoff_port)
+    wait_platform_ready(spec, vm_dir, handoff_host, handoff_port, apiserver_staged)
 }
 
 /// Drive the honest cluster sub-phases through the long "cluster" window
@@ -1742,11 +1759,18 @@ pub fn host_services(
 /// host forward, and — when the media carried the api-server — its
 /// traefik route answering. Backend-neutral (plain HTTP polling of
 /// host-reachable endpoints): the vz and WSL host services both end here.
+///
+/// `apiserver_staged` is whether THIS boot's media carries the
+/// api-server binary — captured at media-build time by the backend and
+/// plumbed through, never re-probed off the shared guest-assets cache
+/// here (a CLI staging or pruning the binary mid-boot must not change
+/// what readiness means for a VM already booted without/with it).
 pub(crate) fn wait_platform_ready(
     spec: &crate::spec::VmSpec,
     vm_dir: &Path,
     handoff_host: std::net::IpAddr,
     handoff_port: u16,
+    apiserver_staged: bool,
 ) -> Result<()> {
     use crate::bringup::{hostlog, set, Phase};
     use std::time::{Duration, Instant};
@@ -1794,31 +1818,57 @@ pub(crate) fn wait_platform_ready(
     // The marker can beat a first fetch by a beat — give it patience.
     crate::net::wait_http(&kubeconfig_url, Duration::from_secs(30))?;
     let kubeconfig = crate::net::fetch_kubeconfig(handoff_host, handoff_port, spec.api_port)?;
-
-    // Last mile — what `ready` must actually mean. The registry rides
-    // every k3s VM (first boot may still be pulling registry:2, so keep
-    // the old CLI cold budget); the api-server route only exists when the
-    // media carried the binary, and traefik's own install shares the same
-    // cold window.
-    set(vm_dir, Phase::Ingress, Some("in-VM registry".into()));
-    let registry_url = format!("http://127.0.0.1:{}/v2/", spec.registry_port);
-    crate::net::wait_http(&registry_url, Duration::from_secs(300))?;
-    hostlog("in-VM registry answering");
-    if apiserver_assets().is_some() {
-        set(vm_dir, Phase::Ingress, Some("api-server route".into()));
-        let ingress_url = format!("http://127.0.0.1:{}/bootstrap/status", spec.host_port);
-        crate::net::wait_http_host(&ingress_url, "api.appliance.localhost", Duration::from_secs(600))?;
-        hostlog("api-server ingress answering");
-    }
-
-    // The kubeconfig write is the readiness contract `up` polls on —
-    // deliberately LAST, so its presence now means "actually usable",
-    // not just "k3s elected itself".
+    // Persist the kubeconfig the moment it exists — BEFORE the last-mile
+    // waits below, exactly like main always did. A registry/ingress
+    // failure then still leaves kubectl usable for debugging (the CLI's
+    // kubeconfig path helpers gate on this file); it no longer implies
+    // readiness — `up` gates on the terminal `Ready` phase, which only
+    // lands after the last mile answers.
     fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
     hostlog(&format!(
         "kubeconfig written to {}",
         vm_dir.join("kubeconfig.yaml").display()
     ));
+
+    // Last mile — what `ready` must actually mean. The registry rides
+    // every k3s VM (first boot may still be pulling registry:2); the
+    // api-server route only exists when the media carried the binary,
+    // and traefik's own install shares the same cold window. Each cold
+    // budget is capped by what REMAINS of the total bring-up budget
+    // (`up --timeout`, threaded in via the env var), so the serial waits
+    // can never add up past what the caller is polling against. On
+    // failure the error propagates to the backend's host-services
+    // supervisor, which publishes Phase::Failed with the detail —
+    // kubeconfig.yaml stays on disk.
+    let budgeted = |what: &str, cold: Duration| {
+        let (wait, truncated) = crate::bringup::budgeted_wait(cold, crate::bringup::remaining_budget());
+        if truncated {
+            hostlog(&format!(
+                "{what} wait capped at {}s by the remaining bring-up budget (cold budget {}s)",
+                wait.as_secs(),
+                cold.as_secs()
+            ));
+        }
+        wait
+    };
+    set(vm_dir, Phase::Ingress, Some("in-VM registry".into()));
+    let registry_url = format!("http://127.0.0.1:{}/v2/", spec.registry_port);
+    crate::net::wait_http(&registry_url, budgeted("in-VM registry", Duration::from_secs(300)))?;
+    hostlog("in-VM registry answering");
+    if apiserver_staged {
+        set(vm_dir, Phase::Ingress, Some("api-server route".into()));
+        let ingress_url = format!("http://127.0.0.1:{}/bootstrap/status", spec.host_port);
+        crate::net::wait_http_host(
+            &ingress_url,
+            "api.appliance.localhost",
+            budgeted("api-server ingress", Duration::from_secs(600)),
+        )?;
+        hostlog("api-server ingress answering");
+    }
+
+    // Terminal success — the phase `up` gates readiness on (together
+    // with the kubeconfig marker), deliberately LAST so `Ready` means
+    // "actually usable", not just "k3s elected itself".
     set(vm_dir, Phase::Ready, None);
     Ok(())
 }
@@ -2322,7 +2372,10 @@ mod tests {
         let httpd_at = start
             .find(&format!("httpd -f -p {KUBECONFIG_PORT} -h /srv/handoff"))
             .unwrap();
-        let k3s_at = start.find("k3s server").unwrap();
+        // Anchor on the LAUNCH LINE itself ("/usr/local/bin/k3s server"),
+        // never bare "k3s server" — prose in the bootstrap's comments
+        // could shadow a bare needle and let the ordering rot unnoticed.
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
         assert!(httpd_at < k3s_at, "handoff httpd must start before k3s launches");
         // Grippable markers (never console echo), appended in order:
         // base system up before k3s, the API marker after it.
@@ -2356,12 +2409,22 @@ mod tests {
         assert!(start.contains(&format!("$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}")));
         assert!(start.contains(&format!("cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE}")));
         assert!(start.contains("echo images-imported >> /srv/handoff/progress"));
-        // A failed copy must not leave a truncated tarball as the stamp.
-        assert!(start.contains(&format!("rm -f \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}\"")));
+        // Crash-atomic staging: the copy lands at a .tmp sibling and mv
+        // (same filesystem) is the commit point — the stamp name never
+        // exists truncated, and a failed cp sweeps only the .tmp.
+        assert!(start.contains(&format!(
+            "cp /media/k3s-images/{K3S_AIRGAP_MEDIA_FILE} \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\""
+        )));
+        assert!(start.contains(&format!(
+            "mv \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\" \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}\""
+        )));
+        assert!(start.contains(&format!("rm -f \"$PERSIST/k3s/agent/images/{K3S_AIRGAP_MEDIA_FILE}.tmp\"")));
         // The preload runs before k3s server starts (containerd imports at
-        // startup) and after the persist mount.
-        let preload_at = start.find("APPLIANCE_AIRGAP_PROBE=1").unwrap();
-        let k3s_at = start.find("k3s server").unwrap();
+        // startup) and after the persist mount. Anchored on the REAL code
+        // lines — the probe's `if` and the launch line — never on comment
+        // prose that could shadow the needles.
+        let preload_at = start.find(r#"if [ -n "$APPLIANCE_AIRGAP_PROBE" ]"#).unwrap();
+        let k3s_at = start.find("/usr/local/bin/k3s server").unwrap();
         let mount_at = start.find("mount -t ext4 /dev/vda").unwrap();
         assert!(mount_at < preload_at && preload_at < k3s_at, "preload sits between the persist mount and k3s launch");
 
