@@ -2847,10 +2847,15 @@ struct MicroVmStatus {
     /// file lingers on disk) doesn't read as ready.
     kubeconfig_ready: bool,
     /// Current bring-up stage while starting: media | booting | network |
-    /// cluster | ready | failed. `None` when not running. Lets the UI
+    /// cluster (+ cluster-node/cluster-images/cluster-api/ingress
+    /// sub-phases) | ready | failed. `None` when not running. Lets the UI
     /// show "starting (k3s)" / "failed" instead of a blunt "running".
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
+    /// Free-text context for `phase` (what the engine is waiting on) —
+    /// rendered as the live detail under the in-flight bring-up rung.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_detail: Option<String>,
     /// Whether this VM is provisioned as a development environment
     /// (`appliance vm dev up`). Drives the dev-shell affordance.
     dev: bool,
@@ -2978,6 +2983,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             running: false,
             kubeconfig_ready: false,
             phase: None,
+            phase_detail: None,
             dev: false,
             dev_mount: None,
             api_server_url,
@@ -3002,6 +3008,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
                 running: false,
                 kubeconfig_ready: false,
                 phase: None,
+                phase_detail: None,
                 dev: false,
                 dev_mount: None,
                 api_server_url,
@@ -3017,6 +3024,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
             running: false,
             kubeconfig_ready: false,
             phase: None,
+            phase_detail: None,
             dev: false,
             dev_mount: None,
             api_server_url,
@@ -3058,6 +3066,10 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         .get("phase")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let phase_detail = parsed
+        .get("phaseDetail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if running && kubeconfig_ready {
         // Keep the desktop's cluster registration in step with the
         // CLI-owned profile while the engine is up — this also catches
@@ -3076,6 +3088,7 @@ async fn microvm_status(app: AppHandle, name: Option<String>) -> MicroVmStatus {
         running,
         kubeconfig_ready,
         phase,
+        phase_detail,
         dev: parsed.get("dev").and_then(|v| v.as_bool()).unwrap_or(false),
         dev_mount: vm_dev_mount(&name),
         api_server_url,

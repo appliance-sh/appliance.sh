@@ -42,7 +42,7 @@ program
   .option('--name <name>', 'microVM to boot (local onboarding)', DEFAULT_VM_NAME)
   .option('--no-deploy', 'skip the first-deploy hand-off (local onboarding)')
   .option('-y, --yes', 'skip interactive prompts (CI/non-TTY safe)', false)
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .action(
     async (opts: {
       profile?: string;

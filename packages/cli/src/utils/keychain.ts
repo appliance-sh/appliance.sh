@@ -66,6 +66,46 @@ export function parseKeychainPayload(out: string): KeychainApiKey | null {
 }
 
 /**
+ * Classify a failed `security find-generic-password` by exit code (pure,
+ * unit-tested): 44 is errSecItemNotFound — the item genuinely does not
+ * exist. ANY other failure (36 errSecAuthFailed, ACL denial on a
+ * dev-signed binary, missing binary → no status at all) means macOS
+ * refused to answer, so the item's existence is UNKNOWN. The doctor
+ * must never report a denied read as a missing secret.
+ */
+export function classifySecurityExit(status: number | null | undefined): 'missing' | 'unreadable' {
+  return status === 44 ? 'missing' : 'unreadable';
+}
+
+export type KeychainProbeResult =
+  | { state: 'present'; key: KeychainApiKey }
+  | { state: 'missing' }
+  | { state: 'unreadable' };
+
+/**
+ * Probe variant of readKeychainApiKey for `appliance doctor`: where the
+ * read path folds every failure into null (fall back to the file), the
+ * doctor needs "the entry does not exist" (exit 44) kept distinct from
+ * "macOS denied the read" (anything else). A present-but-unparseable
+ * payload also reports 'unreadable' — the entry EXISTS, so it must not
+ * be diagnosed as missing. Never logs the secret.
+ */
+export function probeKeychainApiKey(account: string): KeychainProbeResult {
+  if (!isMacOS()) return { state: 'missing' };
+  let out: string;
+  try {
+    out = execFileSync(SECURITY_BIN, ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (err) {
+    return { state: classifySecurityExit((err as { status?: number | null }).status) };
+  }
+  const key = parseKeychainPayload(out);
+  return key ? { state: 'present', key } : { state: 'unreadable' };
+}
+
+/**
  * Read a desktop-written Keychain entry, avoiding a GUI prompt where
  * possible. Uses `security find-generic-password -w`, which prints the
  * stored password (the JSON ApiKey) to stdout. A cross-binary read of an
@@ -73,20 +113,12 @@ export function parseKeychainPayload(out: string): KeychainApiKey | null {
  * first time; "Always Allow" suppresses it thereafter (this is the
  * macOS ACL behaviour, not something the CLI can opt out of). Returns
  * null on any miss / parse / permission failure so callers fall back to
- * the profiles.json copy. Never logs the secret.
+ * the profiles.json copy (the doctor uses probeKeychainApiKey when it
+ * needs the failure mode). Never logs the secret.
  */
 export function readKeychainApiKey(account: string): KeychainApiKey | null {
-  if (!isMacOS()) return null;
-  try {
-    const out = execFileSync(SECURITY_BIN, ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return parseKeychainPayload(out);
-  } catch {
-    // Item missing or access denied — fall back to file.
-    return null;
-  }
+  const probe = probeKeychainApiKey(account);
+  return probe.state === 'present' ? probe.key : null;
 }
 
 /**
@@ -108,6 +140,25 @@ export function writeKeychainApiKey(account: string, key: KeychainApiKey): boole
   try {
     const payload = JSON.stringify({ id: key.keyId, secret: key.secret });
     execFileSync(SECURITY_BIN, ['add-generic-password', '-U', '-s', KEYCHAIN_SERVICE, '-a', account, '-w', payload], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Delete a desktop Keychain entry from the CLI — used by `appliance
+ * doctor`'s orphan-profile cleanup so a removed cluster doesn't leave a
+ * dangling secret behind. Best-effort: returns false on any failure
+ * (missing item included); nothing sensitive rides argv. Never logs
+ * the secret.
+ */
+export function deleteKeychainApiKey(account: string): boolean {
+  if (!isMacOS()) return false;
+  try {
+    execFileSync(SECURITY_BIN, ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     return true;

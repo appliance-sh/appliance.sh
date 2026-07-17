@@ -432,9 +432,21 @@ export function devMachineLabel(vmName: string): string {
 // which VM row, and what a stored alias selection resolves to).
 
 /** A microVM bring-up stage, mirrors Phase in packages/vm/src/bringup.rs.
- *  Ordered: media → booting → network → cluster → ready (terminal), or
- *  failed (terminal). */
-export type MicroVmPhase = 'media' | 'booting' | 'network' | 'cluster' | 'ready' | 'failed';
+ *  Ordered: media → booting → network → cluster (sliced open by the
+ *  cluster-node / cluster-images / cluster-api / ingress sub-phases) →
+ *  ready (terminal), or failed (terminal). Engines may add phases; render
+ *  code must tolerate unknown strings (it ignores them). */
+export type MicroVmPhase =
+  | 'media'
+  | 'booting'
+  | 'network'
+  | 'cluster'
+  | 'cluster-node'
+  | 'cluster-images'
+  | 'cluster-api'
+  | 'ingress'
+  | 'ready'
+  | 'failed';
 
 export interface MicroVmStatus {
   /** appliance-vm binary present on this machine. */
@@ -450,6 +462,9 @@ export interface MicroVmStatus {
    *  when the engine predates phase reporting. Lets the badge show
    *  "starting (k3s)" / "failed" instead of a blunt "running". */
   phase?: MicroVmPhase;
+  /** Free-text context for `phase` (what the engine is waiting on) —
+   *  rendered as the live detail line under the in-flight rung. */
+  phaseDetail?: string;
   /** Whether this VM is provisioned as a development environment
    *  (`appliance vm dev up`) — drives the dev-shell affordance. */
   dev: boolean;
