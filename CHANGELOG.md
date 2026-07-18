@@ -1,3 +1,34 @@
+## 1.52.0 (2026-07-17)
+
+### Features
+
+- microvm for windows ([dfcbe3c](https://github.com/appliance-sh/appliance.sh/commit/dfcbe3c))
+- improvements to ui and ux ([35be0ea](https://github.com/appliance-sh/appliance.sh/commit/35be0ea))
+- appliance stack and replica improvements ([d36d6f3](https://github.com/appliance-sh/appliance.sh/commit/d36d6f3))
+- improved server ergonomics ([21230c2](https://github.com/appliance-sh/appliance.sh/commit/21230c2))
+- improve microvm management ([50a400e](https://github.com/appliance-sh/appliance.sh/commit/50a400e))
+- consolidate microvm runtime ([3a5208b](https://github.com/appliance-sh/appliance.sh/commit/3a5208b))
+- microvm based builds ([4c9c96e](https://github.com/appliance-sh/appliance.sh/commit/4c9c96e))
+- improve dx and cli ([c67f933](https://github.com/appliance-sh/appliance.sh/commit/c67f933))
+- **desktop:** self-heal microVM credentials on auth failure ([#59](https://github.com/appliance-sh/appliance.sh/pull/59))
+- **examples:** three tier demo ([b3df26a](https://github.com/appliance-sh/appliance.sh/commit/b3df26a))
+- **vm:** engine-owned credential mint at bring-up ([#60](https://github.com/appliance-sh/appliance.sh/pull/60))
+
+### Bug Fixes
+
+- **ci:** publish api-server guest binaries + console bundle in CLI release ([5e88cbd](https://github.com/appliance-sh/appliance.sh/commit/5e88cbd))
+- **ci:** sync cli lockfile + allow dead_code on stop_request ([#62](https://github.com/appliance-sh/appliance.sh/pull/62))
+- **cli:** route server self-invocation through subcommand under bun binary ([f0daa1c](https://github.com/appliance-sh/appliance.sh/commit/f0daa1c))
+- **vm:** stop the api-server manifest heredoc from executing the binary ([422020c](https://github.com/appliance-sh/appliance.sh/commit/422020c))
+
+### Chores
+
+- **lint:** exclude examples from eslint ([c9a223a](https://github.com/appliance-sh/appliance.sh/commit/c9a223a))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## Unreleased
 
 ### ⚠️ Breaking Changes — the Docker-free, one-VM overhaul

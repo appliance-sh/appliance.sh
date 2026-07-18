@@ -7,6 +7,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { buildUploadService } from './build-upload.service';
+import { scopePath } from './tenant-context';
 import { assertSupportedBase } from './deployment-backend';
 import {
   buildImageWithBuildKit,
@@ -126,7 +127,10 @@ export class BuildService {
       return { imageUri: stored.source };
     }
 
-    const s3Key = stored?.source ?? `builds/${buildId}.zip`;
+    // A stored `source` was already tenant-scoped at upload time; only
+    // the legacy-fallback key (no build record) needs scoping applied
+    // here so it matches what an upload would have written (Quinn #2).
+    const s3Key = stored?.source ?? scopePath(`builds/${buildId}.zip`);
     const s3 = new S3Client({ region: aws.region });
 
     // Download the build zip

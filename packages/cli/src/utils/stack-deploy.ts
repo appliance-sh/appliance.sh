@@ -25,6 +25,7 @@ export function requireClient() {
     client: createApplianceClient({
       baseUrl: credentials.apiUrl,
       credentials: { keyId: credentials.keyId, secret: credentials.secret },
+      product: 'cli',
     }),
     apiUrl: credentials.apiUrl,
   };

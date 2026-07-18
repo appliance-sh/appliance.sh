@@ -25,7 +25,7 @@ program.action(async () => {
     default: apiServerUrlForHostPort(readVmPorts().hostPort),
   });
 
-  const client = createApplianceClient({ baseUrl: apiUrl });
+  const client = createApplianceClient({ baseUrl: apiUrl, product: 'cli' });
 
   const method = await select({
     message: 'Authentication method:',
@@ -79,6 +79,7 @@ program.action(async () => {
   const verifyClient = createApplianceClient({
     baseUrl: apiUrl,
     credentials: { keyId, secret },
+    product: 'cli',
   });
 
   const testResult = await verifyClient.listProjects();

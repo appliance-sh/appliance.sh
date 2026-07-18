@@ -21,7 +21,7 @@ program.action(async () => {
   }
   console.log(chalk.green(`✓ Credentials loaded (${credentials.keyId})`));
 
-  const client = createApplianceClient({ baseUrl: credentials.apiUrl });
+  const client = createApplianceClient({ baseUrl: credentials.apiUrl, product: 'cli' });
 
   // 2. Check connectivity
   const connectivity = startProgressLine(`Checking server at ${credentials.apiUrl}...`);
@@ -45,6 +45,7 @@ program.action(async () => {
   const signedClient = createApplianceClient({
     baseUrl: credentials.apiUrl,
     credentials: { keyId: credentials.keyId, secret: credentials.secret },
+    product: 'cli',
   });
 
   const signing = startProgressLine('Checking request signing...');

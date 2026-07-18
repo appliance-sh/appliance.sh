@@ -10,6 +10,11 @@ on:
         description: Release tag the bundles attach to (e.g. v1.48.0). Defaults to the desktop package.json version with a leading "v".
         required: false
         default: ''
+      unsigned:
+        description: Build UNSIGNED, un-notarized macOS bundles (skips the Developer ID keychain import + notarization). Updater .sig generation via TAURI_SIGNING_PRIVATE_KEY is unaffected.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write # to upload DMGs + the updater manifest to the release
@@ -39,8 +44,11 @@ jobs:
             runs_on: macos-14
           - arch: x86_64
             rust_target: x86_64-apple-darwin
-            # Intel runner.
-            runs_on: macos-13
+            # Intel runner. macos-13 was retired by GitHub (jobs never
+            # schedule and time out after 24h); macos-15-intel is the
+            # supported native-Intel image, so the Bun sidecar arch
+            # still matches the bundle without cross-compiling.
+            runs_on: macos-15-intel
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
@@ -125,8 +133,15 @@ jobs:
           # --- updater artifact signing (Tauri) ---
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # workflow_dispatch escape hatch: force an unsigned build even
+          # when the APPLE_* secrets exist (e.g. cert expired mid-release).
+          UNSIGNED: ${{ inputs.unsigned }}
         run: |
           set -euo pipefail
+          if [ "${UNSIGNED:-false}" = "true" ]; then
+            echo "unsigned=true — masking APPLE_* creds; keychain import and notarization will be skipped."
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD
+          fi
           # Import the Developer ID cert into a temporary keychain when the
           # secret is present; codesign can't see a cert that isn't in a
           # keychain. Skipped (with the rest of signing) when absent.

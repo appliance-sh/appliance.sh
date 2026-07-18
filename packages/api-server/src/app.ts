@@ -1,5 +1,6 @@
 import express, { type Express } from 'express';
 import type { Server } from 'node:http';
+import { VERSION } from '@appliance.sh/sdk';
 import { indexRoutes } from './routes';
 
 import { projectRoutes } from './routes/projects';
@@ -109,6 +110,24 @@ export function startServer(): Server {
   // a host, Node listens on `::` only, which the forward can't
   // connect to in containers without dual-stack mapping.
   const host = process.env.HOST ?? '0.0.0.0';
+
+  // Drift visibility (incident B follow-up): the engine stamps the
+  // base config it writes with its own version. Log writer vs parser
+  // once at startup so an engine/guest-binary schema skew is
+  // diagnosable straight from the server log. Best-effort — a missing
+  // or unparseable config is reported by the routes that need it.
+  try {
+    const raw = process.env.APPLIANCE_BASE_CONFIG;
+    if (raw) {
+      const baseConfigVersion = (JSON.parse(raw) as { baseConfigVersion?: string }).baseConfigVersion;
+      logger.info('base config loaded', {
+        baseConfigVersion: baseConfigVersion ?? 'unstamped (pre-baseConfigVersion writer)',
+        serverVersion: VERSION,
+      });
+    }
+  } catch {
+    // The parse failure will surface with context on first use.
+  }
 
   return app.listen(Number(port), host, () => {
     logger.info('server started', { host, port: Number(port), mode });

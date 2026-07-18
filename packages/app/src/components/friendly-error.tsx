@@ -1,5 +1,7 @@
 import * as React from 'react';
 import { Link } from 'react-router';
+import type { AuthFailureCause } from '@appliance.sh/sdk';
+import { parseStructuredHttpError } from '@/lib/http-error';
 import { cn } from '@/lib/utils';
 
 // The friendly error layer: every surface that used to dump a raw
@@ -24,6 +26,27 @@ export function errorText(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+const AUTH_CAUSES: ReadonlySet<string> = new Set([
+  'missing_signature',
+  'missing_digest',
+  'digest_mismatch',
+  'invalid_host',
+  'unknown_key',
+  'clock_skew',
+  'malformed_signature',
+  'signature_mismatch',
+] satisfies AuthFailureCause[]);
+
+/** The server's machine-readable auth-failure cause, when the error
+ *  carries a cause-bearing 401 body (newer api-servers). Undefined on
+ *  cause-less older servers — callers keep `isAuthShapedError` as the
+ *  text-shape fallback. */
+export function authFailureCause(error: unknown): AuthFailureCause | undefined {
+  const parsed = parseStructuredHttpError(errorText(error));
+  const cause = parsed?.cause;
+  return cause && AUTH_CAUSES.has(cause) ? (cause as AuthFailureCause) : undefined;
 }
 
 /** Does an error look like an UPSTREAM auth rejection (401/403, bad or

@@ -177,8 +177,13 @@ impl VmBackend for WslBackend {
             let spec = spec.clone();
             let paths_dir = paths.dir.clone();
             let distro = distro.clone();
+            // What THIS boot's bootstrap embeds decides the readiness
+            // gate — captured at bootstrap build, never re-probed at
+            // readiness time (the shared guest-assets cache can change
+            // under a running VM).
+            let apiserver_staged = apiserver.is_some();
             std::thread::spawn(move || {
-                if let Err(err) = host_services(&spec, &paths_dir, &distro) {
+                if let Err(err) = host_services(&spec, &paths_dir, &distro, apiserver_staged) {
                     eprintln!("host services: {err:#}");
                     crate::bringup::set(
                         &paths_dir,
@@ -669,6 +674,10 @@ fn build_bootstrap(
             if spec.agent_only { "" } else { crate::guest::BUILDKIT_PROVISION },
         )
         .replace("__EGRESS_CA__", &ca_block)
+        // No virtio-blk media inside a WSL distro: leave the airgap
+        // probe unarmed so the shared K3S_COMMON block is a no-op and
+        // k3s pulls from the network exactly as before.
+        .replace("__K3S_AIRGAP_PREAMBLE__", "")
         .replace("__TMUX_CONF__\n", crate::guest::TMUX_CONF)
         .replace("__KUBECONFIG_PORT__", &crate::guest::KUBECONFIG_PORT.to_string())
         .replace("__REGISTRY_NODEPORT__", &crate::guest::REGISTRY_NODEPORT.to_string())
@@ -688,9 +697,9 @@ fn build_bootstrap(
 /// (there is no macOS lease table here); everything downstream — the TCP
 /// forwards, the kubeconfig/agent handoff, the bringup phases and marker
 /// files `up` polls on — is the same contract.
-fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
+fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str, apiserver_staged: bool) -> Result<()> {
     let guest_ip = discover_guest_ip(distro, Duration::from_secs(120))?;
-    eprintln!("guest address: {guest_ip}");
+    crate::bringup::hostlog(&format!("guest address: {guest_ip}"));
     std::fs::write(vm_dir.join("guest-ip"), guest_ip.to_string())?;
     // The guest reaches host-side services (the egress proxy) at its
     // default gateway. The WSL NAT prefix is a /20 — NOT the vz /24 —
@@ -730,7 +739,7 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
         for port in 30000..=30050u16 {
             let _ = crate::net::spawn_proxy(port, SocketAddr::new(guest_ip, port));
         }
-        eprintln!(
+        crate::bringup::hostlog(&format!(
             "forwarding 127.0.0.1:{} → guest:6443, 127.0.0.1:{} → guest:80, 127.0.0.1:{} → guest:{} (registry), 127.0.0.1:{} → guest:{} (buildkit)",
             spec.api_port,
             spec.host_port,
@@ -738,11 +747,11 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
             crate::guest::REGISTRY_NODEPORT,
             spec.buildkit_port,
             crate::guest::BUILDKITD_GUEST_PORT
-        );
+        ));
     }
 
     if spec.agent_only {
-        eprintln!("agent-only: gating on the agent runtime (node toolchain)");
+        crate::bringup::hostlog("agent-only: gating on the agent runtime (node toolchain)");
         crate::bringup::set(vm_dir, crate::bringup::Phase::Agent, None);
         let handoff = format!(
             "http://{guest_ip}:{}/agent-ready",
@@ -754,15 +763,16 @@ fn host_services(spec: &VmSpec, vm_dir: &Path, distro: &str) -> Result<()> {
         return Ok(());
     }
 
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Cluster, None);
-    let handoff = format!("http://{guest_ip}:{}/k3s.yaml", crate::guest::KUBECONFIG_PORT);
-    crate::net::wait_http(&handoff, Duration::from_secs(600))?;
-    let kubeconfig =
-        crate::net::fetch_kubeconfig(guest_ip, crate::guest::KUBECONFIG_PORT, spec.api_port)?;
-    std::fs::write(vm_dir.join("kubeconfig.yaml"), kubeconfig)?;
-    eprintln!("kubeconfig written to {}", vm_dir.join("kubeconfig.yaml").display());
-    crate::bringup::set(vm_dir, crate::bringup::Phase::Ready, None);
-    Ok(())
+    // Shared with the vz backend: honest cluster sub-phases off the
+    // guest's /progress markers, and `Ready` only once the kubeconfig,
+    // registry, and (when staged) api-server route actually answer.
+    crate::guest::wait_platform_ready(
+        spec,
+        vm_dir,
+        guest_ip,
+        crate::guest::KUBECONFIG_PORT,
+        apiserver_staged,
+    )
 }
 
 /// Poll `ip addr show eth0` inside the distro until the WSL NAT lease
@@ -920,6 +930,7 @@ mod tests {
             "__DOCKER_PROVISION__",
             "__BUILDKIT_PROVISION__",
             "__BUILDKITD_GUEST_PORT__",
+            "__K3S_AIRGAP_PREAMBLE__",
             "__APISERVER_PROVISION__",
             "__APISERVER_WIN_PATH__",
             "__CONSOLE_WIN_PATH__",
@@ -939,6 +950,12 @@ mod tests {
                 "literal marker {marker} leaked into the WSL bootstrap"
             );
         }
+        // The airgap probe stays UNARMED on WSL (no virtio-blk media in a
+        // distro): the shared preload block must be a no-op here.
+        assert!(
+            !script.contains("APPLIANCE_AIRGAP_PROBE=1"),
+            "WSL must not arm the k3s airgap probe"
+        );
         // The k3s core is the shared fragment, wired to the real ports.
         assert!(script.contains("k3s server"));
         assert!(script.contains(&format!(

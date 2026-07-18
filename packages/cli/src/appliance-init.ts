@@ -42,7 +42,7 @@ program
   .option('--name <name>', 'microVM to boot (local onboarding)', DEFAULT_VM_NAME)
   .option('--no-deploy', 'skip the first-deploy hand-off (local onboarding)')
   .option('-y, --yes', 'skip interactive prompts (CI/non-TTY safe)', false)
-  .option('--timeout <seconds>', 'seconds to wait for the kubernetes endpoint', '600')
+  .option('--timeout <seconds>', 'seconds to wait for the platform to be ready', '900')
   .action(
     async (opts: {
       profile?: string;
@@ -329,7 +329,7 @@ async function runRemoteInit(apiUrl: string, profileOverride?: string): Promise<
     });
   }
 
-  const client = createApplianceClient({ baseUrl: apiUrl });
+  const client = createApplianceClient({ baseUrl: apiUrl, product: 'cli' });
 
   // Check server connectivity and bootstrap status
   console.log(chalk.dim('Checking server status...'));
@@ -381,6 +381,7 @@ async function runRemoteInit(apiUrl: string, profileOverride?: string): Promise<
   const verifyClient = createApplianceClient({
     baseUrl: apiUrl,
     credentials: { keyId, secret },
+    product: 'cli',
   });
 
   const testResult = await verifyClient.listProjects();

@@ -7,6 +7,18 @@ on:
 permissions:
   contents: read # for checkout
 
+# One release train at a time. Concurrency dedup only applies to
+# PENDING (queued) runs: a run WAITING on the `release` environment
+# approval holds the group, and newer pushes queue behind it as a
+# single pending run (each new push supersedes the previous pending
+# one, not the waiting one). Stale waiting runs must be cancelled or
+# approved by the operator — they are never auto-superseded.
+# cancel-in-progress stays false so an approved, in-flight publish is
+# never killed halfway through.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Release
@@ -18,8 +30,6 @@ jobs:
       pull-requests: write # to be able to comment on released pull requests
       id-token: write # to enable use of OIDC for npm provenance and trusted publishing
       actions: write # to dispatch the api-server image build workflow on a fresh release
-    outputs:
-      publish_required: ${{ steps.semantic_release.outputs.publish_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

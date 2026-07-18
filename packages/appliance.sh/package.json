@@ -1,6 +1,6 @@
 {
   "name": "appliance.sh",
-  "version": "1.51.2",
+  "version": "1.52.0",
   "description": "Install and run applications on the cloud. Alias for @appliance.sh/cli.",
   "repository": {
     "type": "git",

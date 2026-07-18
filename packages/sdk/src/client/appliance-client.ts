@@ -9,16 +9,69 @@ import { InviteCreateResponse, InviteSummary } from '../models/invite';
 import { ApplianceBaseConfig } from '../models/appliance-base';
 import { Workloads } from '../models/workloads';
 import { signRequest } from '../signing';
+import { VERSION } from '../version';
+
+/** GET /api/v1/cluster-info response. Mirrors the api-server's
+ *  ClusterInfo (routes/cluster-info); every field beyond `version` +
+ *  `baseConfig` is optional because older servers omit it — clients
+ *  must tolerate absence rather than block. */
+export interface ClusterInfoResponse {
+  version: string;
+  baseConfig: ApplianceBaseConfig;
+  /** How this server exposes its web console. Absent on older servers — treat as 'full'. */
+  consoleMode?: 'full' | 'bootstrap' | 'off';
+  /** Canonical console URL when hosted separately from the api-server. */
+  consoleUrl?: string;
+  /** The server's own version. Absent on older servers — treat as unknown. */
+  serverVersion?: string;
+  /**
+   * The oldest client version this server supports. ADVISORY: clients
+   * compare against their own version and warn with an upgrade hint —
+   * nothing is enforced on either side. Absent on older servers.
+   */
+  minClientVersion?: string;
+  /**
+   * What this base can do. `uploadBuilds`: whether upload-flow
+   * (source zip) builds can run here — POST /api/v1/builds 409s
+   * when they can't. Absent on older servers — treat as unknown
+   * and let the request's error responses decide.
+   */
+  capabilities?: { uploadBuilds: boolean };
+  /**
+   * Operational warnings raised around the server (e.g. the microVM
+   * guest's legacy-deploy quarantine watchdog). Human-readable lines,
+   * deduplicated; absent when there are none.
+   */
+  warnings?: string[];
+}
 
 export class ApplianceClient {
   private readonly baseUrl: string;
   private readonly timeout: number;
   private readonly credentials?: { keyId: string; secret: string };
+  /** `x-appliance-client` header value: `<product>/<version>`. Sent on
+   *  every request from NON-BROWSER contexts (CLI, server-side callers);
+   *  `undefined` — never sent — when a `document` global exists.
+   *  Browser/webview requests would need the header allow-listed in the
+   *  server's CORS preflight, and servers deployed before the header
+   *  existed don't list it: attaching it there kills every cross-origin
+   *  request as a network-shaped TypeError (no 401, so no heal path).
+   *  Deliberately OUTSIDE the signed field set (the signing FIELDS_*
+   *  stay untouched) so old servers ignore it and a proxy stripping it
+   *  can't break signatures. */
+  private readonly clientTag?: string;
 
   constructor(config: ClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.timeout = config.timeout ?? 30000;
     this.credentials = config.credentials;
+    this.clientTag = typeof document === 'undefined' ? `${config.product ?? 'sdk'}/${VERSION}` : undefined;
+  }
+
+  /** The `x-appliance-client` header — or nothing, in browser contexts
+   *  (see `clientTag`). Spread into every request's headers. */
+  private clientTagHeaders(): Record<string, string> {
+    return this.clientTag ? { 'x-appliance-client': this.clientTag } : {};
   }
 
   private async request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<Result<T>> {
@@ -31,6 +84,7 @@ export class ApplianceClient {
 
       const headers: Record<string, string> = {
         'content-type': 'application/json',
+        ...this.clientTagHeaders(),
       };
 
       if (this.credentials && bodyStr) {
@@ -99,7 +153,7 @@ export class ApplianceClient {
       const timeoutId = setTimeout(() => controller.abort(), timeout ?? this.timeout);
 
       const url = `${this.baseUrl}${path}`;
-      const headers: Record<string, string> = {};
+      const headers: Record<string, string> = { ...this.clientTagHeaders() };
 
       if (this.credentials) {
         const sigHeaders = await signRequest(this.credentials, {
@@ -139,6 +193,7 @@ export class ApplianceClient {
         headers: {
           'content-type': 'application/json',
           'x-bootstrap-token': token,
+          ...this.clientTagHeaders(),
         },
         body: JSON.stringify({ name }),
         signal: controller.signal,
@@ -164,13 +219,17 @@ export class ApplianceClient {
     }
   }
 
-  async getBootstrapStatus(): Promise<Result<{ initialized: boolean }>> {
+  /** `serverVersion` is reported by newer servers on this
+   *  unauthenticated probe (pre-credential skew visibility); absent on
+   *  older ones. */
+  async getBootstrapStatus(): Promise<Result<{ initialized: boolean; serverVersion?: string }>> {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
       const response = await fetch(`${this.baseUrl}/bootstrap/status`, {
         method: 'GET',
+        headers: this.clientTagHeaders(),
         signal: controller.signal,
       });
 
@@ -185,7 +244,7 @@ export class ApplianceClient {
       }
 
       const data = await response.json();
-      return { success: true, data: data as { initialized: boolean } };
+      return { success: true, data: data as { initialized: boolean; serverVersion?: string } };
     } catch (error) {
       return {
         success: false,
@@ -279,7 +338,7 @@ export class ApplianceClient {
 
       const response = await fetch(`${this.baseUrl}/bootstrap/redeem-invite`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...this.clientTagHeaders() },
         body: JSON.stringify({ token }),
         signal: controller.signal,
       });
@@ -548,7 +607,7 @@ export class ApplianceClient {
       if (opts.sinceSeconds !== undefined) params.set('sinceSeconds', String(opts.sinceSeconds));
       const url = `${this.baseUrl}/api/v1/pods/${encodeURIComponent(pod)}/logs?${params.toString()}`;
 
-      const headers: Record<string, string> = {};
+      const headers: Record<string, string> = { ...this.clientTagHeaders() };
       if (this.credentials) {
         const sigHeaders = await signRequest(this.credentials, { method: 'GET', url, headers });
         Object.assign(headers, sigHeaders);
@@ -608,7 +667,11 @@ export class ApplianceClient {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
-      const response = await fetch(`${this.baseUrl}/healthz`, { method: 'GET', signal: controller.signal });
+      const response = await fetch(`${this.baseUrl}/healthz`, {
+        method: 'GET',
+        headers: this.clientTagHeaders(),
+        signal: controller.signal,
+      });
       clearTimeout(timeoutId);
 
       if (!response.ok) {
@@ -637,22 +700,8 @@ export class ApplianceClient {
    * 500 — callers should fall back to "version unknown, allow update
    * anyway" rather than blocking on the missing data.
    */
-  async getClusterInfo(): Promise<
-    Result<{
-      version: string;
-      baseConfig: ApplianceBaseConfig;
-      /** How this server exposes its web console. Absent on older servers — treat as 'full'. */
-      consoleMode?: 'full' | 'bootstrap' | 'off';
-      /** Canonical console URL when hosted separately from the api-server. */
-      consoleUrl?: string;
-    }>
-  > {
-    return this.request<{
-      version: string;
-      baseConfig: ApplianceBaseConfig;
-      consoleMode?: 'full' | 'bootstrap' | 'off';
-      consoleUrl?: string;
-    }>('GET', '/api/v1/cluster-info');
+  async getClusterInfo(): Promise<Result<ClusterInfoResponse>> {
+    return this.request<ClusterInfoResponse>('GET', '/api/v1/cluster-info');
   }
 
   /**
@@ -737,7 +786,7 @@ export class ApplianceClient {
 
       const response = await fetch(uploadUrl, {
         method: 'PUT',
-        headers: { 'content-type': 'application/zip' },
+        headers: { 'content-type': 'application/zip', ...this.clientTagHeaders() },
         body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
         signal: controller.signal,
       });

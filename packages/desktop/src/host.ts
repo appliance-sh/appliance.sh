@@ -28,6 +28,7 @@ import type {
   HostConfig,
   LatestGhcrTagInput,
   LocalApplianceManifest,
+  LocalDeployToCloudInput,
   LocalPackageUploadInput,
   LocalHelperInstallResult,
   LocalLogEvent,
@@ -208,6 +209,16 @@ export const tauriHost: ConsoleHost = {
       };
       await invoke('package_and_upload_build', { input, onEvent: channel });
     },
+    async deployToCloud(input: LocalDeployToCloudInput, onEvent: (event: LocalLogEvent) => void): Promise<void> {
+      // Shells the SAME bundled `appliance` sidecar the helper-install /
+      // agent paths use (src-tauri: app.shell().sidecar("appliance")), with
+      // `deploy <project> <env> --profile <clusterId> --yes` run from the
+      // project folder. The Rust side streams the CLI's stdout/stderr back
+      // as LocalLogEvents over this Channel.
+      const channel = new Channel<LocalLogEvent>();
+      channel.onmessage = onEvent;
+      await invoke('deploy_to_cloud', { input, onEvent: channel });
+    },
   },
 
   vm: {
@@ -242,6 +253,13 @@ export const tauriHost: ConsoleHost = {
         },
         async cleanupShell() {
           await invoke('microvm_dev_cleanup', { name: vm });
+        },
+        healCredentials(failedKeyId?: string, cause?: string) {
+          return invoke<boolean>('microvm_heal_credentials', {
+            name: vm,
+            failedKeyId: failedKeyId ?? null,
+            cause: cause ?? null,
+          });
         },
         stop() {
           return invoke('microvm_stop', { name: vm });

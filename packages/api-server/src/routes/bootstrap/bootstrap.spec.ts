@@ -180,5 +180,18 @@ describe('Bootstrap routes', () => {
       expect(res.status).toBe(200);
       expect(res.body.initialized).toBe(true);
     });
+
+    it('should report serverVersion on the unauthenticated probe', async () => {
+      mockApiKeyService.exists.mockResolvedValue(true);
+
+      const app = createTestApp();
+      const res = await request(app).get('/bootstrap/status');
+
+      expect(res.status).toBe(200);
+      // The pre-credential version-skew signal: cluster-info needs a
+      // signed request, this route does not.
+      expect(typeof res.body.serverVersion).toBe('string');
+      expect(res.body.serverVersion.length).toBeGreaterThan(0);
+    });
   });
 });

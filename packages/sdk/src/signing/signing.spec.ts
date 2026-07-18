@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { signRequest, verifySignedRequest, computeContentDigest } from './index';
 
 const TEST_CREDENTIALS = {
@@ -179,5 +179,87 @@ describe('verifySignedRequest', () => {
     );
 
     expect(result.verified).toBe(false);
+  });
+});
+
+describe('verifySignedRequest failure causes', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const url = `http://${TEST_HOST}/api/v1/test`;
+
+  async function signedHeaders(): Promise<Record<string, string>> {
+    const sigHeaders = await signRequest(TEST_CREDENTIALS, { method: 'GET', url, headers: {} });
+    return { ...sigHeaders, host: TEST_HOST };
+  }
+
+  const lookupReal = async (keyId: string) =>
+    keyId === TEST_CREDENTIALS.keyId ? { secret: TEST_CREDENTIALS.secret } : null;
+
+  it('classifies a key-store miss as unknown_key', async () => {
+    const headers = await signedHeaders();
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, async () => null);
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('unknown_key');
+  });
+
+  it('classifies a wrong secret as signature_mismatch', async () => {
+    const headers = await signedHeaders();
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, async () => ({
+      secret: 'wrong-secret',
+    }));
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('signature_mismatch');
+  });
+
+  it('classifies a stale created timestamp as clock_skew', async () => {
+    // Sign 10 minutes in the "past" (beyond maxAge 300s + tolerance):
+    // the verifier throws ExpiredError('Signature is too old'). On a
+    // local appliance this shape is guest-clock skew, not replay.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() - 10 * 60 * 1000);
+    const headers = await signedHeaders();
+    vi.useRealTimers();
+
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, lookupReal);
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('clock_skew');
+  });
+
+  it('classifies a future-dated created timestamp as clock_skew', async () => {
+    // Host clock ahead of the verifier — the historical microVM 401.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 10 * 60 * 1000);
+    const headers = await signedHeaders();
+    vi.useRealTimers();
+
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, lookupReal);
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('clock_skew');
+  });
+
+  it('classifies corrupted signature bytes as malformed_signature', async () => {
+    const headers = await signedHeaders();
+    // Not a structured-field byte sequence -> MalformedSignatureError.
+    headers['signature'] = 'sig1=notbytes';
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, lookupReal);
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('malformed_signature');
+  });
+
+  it('classifies a signature-input without its signature as malformed_signature', async () => {
+    const headers = await signedHeaders();
+    delete headers['signature'];
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, lookupReal);
+    expect(result.verified).toBe(false);
+    expect(result.cause).toBe('malformed_signature');
+  });
+
+  it('carries no cause on success', async () => {
+    const headers = await signedHeaders();
+    const result = await verifySignedRequest({ method: 'GET', url, headers }, lookupReal);
+    expect(result.verified).toBe(true);
+    expect(result.cause).toBeUndefined();
   });
 });

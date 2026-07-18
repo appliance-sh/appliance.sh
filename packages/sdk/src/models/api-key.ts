@@ -37,6 +37,13 @@ export const apiKey = z.object({
   secretHash: z.string(),
   createdAt: z.string(),
   lastUsedAt: z.string().optional(),
+  /**
+   * Owning principal (tenant) this key is bound to. Server-derived and
+   * stamped at mint time from the authenticated principal — NEVER
+   * client-asserted. Optional + additive: a legacy key minted before the
+   * tenant dimension has no value and resolves to the default tenant.
+   */
+  tenantId: z.string().optional(),
 });
 
 export type ApiKey = z.infer<typeof apiKey>;

@@ -239,9 +239,6 @@ importers:
 
   packages/cli:
     devDependencies:
-      '@appliance.sh/api-server':
-        specifier: workspace:*
-        version: link:../api-server
       '@appliance.sh/bootstrap':
         specifier: workspace:*
         version: link:../bootstrap

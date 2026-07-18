@@ -36,8 +36,9 @@ export function SetupDoctorPage() {
       <header>
         <h1 className="text-xl font-semibold">Doctor</h1>
         <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-          Prerequisite checks for the Dev Machine — Docker / kubectl, a running container-runtime daemon, and a
-          one-click start.
+          Prerequisite checks for the Dev Machine — kubectl for workload views and pod shells, with one-click installs.
+          Docker isn&rsquo;t required: images build server-side inside the Dev Machine, so it&rsquo;s only checked for
+          the deprecated host-Docker runtime.
         </p>
       </header>
       <DoctorPanel />
@@ -153,12 +154,12 @@ function PreflightPanel({
           <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-300" />
           <div>
             <h2 className="text-sm font-semibold text-amber-200">
-              {onlyDaemonDown ? 'Start the container runtime' : 'Install required tools'}
+              {onlyDaemonDown ? 'Container runtime not running' : 'Install missing tools'}
             </h2>
             <p className="mt-0.5 text-xs text-amber-200/80">
               {onlyDaemonDown
-                ? 'The Dev Machine needs a running Docker daemon. Start it below, then re-check.'
-                : 'Image builds need Docker; pod shells and deploys need kubectl. Install the missing tools below, then re-check.'}
+                ? 'Docker is installed but not running. The Dev Machine doesn’t need it — images build server-side — so start it only if you use the deprecated host-Docker runtime, then re-check.'
+                : 'Workload views and pod shells need kubectl. Docker is optional — the Dev Machine builds images server-side; only the deprecated host-Docker runtime uses it. Install what’s missing below, then re-check.'}
             </p>
           </div>
         </div>

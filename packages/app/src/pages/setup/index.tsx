@@ -144,7 +144,7 @@ function GetStarted({ caps, canBootstrap }: { caps: LocalRuntimeCapabilities; ca
           <ActionCard
             icon={Stethoscope}
             title="Check this computer"
-            body="Something not working? This checks that the tools Appliance needs (like Docker) are installed and running, and fixes what it can in one click."
+            body="Something not working? This checks that this computer is ready to run the isolated Dev Machine — everything it needs installed and running — and fixes what it safely can in one click."
             cta="Run checks"
             to="/setup/doctor"
           />

@@ -1,6 +1,8 @@
 import { Router } from 'express';
-import { applianceBaseConfig, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
+import { readFileSync } from 'fs';
+import { applianceBaseConfig, sanitizeBaseConfigForWire, VERSION, type ApplianceBaseConfig } from '@appliance.sh/sdk';
 import { getConsoleMode, getExternalConsoleUrl, type ConsoleMode } from '../../console-static';
+import { supportsUploadBuilds } from '../../services/build-upload.service';
 import { logger } from '../../logger';
 
 export interface ClusterInfo {
@@ -13,6 +15,14 @@ export interface ClusterInfo {
    * "version unknown" and allow updating regardless.
    */
   version: string;
+  /**
+   * SANITIZED copy of the server's resolved base config: unknown keys
+   * are stripped (the passthrough round-trip is an internal surface,
+   * not a wire one) and credential-bearing fields (`kubernetes.token`,
+   * `kubernetes.kubeconfig`, `kubernetes.ca` — the k3s SA credentials)
+   * are dropped. This route answers ANY authenticated key, member role
+   * included, so nothing here may grant cluster access.
+   */
   baseConfig: ApplianceBaseConfig;
   /**
    * How this server exposes its web console (`full` | `bootstrap` |
@@ -23,6 +33,56 @@ export interface ClusterInfo {
    */
   consoleMode?: ConsoleMode;
   consoleUrl?: string;
+  /**
+   * The server's own version, under the name the desktop's capability
+   * probe reads (same value as `version`, which predates it). Absent
+   * on older servers — clients must tolerate omission.
+   */
+  serverVersion: string;
+  /**
+   * The oldest client version this server supports, for the client-side
+   * preflight. ADVISORY ONLY: clients compare their own version and
+   * print/render an upgrade hint — neither side enforces anything.
+   */
+  minClientVersion: string;
+  /**
+   * What this base can do, so clients can warn up front instead of
+   * discovering it via a failed request. `uploadBuilds`: whether
+   * upload-flow (source zip) builds can run here — mirrors the gates
+   * POST /api/v1/builds enforces (409 when they fail). Absent on
+   * older servers.
+   */
+  capabilities: { uploadBuilds: boolean };
+  /**
+   * Operational warnings raised OUTSIDE this process (e.g. the guest's
+   * legacy-deploy quarantine watchdog appends to the file named by
+   * APPLIANCE_WARNINGS_FILE). Deduplicated; omitted when there are
+   * none. Best-effort — a missing/unreadable file is simply no
+   * warnings.
+   */
+  warnings?: string[];
+}
+
+/**
+ * Hand-raised when a wire-breaking change ships. "0.0.0" = every client
+ * is acceptable (the advisory floor has never been raised).
+ */
+const MIN_CLIENT_VERSION = '0.0.0';
+
+/** Read + dedupe the watchdog warnings file. Never throws. */
+function readWarnings(): string[] | undefined {
+  const file = process.env.APPLIANCE_WARNINGS_FILE;
+  if (!file) return undefined;
+  try {
+    const lines = readFileSync(file, 'utf8')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const unique = [...new Set(lines)];
+    return unique.length > 0 ? unique : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export const clusterInfoRoutes: Router = Router();
@@ -36,11 +96,18 @@ clusterInfoRoutes.get('/', async (req, res) => {
     }
     const baseConfig = applianceBaseConfig.parse(JSON.parse(raw));
     const externalUrl = getExternalConsoleUrl();
+    const warnings = readWarnings();
     const body: ClusterInfo = {
       version: VERSION,
-      baseConfig,
+      // The RESPONSE copy is sanitized; `baseConfig` itself (the full
+      // passthrough parse) stays local to compute capabilities.
+      baseConfig: sanitizeBaseConfigForWire(baseConfig),
       consoleMode: getConsoleMode(),
       ...(externalUrl ? { consoleUrl: externalUrl } : {}),
+      serverVersion: VERSION,
+      minClientVersion: MIN_CLIENT_VERSION,
+      capabilities: { uploadBuilds: supportsUploadBuilds(baseConfig) },
+      ...(warnings ? { warnings } : {}),
     };
     res.json(body);
   } catch (error) {
