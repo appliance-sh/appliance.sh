@@ -99,7 +99,7 @@ jobs:
       # topological order. nx derives the order from the graph — no
       # hand-maintained list shared with release-cli-binaries.yml to drift.
       - name: Build desktop prerequisites
-        run: pnpm exec nx run-many -t build -p @appliance.sh/cli @appliance.sh/app
+        run: pnpm exec nx run-many -t build -p '@appliance.sh/cli' '@appliance.sh/app'
 
       # nx-release bumps the package.json versions but does NOT touch the
       # Rust-side version sources (tauri.conf.json, Cargo.toml). The
@@ -330,7 +330,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build desktop prerequisites
-        run: pnpm exec nx run-many -t build -p @appliance.sh/cli @appliance.sh/app
+        run: pnpm exec nx run-many -t build -p '@appliance.sh/cli' '@appliance.sh/app'
 
       - name: Sync bundle version from package.json
         run: node packages/desktop/scripts/sync-version.mjs
