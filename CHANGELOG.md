@@ -1,3 +1,14 @@
+## 1.53.0 (2026-07-20)
+
+### Features
+
+- improve documentation and user journeys ([80bcc6f](https://github.com/appliance-sh/appliance.sh/commit/80bcc6f))
+- **app:** start machine recovery ([57e1502](https://github.com/appliance-sh/appliance.sh/commit/57e1502))
+
+### ❤️ Thank You
+
+- Eliot Lim @eliotlim
+
 ## 1.52.0 (2026-07-17)
 
 ### Features
