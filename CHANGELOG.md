@@ -1,3 +1,13 @@
+## 1.53.1 (2026-07-20)
+
+### CI
+
+- **release:** scope desktop signing to publish env + guard signed output ([b5fdc2b](https://github.com/appliance-sh/appliance.sh/commit/b5fdc2b))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.53.0 (2026-07-20)
 
 ### Features
