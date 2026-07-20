@@ -1,3 +1,13 @@
+## 1.53.2 (2026-07-20)
+
+### Bug Fixes
+
+- **ci:** quote scoped package names in windows desktop build ([f3ae879](https://github.com/appliance-sh/appliance.sh/commit/f3ae879))
+
+### ❤️ Thank You
+
+- Eliot Lim
+
 ## 1.53.1 (2026-07-20)
 
 ### CI
