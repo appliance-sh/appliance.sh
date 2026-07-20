@@ -12,6 +12,13 @@ pnpm --filter @appliance.sh/sdk run build
 echo "Building infra..."
 pnpm --filter @appliance.sh/infra run build
 
+# The web console (@appliance.sh/app) type-checks against
+# @appliance.sh/bootstrap (src/lib/host.ts imports its types), so its
+# .d.ts must exist before the app's `tsc --emitDeclarationOnly`. bootstrap
+# depends on sdk+infra, already built above.
+echo "Building bootstrap..."
+pnpm --filter @appliance.sh/bootstrap run build
+
 echo "Building api-server..."
 pnpm --filter @appliance.sh/api-server run build
 
