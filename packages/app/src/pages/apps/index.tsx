@@ -4,7 +4,8 @@ import { useMutation, useQuery, useQueries, useQueryClient } from '@tanstack/rea
 import { Plus, Rocket, Search, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CommandSnippet } from '@/components/ui/command-snippet';
-import { FriendlyError } from '@/components/friendly-error';
+import { FriendlyError, classifyError } from '@/components/friendly-error';
+import { StartMachineRecovery, useStartableDevMachine } from '@/components/start-machine-recovery';
 import { EntityLabel } from '@/components/ui/entity-label';
 import { LiveUrl } from '@/components/ui/live-url';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -29,7 +30,7 @@ export function AppsPage() {
   const { cluster, isLoading } = useSelectedCluster();
   if (isLoading) return null;
   if (!cluster) return <Navigate to="/setup" replace />;
-  return <Overview clusterName={cluster.name} serverUrl={cluster.apiServerUrl} />;
+  return <Overview clusterName={cluster.name} clusterId={cluster.id} serverUrl={cluster.apiServerUrl} />;
 }
 
 // The app grid. Owns the app CRUD the old `pages/projects.tsx`
@@ -38,12 +39,25 @@ export function AppsPage() {
 // every env's URL). "Project" survives only as internal ids/props — the
 // user-facing unit is an App.
 
-function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: string }) {
+function Overview({
+  clusterName,
+  clusterId,
+  serverUrl,
+}: {
+  clusterName: string;
+  clusterId: string;
+  serverUrl: string;
+}) {
   const client = useApplianceClient();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
   const { toast } = useToast();
   const [filter, setFilter] = React.useState('');
+  // When the apps query fails because the local Dev Machine isn't running,
+  // offer a one-click Start instead of a dead-end error (post-delete / stop
+  // / fresh install). Null unless the selected target is a startable local
+  // VM on this (desktop) host.
+  const startableVm = useStartableDevMachine({ id: clusterId, apiServerUrl: serverUrl });
 
   // Inline "New app" create (folded in from ConnectedProjects) — the
   // grid's create CTA used to dead-link back to /projects.
@@ -229,7 +243,11 @@ function Overview({ clusterName, serverUrl }: { clusterName: string; serverUrl: 
       {mutationError ? (
         <FriendlyError error={mutationError} fallbackHeadline="That change didn't go through" />
       ) : error ? (
-        <FriendlyError error={error} fallbackHeadline="Couldn't load your apps" />
+        classifyError(error) === 'network' && startableVm ? (
+          <StartMachineRecovery vmName={startableVm} error={error} />
+        ) : (
+          <FriendlyError error={error} fallbackHeadline="Couldn't load your apps" />
+        )
       ) : null}
 
       {loading ? (
