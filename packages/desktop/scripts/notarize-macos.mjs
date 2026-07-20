@@ -109,6 +109,20 @@ if (!appPath) {
 // embedded sidecars (appliance CLI, appliance-vm) are sealed under the
 // same identity via --deep so the bundle verifies as a whole.
 
+// Hardened-runtime entitlements for the notarized build (scripts/
+// entitlements.plist — kept comment-free so `codesign`'s DER entitlement
+// encoding never trips over XML comments). Why each one is present:
+//   - allow-jit / allow-unsigned-executable-memory: the Bun-compiled
+//     `appliance` CLI and the bootstrap `node` both JIT JavaScript, which
+//     the hardened runtime forbids by default.
+//   - allow-dyld-environment-variables / disable-library-validation: let
+//     the shell launch our-identity-signed sidecars that load their own
+//     (differently-signed / unsigned) libraries — Bun single-file
+//     executables embed their runtime this way.
+// Keychain access needs no entitlement (gated by signing identity, not a
+// hardened-runtime capability); network client access is the GUI default.
+// Keep the list MINIMAL — some entitlements (e.g. get-task-allow) fail
+// notarization outright.
 const entitlements = process.env.APPLIANCE_ENTITLEMENTS || path.join(__dirname, 'entitlements.plist');
 const haveEntitlements = fs.existsSync(entitlements);
 

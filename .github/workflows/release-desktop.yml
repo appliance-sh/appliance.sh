@@ -50,6 +50,14 @@ jobs:
             # still matches the bundle without cross-compiling.
             runs_on: macos-15-intel
     runs-on: ${{ matrix.runs_on }}
+    # The Developer ID cert (APPLE_CERTIFICATE + password), the notarization
+    # creds (APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID/APPLE_SIGNING_IDENTITY) and
+    # the Tauri updater keys (TAURI_SIGNING_PRIVATE_KEY, TAURI_UPDATER_PUBKEY)
+    # are scoped to the `publish` GitHub environment. A job only sees
+    # environment-scoped secrets when it opts in here; without this the
+    # secrets.* refs below resolve to empty strings and the bundle ships
+    # UNSIGNED + un-notarized with a placeholder updater key.
+    environment: publish
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,6 +126,7 @@ jobs:
       # so a fork without secrets still gets unsigned bundles instead of
       # a hard failure. See packages/desktop/README.md -> Auto-update.
       - name: Build + sign + notarize bundle
+        id: bundle
         working-directory: packages/desktop
         env:
           # --- Developer ID cert import (into a temp keychain, below) ---
@@ -158,6 +167,80 @@ jobs:
             echo "APPLE_CERTIFICATE not set — building an UNSIGNED, un-notarized bundle (expected for forks / dry runs)."
           fi
           pnpm run tauri:build:release
+          # Record what signing this build actually attempted, so the guard
+          # step can hard-fail if the expected artifacts don't materialize.
+          # apple_signing reflects the post-UNSIGNED-mask state; updater
+          # signing is independent (UNSIGNED does not touch the Tauri key).
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "apple_signing=expected" >> "$GITHUB_OUTPUT"
+          else
+            echo "apple_signing=skipped" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "updater_signing=expected" >> "$GITHUB_OUTPUT"
+          else
+            echo "updater_signing=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail LOUD when signing was configured but the outputs aren't actually
+      # signed / notarized / updater-signed. A silent no-op (partial creds, a
+      # Tauri version that stopped invoking notarize-macos, an expired cert
+      # that imported but can't sign) would otherwise ship a bundle Gatekeeper
+      # blocks or the updater can't verify. Forks with no secrets skip every
+      # assertion (both signals are 'skipped'), preserving unsigned dry runs.
+      - name: Guard — signing + notarization actually happened
+        if: steps.bundle.outputs.apple_signing == 'expected' || steps.bundle.outputs.updater_signing == 'expected'
+        working-directory: packages/desktop/src-tauri/target/release/bundle
+        env:
+          APPLE_SIGNING: ${{ steps.bundle.outputs.apple_signing }}
+          UPDATER_SIGNING: ${{ steps.bundle.outputs.updater_signing }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if [ "$APPLE_SIGNING" = "expected" ]; then
+            APP=$(find macos -maxdepth 1 -name '*.app' | head -n1 || true)
+            if [ -z "$APP" ]; then
+              echo "::error::signing was configured but no .app was produced under macos/ — did tauri:build:release run?" >&2
+              fail=1
+            else
+              # The whole bundle (shell + embedded sidecars) must verify as a
+              # validly sealed Developer-ID signature, not an ad-hoc "-" one.
+              if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
+                echo "::error::$APP failed codesign --verify --deep --strict." >&2
+                fail=1
+              fi
+              if ! codesign -dvv "$APP" 2>&1 | grep -q 'Authority=Developer ID Application'; then
+                echo "::error::$APP is not Developer-ID signed (ad-hoc / dev signatures fail Gatekeeper)." >&2
+                codesign -dvv "$APP" 2>&1 | grep -E 'Authority=|Signature' >&2 || true
+                fail=1
+              fi
+              # Stapled ticket = notarization succeeded AND is verifiable
+              # offline. This transitively proves the hardened runtime, since
+              # Apple won't notarize a bundle without it.
+              if ! xcrun stapler validate "$APP"; then
+                echo "::error::$APP has no stapled notarization ticket." >&2
+                fail=1
+              fi
+              DMG=$(find dmg -maxdepth 1 -name '*.dmg' | head -n1 || true)
+              if [ -n "$DMG" ] && ! xcrun stapler validate "$DMG"; then
+                echo "::error::$DMG has no stapled notarization ticket." >&2
+                fail=1
+              fi
+            fi
+          fi
+
+          if [ "$UPDATER_SIGNING" = "expected" ]; then
+            SIG=$(find macos -maxdepth 1 -name '*.app.tar.gz.sig' | head -n1 || true)
+            if [ -z "$SIG" ]; then
+              echo "::error::TAURI_SIGNING_PRIVATE_KEY was set but no *.app.tar.gz.sig was produced — self-update would be unverifiable." >&2
+              find macos -maxdepth 1 -type f >&2 || true
+              fail=1
+            fi
+          fi
+
+          [ "$fail" -eq 0 ] && echo "Signing guard passed — expected artifacts are present and valid."
+          exit "$fail"
 
       - name: Stage release assets
         id: stage
@@ -205,6 +288,12 @@ jobs:
   build-windows:
     name: Build windows-x86_64 bundle
     runs-on: windows-latest
+    # Opt in to the `publish` environment for the Tauri updater secrets
+    # (TAURI_SIGNING_PRIVATE_KEY + TAURI_UPDATER_PUBKEY). Without it the
+    # NSIS installer's updater archive ships unsigned and the injected
+    # pubkey stays the fail-safe placeholder, so self-update breaks. (No
+    # Apple creds are used here — Authenticode signing is still TODO.)
+    environment: publish
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -256,11 +345,39 @@ jobs:
       # ships unsigned (SmartScreen shows a "more info" step) until a
       # WINDOWS_CERTIFICATE secret + signtool step is added.
       - name: Build bundle
+        id: bundle
         working-directory: packages/desktop
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm run tauri:build:release
+        run: |
+          set -euo pipefail
+          pnpm run tauri:build:release
+          # Record whether updater signing was configured, so the guard below
+          # can hard-fail a real release whose installer came out unsigned.
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "updater_signing=expected" >> "$GITHUB_OUTPUT"
+          else
+            echo "updater_signing=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail LOUD when updater signing was configured but produced no .sig —
+      # the Windows installer IS the updater artifact, so an unsigned one
+      # breaks self-update. Forks without the Tauri key skip this assertion.
+      - name: Guard — updater signature exists
+        if: steps.bundle.outputs.updater_signing == 'expected'
+        working-directory: packages/desktop/src-tauri/target/release/bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIG=$(find nsis -maxdepth 1 -name '*-setup.exe.sig' | head -n1 || true)
+          if [ -z "$SIG" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY was set but no *-setup.exe.sig was produced — Windows self-update would be unverifiable." >&2
+            find nsis -maxdepth 1 -type f >&2 || true
+            exit 1
+          fi
+          echo "Updater signature present: $SIG"
 
       - name: Stage release assets
         id: stage

@@ -9,5 +9,9 @@ cd "$(dirname "$0")/.."
 PROFILE=debug
 [ "${1:-}" = "--release" ] && PROFILE=release
 BIN="target/$PROFILE/appliance-vm"
+# vz.entitlements grants com.apple.security.virtualization — required to
+# create VMs via Virtualization.framework. Kept comment-free so codesign's
+# DER entitlement encoding never trips over XML comments. The desktop app's
+# release signing pipeline must apply the same entitlement for distribution.
 codesign --force --sign - --entitlements vz.entitlements "$BIN"
 echo "signed $BIN with com.apple.security.virtualization"

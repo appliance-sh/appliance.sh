@@ -2,29 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!--
-    Hardened-runtime entitlements for the notarized release build, passed
-    to `codesign --options runtime --entitlements` by notarize-macos.mjs.
-
-    The desktop shell spawns bundled sidecars (the `appliance` CLI, the
-    `appliance-vm` engine) and a system `node` for the bootstrap flow.
-    The hardened runtime blocks a few things those need:
-
-    - allow-jit / allow-unsigned-executable-memory: the Bun-compiled
-      `appliance` CLI and Node both JIT JavaScript, which the hardened
-      runtime forbids by default.
-    - allow-dyld-environment-variables / disable-library-validation:
-      let the app launch sidecars that are signed with our identity but
-      load their own (differently-signed or unsigned) libraries — Bun's
-      single-file executables embed their runtime this way.
-
-    Keychain access (the API-key store) does NOT need an entitlement —
-    it's gated by the app's signing identity, not a hardened-runtime
-    capability. Network client access is the default for GUI apps.
-
-    Keep this list MINIMAL: every entitlement widens the attack surface
-    and some (e.g. get-task-allow) would fail notarization outright.
-  -->
   <key>com.apple.security.cs.allow-jit</key>
   <true/>
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key>

@@ -2,10 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Required to create virtual machines via Virtualization.framework.
-       Local dev: applied with an ad-hoc signature by scripts/sign-dev.sh
-       (cargo build doesn't sign). Distribution: the desktop app's signing
-       pipeline must include the same entitlement. -->
   <key>com.apple.security.virtualization</key>
   <true/>
 </dict>
